@@ -24,6 +24,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
+import { approveFastForward, parseFastForward } from "./fast-forward-approval.mjs";
 import {
   AUTHORIZATION_CAPABILITIES,
   SUPPORTED_AGENT_KINDS,
@@ -7190,18 +7191,32 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     }
     const command = call.input?.command;
     if (call.toolName !== "bash" || typeof command !== "string") return;
-    const gitPush = /(?:^|[;&|]\s*)git(?:\s+\S+)*\s+push\b/im;
+    if (process.env.HERDR_ENV === "1" && parseFastForward(command)) {
+      try {
+        const approved = await approveFastForward(command, ctx, {
+          rootIdentity: () => isRootOrchestrator()
+            ? JSON.stringify({ pane: process.env.HERDR_PANE_ID, workspace: process.env.HERDR_WORKSPACE_ID, config: readControllerConfigForCurrentPane() })
+            : null,
+          git: (args: string[]) => runDirectGit(args, ctx.signal),
+        });
+        return approved ? undefined : { block: true, reason: "Local fast-forward approval was declined; no integration performed." };
+      } catch (error) {
+        return { block: true, reason: `Local fast-forward blocked: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    const gitPush = /(?:^|[;&|]\s*)(?:rtk\s+(?:proxy\s+)?)?git(?:\s+\S+)*\s+push\b/im;
     const nonAutonomousMutation =
-      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
+      /(?:^|[;&|]\s*)(?:rtk\s+(?:proxy\s+)?)?(?:git(?:\s+\S+)*\s+(?:push|merge)(?=\s|$)|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
     // 2026-09-16 ruling: the verified controller-mapped root is the parent
     // executor acting with the user present, so a plain `git push` is allowed
     // there, and it may retire its own lane tabs/panes (children remain
     // reachable through durable manifests). Every other mutation stays
-    // blocked for every caller, workspace closure is never allowed from an
+    // blocked except for the confirmed standalone fast-forward above; workspace
+    // closure is never allowed from an
     // agent shell (it would close the root's own session), and a compound
     // command that also carries a non-push mutation keeps the block.
     const nonPushMutation =
-      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b)/im;
+      /(?:^|[;&|]\s*)(?:rtk\s+(?:proxy\s+)?)?(?:git(?:\s+\S+)*\s+merge(?=\s|$)|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b)/im;
     const herdrWorkspaceClose =
       /(?:^|[;&|]\s*)herdr\s+workspace\s+close\b/im;
     const herdrPaneClose =

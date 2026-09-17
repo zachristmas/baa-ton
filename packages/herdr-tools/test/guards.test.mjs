@@ -10,6 +10,32 @@ const { blocksUnmanagedAgentCommand, isReadOnlyPiDiagnostic } =
   await jiti.import("../command-policy.ts");
 const { default: extension } = await jiti.import("../index.ts");
 
+test("Git shell guard distinguishes merge-base and requires root approval for fast-forward", async () => {
+  const saved = Object.fromEntries(["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID"].map(k => [k, process.env[k]]));
+  const handlers = new Map();
+  extension({ on: (event, handler) => handlers.set(event, handler), registerTool() {}, registerCommand() {} });
+  process.env.HERDR_ENV = "1";
+  delete process.env.HERDR_PANE_ID;
+  delete process.env.HERDR_WORKSPACE_ID;
+  const call = command => handlers.get("tool_call")({ toolName: "bash", input: { command } }, { cwd: "/tmp", hasUI: false });
+  try {
+    for (const prefix of ["git", "rtk git", "rtk proxy git"]) {
+      assert.equal(await call(`${prefix} -C '/tmp/project with spaces' merge-base --is-ancestor HEAD main`), undefined);
+      for (const tail of ["merge main", "merge --no-ff main", "push origin main"])
+        assert.equal((await call(`${prefix} ${tail}`)).block, true);
+      const blocked = await call(`${prefix} merge --ff-only ${"a".repeat(40)}`);
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /verified controller-mapped root/);
+    }
+    assert.equal((await call("git merge-base HEAD main; git merge main")).block, true);
+    assert.equal((await call(`git merge --ff-only ${"a".repeat(40)} && git push`)).block, true);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
 test("standalone non-secret Pi diagnostics are allowed, not launches or shell tails", () => {
   for (const command of [
     "pi auth check --provider openai-codex --model gpt-5.6-luna --json --no-refresh",

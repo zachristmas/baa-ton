@@ -17,6 +17,27 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
 
+## Local fast-forward approval
+
+The Pi shell guard allows read-only `git merge-base` checks. A verified controller
+root can request native TUI approval for one standalone command:
+
+```sh
+git -C '/absolute/checkout' merge --ff-only <full-commit-object-id>
+```
+
+`rtk git` and `rtk proxy git` wrappers are also supported. Use the checkout root,
+a full commit ID, and a clean attached branch. The confirmation shows the exact
+checkout, branch, old HEAD, target commit, and command. State and root registration
+are checked again after confirmation; any change fails closed. Declining leaves
+the checkout untouched. This approval is not saved as a general permission.
+
+Children, headless callers, compound commands, shell expansions, symbolic target
+refs, and other merge forms cannot use this path. The local autonomous policy
+does not grant integration approval. Push, PR, deployment and resource-management
+rules are unchanged. The shell guard is advisory, not a filesystem sandbox;
+exclusive checkout ownership still matters while a command executes.
+
 ## Messaging the parent
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.
