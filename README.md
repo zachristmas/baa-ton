@@ -55,6 +55,10 @@ node ~/.baa-ton/packages/herdr-tools/root-setup.mjs --harness claude
 
 Keep the harness in the same Herdr pane so its identity is preserved.
 
+If the old workspace is gone, use the audited `herdr_recover_root` preview
+instead of resetting the controller. See [stale-root recovery](packages/herdr-tools/README.md#recover-a-stale-project-root)
+for its evidence requirements, explicit execution step, and limitations.
+
 ## Configure workers
 
 Invoke `baa-ton-configure` in the project to edit `.baa-ton/config.json`, where each task profile’s harness, provider, model, thinking, and auth settings are stored. It only changes configuration; it does not start work.

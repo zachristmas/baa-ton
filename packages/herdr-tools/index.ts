@@ -91,6 +91,7 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
 import { resolveTaskProfile } from "./profile-config.mjs";
+import { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } from "./root-recovery.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -3404,6 +3405,69 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         "Only the verified controller-mapped root may register the event controller.",
       );
     return currentPaneRoot(signal);
+  }
+
+  async function recoverRoot(
+    cwd: string,
+    oldRootId: string,
+    execute: boolean,
+    expectedFingerprint: string | undefined,
+    evidence: string | undefined,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    requireHerdr();
+    const root = await currentPaneRoot(signal);
+    if (process.env.HERDR_WORKSPACE_ID !== root.workspace_id)
+      throw new Error("Current environment workspace differs from native pane identity.");
+    const rootAgent = responseRecord(await runHerdr(["agent", "get", root.pane_id], signal), "recovery root").agent;
+    const live = liveAgentIdentity({ type: "agent_info", agent: rootAgent }, "recovery root");
+    if (live.paneId !== root.pane_id || live.workspaceId !== root.workspace_id || live.kind !== root.agent_kind)
+      throw new Error("Native root identity changed during discovery.");
+    if (!isRecord(rootAgent) || !isRecord(rootAgent.agent_session) || rootAgent.agent_session.kind !== "path" ||
+      rootAgent.agent_session.value !== ctx.sessionManager.getSessionFile())
+      throw new Error("Recovery requires this exact live native session path.");
+    const configPath = await controllerConfigPath(signal);
+    const auditDir = join(dirname(manifestPath(cwd)), "root-recovery");
+    const release = await acquireManifestLock(cwd);
+    try {
+      const configLock = `${configPath}.lock`;
+      await mkdir(configLock, { mode: 0o700 });
+      try {
+        await assertNoPendingRecovery(auditDir);
+        await loadControllerConfig(configPath); // Validate existing controller schema/security.
+        const before = await readRecoveryFiles(configPath, manifestPath(cwd));
+        const config = JSON.parse(before.config);
+        const old = config.orchestrators?.find((item: ControllerOrchestrator) => item.id === oldRootId);
+        if (!old) throw new Error("Selected old root does not exist.");
+        // A missing agent alone is not proof a workspace has disappeared.
+        const workspaces = responseRecord(await runHerdr(["workspace", "list"], signal), "recovery workspace list");
+        if (!Array.isArray(workspaces.workspaces)) throw new Error("No authoritative workspace list.");
+        const liveWorkspaceIds = workspaces.workspaces.map(item => {
+          if (!isRecord(item)) throw new Error("Invalid workspace list entry.");
+          return requiredString(item, "workspace_id", "recovery workspace list");
+        });
+        let missing = false;
+        try { await runHerdr(["agent", "get", old.root.pane_id], signal); }
+        catch (error) {
+          const prefix = `herdr agent get ${old.root.pane_id} failed: `;
+          const text = error instanceof Error ? error.message : String(error);
+          let failure: unknown;
+          try { if (text.startsWith(prefix)) failure = JSON.parse(text.slice(prefix.length)); } catch { /* fail closed */ }
+          if (!isRecord(failure) || !isRecord(failure.error) || failure.error.code !== "agent_not_found") throw error;
+          missing = true;
+        }
+        if (!missing) throw new Error("Old root is still live; migration refused.");
+        const session = rootSessionEntry(root, rootAgent, undefined, now(), undefined);
+        const plan = rootRecoveryPlan({ config, manifest: JSON.parse(before.manifest), cwd, oldRootId, root, session, liveWorkspaceIds });
+        const fingerprint = recoveryHash(JSON.stringify({ before, oldRootId, root, sessionRef: session.sessionRef }));
+        if (!execute) return { mode: "preview", fingerprint, oldRootId, newRootId: plan.newRootId, oldRoot: plan.oldRoot, root, workflowIds: plan.workflowIds,
+          note: "No migration applied. Exact preimages will be audited on execution. Historical task bindings and receipts remain unchanged; this does not verify or resume old workflows." };
+        if (expectedFingerprint !== fingerprint) throw new Error("Recovery preview is missing or stale; preview again.");
+        if (!evidence?.trim()) throw new Error("Explicit migration authorization/evidence is required.");
+        return { mode: "applied", ...await commitRootRecovery({ configPath, manifestPath: manifestPath(cwd), auditDir, before, plan, evidence: evidence.trim() }) };
+      } finally { await rm(configLock, { recursive: true, force: true }); }
+    } finally { await release(); }
   }
 
   async function bootstrapRoot(
@@ -7248,6 +7312,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ],
         details: result,
       };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_recover_root",
+    label: "Recover stale project root",
+    description: "Preview or explicitly apply an audited migration from a gone workspace/root to this verified native session. Preserves other roots, completed workflow receipts and historical task bindings. Requires quiescent workflows; never resets, dispatches or resumes work. Preview first, then execute only with user authorization and its exact fingerprint. Reconcile any failed external submission before changing the manifest.",
+    parameters: Type.Object({
+      oldRootId: Type.String({ minLength: 1 }),
+      execute: Type.Optional(Type.Boolean()),
+      expectedFingerprint: Type.Optional(Type.String()),
+      evidence: Type.Optional(Type.String()),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await recoverRoot(ctx.cwd, params.oldRootId, params.execute ?? false, params.expectedFingerprint, params.evidence, ctx, signal);
+      return { content: [{ type: "text", text: jsonText(result) }], details: result };
     },
   });
   pi.registerTool({

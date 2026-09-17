@@ -8,6 +8,7 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 | --- | --- |
 | `herdr_goal` | Manage the root-only durable parent goal. |
 | `herdr_reparent` | Preview or root-confirm a controller-root handoff. |
+| `herdr_recover_root` | Preview or explicitly apply an audited migration of a stale project root whose workspace is gone. |
 | `herdr_plan` | Create a durable workflow and its lanes. |
 | `herdr_dispatch` | Preview or create owned Herdr workspace/tab/lane resources. |
 | `herdr_observe` | Record lane state and bounded recent output, including child messages. |
@@ -16,6 +17,46 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 | `herdr_close` | Close only a completed, evidenced, extension-owned workspace. |
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
+
+## Recover a stale project root
+
+Use `herdr_recover_root` when the registered root's workspace has disappeared
+and a manually started session in the same checkout needs to take ownership.
+Use `herdr_reparent` for its existing live-root handoff case. Recovery does not
+bootstrap with reset or discard previous workflows.
+
+1. Read the controller registrations and select the exact recorded `oldRootId`.
+   Resolve any external failed-submission records before changing the manifest.
+2. Call `herdr_recover_root` with `oldRootId` only. The preview verifies the real
+   current pane, workspace and native session, requires the old workspace to be
+   absent and its agent probe to return structured `agent_not_found`, and rejects
+   conflicting root/child ownership or non-quiescent workflows.
+3. Show the preview. With explicit migration authorization, call the same tool
+   with `execute: true`, its `expectedFingerprint`, and `evidence` describing that
+   authorization. Changed inputs require another preview. Run `herdr_doctor`
+   afterward; do not infer dispatch readiness from migration alone.
+
+Recovery retains other roots and routes. It migrates the selected root's scoped
+goal/queue ownership and session log, and updates its workflow controller-root
+references. Workflow receipts and original `taskBinding` provenance are retained;
+this is not an adoption, verification, resume, or cleanup of historical workflows.
+Only completed workflows with durable receipts and untouched, unrouted plans
+are accepted. Cross-manifest routes and legacy draft scoped-goal schemas require
+separate investigation. The new session must expose an exact native session path.
+
+Manifest and controller locks protect the update. Private preimages and proposed
+postimages are written to `.pi/herdr-orchestrator/root-recovery/` before applying
+either document. Ordinary second-write failures restore the unchanged first
+document; uncertain or crash-interrupted writes leave a pending journal and
+further recovery refuses to proceed. Inspect that journal before any manual
+repair. Keep `.pi/herdr-orchestrator/` excluded from Git. No lanes, worktrees,
+model calls, authentication changes, or resource closures are performed.
+
+Local live validation exercised a stale-root migration with prior workflow
+history retained. Doctor reported healthy overall with an existing lane-bridge
+warning; a subsequent read-only native Claude Code review completed with a
+durable receipt and independent root verification. Migration alone does not
+qualify other profiles or clear unrelated readiness warnings.
 
 ## Messaging the parent
 
