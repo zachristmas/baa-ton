@@ -240,6 +240,8 @@ async function fixture(options = {}) {
               pane_id: p.paneId,
               workspace_id: "task-space",
               agent: options.adapter?.kind ?? "pi",
+              interactive_ready: !options.waitingForApproval,
+              agent_status: options.waitingForApproval ? "blocked" : "idle",
               agent_session: {
                 kind: p.sessionKind ?? "path",
                 value: options.unrelatedSession
@@ -739,7 +741,7 @@ test("claude adapter dispatches through unchanged sequencing with its own attest
   }
 });
 
-test("startup-blocked lane is adopted on retry once its attestation appears", async () => {
+for (const observedStatus of ["dispatch-failed", "blocked", "unknown"]) test(`startup-blocked lane is adopted after attestation (observed: ${observedStatus})`, async () => {
   const f = await fixture({ notReadyOnce: true });
   try {
     await assert.rejects(f.run(), /agent_not_ready/);
@@ -747,6 +749,17 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
       f.calls.some((c) => c[1] === "prompt"),
       false,
     );
+    if (observedStatus !== "dispatch-failed") {
+      f.state.status = observedStatus;
+      f.options.waitingForApproval = true;
+      const before = structuredClone(f.state), calls = f.calls.length;
+      await assert.rejects(f.run(), /awaiting user approval/);
+      assert.deepEqual(f.state, before, "waiting never rewrites blocked state");
+      assert.ok(f.calls.slice(calls).every(c => c[0] === "agent" && c[1] === "get"));
+      f.options.waitingForApproval = false;
+      await assert.rejects(f.run(), /no complete attestation/);
+      assert.deepEqual(f.state, before);
+    }
     // Operator unblocks the harness; its SessionStart hook writes the
     // attestation for the blocked lane and its native session appears.
     const blocked = f.state.lanes[0];
@@ -767,6 +780,20 @@ test("startup-blocked lane is adopted on retry once its attestation appears", as
         tools: ["herdr_complete", "herdr_plan", "herdr_dispatch"],
       }),
     );
+    if (observedStatus !== "dispatch-failed") {
+      const before = structuredClone(f.state);
+      f.options.unrelatedSession = true;
+      await assert.rejects(f.run());
+      assert.deepEqual(f.state, before);
+      f.options.unrelatedSession = false;
+      blocked.promptAttemptedAt = new Date().toISOString();
+      await assert.rejects(f.run(), new RegExp(`cannot be dispatched from ${observedStatus}`));
+      delete blocked.promptAttemptedAt;
+      const previousError = f.state.retry.error;
+      f.state.retry.error = "unrelated failure";
+      await assert.rejects(f.run(), new RegExp(`cannot be dispatched from ${observedStatus}`));
+      f.state.retry.error = previousError;
+    }
     assert.equal((await f.run()).dispatched, true);
     // One blocked attempt plus one fresh start for the untouched lane.
     assert.equal(f.calls.filter((c) => c[1] === "start").length, 2);

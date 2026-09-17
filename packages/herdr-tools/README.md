@@ -17,6 +17,26 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
 
+## Startup approval waits
+
+A harness can stop at a folder-trust or other interactive startup prompt after
+Herdr creates the lane. Baa-ton does not answer that prompt. Keep the pane and
+workflow intact while the user reviews it; do not launch a replacement agent.
+
+After the user resolves the prompt, retry `herdr_dispatch` for the **same**
+workflow. A controller-observed `blocked` or `unknown` workflow can resume startup only if its
+recorded failure was `agent-start` / `agent_not_ready`, no assignment or receipt
+exists, and each previously attempted agent is now natively ready with matching
+startup identity, session, exact profile and protocol-tool proof. Missing or
+mismatched proof and a still-blocked agent refuse recovery before changing the
+workflow. Ordinary blocked/unknown work and uncertain assignment submissions remain
+ineligible. The existing startup adoption path reuses the blocked agent; later,
+previously unstarted lanes may start normally after qualification.
+
+This path performs no approval keystrokes and does not infer permission from
+elapsed time. `herdr_resume` remains native-session reattachment for done/gone
+lanes, not recovery of a live agent awaiting startup approval.
+
 ## Messaging the parent
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.

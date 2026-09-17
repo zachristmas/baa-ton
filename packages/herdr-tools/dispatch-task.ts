@@ -346,11 +346,50 @@ export async function dispatchTask(
     throw new Error(
       "Missing or mismatched task workspace binding; no replacement workspace will be created.",
     );
+  // Controller observations can turn a failed startup into `blocked` during
+  // a human trust prompt, then `unknown` when idle without a receipt. Only an unassigned startup
+  // rejection may re-enter dispatch, and only with proof from its existing
+  // native agent. Never answer the dialog, restart it, or manufacture readiness.
+  const recoverObservedStartup = ["blocked", "unknown"].includes(workflow.status) && !restart &&
+    workflow.retry?.failedStage === "agent-start" &&
+    /\bagent_not_ready\b/.test(workflow.retry?.error ?? "") &&
+    workflow.lanes.some(lane => lane.agentStartAttemptedAt) &&
+    workflow.lanes.every(lane => !lane.promptAttemptedAt && !lane.promptedAt && !lane.completionReceipt);
+  if (recoverObservedStartup) {
+    for (const [index, lane] of workflow.lanes.entries()) {
+      if (!lane.agentStartAttemptedAt) continue;
+      if (!lane.paneId || !lane.startupIntentPath || !lane.startupNonce)
+        throw new Error("Blocked startup lacks its original pane/intent identity; no recovery performed.");
+      const raw = await port.run(["agent", "get", lane.paneId], signal);
+      const agent = (raw.result ?? raw).agent;
+      if (agent?.launch_pending || agent?.interactive_ready === false ||
+        ["blocked", "working", "starting"].includes(agent?.agent_status) ||
+        !(agent?.interactive_ready === true || ["idle", "done"].includes(agent?.agent_status)))
+        throw new Error("Startup is still awaiting user approval or native readiness; leave the existing lane in place.");
+      const intent = JSON.parse(await readFile(lane.startupIntentPath, "utf8"));
+      const hello = await readFile(`${lane.startupIntentPath}.ready`, "utf8")
+        .then(text => JSON.parse(text)).catch(() => null);
+      if (!hello || (adapters[index].attestationComplete && !adapters[index].attestationComplete(hello)))
+        throw new Error("Approved startup has no complete attestation yet; no recovery performed.");
+      const proof = adapters[index].verifyStartup(agent, hello);
+      if (intent.incarnationId !== lane.incarnationId || intent.nonce !== lane.startupNonce ||
+        intent.paneId !== lane.paneId || intent.workspaceId !== workspaceId ||
+        intent.source !== port.source || JSON.stringify(intent.profile) !== JSON.stringify(profiles[index]) ||
+        agent.pane_id !== lane.paneId || agent.workspace_id !== workspaceId || agent.agent !== lane.agentKind ||
+        proof.paneId !== lane.paneId || proof.workspaceId !== workspaceId ||
+        proof.nonce !== lane.startupNonce || proof.source !== port.source ||
+        JSON.stringify(proof.profile) !== JSON.stringify(profiles[index]) ||
+        !STARTUP_PROOF_REQUIRED_OPERATIONS.every(operation => proof.operations?.includes(operation)) ||
+        (lane.nativeSession && (lane.nativeSession.kind !== proof.session.kind || lane.nativeSession.value !== proof.session.value)))
+        throw new Error("Blocked startup identity/profile/session proof mismatch; no recovery performed.");
+    }
+  }
   if (
     ![
       "planned",
       "dispatch-failed",
       "starting",
+      ...(recoverObservedStartup ? [workflow.status] : []),
       ...(restart ? ["running"] : []),
     ].includes(workflow.status)
   )
@@ -500,6 +539,11 @@ export async function dispatchTask(
     await update((w) => {
       w.status = "starting";
       w.ownership.workspaceId = workspaceId;
+      if (recoverObservedStartup) w.evidence.push({
+        at: new Date().toISOString(),
+        kind: "blocked-startup-requalified",
+        text: "Existing native startup passed readiness and identity/profile proof; no approval input or replacement launch was sent for the blocked agent.",
+      });
       w.retry = {
         state: "dispatching",
         attempt: (w.retry?.attempt ?? 0) + 1,
