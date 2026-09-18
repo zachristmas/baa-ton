@@ -31,6 +31,42 @@ install -m 600 config.sample.json "$PLUGIN_CONFIG_DIR/config.json"
 
 Replace all placeholders with real opaque IDs and the absolute workflow manifest path. The controller never links or enables itself.
 
+## Activate an already-installed supervisor
+
+Herdr 0.9.1 runs `[[startup]]` hooks at server startup/live handoff, **not** on
+plugin enable, relink, client attach, or config reload. Startup hooks are not
+supervised daemons. Disable/enable is therefore not a supervisor restart.
+See [Herdr's startup-hook contract](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.1/docs/next/website/src/content/docs/plugins.mdx).
+
+For an already-enabled, configured plugin with no running supervisor, the owning
+root can explicitly open the `supervisor` plugin pane:
+
+```sh
+herdr plugin pane open --plugin herdr-orchestrator-controller --entrypoint supervisor --placement tab --no-focus
+```
+
+Herdr caches manifest entrypoints in its plugin registry. After updating a local
+checkout, refresh its existing link with `herdr plugin link /absolute/plugin/root
+--enabled` and verify the registered `supervisor` entrypoint before opening it.
+Use the already-installed plugin root, not a new copy; do not unlink first or
+replace the controller configuration. Relinking refreshes metadata and does not
+run startup hooks. For a managed installation, use the documented plugin update
+flow instead of converting it to a local link.
+
+Run this from the verified native root context. Let Herdr supply plugin paths,
+socket and workspace identity; do not add guessed environment overrides or a
+checkout `--cwd`. The foreground Node process runs in a Herdr-owned tab and uses
+the same config-directory lease as the startup path. If another supervisor owns
+the lease it reports `supervisor_already_running` and exits without starting a
+second loop. An unreadable lease also fails closed; inspect it instead of deleting it.
+
+Confirm the pane output (`started: true`), live process and matching lease before
+a notification trial. A pane is not an agent or a new Baa-ton root. Preserve the
+controller config, workflow manifests and Herdr server. Opening this pane does
+not hot-reload or replace a running supervisor; stop an existing instance only
+through an explicitly authorized lifecycle action, then verify lease release.
+Closing this pane stops its foreground service, so it is not routine trial cleanup.
+
 ## Safety model
 
 - Configuration maps one verified root and explicit child lanes to workflow IDs.

@@ -340,28 +340,31 @@ function parsePluginManifest(raw) {
   const top = {};
   const events = [];
   const actions = [];
+  const panes = [];
   let current = top;
   for (const untrimmed of raw.split(/\r?\n/)) {
     const line = untrimmed.trim();
     if (!line || line.startsWith("#")) continue;
-    if (["[[events]]", "[[startup]]", "[[actions]]"].includes(line)) {
+    if (["[[events]]", "[[startup]]", "[[actions]]", "[[panes]]"].includes(line)) {
       current = {};
       (line === "[[events]]"
         ? events
         : line === "[[actions]]"
           ? actions
-          : (top.startup ??= [])
+          : line === "[[panes]]"
+            ? panes
+            : (top.startup ??= [])
       ).push(current);
       continue;
     }
     const match =
-      /^(id|name|version|min_herdr_version|description|platforms|on|command|title) = (.+)$/.exec(
+      /^(id|name|version|min_herdr_version|description|platforms|on|command|title|placement) = (.+)$/.exec(
         line,
       );
     assert.ok(match, `unsupported or malformed manifest line: ${line}`);
     current[match[1]] = JSON.parse(match[2]);
   }
-  return { top, events, actions };
+  return { top, events, actions, panes };
 }
 
 test("manifest has the required ID, compatible version floor, and supported event hooks", async () => {
@@ -409,6 +412,10 @@ test("manifest has the required ID, compatible version floor, and supported even
       ],
     },
   ]);
+  assert.deepEqual(manifest.panes, [{
+    id: "supervisor", title: "Baa-ton controller supervisor", placement: "tab",
+    command: ["node", "controller.mjs", "supervisor"],
+  }]);
   assert.deepEqual(manifest.events, [
     {
       on: "pane.agent_status_changed",
@@ -2774,6 +2781,107 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
   } finally {
     await mock.close();
     await fixture.cleanup();
+  }
+});
+
+async function receiptFixture(delivery = "pending", parentGoal) {
+  const fixture = await createFixture({ parentGoal, workflowStatus: "completed", workflowOutcome: "completed",
+    completionReceipt: { id: "incarnation-receipt", summary: "Verified output in lane", delivery } });
+  const manifest = await fixture.manifest();
+  manifest.workflows[0].taskBinding = { rootPaneId: ROOT.pane_id, workspaceId: ROOT.workspace_id, rootSessionPath: "/sessions/owning-root.jsonl" };
+  manifest.workflows[0].lanes[0].incarnationId = "incarnation-receipt";
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  return fixture;
+}
+
+test("completed receipt retries after a busy root without another hook and is delivered once across concurrent ticks", async () => {
+  for (const withGoal of [false, true]) {
+    const fixture = await receiptFixture("pending", withGoal ? { ...dueParentGoal(), status: "review-requested" } : undefined);
+    let status = "working", session = "/sessions/owning-root.jsonl", prompts = 0;
+    const api = { async request(method) {
+      if (method === "pane.report_metadata") return {};
+      if (method === "agent.get") {
+        const info = rootAgentInfo().result;
+        Object.assign(info.agent, { agent_status: status, agent_session: { kind: "path", value: session } });
+        return info;
+      }
+      if (method === "agent.prompt") {
+        assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, "sending", "claim is durable before prompt I/O");
+        prompts++; return {};
+      }
+      throw new Error(`Unexpected method ${method}`);
+    } };
+    const tick = () => runSupervisorTick({ stateDir: fixture.stateDir, herdr: api });
+    try {
+      await tick(); assert.equal(prompts, 0);
+      assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, "pending");
+      status = "idle"; session = "/sessions/replacement-root.jsonl";
+      await tick(); assert.equal(prompts, 0, "same pane with foreign session cannot consume receipt");
+      session = "/sessions/owning-root.jsonl";
+      const outcomes = await Promise.all([tick(), tick()]);
+      assert.equal(prompts, 1);
+      assert.equal(outcomes.flatMap(item => item.pendingWakes).filter(item => item.kind === "completion-receipt").length, 1);
+      const manifest = await fixture.manifest();
+      assert.equal(manifest.workflows[0].lanes[0].completionReceipt.delivery, "delivered");
+      assert.equal(manifest.workflows[0].status, "completed");
+      if (withGoal) assert.equal(manifest.parentGoal.status, "review-requested");
+      await tick(); assert.equal(prompts, 1);
+    } finally { await fixture.cleanup(); }
+  }
+});
+
+test("receipt delivery leaves interrupted, ambiguous, and already delivered states untouched", async () => {
+  for (const delivery of ["sending", "uncertain", "delivered"]) {
+    const fixture = await receiptFixture(delivery);
+    try {
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: { async request(method) {
+        assert.equal(method, "pane.report_metadata"); return {};
+      } } });
+      assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, delivery);
+    } finally { await fixture.cleanup(); }
+  }
+});
+
+test("receipt retries definite prompt rejection but never ambiguous delivery", async () => {
+  for (const code of ["agent_blocked", "socket_timeout"]) {
+    const fixture = await receiptFixture();
+    let rejected = true;
+    const mock = await startHerdrMock(request => {
+      if (request.method === "pane.report_metadata") return { result: {} };
+      if (request.method === "agent.get") {
+        const info = rootAgentInfo();
+        info.result.agent.agent_session = { kind: "path", value: "/sessions/owning-root.jsonl" };
+        return info;
+      }
+      if (request.method === "agent.prompt") return rejected ? { error: { code, message: "test rejection" } } : { result: {} };
+      throw new Error(`Unexpected method ${request.method}`);
+    });
+    try {
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: client(mock) });
+      assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, code === "agent_blocked" ? "pending" : "uncertain");
+      rejected = false;
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: client(mock) });
+      assert.equal(requestsFor(mock, "agent.prompt").length, code === "agent_blocked" ? 2 : 1);
+    } finally { await mock.close(); await fixture.cleanup(); }
+  }
+});
+
+test("receipt drain rejects foreign root bindings and stale lane incarnations", async () => {
+  for (const mutate of [
+    workflow => { workflow.taskBinding.rootPaneId = "foreign:p1"; },
+    workflow => { workflow.taskBinding.workspaceId = "foreign"; },
+    workflow => { workflow.lanes[0].completionReceipt.id = "old-incarnation"; },
+    workflow => { workflow.lanes[0].completionReceipt.summary = ""; },
+  ]) {
+    const fixture = await receiptFixture();
+    try {
+      const manifest = await fixture.manifest(); mutate(manifest.workflows[0]);
+      await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: { async request(method) {
+        assert.equal(method, "pane.report_metadata"); return {};
+      } } });
+      assert.equal((await fixture.manifest()).workflows[0].lanes[0].completionReceipt.delivery, "pending");
+    } finally { await fixture.cleanup(); }
   }
 });
 

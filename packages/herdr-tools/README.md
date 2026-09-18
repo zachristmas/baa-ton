@@ -17,6 +17,31 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 
 All operations fail closed outside a Herdr session. Dispatch, resume, and close are previews by default. Non-root callers persist a parent-approval request rather than presenting approval UI.
 
+## Completion notification recovery
+
+`herdr_complete` saves its receipt before notifying the root. A busy or unavailable
+root can leave notification delivery `pending` after the workflow has completed.
+The controller's existing supervisor tick now retries these pending receipts
+without needing another lifecycle event or an active parent goal. It checks the
+configured root, exact root session, mapped lane and receipt incarnation, and
+native readiness before sending.
+
+The shared manifest lock and persisted `sending` claim prevent competing ticks
+and the child completion call from delivering the same receipt twice. Definite
+pre-submission readiness rejections remain pending; ambiguous sends are marked
+`uncertain`. Existing `sending`, `uncertain`, and `delivered` receipts are never
+automatically replayed. An interrupted `sending` claim requires manual review.
+Historical routes with mismatched root sessions are left untouched.
+
+Roots should inspect durable receipts before waiting. A receipt is a worker's
+claim to verify, regardless of notification status. No notification authorizes
+integration, publication, cleanup, or redispatch. This recovery requires the
+updated controller supervisor to be running; reloading only the Pi extension
+does not reload an already-running controller process.
+For safe activation on an existing server, see the controller's
+[supervisor plugin-pane entrypoint](../controller/README.md#activate-an-already-installed-supervisor).
+Herdr's startup hooks do not run on plugin enable; disable/enable is not a restart.
+
 ## Messaging the parent
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.

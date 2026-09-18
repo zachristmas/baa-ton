@@ -18,6 +18,14 @@ id = "configure-sidebar"
 title = "Install / repair Baa-ton sidebar rows"
 command = ["sh", "-c", "node \"$HERDR_PLUGIN_ROOT/sidebar-configure.mjs\" --apply && herdr server reload-config"]
 
+# Startup hooks do not run when an already-running server enables a plugin.
+# Keep explicit activation foregrounded in a Herdr-owned pane, not a detached job.
+[[panes]]
+id = "supervisor"
+title = "Baa-ton controller supervisor"
+placement = "tab"
+command = ["node", "controller.mjs", "supervisor"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["node", "controller.mjs", "hook"]

@@ -2535,6 +2535,56 @@ export async function runSupervisorTick({
       );
       const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
       const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
+      // Completion receipts are independent of lifecycle events. A worker can
+      // finish while the root is busy and never produce another actionable hook.
+      // Drain this durable outbox even for completed workflows/non-active goals.
+      // The manifest lock is shared with herdr_complete: claiming `sending`
+      // before I/O prevents the child and concurrent ticks from double-sending.
+      for (const [workflowIndex, stored] of matchedWorkflows.entries()) {
+        const binding = stored.taskBinding;
+        const root = orchestrator.root;
+        if (!binding || binding.rootPaneId !== root.pane_id ||
+            binding.workspaceId !== root.workspace_id ||
+            typeof binding.rootSessionPath !== "string" || !binding.rootSessionPath)
+          continue;
+        for (const route of workflows[workflowIndex].lanes) {
+          const lane = stored.lanes.find(item => item.id === route.lane_id);
+          const receipt = lane?.completionReceipt;
+          if (!receipt || receipt.delivery !== "pending" || lane.paneId !== route.pane_id ||
+              receipt.id !== (lane.incarnationId ?? lane.relationshipId) ||
+              typeof receipt.id !== "string" || !receipt.id.trim() ||
+              typeof receipt.summary !== "string" || !receipt.summary.trim()) continue;
+          // `sending` may belong to a live herdr_complete call; neither it nor
+          // ambiguous/delivered outcomes are automatically replayed.
+          let agent;
+          try {
+            agent = rootAgent(await api.request("agent.get", { target: root.target }), root);
+          } catch { continue; } // A read failure cannot consume a pending receipt.
+          if (!agent || !["idle", "done"].includes(agent.agent_status) ||
+              agent.interactive_ready === false || agent.launch_pending ||
+              agent.agent_session?.value !== binding.rootSessionPath ||
+              !["path", "id"].includes(agent.agent_session?.kind) ||
+              goal?.supervisor?.rootTurn?.state === "active") continue;
+          receipt.delivery = "sending";
+          await atomicWriteJson(manifestPath, manifest);
+          try {
+            await api.request("agent.prompt", {
+              target: root.target,
+              text: `[Herdr completion receipt] ${stored.id}/${lane.id} reports complete. Receipt ${receipt.id}: ${receipt.summary.slice(0, 2000)}\nInspect the durable receipt and independently verify it. This notification grants no new authority.`,
+            });
+            receipt.delivery = "delivered";
+          } catch (error) {
+            // Only a definite rejection before submission is retryable. A
+            // transport failure or interrupted sending state requires review.
+            receipt.delivery = !error?.sent && error instanceof HerdrApiError &&
+              ["agent_busy", "agent_blocked", "agent_not_ready", "agent_not_found", "agent_not_running", "agent_pane_not_found", "agent_pane_unavailable"].includes(error.code)
+              ? "pending" : "uncertain";
+          }
+          await atomicWriteJson(manifestPath, manifest);
+          pendingWakes.push({ manifestPath, workflowId: stored.id, laneId: lane.id,
+            kind: "completion-receipt", status: receipt.delivery });
+        }
+      }
       // Queue continuation uses this existing event-driven tick as its retry
       // point. A landed predecessor can wake only a clear ordered head.
       for (const [workflowIndex, stored] of matchedWorkflows.entries()) {

@@ -113,6 +113,10 @@ isolation or clarity.
 5. Observe through Herdr. If blocked on a question or approval, inspect the UI and
    ask the user before answering it. If stalled, inspect first.
 6. Verify the result independently, distinguishing observed evidence from claims.
+   Before waiting for a completion notification, inspect the assigned workflows'
+   durable receipts. A worker may already have finished while the root was busy;
+   pending notification delivery does not invalidate a saved receipt. Verify it
+   rather than waiting for another signal or dispatching the work again.
 7. Close only when every done condition passes and review has no blocking finding.
 
 ## Safety and coordination
