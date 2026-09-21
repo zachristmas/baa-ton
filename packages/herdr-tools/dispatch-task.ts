@@ -269,6 +269,26 @@ async function waitForShellReady(
   );
 }
 
+// Shell process visibility can precede Herdr interactive-shell readiness.
+// Retry only its explicit pre-launch busy rejection, using the same pane and
+// arguments. Timeouts and agent_not_ready may already have launched an agent.
+async function startWhenShellReady(
+  port: Pick<DispatchPorts, "run" | "busyRetryDelayMs">,
+  paneId: string,
+  args: string[],
+  signal?: AbortSignal,
+) {
+  for (let attempt = 0; ; attempt++) {
+    await waitForShellReady(port, paneId, signal);
+    try {
+      return await port.run(args, signal, 65_000);
+    } catch (error) {
+      if (attempt >= 2 || !/agent_pane_busy/.test(String(error))) throw error;
+      await delay(port.busyRetryDelayMs ?? 1_500, { signal });
+    }
+  }
+}
+
 /** The only dispatch implementation. Never creates, moves, replaces or closes a workspace. */
 export async function dispatchTask(
   workflow: Workflow,
@@ -715,42 +735,19 @@ export async function dispatchTask(
           await update((w) => {
             w.lanes[i].agentStartAttemptedAt = new Date().toISOString();
           });
-          await waitForShellReady(port, lane.paneId!, signal);
-          for (let attempt = 0; ; attempt++) {
-            try {
-              await port.run(
-                [
-                  "agent",
-                  "start",
-                  lane.agentName!,
-                  "--kind",
-                  lane.agentKind,
-                  "--pane",
-                  lane.paneId!,
-                  "--timeout",
-                  "60000",
-                  "--",
-                  ...adapters[i].launchArguments(profile, port.source, {
-                    startupIntentPath: lane.startupIntentPath!,
-                    extraMcpServers: lane.mcpServers,
-                  }),
-                ],
-                signal,
-                65_000,
-              );
-              break;
-            } catch (error) {
-              // Native busy rejection is before launch, unlike timeout after submission.
-              if (attempt < 2 && /agent_pane_busy/.test(String(error))) {
-                await delay(port.busyRetryDelayMs ?? 1_500, { signal });
-                continue;
-              }
-              if (/agent_pane_busy/.test(String(error)))
-                await update((w) => {
-                  delete w.lanes[i].agentStartAttemptedAt;
-                });
-              throw error;
-            }
+          try {
+            await startWhenShellReady(port, lane.paneId!, [
+              "agent", "start", lane.agentName!, "--kind", lane.agentKind,
+              "--pane", lane.paneId!, "--timeout", "60000", "--",
+              ...adapters[i].launchArguments(profile, port.source, {
+                startupIntentPath: lane.startupIntentPath!,
+                extraMcpServers: lane.mcpServers,
+              }),
+            ], signal);
+          } catch (error) {
+            if (/agent_pane_busy/.test(String(error)))
+              await update((w) => { delete w.lanes[i].agentStartAttemptedAt; });
+            throw error;
           }
           await update((w) => {
             w.lanes[i].agentStartedAt = new Date().toISOString();
@@ -866,7 +863,11 @@ export async function dispatchTask(
         w.lanes[i].promptAttemptedAt = new Date().toISOString();
       });
       await port.run(
-        ["agent", "prompt", lane.paneId!, port.contract(workflow, lane)],
+        // Wait for observed activity, not merely terminal input acceptance.
+        // A stalled or timed-out submission remains uncertain and must not be resent.
+        ["agent", "prompt", lane.paneId!, port.contract(workflow, lane),
+          "--wait", "--until", "working", "--until", "blocked",
+          "--until", "done", "--timeout", "10000"],
         signal,
       );
       await update((w) => {
@@ -1288,14 +1289,13 @@ export async function resumeTask(
         await update((w) => {
           w.lanes[index].resumeAgentStartAttemptedAt = new Date().toISOString();
         });
-        await waitForShellReady(port, lane.paneId!, signal);
         const argumentsForResume = resumeArguments(
           profile,
           info.session,
           port.source,
           { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers },
         );
-        await port.run(
+        await startWhenShellReady(port, lane.paneId!,
           [
             "agent",
             "start",
@@ -1310,7 +1310,6 @@ export async function resumeTask(
             ...argumentsForResume,
           ],
           signal,
-          65_000,
         );
         await update((w) => {
           w.lanes[index].agentStartedAt = new Date().toISOString();

@@ -257,6 +257,12 @@ async function fixture(options = {}) {
             state.lanes.every((l) => l.nativeSession),
             "all startup proofs precede every assignment",
           );
+        if (args[3]?.startsWith("assignment:")) {
+          assert.deepEqual(args.slice(4), ["--wait", "--until", "working",
+            "--until", "blocked", "--until", "done", "--timeout", "10000"]);
+          if (options.stalledPrompt)
+            throw new Error("agent_prompt_stalled: no working or blocked state observed");
+        }
         if (options.lostPrompt)
           throw new Error("socket_timeout after submitted");
         return {};
@@ -882,4 +888,20 @@ test("crashed lane start retries fresh when the pane holds no agent", async () =
   } finally {
     await f.close();
   }
+});
+
+test("stalled assignment remains uncertain and cannot be automatically resubmitted", async () => {
+  const f = await fixture({ stalledPrompt: true });
+  try {
+    await assert.rejects(f.run(), /agent_prompt_stalled/);
+    assert.equal(f.state.status, "dispatch-failed");
+    assert.equal(f.state.outcome, "unknown");
+    assert.ok(f.state.lanes[0].promptAttemptedAt);
+    assert.equal(f.state.lanes[0].promptedAt, undefined);
+    assert.equal(f.state.lanes[1].promptAttemptedAt, undefined);
+    const topology = structuredClone(f.state.ownership);
+    await assert.rejects(f.run(), /submission is uncertain/);
+    assert.equal(f.calls.filter(c => c[1] === "prompt").length, 1);
+    assert.deepEqual(f.state.ownership, topology);
+  } finally { await f.close(); }
 });

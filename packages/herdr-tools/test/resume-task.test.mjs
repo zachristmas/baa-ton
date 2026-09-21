@@ -20,6 +20,8 @@ async function fixture({
   unsupported = false,
   badProof = false,
   wrongWorkspace = false,
+  busyStarts = 0,
+  startFailure = null,
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "baa-resume-task-"));
   const calls = [];
@@ -113,6 +115,7 @@ async function fixture({
   };
   const ports = {
     directory: root,
+    busyRetryDelayMs: 1,
     source: "/source/index.ts",
     adapter: () => adapter,
     verifyRoot: async () => {},
@@ -177,6 +180,8 @@ async function fixture({
           args.slice(args.indexOf("--") + 1, args.indexOf("--") + 3),
           ["resume", sessionId],
         );
+        if (busyStarts-- > 0) throw new Error("agent_pane_busy");
+        if (startFailure) throw new Error(startFailure);
         const pane = panes.get(args[args.indexOf("--pane") + 1]);
         const intent = JSON.parse(await readFile(pane.intentPath, "utf8"));
         await writeFile(
@@ -283,3 +288,32 @@ test("startup proof gates native reattachment", async () => {
     await f.cleanup();
   }
 });
+
+test("resume rechecks shell readiness after a pre-launch busy rejection in the same pane", async () => {
+  const f = await fixture({ busyStarts: 1 });
+  try {
+    assert.equal((await resumeTask(f.state, true, f.ports)).resumed, true);
+    const starts = f.calls.filter(c => c[0] === "agent" && c[1] === "start");
+    assert.equal(starts.length, 2);
+    assert.deepEqual(starts[0], starts[1]);
+    for (const start of starts) {
+      const prior = f.calls[f.calls.indexOf(start) - 1];
+      assert.deepEqual(prior, ["pane", "process-info", "--pane", "new-pane"]);
+    }
+    assert.equal(f.calls.filter(c => c[0] === "tab" && c[1] === "create").length, 1);
+    assert.equal(f.calls.some(c => c[1] === "prompt"), false);
+  } finally { await f.cleanup(); }
+});
+
+for (const [failure, attempts] of [["agent_pane_busy", 3], ["socket_timeout after launch", 1], ["agent_not_ready", 1]]) {
+  test(`resume bounds starts and never resends an assignment after ${failure}`, async () => {
+    const f = await fixture({ startFailure: failure });
+    try {
+      await assert.rejects(resumeTask(f.state, true, f.ports), e => e.message.includes(failure));
+      assert.equal(f.calls.filter(c => c[0] === "agent" && c[1] === "start").length, attempts);
+      assert.equal(f.calls.filter(c => c[0] === "tab" && c[1] === "create").length, 1);
+      assert.equal(f.calls.some(c => c[1] === "prompt"), false);
+      assert.ok(f.state.lanes[0].resumeAgentStartAttemptedAt);
+    } finally { await f.cleanup(); }
+  });
+}
