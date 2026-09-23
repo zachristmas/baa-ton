@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test stub: the hermetic test runner puts this first on PATH so no test can
+# reach a live claude install. Tests that need claude behavior inject their own fake.
+echo "baa-ton test stub: live claude is blocked during tests ($*)" >&2
+exit 97

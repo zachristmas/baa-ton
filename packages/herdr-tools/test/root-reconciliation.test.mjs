@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, readFile, rm, writeFile, mkdtemp } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile, mkdtemp, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
@@ -28,7 +28,9 @@ function persistence(provider, value) {
 }
 
 async function fixture({ foreign = false, childConflict = false } = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "baa-root-reconcile-"));
+  // realpath: macOS tmpdir() is a /var symlink to /private/var, and the Pi
+  // session proof canonicalizes session paths.
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "baa-root-reconcile-")));
   const cwd = join(directory, "project");
   const otherCwd = join(directory, "other-project");
   const configDir = join(directory, "config");
