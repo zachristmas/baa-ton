@@ -387,7 +387,7 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 17, "extension registered its workflow tools");
+assert.equal(tools.size, 18, "extension registered its workflow tools");
 assert.ok(
   tools.has("herdr_bootstrap_root"),
   "extension registers manual root bootstrap",
@@ -704,6 +704,31 @@ try {
     0,
     "child dispatch opens no Herdr resource",
   );
+
+  // Standing approvalPolicy: visible, never acknowledged implicitly, durable.
+  await mkdir(join(testCwd, ".baa-ton"), { recursive: true });
+  await writeFile(
+    join(testCwd, ".baa-ton", "config.json"),
+    JSON.stringify({ version: 1, approvalPolicy: { version: 2, grants: ["dispatch", "retry", "resume"] } }),
+  );
+  const policyShown = await tools
+    .get("herdr_policy")
+    .execute("policy-show", { action: "show" }, undefined, undefined, headlessRootCtx);
+  assert.equal(policyShown.details.acknowledged, false, "a new policy starts unacknowledged");
+  assert.match(policyShown.content[0].text, /Always asks: push, merge, deploy/);
+  await assert.rejects(
+    tools
+      .get("herdr_policy")
+      .execute("policy-ack-unconfirmed", { action: "ack" }, undefined, undefined, headlessRootCtx),
+    /confirm=true after the user has explicitly approved this exact policy/,
+    "a headless root cannot acknowledge without explicit confirmation",
+  );
+  const policyAck = await tools
+    .get("herdr_policy")
+    .execute("policy-ack", { action: "ack", confirm: true }, undefined, undefined, headlessRootCtx);
+  assert.equal(policyAck.details.acknowledged, true);
+  assert.equal(policyAck.details.ack.hash, policyShown.details.hash);
+  assert.equal(policyAck.details.ack.rootPaneId, rootPaneId);
 
   const manifestPath = join(
     testCwd,
@@ -1114,6 +1139,11 @@ try {
         (args[0] === "worktree" && args[1] === "open"),
     ),
     false,
+  );
+  assert.equal(
+    JSON.parse(await readFile(manifestPath, "utf8")).approvalPolicyAck?.hash,
+    policyAck.details.ack.hash,
+    "later manifest writes keep the policy acknowledgement",
   );
 } finally {
   if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;

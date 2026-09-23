@@ -70,37 +70,49 @@ The lane's identity comes from the existing route resolution (pane/workspace env
 
 ### Shape (`.baa-ton/config.json`, new `approvalPolicy`)
 
+As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
+
 ```json
 "approvalPolicy": {
   "version": 2,
-  "grants": ["dispatch", "retry", "resume", "lease", "runtime-launch"],
-  "dispatch": { "taskProfilesOnly": true, "cleanWorktreeRequired": true },
-  "runtimeLaunch": { "commands": ["docker compose -p {lane} up -d", "npm run dev -- --port {lease.app[0]}"] }
+  "grants": ["dispatch", "retry", "resume", "retire", "lease", "runtime-launch"],
+  "runtimeLaunch": {
+    "commands": [
+      { "name": "compose", "start": "docker compose -p {lane} up -d", "stop": "docker compose -p {lane} down" },
+      { "name": "web", "start": "npm run dev -- --port {lease.app[0]}" }
+    ]
+  }
 }
 ```
 
-- `grants` accepts only `dispatch | retry | resume | lease | runtime-launch`. Any other value, including push, merge, deploy, close or sweep, fails validation, and the whole policy is then treated as absent (fail closed).
+- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch`.
+  - `retire` covers closing a finished lane's session and stopping its leased services. It never removes a worktree.
+  - Push, merge, deploy, production, close, sweep, reparent and external messages are rejected by name.
+  - Any invalid field makes the whole policy count as absent (fail closed).
+- The task-profile and clean-worktree rules are fixed, not configurable.
+- `runtimeLaunch` requires the `runtime-launch` grant.
+  - Templates are single-space-separated tokens with no shell metacharacters.
+  - Placeholders are `{lane}`, `{workflow}` and `{lease.<resource>...}`.
+  - `stop` is the command auto-retire runs (PR 5).
 - **Within policy** means:
-  - **dispatch/retry:** the workflow is local to its bound task workspace and uses a configured `taskProfile`, not an ad-hoc `launchProfile`. A worktree must be clean. Retry stays within the existing retry state machine.
-  - **runtime-launch:** the command matches a template token for token, with no shell metacharacters (the same approach as `isReadOnlyPiDiagnostic`), and every `{lease.*}` placeholder resolves to one of this lane's active leases. This is what goal 3's permission auto-answer checks.
+  - **dispatch/retry:** every lane resolves to a named `taskProfile` (its own or the workflow's). No lane has an ad-hoc `launchProfile` or extra `mcpServers`. The worktree, if any, is clean.
+  - **resume:** a clean worktree.
+  - **runtime-launch:** the command matches a template token for token, and every `{lease.*}` placeholder resolves to one of this lane's active leases (PR 4).
 
 ### Recording it once, safely
 
 The policy file is plain JSON in the repo, and a lane could edit it by accident. To guard against that, the root acknowledges it:
 
-- On the first dispatch after the policy appears or changes, the root shows one native confirmation listing the grants.
-- The accepted SHA-256 is saved in the manifest as `approvalPolicyAck { hash, grants, ackedAt, rootPaneId }`.
-- After that, `authorizationDecision` grants silently only while the file's hash still equals the acknowledged hash. A changed file means one new confirmation, never a silent widening.
-
-On a headless root, the existing `confirm=true` bar applies to the acknowledgement: only after Zach says so in that conversation.
-
-Each auto-grant adds an `authorization-policy-granted` evidence entry naming the operation and policy hash, as today. Auto-grants don't wake the root.
+- **Hash:** the policy hash is SHA-256 over the validated, canonicalized policy. Reformatting the file keeps the acknowledgement, but any change to what it grants needs a new one.
+- **Stored acknowledgement:** the manifest records `approvalPolicyAck { hash, grants, ackedAt, rootPaneId }`. `loadManifest` carries it through, and the smoke check guards against later writes dropping it.
+- **Acknowledging on a TUI root:** the first routine operation after the policy appears or changes shows one dialog. It lists the grants and says what always asks, then "Record this policy and dispatch X?". Declining falls back to the ordinary one-off dialog.
+- **Acknowledging on a headless root:** there is never an implicit acknowledgement. `herdr_policy action=ack confirm=true` is allowed only after the user approves the exact policy shown by `herdr_policy action=show`. Until then, headless dispatch keeps the existing `confirm=true` one-off path.
+- **Evidence:** each standing decision adds workflow evidence: `authorization-policy-granted`, `approval-policy-not-applied` (with the reason) or `approval-policy-acknowledged`. Standing grants don't wake the root.
 
 ### BB-029 legacy
 
-- `authorizationDecision` keeps honouring an already recorded per-workflow `authorizationPolicy`, so existing manifests behave the same.
-- `herdr_plan` stops accepting new ones and points to `approvalPolicy`.
-- The BB-029 regex and `validateAuthorizationPolicy` stay only on the legacy read path.
+- `authorizationDecision` keeps honouring an already recorded per-workflow `authorizationPolicy`, and it is checked first.
+- **Deviation from the first draft:** `herdr_plan` still accepts a BB-029 policy, now documented as legacy. Removing it would have rewritten most of the smoke check for no gain. It can be removed once nothing uses it.
 
 ### Parallel-confirm deadlock
 
@@ -113,12 +125,25 @@ Each auto-grant adds an `authorization-policy-granted` evidence entry naming the
 
 ## PR plan
 
-1. **Confirmation queue + deadlock test.** Small; ships first.
-2. **`approvalPolicy` v2**: the validator, hash acknowledgement, `authorizationDecision` rewrite, BB-029 legacy path and docs (BAA.md, tool descriptions).
-3. **Leases**: config validation, ledger, allocator, bind probe, dispatch allocation, release on close and sweep, `herdr_lease` in the extension and bridge.
-4. **Goal 3**: `herdr_permission_prompt` and lease requests answered against the policy on the lane side; anything outside policy becomes a root digest item.
+Updated 2026-09-23 with Zach's five additions (items 1-5 in his note), each from a stall in the live cic run.
 
-Each PR adds unit tests using fakes (a fake bind probe, a fake `ui.confirm`) and keeps `npm test` green.
+1. **Confirmation queue + deadlock test.** Merged as #20.
+2. **`approvalPolicy` v2**: the validator, hash acknowledgement, `herdr_policy` (show/ack), standing grants for dispatch/retry/resume, BB-029 legacy path and docs.
+3. **Leases**: config validation, ledger, allocator, bind probe, dispatch allocation for writer lanes, release on close, retire and sweep, `herdr_lease` in the extension and bridge.
+4. **Formal lane requests (goal 3 + item 5)**: a `herdr_request` tool (lease, runtime-launch, approval, permission), tracked in the manifest until answered.
+   - Policy-matching requests are answered automatically.
+   - Other requests appear in every root digest until they are answered.
+   - `herdr_permission_prompt` uses the same path.
+5. **Auto-retire (item 2)**: when a lane's completion is accepted and the policy grants `retire`, close its session, run its runtime `stop` commands and release its leases. The worktree stays.
+6. **Directives with ack (item 4)**: directives to the root are stored in the manifest and delivered as urgent digest items.
+   - They stay open until the root runs `herdr_directive ack`.
+   - If the root finishes a turn without acking, the directive is re-sent once. If it is still unacked, Zach gets a `herdr notification show`.
+7. **Capacity gate + no-progress watchdog (items 1 and 3)**: two monitors on the existing supervisor tick.
+   - **Capacity gate:** when the root's recorded capacity gate clears, "capacity available" goes into the digest. If capacity stays blocked for more than `program.capacity_escalate_minutes` (default 15), Zach gets a notification naming the top memory users.
+   - **Watchdog:** if no lane has been `working` for `program.watchdog_minutes` (default 30) while the parent goal isn't terminal, Zach gets a notification and the root a nudge. Each alert fires once per episode.
+   - These are the controller's first wall-clock thresholds, so the controller README text about "no stall timer" changes with this PR.
+
+Each PR adds unit tests using fakes (a fake bind probe, a fake `ui.confirm`, the stub `herdr` for notifications) and keeps `npm test` green.
 
 ## Decisions (2026-09-23)
 

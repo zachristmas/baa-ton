@@ -92,7 +92,16 @@ import {
 } from "./harness-adapter.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acknowledgeActivation } from "./activation-ack.mjs";
-import { resolveTaskProfile } from "./profile-config.mjs";
+import { loadTaskProfileConfig, resolveTaskProfile } from "./profile-config.mjs";
+import {
+  authorizeStanding,
+  approvalPolicySummary,
+  validateApprovalPolicy,
+  approvalPolicyHash,
+  type ApprovalPolicyAck,
+  type StandingOperation,
+  type StandingResult,
+} from "./approval-policy.js";
 import {
   applyHerdrIdentity,
   currentAppliedHerdrIdentity,
@@ -222,6 +231,8 @@ type GoalHistoryRecord = ParentGoal & {
 };
 type ManifestWithGoalHistory = Manifest & {
   goalHistory?: GoalHistoryRecord[];
+  /** The standing approvalPolicy hash the root has confirmed once. */
+  approvalPolicyAck?: ApprovalPolicyAck;
 };
 type ParentGoalActionResult =
   | { goal: ParentGoal; goalHistoryCount: number }
@@ -754,6 +765,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       queue?: unknown;
       rootQueues?: unknown;
       goalHistoryByRoot?: unknown;
+      approvalPolicyAck?: ApprovalPolicyAck;
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -785,6 +797,9 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
           : {}),
         ...(parsed.queue !== undefined
           ? { queue: queueStore(parsed.queue) }
+          : {}),
+        ...(parsed.approvalPolicyAck
+          ? { approvalPolicyAck: parsed.approvalPolicyAck }
           : {}),
       };
     return { version: 2, workflows: [] };
@@ -3324,6 +3339,121 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return checkoutPath;
   }
 
+  /** Adapter from the extension to the standing-policy core. */
+  function standingAuthorization(
+    cwd: string,
+    workflow: Workflow,
+    operation: StandingOperation,
+    ctx: ExtensionContext,
+    label: string,
+    signal?: AbortSignal,
+  ): Promise<StandingResult> {
+    return authorizeStanding(
+      {
+        policy: () => loadTaskProfileConfig(cwd)?.approvalPolicy,
+        ack: async () => (await loadManifest(cwd)).approvalPolicyAck,
+        interactive: ctx.mode === "tui" && ctx.hasUI,
+        confirm: (title, message) =>
+          nativeConfirms.confirm(ctx.ui, title, message, signal),
+        ...(workflow.worktree
+          ? {
+              cleanWorktree: async () => {
+                await assertCleanLocalWorktree(workflow.worktree!, signal);
+              },
+            }
+          : {}),
+        now,
+        rootPaneId: workflow.taskBinding?.rootPaneId ?? "unknown",
+      },
+      workflow,
+      operation,
+      label,
+    );
+  }
+
+  function applyStanding(
+    manifest: ManifestWithQueue,
+    workflow: Workflow,
+    result: StandingResult,
+  ): void {
+    if (result.ack) manifest.approvalPolicyAck = result.ack;
+    workflow.evidence.push(...result.evidence);
+  }
+
+  async function persistStanding(
+    cwd: string,
+    workflowId: string,
+    result: StandingResult,
+  ): Promise<void> {
+    if (!result.evidence.length && !result.ack) return;
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const current = await loadManifest(cwd);
+      applyStanding(current, workflowFor(current, workflowId), result);
+      await saveManifest(cwd, current);
+    } finally {
+      await release();
+    }
+  }
+
+  async function policyStatus(cwd: string) {
+    const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
+    const ack = (await loadManifest(cwd)).approvalPolicyAck;
+    if (raw === undefined) return { configured: false as const, ack };
+    try {
+      const policy = validateApprovalPolicy(raw);
+      const hash = approvalPolicyHash(policy);
+      return { configured: true as const, valid: true as const, policy, hash, acknowledged: ack?.hash === hash, ack };
+    } catch (error) {
+      return { configured: true as const, valid: false as const, error: (error as Error).message, ack };
+    }
+  }
+
+  async function acknowledgePolicy(
+    cwd: string,
+    ctx: ExtensionContext,
+    confirm: boolean,
+    signal?: AbortSignal,
+  ) {
+    requireRootManifestExecutor(cwd);
+    const status = await policyStatus(cwd);
+    if (!status.configured)
+      throw new Error("No approvalPolicy is configured in .baa-ton/config.json.");
+    if (!status.valid)
+      throw new Error(`approvalPolicy is invalid: ${status.error}`);
+    if (status.acknowledged) return { ...status, unchanged: true };
+    let approved: boolean;
+    if (ctx.mode !== "tui" || !ctx.hasUI) {
+      if (!confirm)
+        throw new Error(
+          "Acknowledging approvalPolicy requires native TUI confirmation or confirm=true after the user has explicitly approved this exact policy in this conversation.",
+        );
+      approved = true;
+    } else
+      approved = await nativeConfirms.confirm(
+        ctx.ui,
+        "Herdr standing approval policy",
+        `${approvalPolicySummary(status.policy, status.hash)}\n\nRecord this policy?`,
+        signal,
+      );
+    if (!approved) return { ...status, cancelled: true };
+    const ack: ApprovalPolicyAck = {
+      hash: status.hash,
+      grants: status.policy.grants,
+      ackedAt: now(),
+      rootPaneId: (await currentPaneRoot(signal)).pane_id,
+    };
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const current = await loadManifest(cwd);
+      current.approvalPolicyAck = ack;
+      await saveManifest(cwd, current);
+    } finally {
+      await release();
+    }
+    return { ...status, acknowledged: true, ack };
+  }
+
   function responseRecord(
     value: unknown,
     label: string,
@@ -5184,12 +5314,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             );
         },
         async authorize(w) {
-          const decision = authorizationDecision(
+          const operation = w.retry ? "retry" : "dispatch";
+          if (authorizationDecision(w, operation).allowed) return true;
+          const standing = await standingAuthorization(
+            cwd,
             w,
-            w.retry ? "retry" : "dispatch",
+            operation,
+            ctx,
+            `dispatch ${w.id}`,
+            signal,
           );
+          await persistStanding(cwd, w.id, standing);
           return (
-            decision.allowed ||
+            standing.granted ||
             (await confirmExecution(
               ctx,
               `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
@@ -5584,6 +5721,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             return true;
           }
           auditAuthorization(w, decision);
+          const standing = await standingAuthorization(
+            cwd,
+            w,
+            "resume",
+            ctx,
+            `resume native sessions for ${w.id}`,
+            signal,
+          );
+          await persistStanding(cwd, w.id, standing);
+          if (standing.granted) return true;
           return confirmExecution(
             ctx,
             `Resume native sessions for ${w.id}`,
@@ -5706,14 +5853,25 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await saveManifest(cwd, manifest);
     } else {
       auditAuthorization(workflow, decision);
-      workflow.updatedAt = now();
-      await saveManifest(cwd, manifest);
-      const approved = await confirmExecution(
+      const standing = await standingAuthorization(
+        cwd,
+        workflow,
+        "resume",
         ctx,
-        `Resume paused Pi goals for ${id}`,
-        false,
+        `resume paused Pi goals for ${id}`,
         signal,
       );
+      applyStanding(manifest, workflow, standing);
+      workflow.updatedAt = now();
+      await saveManifest(cwd, manifest);
+      const approved =
+        standing.granted ||
+        (await confirmExecution(
+          ctx,
+          `Resume paused Pi goals for ${id}`,
+          false,
+          signal,
+        ));
       resolveParentApproval(
         workflow,
         "resume",
@@ -8277,7 +8435,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       "Create a durable local plan manifest for Herdr-managed agent lanes, optionally using a named task profile or linking to a dispatchable queue item.",
     promptSnippet: "Plan a Herdr-only delegated agent workflow.",
     promptGuidelines: [
-      "Use herdr_plan before herdr_dispatch; select a named taskProfile from .baa-ton/config.json when configured, or provide an exact launchProfile. Pass queueItemId to consume the clear queue head and copy its objective/notes. Supply authorizationPolicy only for the narrowly validated BB-029 local-only scope.",
+      "Use herdr_plan before herdr_dispatch; select a named taskProfile from .baa-ton/config.json when configured, or provide an exact launchProfile. Pass queueItemId to consume the clear queue head and copy its objective/notes. Supply authorizationPolicy only for the legacy BB-029 local-only scope; standing approval for routine work belongs in approvalPolicy in .baa-ton/config.json (see herdr_policy).",
     ],
     parameters: Type.Object(
       {
@@ -8388,7 +8546,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet:
       "Dispatch only a planned Herdr workflow; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI only when the workflow's validated local authorizationPolicy grants dispatch or retry; children remain UI-free and return parentApprovalRequired. On a headless bridge with no native confirm UI, pass confirm=true only after the user has explicitly said to proceed in this exact conversation; never set it speculatively.",
+      "Use herdr_dispatch with execute=true only after explicit user intent. A root bypasses UI when the project's acknowledged approvalPolicy (herdr_policy) covers this dispatch or retry, or the workflow's legacy BB-029 authorizationPolicy grants it; children remain UI-free and return parentApprovalRequired. On a headless bridge with no native confirm UI, pass confirm=true only after the user has explicitly said to proceed in this exact conversation; never set it speculatively.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
@@ -8421,6 +8579,38 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ],
         details: result,
       };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_policy",
+    label: "Herdr Policy",
+    description:
+      "Show or acknowledge the project's standing approvalPolicy in .baa-ton/config.json. Once the root acknowledges its hash, routine local dispatch, retry and resume inside it run without a native dialog. Push, merge, deploy, production, close and sweep always ask.",
+    promptSnippet: "Show or acknowledge the standing approval policy.",
+    promptGuidelines: [
+      "Use herdr_policy action=show to inspect the standing approvalPolicy and whether its current hash is acknowledged. Use action=ack only from the root after showing the user the policy summary. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("show"), Type.Literal("ack")]),
+      confirm: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result =
+        params.action === "ack"
+          ? await acknowledgePolicy(ctx.cwd, ctx, params.confirm ?? false, signal)
+          : await policyStatus(ctx.cwd);
+      const text = !result.configured
+        ? "No approvalPolicy is configured in .baa-ton/config.json."
+        : !result.valid
+          ? `approvalPolicy is invalid and treated as absent: ${result.error}`
+          : `${approvalPolicySummary(result.policy, result.hash)}\n${
+              "cancelled" in result && result.cancelled
+                ? "Acknowledgement cancelled."
+                : result.acknowledged
+                  ? `Acknowledged${result.ack ? ` at ${result.ack.ackedAt}` : ""}.`
+                  : "Not acknowledged: routine operations still ask until the root runs herdr_policy action=ack."
+            }`;
+      return { content: [{ type: "text", text }], details: result };
     },
   });
   pi.registerTool({
@@ -8457,7 +8647,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet:
       "Resume paused Pi goals or natively reattach terminal/gone Herdr lane sessions; dry-run by default.",
     promptGuidelines: [
-      "Use herdr_resume after herdr_observe. Pi goal-paused lanes receive /goal-resume; done/gone lanes use only their durable session log and harness-native resume invocation. A root bypasses UI only when the workflow's validated local authorizationPolicy grants resume; children remain UI-free and return parentApprovalRequired.",
+      "Use herdr_resume after herdr_observe. Pi goal-paused lanes receive /goal-resume; done/gone lanes use only their durable session log and harness-native resume invocation. A root bypasses UI when the project's acknowledged approvalPolicy (herdr_policy) grants resume, or the workflow's legacy BB-029 authorizationPolicy does; children remain UI-free and return parentApprovalRequired.",
     ],
     parameters: Type.Object({
       workflowId: Type.String(),
