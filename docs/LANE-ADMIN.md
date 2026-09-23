@@ -48,12 +48,22 @@ type Lease = {
 ```
 
 - Top level rather than per workflow, so the uniqueness check is a single scan across every workflow in the project. That scan is what would have caught D13 vs D18.
-- **Uniqueness:** an allocation runs inside one manifest-lock transaction: reload, then pick the lowest free slot in the range, where free means no active lease holds any of its ports or the name. After picking, a TCP bind probe on `127.0.0.1` skips slots that something outside Baa-ton is already listening on. Then save. `loadManifest` also fails closed if two active leases overlap, so hand edits can't create a silent collision.
+- **Uniqueness:** an allocation runs inside one manifest-lock transaction.
+  - It reloads the manifest and picks the lowest free slot in the range. Free means no active lease holds any of the slot's ports or the name.
+  - A TCP bind probe on `127.0.0.1` skips slots that something outside Baa-ton is already listening on. Then the manifest is saved.
+  - Overlapping port ranges between two resources are rejected at config validation.
+- **Hand edits (as built, PR 3):** a ledger in which two active leases overlap does not make `loadManifest` throw, since that would stop every tool. Instead, `herdr_lease list` shows each overlap as `CONFLICT: ...`, and every allocation refuses until it is resolved.
+- **Labels (as built):** a lease is keyed by workflow, lane, resource and label (default `default`).
+  - Asking again for the same key returns the existing lease.
+  - `maxPerLane` (default 1) limits how many labels a lane may hold per resource, e.g. `postgres` plus `postgres:test`.
 - **Allocation points:**
   - Dispatch: each writer lane gets `dispatchLeases`, allocated before launch, and the values go into the lane brief and the Claude SessionStart assignment from PR #18.
   - On request: `herdr_lease request`.
   - Read-only lanes get no automatic leases.
-- **Release:** closing a lane or workflow releases its leases in the same transaction. `herdr_sweep` releases leases whose workflow is closed or whose lane is gone. Its dry-run lists them, and executing the sweep still requires confirmation. There is no time-based expiry, because nothing polls.
+- **Release:**
+  - `herdr_close`, and the completion of lane-tab retirement, release the workflow's leases in the same manifest write.
+  - `herdr_sweep` releases leases whose root-owned workflow is terminal (or all of its lanes are), or whose workflow is gone from the manifest.
+  - Auto-retire (PR 5) will release per lane. Its dry-run lists them, and executing the sweep still requires confirmation. There is no time-based expiry, because nothing polls.
 - **Idempotent:** asking again for a resource a lane already holds returns the existing lease.
 
 ### Tool: `herdr_lease` (extension and MCP bridge)
@@ -61,7 +71,7 @@ type Lease = {
 | action | root | lane |
 | --- | --- | --- |
 | `list` | all leases in its manifest | its own workflow's leases |
-| `request {resource}` | for any lane it owns | for itself. Granted at once if the resource is configured, the lane is under `maxPerLane`, and the policy includes `lease` (see 2). Otherwise it becomes a root request (goal 3, digest). |
+| `request {resource, label?}` | for any lane it owns (`workflowId`, `laneId` required) | for itself. Granted at once if the resource is configured, the lane is under `maxPerLane`, and the acknowledged policy grants `lease`. Otherwise it returns `parentApprovalRequired`; PR 4 turns that into a tracked root request. |
 | `release {leaseId}` | any | its own |
 
 The lane's identity comes from the existing route resolution (pane/workspace env matched against the controller config, the same path `herdr_message` uses). Lanes never pass it as an argument.

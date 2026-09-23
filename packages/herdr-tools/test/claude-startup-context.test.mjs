@@ -64,6 +64,34 @@ test("validated SessionStart injects the manifest assignment, without blanket pa
   });
 });
 
+test("startup context lists only this lane's active leases", async () => {
+  await fixture(async ({ invoke }) => {
+    const result = invoke();
+    assert.equal(result.status, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /Runtime leases reserved for this lane/);
+    assert.match(context, /- app = 3600-3603 \(lease-a\)/);
+    assert.match(context, /- postgres:test = cic_test_lane_1_test \(lease-b\)/);
+    assert.equal(context.includes("lease-other"), false);
+    assert.equal(context.includes("lease-old"), false);
+  }, ({ manifest, intent }) => {
+    const base = { workflowId: intent.workflowId, laneId: intent.laneId, state: "active" };
+    manifest.leases = [
+      { ...base, id: "lease-a", resource: "app", label: "default", ports: [3600, 3601, 3602, 3603] },
+      { ...base, id: "lease-b", resource: "postgres", label: "test", name: "cic_test_lane_1_test" },
+      { ...base, id: "lease-old", resource: "redis", label: "default", ports: [6400], state: "released" },
+      { ...base, id: "lease-other", laneId: "lane-2", resource: "app", label: "default", ports: [3604, 3605, 3606, 3607] },
+    ];
+  });
+});
+
+test("startup context has no lease section without leases", async () => {
+  await fixture(async ({ invoke }) => {
+    const context = JSON.parse(invoke().stdout).hookSpecificOutput.additionalContext;
+    assert.equal(context.includes("Runtime leases"), false);
+  });
+});
+
 test("read-only lanes retain their restriction in startup context", async () => {
   await fixture(({ invoke }) => {
     const result = invoke();

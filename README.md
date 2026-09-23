@@ -126,6 +126,8 @@ the current pane's root mapping; it does not reset concurrent roots.
 - Plans, events, queues, sessions, and receipts are durable local records.
 - Writers use isolated worktrees; read-only review lanes are explicit.
 - Push, merge, deploy, and resource closure remain human-gated.
+- Routine local dispatch, retry and resume run without a dialog only under an `approvalPolicy` in `.baa-ton/config.json` that the root has acknowledged (`herdr_policy`); push, merge, deploy, production, close and sweep always ask.
+- Ports and service names come from `runtime.leases` in `.baa-ton/config.json` through `herdr_lease`; active leases never share a port or name, and close/sweep release them.
 - `herdr_sweep` is dry-run by default; execution requires the native confirmation dialog. A headless MCP caller must show the exact inventory and obtain approval before cleanup.
 
 ## Tests

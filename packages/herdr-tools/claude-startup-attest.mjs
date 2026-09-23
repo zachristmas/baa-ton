@@ -39,7 +39,32 @@ async function delegatedContext(intent, intentPath) {
     "Do not create subagents, push, merge, deploy, mutate production, or widen the assignment. Route blockers through the mapped Herdr parent; never impersonate the human or fabricate completion evidence.",
     "Assigned objective from the controller-owned manifest:",
     lane.objective,
+    ...leaseSection(manifest, intent),
   ].join("\n\n");
+}
+
+/** Runtime leases the manifest reserves for this lane, if any. */
+function leaseSection(manifest, intent) {
+  const leases = (Array.isArray(manifest.leases) ? manifest.leases : []).filter(
+    (lease) =>
+      lease?.state === "active" &&
+      lease.workflowId === intent.workflowId &&
+      lease.laneId === intent.laneId,
+  );
+  if (!leases.length) return [];
+  return [
+    "Runtime leases reserved for this lane (use only these ports and names; request more with herdr_lease):",
+    leases
+      .map((lease) => {
+        const value = typeof lease.name === "string"
+          ? lease.name
+          : lease.ports?.length > 1
+            ? `${lease.ports[0]}-${lease.ports.at(-1)}`
+            : String(lease.ports?.[0]);
+        return `- ${lease.resource}${lease.label && lease.label !== "default" ? `:${lease.label}` : ""} = ${value} (${lease.id})`;
+      })
+      .join("\n"),
+  ];
 }
 
 let input = "";

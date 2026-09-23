@@ -104,8 +104,9 @@ confirmation and headless-MCP handoff rules.
 
 ## Cleanup sweep
 
-`herdr_sweep` is a root-only, dry-run-by-default inventory of terminal lane tabs
-and unopened orphaned Git worktrees belonging to the current root. Passing
+`herdr_sweep` is a root-only, dry-run-by-default inventory of terminal lane tabs,
+unopened orphaned Git worktrees and runtime leases held by finished or vanished
+workflows belonging to the current root. Passing
 `execute: true` always shows the complete bounded tab/worktree list in the
 native `ctx.ui.confirm` dialog; no authorization policy can bypass that human
 gate. A decline has zero side effects. After confirmation it retires recorded

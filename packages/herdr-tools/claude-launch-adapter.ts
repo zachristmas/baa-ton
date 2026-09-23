@@ -133,6 +133,8 @@ const LANE_PERMISSIONS = {
     // to answer it for a headless dispatched lane.
     "mcp__herdr-orchestrator__herdr_message",
     "mcp__herdr-orchestrator__herdr_complete",
+    // Leases are enforced by the tool itself (own lane only, policy-gated).
+    "mcp__herdr-orchestrator__herdr_lease",
   ],
   deny: [
     "Bash(git push:*)",
