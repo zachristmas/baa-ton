@@ -34,6 +34,7 @@ const LOCK_RETRY_MS = 10;
 const SOCKET_TIMEOUT_MS = 2_500;
 const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
+const MAX_DIGEST_WINDOW_SECONDS = 3_600;
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
 const MESSAGE_DETAILS_MAX_LENGTH = 6_000;
 // Windows ACLs do not map to Node's POSIX mode bits. Privacy is provided by
@@ -45,14 +46,10 @@ const MESSAGE_DELIVERY_STATUSES = new Set([
   "delivered",
   "uncertain",
 ]);
-const STALL_SUSPECTED_CLASSIFICATION = "stall-suspected";
-const STALL_SUSPECTED_THRESHOLD_MS = 5 * 60 * 1_000;
-const IN_PROGRESS_AGENT_STATUSES = new Set(["working"]);
 const ACTIONABLE_CLASSIFICATIONS = new Set([
   "done",
   "blocked",
   "goal-paused",
-  STALL_SUSPECTED_CLASSIFICATION,
 ]);
 const TERMINAL_PARENT_GOAL_STATES = new Set([
   "completed",
@@ -351,8 +348,15 @@ export function validateOrchestrator(input, index) {
     value.program,
     `${label}.program`,
     ["id", "workspace_id"],
-    ["parent_manifest_path"],
+    ["parent_manifest_path", "digest_window_seconds"],
   );
+  if ("digest_window_seconds" in program)
+    assert(
+      Number.isSafeInteger(program.digest_window_seconds) &&
+        program.digest_window_seconds >= 0 &&
+        program.digest_window_seconds <= MAX_DIGEST_WINDOW_SECONDS,
+      `${label}.program.digest_window_seconds must be an integer from 0 to ${MAX_DIGEST_WINDOW_SECONDS}.`,
+    );
   assert(
     Array.isArray(value.workflows),
     `${label}.workflows must be an array.`,
@@ -396,6 +400,9 @@ export function validateOrchestrator(input, index) {
       workspace_id: program.workspace_id,
       ...(parentManifestPath
         ? { parent_manifest_path: resolve(parentManifestPath) }
+        : {}),
+      ...("digest_window_seconds" in program
+        ? { digest_window_seconds: program.digest_window_seconds }
         : {}),
     },
     workflows,
@@ -1573,162 +1580,6 @@ function isPostCompletionLane(workflow, mapping) {
   );
 }
 
-function laneStatusTransition(record, lane) {
-  if (
-    !isRecord(record) ||
-    ![
-      "pane.agent_status_changed",
-      "pane_agent_status_changed",
-    ].includes(record.event) ||
-    (record.pane_id !== lane.pane_id &&
-      !(record.pane_id === undefined && record.lane_id === lane.lane_id)) ||
-    !isRecord(record.source) ||
-    typeof record.source.agent_status !== "string"
-  )
-    return false;
-  return true;
-}
-
-function latestLaneStatusTransition(workflow, lane) {
-  const events = workflow.eventController?.events;
-  if (!Array.isArray(events)) return undefined;
-  return events.filter((record) => laneStatusTransition(record, lane)).at(-1);
-}
-
-function stallSignalIdentity(orchestrator, manifestPath, workflowId, laneId, transition) {
-  return `stall-suspected:${routeScope(orchestrator, manifestPath)}:${workflowId}/${laneId}:${transition.identity}`;
-}
-
-function newStallRecord({
-  mapping,
-  transition,
-  identity,
-  elapsedMs,
-  timestamp,
-}) {
-  return {
-    identity,
-    // A stall signal is not a pane transition. Preserve the transition time so
-    // session-log lastResponseAt remains derived from actual lane activity.
-    received_at: transition.received_at,
-    detected_at: timestamp,
-    event: STALL_SUSPECTED_CLASSIFICATION,
-    workflow_id: mapping.workflow.workflow_id,
-    lane_id: mapping.lane.lane_id,
-    pane_id: mapping.lane.pane_id,
-    workspace_id: mapping.lane.workspace_id,
-    agent_target: mapping.lane.target,
-    ...(mapping.lane.relationship_id
-      ? { relationship_id: mapping.lane.relationship_id }
-      : {}),
-    classification: STALL_SUSPECTED_CLASSIFICATION,
-    source: {
-      agent_status: transition.source.agent_status,
-      last_event_identity: transition.identity,
-      last_event_received_at: transition.received_at,
-      detected_at: timestamp,
-      elapsed_ms: elapsedMs,
-    },
-    wake: {
-      status: "pending",
-      attempts: 0,
-      updated_at: timestamp,
-    },
-  };
-}
-
-async function detectStalledLanes({
-  manifest,
-  workflows,
-  orchestrator,
-  manifestPath,
-  timestamp,
-  herdr,
-  goal,
-}) {
-  const timestampMs = Date.parse(timestamp);
-  if (!Number.isFinite(timestampMs)) return false;
-  let changed = false;
-  for (const candidate of workflows) {
-    const workflow = manifest.workflows.find(
-      (stored) => isRecord(stored) && stored.id === candidate.workflow_id,
-    );
-    if (!workflow || !isRecord(workflow.eventController)) continue;
-    const events = workflow.eventController.events;
-    if (!Array.isArray(events)) continue;
-    for (const lane of candidate.lanes) {
-      const mapping = { orchestrator, workflow: candidate, lane };
-      // This is the same terminal-lane/workflow suppression used by ordinary
-      // lifecycle observations; a stale historical timestamp is irrelevant.
-      if (isPostCompletionLane(workflow, mapping)) continue;
-      const transition = latestLaneStatusTransition(workflow, lane);
-      if (
-        !transition ||
-        !IN_PROGRESS_AGENT_STATUSES.has(transition.source.agent_status)
-      )
-        continue;
-      const transitionMs = Date.parse(transition.received_at);
-      if (
-        !Number.isFinite(transitionMs) ||
-        timestampMs - transitionMs <= STALL_SUSPECTED_THRESHOLD_MS
-      )
-        continue;
-      const identity = stallSignalIdentity(
-        orchestrator,
-        manifestPath,
-        candidate.workflow_id,
-        lane.lane_id,
-        transition,
-      );
-      if (events.some((record) => record.identity === identity)) continue;
-      const stallRecord = newStallRecord({
-        mapping,
-        transition,
-        identity,
-        elapsedMs: timestampMs - transitionMs,
-        timestamp,
-      });
-      events.push(stallRecord);
-      // Goal nudge: the same continuation mechanism the root gets from its
-      // parent goal, directed at the stalled lane's own pane. One nudge per
-      // stale period (this record's identity already dedupes); delivery
-      // outcome is recorded on the stall record, never thrown — the stall
-      // signal itself remains the durable wake for the root.
-      const laneObjective =
-        Array.isArray(workflow.lanes) &&
-        workflow.lanes.some(
-          (stored) => isRecord(stored) && stored.id === lane.lane_id,
-        )
-          ? workflow.lanes.find(
-              (stored) => isRecord(stored) && stored.id === lane.lane_id,
-            ).objective
-          : workflow.objective;
-      try {
-        await herdr.request("agent.prompt", {
-          target: mapping.lane.target,
-          text: `Your lane has shown no status transition for ${Math.round(
-            (timestampMs - transitionMs) / 60_000,
-          )} minutes; you may be stalled. Continue your assigned work now (objective: ${laneObjective}). If you are blocked, say so and route it via herdr_message or a parent question; when the work is verified, file your herdr_complete receipt. Do not start anything new.`,
-        });
-        stallRecord.nudge = {
-          status: "delivered",
-          at: timestamp,
-        };
-      } catch (error) {
-        stallRecord.nudge = {
-          status: "uncertain",
-          at: timestamp,
-          reason:
-            error instanceof Error ? error.message : String(error),
-        };
-      }
-      signalParentGoal(goal, events.at(-1), timestamp);
-      changed = true;
-    }
-  }
-  return changed;
-}
-
 function suppressPostCompletionDone(classification, event, workflow, mapping) {
   if (
     event.data.agent_status === "done" &&
@@ -1933,54 +1784,85 @@ function routeScope(orchestrator, manifestPath) {
   return `${orchestrator.id}:${sha256(resolve(manifestPath))}`;
 }
 
-function formatElapsed(milliseconds) {
-  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "an unknown duration";
-  const seconds = Math.floor(milliseconds / 1_000);
-  if (seconds < 60) return `${seconds} seconds`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return remainder === 0 ? `${minutes} minutes` : `${minutes}m ${remainder}s`;
+// Only a definite busy state defers a digest. "unknown" or an absent status
+// must not starve a root of its updates; the Pi turn record gates Pi roots.
+const DIGEST_BUSY_STATUSES = new Set(["working", "blocked"]);
+const DIGEST_DETAILS_MAX_LENGTH = 1_500;
+const AWAITING_ROOT_IDLE = "awaiting_root_idle";
+const COLLECTING_UPDATES = "collecting_updates";
+// Herdr reports done at the end of every child turn, usually right beside
+// that lane's child message, so a short window turns bursts into one wake.
+const DEFAULT_DIGEST_WINDOW_SECONDS = 60;
+// A blocked or paused lane cannot continue until the root acts.
+const URGENT_DIGEST_CLASSIFICATIONS = new Set(["blocked", "goal-paused"]);
+
+function clipText(text, max) {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
-function wakeText(record) {
-  if (record.classification === STALL_SUSPECTED_CLASSIFICATION) {
-    return [
-      `[Herdr Orchestrator stall-suspected] workflow ${record.workflow_id}, lane ${record.lane_id} has had no recorded status transition for ${formatElapsed(record.source?.elapsed_ms)}.`,
-      "This is advisory only and may be a false positive on a genuinely slow turn; inspect the lane and workflow rather than assuming the lane is dead.",
-      `Durable signal identity: ${record.identity}. Review the workflow manifest eventController ledger.`,
-      "This notification is observational only: do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production from it.",
-    ].join(" ");
-  }
-  return [
-    `[Herdr Orchestrator event] ${record.classification}: workflow ${record.workflow_id}, lane ${record.lane_id}.`,
-    `Durable event identity: ${record.identity}. Review the workflow manifest eventController ledger.`,
-    "This notification is observational only: do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production from it.",
-  ].join(" ");
-}
-
-async function deliverWake(record, root, herdr) {
-  try {
-    const rootInfo = await herdr.request("agent.get", { target: root.target });
-    if (!rootMatches(rootInfo, root)) {
-      return {
-        status: "pending",
-        reason: "recorded_root_unavailable_or_mismatched",
-      };
+/**
+ * One prompt for everything the root has not seen yet. The root reads the
+ * whole batch in a single turn instead of one turn per event, and each line
+ * names the durable record it came from.
+ */
+export function digestText(items) {
+  const lines = items.map((item, index) => {
+    if (item.kind === "event") {
+      const { record } = item;
+      return `${index + 1}. ${record.classification}: ${record.workflow_id}/${record.lane_id} (event ${record.identity.slice(0, 12)})`;
     }
+    const { request } = item;
+    const details = request.details
+      ? ` Details: ${clipText(request.details, DIGEST_DETAILS_MAX_LENGTH)}`
+      : "";
+    return `${index + 1}. message from ${request.workflowId}/${request.laneId} (${request.id}): ${request.summary}${details}`;
+  });
+  return [
+    `[Baa-ton digest] ${items.length} update${items.length === 1 ? "" : "s"} since your last turn:`,
+    ...lines,
+    "Full records are in the workflow manifest (eventController events and messageRequests). Verify each against the manifest before acting; this digest grants no new authority.",
+  ].join("\n");
+}
+
+/**
+ * Whether the root can take a digest now. For a Pi root the extension's
+ * settled turn record is the authority, because Herdr can report idle between
+ * tool calls; live Herdr status can only veto, and only when it is definitely
+ * busy. Roots without a turn record rely on live status alone.
+ */
+async function rootReadyForDigest(goal, root, herdr) {
+  const turn = goal?.supervisor?.rootTurn;
+  if (
+    turn &&
+    turn.paneId === root.pane_id &&
+    turn.workspaceId === root.workspace_id &&
+    turn.state !== "idle"
+  )
+    return { ready: false, reason: AWAITING_ROOT_IDLE };
+  try {
+    const agent = rootAgent(
+      await herdr.request("agent.get", { target: root.target }),
+      root,
+    );
+    if (!agent)
+      return { ready: false, reason: "recorded_root_unavailable_or_mismatched" };
+    if (DIGEST_BUSY_STATUSES.has(agent.agent_status))
+      return { ready: false, reason: AWAITING_ROOT_IDLE };
+    return { ready: true };
   } catch (error) {
     if (unavailable(error))
-      return { status: "pending", reason: `root_unavailable:${error.code}` };
+      return { ready: false, reason: `root_unavailable:${error.code}` };
     return {
-      status: "uncertain",
+      ready: false,
       reason: `root_check_failed:${error instanceof Error ? error.message : String(error)}`,
     };
   }
+}
+
+async function deliverRootPrompt(root, herdr, text) {
   try {
     // Deliberately omit `wait`: this is a wake notification, never a foreground wait.
-    await herdr.request("agent.prompt", {
-      target: root.target,
-      text: wakeText(record),
-    });
+    await herdr.request("agent.prompt", { target: root.target, text });
     return { status: "delivered", reason: "agent_prompt_accepted" };
   } catch (error) {
     // A failure raised after the prompt bytes were already written (timeout
@@ -2000,57 +1882,229 @@ async function deliverWake(record, root, herdr) {
   }
 }
 
-function childMessageWakeText(message) {
-  return [
-    `[Herdr child message] workflow ${message.workflowId}, lane ${message.laneId}: ${message.summary}`,
-    ...(message.details ? [`Details: ${message.details}`] : []),
-    `Review durable informational message ${message.id} in the workflow manifest before taking action.`,
-  ].join(" ");
+/**
+ * The project's program setting wins; BAA_TON_DIGEST_WINDOW_SECONDS is a
+ * machine-wide override (and the test seam); otherwise the default applies.
+ */
+function digestWindowSeconds(orchestrator, env = process.env) {
+  if (orchestrator.program.digest_window_seconds !== undefined)
+    return orchestrator.program.digest_window_seconds;
+  const override = env.BAA_TON_DIGEST_WINDOW_SECONDS;
+  if (override !== undefined && /^\d+$/.test(override)) {
+    const seconds = Number(override);
+    if (seconds <= MAX_DIGEST_WINDOW_SECONDS) return seconds;
+  }
+  return DEFAULT_DIGEST_WINDOW_SECONDS;
 }
 
-async function deliverChildMessageWake(message, root, herdr) {
-  try {
-    const rootInfo = await herdr.request("agent.get", { target: root.target });
-    if (!rootMatches(rootInfo, root))
-      return {
-        status: "pending",
-        reason: "recorded_root_unavailable_or_mismatched",
-      };
-  } catch (error) {
-    if (unavailable(error))
-      return { status: "pending", reason: `root_unavailable:${error.code}` };
-    return {
-      status: "uncertain",
-      reason: `root_check_failed:${error instanceof Error ? error.message : String(error)}`,
-    };
+function rootInboxIdentity(root) {
+  return inboxIdentity(root.workspace_id, root.pane_id, root.agent_kind);
+}
+
+function interruptedDelivery(timestamp) {
+  return { reason: "interrupted_root_delivery_requires_parent_review", timestamp };
+}
+
+/** Pending root-bound items for one orchestrator's routes in this manifest. */
+function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timestamp }) {
+  const routes = orchestrator.workflows.filter(
+    (route) => resolve(route.manifest_path) === resolve(manifestPath),
+  );
+  const items = [];
+  let changed = false;
+  for (const route of routes) {
+    const stored = manifest.workflows.find(
+      (candidate) => isRecord(candidate) && candidate.id === route.workflow_id,
+    );
+    if (!stored) continue;
+    const events = isRecord(stored.eventController) && Array.isArray(stored.eventController.events)
+      ? stored.eventController.events
+      : [];
+    for (const record of events) {
+      if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) continue;
+      if (!recordBelongsToRoutes(record, routes)) continue;
+      if (record.wake?.status === "sending") {
+        const interrupted = interruptedDelivery(timestamp);
+        record.wake = {
+          ...record.wake,
+          status: "uncertain",
+          reason: interrupted.reason,
+          updated_at: interrupted.timestamp,
+        };
+        changed = true;
+        continue;
+      }
+      if (record.wake?.status === "pending") items.push({ kind: "event", record });
+    }
+    const laneById = new Map(route.lanes.map((lane) => [lane.lane_id, lane]));
+    const requests = Array.isArray(stored.messageRequests) ? stored.messageRequests : [];
+    for (const request of requests) {
+      const lane = laneById.get(request.laneId);
+      if (!lane) continue;
+      const status = request.delivery?.status ?? "pending";
+      const attempts = Number.isSafeInteger(request.delivery?.attempts) ? request.delivery.attempts : 0;
+      if (status === "sending") {
+        const interrupted = interruptedDelivery(timestamp);
+        request.delivery = {
+          status: "uncertain",
+          attempts,
+          updatedAt: interrupted.timestamp,
+          reason: interrupted.reason,
+        };
+        changed = true;
+        continue;
+      }
+      if (status !== "pending") continue;
+      // A child message is a new review signal, including for terminal lanes
+      // and goals. Signal once, when it is first seen, not on every deferral.
+      if (attempts === 0 && !request.delivery?.reason) {
+        signalParentGoalForMessage(goal, request, timestamp);
+        changed = true;
+      }
+      items.push({ kind: "message", request, lane });
+    }
   }
-  try {
-    // Child messages are controller wakes, not foreground work or questions.
-    await herdr.request("agent.prompt", {
-      target: root.target,
-      text: childMessageWakeText(message),
+  return { items, changed };
+}
+
+/**
+ * The root dispatcher. Every pending lifecycle event and child message for
+ * one orchestrator goes to its root as a single digest, and only when the
+ * root's turn has settled; while the root works they stay pending and the
+ * next hook or supervisor tick delivers them together. Callers hold the
+ * manifest lock and pass the parsed manifest; this writes it back.
+ */
+export async function dispatchRootDigest({
+  orchestrator,
+  manifestPath,
+  manifest,
+  goal,
+  configDir,
+  herdr,
+  timestamp = now(),
+}) {
+  const { items, changed } = collectDigestItems({
+    orchestrator,
+    manifestPath,
+    manifest,
+    goal,
+    timestamp,
+  });
+  let dirty = changed;
+  if (items.length === 0) {
+    if (dirty) await atomicWriteJson(manifestPath, manifest);
+    return { status: "empty", count: 0 };
+  }
+  const defer = async (reason) => {
+    for (const item of items) {
+      if (item.kind === "event" && item.record.wake.reason !== reason) {
+        item.record.wake = { ...item.record.wake, reason, updated_at: timestamp };
+        dirty = true;
+      } else if (item.kind === "message" && item.request.delivery.reason !== reason) {
+        item.request.delivery = { ...item.request.delivery, reason, updatedAt: timestamp };
+        dirty = true;
+      }
+    }
+    if (dirty) await atomicWriteJson(manifestPath, manifest);
+    return { status: "deferred", reason, count: items.length };
+  };
+  const windowSeconds = digestWindowSeconds(orchestrator);
+  const urgent = items.some(
+    (item) =>
+      item.kind === "event" &&
+      URGENT_DIGEST_CLASSIFICATIONS.has(item.record.classification),
+  );
+  if (!urgent && windowSeconds > 0) {
+    const oldest = Math.min(
+      ...items.map((item) =>
+        Date.parse(item.kind === "event" ? item.record.received_at : item.request.requestedAt),
+      ),
+    );
+    const elapsed = Date.parse(timestamp) - oldest;
+    if (Number.isFinite(elapsed) && elapsed < windowSeconds * 1_000)
+      return defer(COLLECTING_UPDATES);
+  }
+  const root = orchestrator.root;
+  const readiness = await rootReadyForDigest(goal, root, herdr);
+  if (!readiness.ready) return defer(readiness.reason);
+
+  const scope = routeScope(orchestrator, manifestPath);
+  const inbox = [];
+  for (const item of items) {
+    if (item.kind === "event") {
+      const { record } = item;
+      inbox.push(
+        await persistControllerMessage(configDir, {
+          logicalKey: `lane-event:${scope}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
+          occurrenceId: record.identity,
+          kind: "lifecycle-event",
+          from: inboxIdentity(record.workspace_id, record.pane_id, record.source?.agent),
+          to: rootInboxIdentity(root),
+          payload: record,
+          wake: true,
+        }),
+      );
+    } else {
+      const { request, lane } = item;
+      inbox.push(
+        await persistControllerMessage(configDir, {
+          logicalKey: `child-message:${scope}:${request.workflowId}/${request.laneId}:${sha256(request.summary)}`,
+          occurrenceId: request.id,
+          kind: "child-message",
+          from: inboxIdentity(lane.workspace_id, lane.pane_id, lane.target),
+          to: rootInboxIdentity(root),
+          payload: request,
+          wake: true,
+        }),
+      );
+    }
+  }
+  // Persist "sending" before the prompt: an interrupted send becomes
+  // uncertain on the next pass and is never replayed.
+  const attemptsFor = [];
+  for (const item of items) {
+    if (item.kind === "event") {
+      const attempts = (Number.isSafeInteger(item.record.wake.attempts) ? item.record.wake.attempts : 0) + 1;
+      item.record.wake = { ...item.record.wake, status: "sending", attempts, reason: "root_digest_started", updated_at: timestamp };
+      attemptsFor.push(attempts);
+    } else {
+      const attempts = (Number.isSafeInteger(item.request.delivery.attempts) ? item.request.delivery.attempts : 0) + 1;
+      item.request.delivery = { status: "sending", attempts, updatedAt: timestamp };
+      attemptsFor.push(attempts);
+    }
+  }
+  await atomicWriteJson(manifestPath, manifest);
+  for (const [index, stored] of inbox.entries())
+    if (stored)
+      await markDelivery(stored.path, stored.message.occurrence_id, "sending", {
+        attempts: attemptsFor[index],
+      });
+
+  const outcome = await deliverRootPrompt(root, herdr, digestText(items));
+  const finishedAt = now();
+  for (const [index, item] of items.entries()) {
+    if (item.kind === "event")
+      item.record.wake = { ...item.record.wake, ...outcome, updated_at: finishedAt };
+    else
+      item.request.delivery = {
+        status: outcome.status,
+        attempts: attemptsFor[index],
+        updatedAt: finishedAt,
+        reason: outcome.reason,
+      };
+    await finishControllerMessage(inbox[index], outcome.status, {
+      attempts: attemptsFor[index],
+      reason: outcome.reason,
     });
-    return { status: "delivered", reason: "agent_prompt_accepted" };
-  } catch (error) {
-    if (error?.sent)
-      return {
-        status: "uncertain",
-        reason: `root_prompt_ambiguous:${error instanceof Error ? error.message : String(error)}`,
-      };
-    if (unavailable(error))
-      return { status: "pending", reason: `root_unavailable:${error.code}` };
-    return {
-      status: "uncertain",
-      reason: `root_prompt_failed:${error instanceof Error ? error.message : String(error)}`,
-    };
   }
+  await atomicWriteJson(manifestPath, manifest);
+  return { status: outcome.status, reason: outcome.reason, count: items.length };
 }
 
 function queueHeadWakeText(item) {
   return [
     `queue head now dispatchable: ${item.id} ${queueObjectiveSlug(item.objective)}`,
-    `Review the durable queue item ${item.id} before planning or dispatching it.`,
-    "This notification is observational only: do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production from it.",
+    `Review the durable queue item ${item.id} before planning or dispatching it; this notice grants no new authority.`,
   ].join(" ");
 }
 
@@ -2171,102 +2225,6 @@ function signalParentGoalForMessage(goal, message, timestamp = now()) {
   return true;
 }
 
-async function processChildMessageRequest({
-  manifestPath,
-  manifest,
-  workflow,
-  mapping,
-  request,
-  configDir,
-  herdr,
-  timestamp = now(),
-  goal,
-}) {
-  const currentStatus = request.delivery?.status ?? "pending";
-  const attempts = Number.isSafeInteger(request.delivery?.attempts) &&
-    request.delivery.attempts >= 0
-    ? request.delivery.attempts
-    : 0;
-  if (currentStatus === "delivered" || currentStatus === "uncertain")
-    return { accepted: true, delivery: currentStatus, request };
-  if (currentStatus === "sending") {
-    request.delivery = {
-      status: "uncertain",
-      attempts,
-      updatedAt: timestamp,
-      reason: "interrupted_root_delivery_requires_parent_review",
-    };
-    await atomicWriteJson(manifestPath, manifest);
-    return { accepted: true, delivery: "uncertain", request };
-  }
-
-  const nextAttempts = attempts + 1;
-  request.delivery = {
-    status: "sending",
-    attempts: nextAttempts,
-    updatedAt: timestamp,
-  };
-  // This is intentionally unconditional, including terminal lanes and goals:
-  // a child message is a new review signal, not post-completion lifecycle noise.
-  signalParentGoalForMessage(goal, request, timestamp);
-  await atomicWriteJson(manifestPath, manifest);
-
-  let inboxMessage;
-  try {
-    inboxMessage = await persistControllerMessage(configDir, {
-      logicalKey: `child-message:${routeScope(mapping.orchestrator, manifestPath)}:${request.workflowId}/${request.laneId}:${sha256(request.summary)}`,
-      occurrenceId: request.id,
-      kind: "child-message",
-      from: inboxIdentity(
-        mapping.lane.workspace_id,
-        mapping.lane.pane_id,
-        mapping.lane.target,
-      ),
-      to: inboxIdentity(
-        mapping.orchestrator.root.workspace_id,
-        mapping.orchestrator.root.pane_id,
-        mapping.orchestrator.root.agent_kind,
-      ),
-      payload: request,
-      wake: true,
-    });
-    if (inboxMessage)
-      await markDelivery(
-        inboxMessage.path,
-        inboxMessage.message.occurrence_id,
-        "sending",
-        { attempts: nextAttempts },
-      );
-  } catch (error) {
-    request.delivery = {
-      status: "uncertain",
-      attempts: nextAttempts,
-      updatedAt: now(),
-      reason: `message_persist_failed:${error instanceof Error ? error.message : String(error)}`,
-    };
-    await atomicWriteJson(manifestPath, manifest);
-    return { accepted: true, delivery: "uncertain", request };
-  }
-
-  const outcome = await deliverChildMessageWake(
-    request,
-    mapping.orchestrator.root,
-    herdr,
-  );
-  request.delivery = {
-    status: outcome.status,
-    attempts: nextAttempts,
-    updatedAt: now(),
-    reason: outcome.reason,
-  };
-  await finishControllerMessage(inboxMessage, outcome.status, {
-    attempts: nextAttempts,
-    reason: outcome.reason,
-  });
-  await atomicWriteJson(manifestPath, manifest);
-  return { accepted: true, delivery: outcome.status, request };
-}
-
 /**
  * Route one durable child message from the extension/bridge through the same
  * controller inbox and root wake path used by lifecycle events. The caller
@@ -2347,16 +2305,20 @@ export async function routeChildMessage(options = {}) {
       mapping.orchestrator,
       manifestHasMultipleRoots(config, manifestPath),
     );
-    return await processChildMessageRequest({
+    const digest = await dispatchRootDigest({
+      orchestrator: mapping.orchestrator,
       manifestPath,
       manifest,
-      workflow,
-      mapping: { orchestrator: mapping.orchestrator, workflow: mapping.workflow, lane: mapping.lane },
-      request,
+      goal,
       configDir,
       herdr: herdr ?? new JsonLineHerdrClient(),
-      goal,
     });
+    return {
+      accepted: true,
+      delivery: request.delivery?.status ?? "pending",
+      request,
+      digest,
+    };
   } finally {
     await release();
   }
@@ -2400,7 +2362,7 @@ async function deliverSupervisorNudge(goal, root, herdr) {
     });
     return { status: "delivered", reason: "agent_prompt_accepted" };
   } catch (error) {
-    // Same ambiguous-send rule as deliverWake: a post-write failure can never
+    // Same ambiguous-send rule as deliverRootPrompt: a post-write failure can never
     // be treated as a definite non-delivery safe to retry.
     if (error?.sent)
       return {
@@ -2602,139 +2564,33 @@ export async function runSupervisorTick({
             queueStore(manifest),
           );
       }
-      // Wall-clock stall detection is sampled here, alongside the existing
-      // event-driven pending-wake reconciliation. It compares only durable
-      // lane transition timestamps; it never polls a child agent.
-      const stallsChanged = await detectStalledLanes({
-        manifest,
-        workflows,
+      // Event-driven delivery point for everything the root has not seen:
+      // a digest deferred while the root worked goes out on the first tick
+      // after its turn settles, independent of parent-goal status.
+      const digest = await dispatchRootDigest({
         orchestrator,
         manifestPath,
-        timestamp,
-        herdr: api,
+        manifest,
         goal,
+        configDir,
+        herdr: api,
+        timestamp,
       });
-      if (stallsChanged) {
-        await atomicWriteJson(manifestPath, manifest);
-        if (goal)
+      if (digest.count > 0) {
+        pendingWakes.push({
+          manifestPath,
+          kind: "digest",
+          status: digest.status,
+          count: digest.count,
+          ...(digest.reason ? { reason: digest.reason } : {}),
+        });
+        if (goal && digest.status !== "deferred")
           await publishParentGoalSidebar(
             goal,
             orchestrator.root,
             api,
             queueStore(manifest),
           );
-      }
-      // Event-driven pending-outbox reconciliation. A lane wake that could
-      // not be delivered earlier (root busy or unavailable) previously
-      // retried only if an identical hook happened to recur later, and was
-      // never attempted while the parent goal sat in a non-active status,
-      // which an undelivered actionable event usually causes in the first
-      // place. This tick is the event-driven recovery point (it fires on
-      // every hook/interval), so drain independently of parent-goal status.
-      // Each deliverWake call still makes its own live root-availability
-      // check and is a no-op unless the root actually accepts the prompt.
-      let pendingChanged = false;
-      for (const stored of matchedWorkflows) {
-        if (!("eventController" in stored)) continue;
-        const pendingRecords = stored.eventController.events.filter(
-          (record) =>
-            ACTIONABLE_CLASSIFICATIONS.has(record.classification) &&
-            record.wake?.status === "pending" &&
-            recordBelongsToRoutes(record, workflows),
-        );
-        for (const record of pendingRecords) {
-          record.wake = {
-            ...record.wake,
-            status: "sending",
-            attempts: Number.isSafeInteger(record.wake.attempts)
-              ? record.wake.attempts + 1
-              : 1,
-            updated_at: timestamp,
-          };
-          const inboxMessage = await persistControllerMessage(configDir, {
-            logicalKey: `lane-event:${routeScope(orchestrator, manifestPath)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
-            occurrenceId: record.identity,
-            kind: "lifecycle-event",
-            from: inboxIdentity(
-              record.workspace_id,
-              record.pane_id,
-              record.source?.agent,
-            ),
-            to: inboxIdentity(
-              orchestrator.root.workspace_id,
-              orchestrator.root.pane_id,
-              orchestrator.root.agent_kind,
-            ),
-            payload: record,
-            wake: true,
-          });
-          if (inboxMessage)
-            await markDelivery(
-              inboxMessage.path,
-              inboxMessage.message.occurrence_id,
-              "sending",
-              { attempts: record.wake.attempts },
-            );
-          const outcome = await deliverWake(record, orchestrator.root, api);
-          record.wake = { ...record.wake, ...outcome, updated_at: timestamp };
-          await finishControllerMessage(
-            inboxMessage,
-            outcome.status,
-            { attempts: record.wake.attempts, reason: outcome.reason },
-          );
-          pendingChanged = true;
-          pendingWakes.push({
-            manifestPath,
-            workflowId: stored.id,
-            laneId: record.lane_id,
-            status: outcome.status,
-          });
-        }
-      }
-      if (pendingChanged) await atomicWriteJson(manifestPath, manifest);
-
-      // Child messages are independent of lifecycle classification and of lane
-      // terminal state. A message left pending by a child/bridge invocation is
-      // retried from the durable manifest on the next controller tick; an
-      // interrupted sending state is converted to uncertain and never replayed.
-      for (const [workflowIndex, candidate] of workflows.entries()) {
-        const stored = matchedWorkflows[workflowIndex];
-        const messageRequests = Array.isArray(stored.messageRequests)
-          ? stored.messageRequests
-          : [];
-        const messageLaneById = new Map(
-          candidate.lanes.map((lane) => [lane.lane_id, lane]),
-        );
-        for (const request of messageRequests) {
-          if ((request.delivery?.status ?? "pending") !== "pending") continue;
-          const lane = messageLaneById.get(request.laneId);
-          if (!lane) continue;
-          const outcome = await processChildMessageRequest({
-            manifestPath,
-            manifest,
-            workflow: stored,
-            mapping: { orchestrator, workflow: candidate, lane },
-            request,
-            configDir,
-            herdr: api,
-            timestamp,
-            goal,
-          });
-          pendingWakes.push({
-            manifestPath,
-            workflowId: stored.id,
-            laneId: request.laneId,
-            kind: "child-message",
-            status: outcome.delivery,
-          });
-          if (goal)
-            await publishParentGoalSidebar(
-              goal,
-              orchestrator.root,
-              api,
-              queueStore(manifest),
-            );
-        }
       }
       if (!goal) {
         results.push({ manifestPath, status: "no-parent-goal" });
@@ -2770,6 +2626,12 @@ export async function runSupervisorTick({
         ["delivered", "uncertain"].includes(supervisor.lastDelivery?.status)
       ) {
         results.push({ manifestPath, status: "wake-suppressed" });
+        continue;
+      }
+      // A digest sent on this tick already woke the root; the Pi turn record
+      // has not caught up yet, so a nudge now would be a second prompt.
+      if (digest.status === "delivered" || digest.status === "uncertain") {
+        results.push({ manifestPath, status: "digest-delivered" });
         continue;
       }
       if (!nudgeDue(supervisor, timestamp)) {
@@ -3196,58 +3058,15 @@ export async function handleHook({
     if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
       return { accepted: true, deduplicated: !created, record, queueWake };
     }
-    if (
-      record.wake.status === "delivered" ||
-      record.wake.status === "uncertain"
-    ) {
-      return { accepted: true, deduplicated: true, record };
-    }
-    if (record.wake.status === "sending") {
-      await updateWake(mapping.workflow.manifest_path, manifest, record, {
-        status: "uncertain",
-        reason: "interrupted_root_delivery_requires_parent_review",
-      });
-      return { accepted: true, deduplicated: true, record, queueWake };
-    }
-    inboxMessage ??= await persistControllerMessage(configDir, {
-      logicalKey: `lane-event:${routeScope(mapping.orchestrator, mapping.workflow.manifest_path)}:${record.workflow_id}/${record.lane_id}/${record.classification}`,
-      occurrenceId: record.identity,
-      kind: "lifecycle-event",
-      from: inboxIdentity(
-        record.workspace_id,
-        record.pane_id,
-        record.source?.agent,
-      ),
-      to: inboxIdentity(
-        mapping.orchestrator.root.workspace_id,
-        mapping.orchestrator.root.pane_id,
-        mapping.orchestrator.root.agent_kind,
-      ),
-      payload: record,
-      wake: true,
+    const digest = await dispatchRootDigest({
+      orchestrator: mapping.orchestrator,
+      manifestPath: mapping.workflow.manifest_path,
+      manifest,
+      goal,
+      configDir,
+      herdr: api,
     });
-    await updateWake(mapping.workflow.manifest_path, manifest, record, {
-      status: "sending",
-      attempts: Number.isSafeInteger(record.wake.attempts)
-        ? record.wake.attempts + 1
-        : 1,
-      reason: "root_delivery_started",
-    });
-    if (inboxMessage)
-      await markDelivery(
-        inboxMessage.path,
-        inboxMessage.message.occurrence_id,
-        "sending",
-        { attempts: record.wake.attempts },
-      );
-    const outcome = await deliverWake(record, mapping.orchestrator.root, api);
-    await updateWake(mapping.workflow.manifest_path, manifest, record, outcome);
-    await finishControllerMessage(
-      inboxMessage,
-      outcome.status,
-      { attempts: record.wake.attempts, reason: outcome.reason },
-    );
-    return { accepted: true, deduplicated: !created, record, queueWake };
+    return { accepted: true, deduplicated: !created, record, queueWake, digest };
   } finally {
     await release();
   }
