@@ -124,6 +124,13 @@ isolation or clarity.
   user explicitly asks.
 - Do not use `--trust-repository` as a retry; it grants Git trust.
 - For cross-machine work, run the agent on the machine that owns the checkout/session.
+- Routine local dispatch, retry and resume can run without a native dialog once the
+  user has recorded `approvalPolicy` in `.baa-ton/config.json` and the root has
+  acknowledged it (`herdr_policy action=ack`; one confirmation per policy change).
+  Only configured task profiles, no extra MCP servers and a clean worktree qualify.
+  Push, merge, deploy, production, close and sweep always ask. On a headless root,
+  acknowledge only after the user has approved the exact policy shown by
+  `herdr_policy action=show`.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —
