@@ -103,6 +103,17 @@ import {
   type StandingResult,
 } from "./approval-policy.js";
 import {
+  activeLeases,
+  allocateLease,
+  ledgerConflicts,
+  leaseLines,
+  leaseValue,
+  probePort,
+  releaseLeases,
+  validateRuntimeConfig,
+  type Lease,
+} from "./leases.js";
+import {
   applyHerdrIdentity,
   currentAppliedHerdrIdentity,
   resolveHerdrIdentity,
@@ -233,6 +244,8 @@ type ManifestWithGoalHistory = Manifest & {
   goalHistory?: GoalHistoryRecord[];
   /** The standing approvalPolicy hash the root has confirmed once. */
   approvalPolicyAck?: ApprovalPolicyAck;
+  /** Runtime lease ledger; active entries never share a port or name. */
+  leases?: Lease[];
 };
 type ParentGoalActionResult =
   | { goal: ParentGoal; goalHistoryCount: number }
@@ -766,6 +779,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       rootQueues?: unknown;
       goalHistoryByRoot?: unknown;
       approvalPolicyAck?: ApprovalPolicyAck;
+      leases?: Lease[];
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -801,6 +815,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         ...(parsed.approvalPolicyAck
           ? { approvalPolicyAck: parsed.approvalPolicyAck }
           : {}),
+        ...(Array.isArray(parsed.leases) ? { leases: parsed.leases } : {}),
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
@@ -965,10 +980,20 @@ type CleanupWorktreeCandidate = {
   openWorkspaceId?: string | null;
 };
 
+type CleanupLeaseCandidate = {
+  leaseId: string;
+  workflowId: string;
+  laneId: string;
+  resource: string;
+  value: string;
+  reason: string;
+};
+
 type CleanupInventory = {
   root: { paneId: string; workspaceId: string; orchestratorId: string };
   laneTabs: CleanupTabCandidate[];
   worktrees: CleanupWorktreeCandidate[];
+  leases: CleanupLeaseCandidate[];
   issues: Array<{ workflowId?: string; resource?: string; error: string }>;
 };
 
@@ -2447,6 +2472,21 @@ function contract(workflow: Workflow, lane: Lane): string {
   ].join("\n");
 }
 
+/** The lane assignment plus the runtime leases it must use. */
+function contractWithLeases(
+  workflow: Workflow,
+  lane: Lane,
+  leases: Lease[] | undefined,
+): string {
+  const base = contract(workflow, lane);
+  if (!leases?.length) return base;
+  return [
+    base,
+    "Runtime leases reserved for this lane (use only these ports and names; request more with herdr_lease):",
+    ...leaseLines(leases).map((line) => `- ${line}`),
+  ].join("\n");
+}
+
 function requireHerdr(): void {
   if (process.env.HERDR_ENV !== "1")
     throw new Error(
@@ -3151,6 +3191,27 @@ async function persistParentMessage(
   }
 }
 
+/** Release a workflow's active leases inside the caller's manifest write. */
+function releaseWorkflowLeases(
+  manifest: { leases?: Lease[] },
+  workflow: Workflow,
+  reason: string,
+): Lease[] {
+  const released = releaseLeases(
+    manifest.leases,
+    (lease) => lease.workflowId === workflow.id,
+    reason,
+    now(),
+  );
+  if (released.length)
+    workflow.evidence.push({
+      at: now(),
+      kind: "lease-released",
+      text: `${reason}: ${released.map((lease) => `${lease.id} ${lease.resource}=${leaseValue(lease)}`).join(", ")}`,
+    });
+  return released;
+}
+
 // Process-wide: Pi renders one extension dialog at a time.
 const nativeConfirms = new ConfirmQueue();
 
@@ -3452,6 +3513,189 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await release();
     }
     return { ...status, acknowledged: true, ack };
+  }
+
+  function runtimeConfigFor(cwd: string) {
+    const raw = loadTaskProfileConfig(cwd)?.runtime;
+    return raw === undefined ? undefined : validateRuntimeConfig(raw);
+  }
+
+  /** Reserve each writer lane's dispatchLeases before launch; idempotent, so
+   * a retry keeps the leases the first attempt took. */
+  async function allocateDispatchLeases(
+    cwd: string,
+    workflow: Workflow,
+  ): Promise<Map<string, Lease[]>> {
+    const byLane = new Map<string, Lease[]>();
+    const config = runtimeConfigFor(cwd);
+    if (!config?.dispatchLeases.length) return byLane;
+    const writers = workflow.lanes.filter((lane) => !lane.readOnly);
+    if (!writers.length) return byLane;
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const manifest = await loadManifest(cwd);
+      const stored = workflowFor(manifest, workflow.id);
+      const ledger = (manifest.leases ??= []);
+      for (const lane of writers) {
+        for (const resource of config.dispatchLeases) {
+          const { lease, created } = await allocateLease(
+            ledger,
+            config,
+            { resource, workflowId: workflow.id, laneId: lane.id, grantedBy: "dispatch" },
+            { probe: probePort, now },
+          );
+          if (created)
+            stored.evidence.push({
+              at: now(),
+              kind: "lease-granted",
+              text: `Dispatch lease for ${lane.id}: ${leaseLines([lease])[0]}`,
+            });
+        }
+        byLane.set(
+          lane.id,
+          activeLeases(ledger).filter(
+            (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id,
+          ),
+        );
+      }
+      await saveManifest(cwd, manifest);
+    } finally {
+      await release();
+    }
+    return byLane;
+  }
+
+  /** Why a lane may not take a lease by itself, or undefined when the
+   * acknowledged approvalPolicy grants `lease`. */
+  function laneLeaseRefusal(cwd: string, ack: ApprovalPolicyAck | undefined) {
+    const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
+    if (raw === undefined) return "no approvalPolicy is configured";
+    try {
+      const policy = validateApprovalPolicy(raw);
+      if (!policy.grants.includes("lease")) return "approvalPolicy does not grant lease";
+      if (ack?.hash !== approvalPolicyHash(policy))
+        return "approvalPolicy is not acknowledged by the root";
+      return undefined;
+    } catch (error) {
+      return `approvalPolicy is invalid: ${(error as Error).message}`;
+    }
+  }
+
+  async function leaseTool(
+    ctx: ExtensionContext,
+    params: {
+      action: "list" | "request" | "release";
+      resource?: string;
+      label?: string;
+      workflowId?: string;
+      laneId?: string;
+      leaseId?: string;
+      includeReleased?: boolean;
+    },
+  ) {
+    const child = isRegisteredChildLane() ? currentChildAssignment() : undefined;
+    let cwd: string;
+    let workflowId = params.workflowId;
+    let laneId = params.laneId;
+    if (child) {
+      cwd = child.cwd;
+      if (
+        (workflowId && workflowId !== child.workflow.workflow_id) ||
+        (laneId && laneId !== child.lane.lane_id)
+      )
+        throw new Error("A lane may act only on its own leases.");
+      workflowId = child.workflow.workflow_id;
+      laneId = child.lane.lane_id;
+    } else {
+      requireRootManifestExecutor(ctx.cwd);
+      cwd = ctx.cwd;
+    }
+    if (params.action === "list") {
+      const manifest = await loadManifest(cwd);
+      const leases = (params.includeReleased ? manifest.leases ?? [] : activeLeases(manifest.leases))
+        .filter((lease) => !workflowId || lease.workflowId === workflowId)
+        .filter((lease) => !child || lease.laneId === laneId);
+      return { kind: "list" as const, role: child ? "lane" : "root", leases, conflicts: ledgerConflicts(manifest.leases) };
+    }
+    if (params.action === "request") {
+      if (!params.resource) throw new Error("resource is required to request a lease.");
+      if (!workflowId || !laneId)
+        throw new Error("workflowId and laneId are required when the root requests a lease.");
+      const config = runtimeConfigFor(cwd);
+      if (!config) throw new Error("No runtime leases are configured in .baa-ton/config.json.");
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const workflow = workflowFor(manifest, workflowId);
+        if (!workflow.lanes.some((lane) => lane.id === laneId))
+          throw new Error(`Workflow ${workflowId} has no lane ${laneId}.`);
+        if (child) {
+          const refusal = laneLeaseRefusal(cwd, manifest.approvalPolicyAck);
+          const alreadyHeld = activeLeases(manifest.leases).find(
+            (lease) =>
+              lease.workflowId === workflowId &&
+              lease.laneId === laneId &&
+              lease.resource === params.resource &&
+              lease.label === (params.label ?? "default"),
+          );
+          if (refusal && !alreadyHeld)
+            return {
+              kind: "refused" as const,
+              granted: false,
+              parentApprovalRequired: true,
+              reason: `${refusal}; ask the root for this lease`,
+            };
+        }
+        const { lease, created } = await allocateLease(
+          (manifest.leases ??= []),
+          config,
+          {
+            resource: params.resource,
+            label: params.label,
+            workflowId,
+            laneId,
+            grantedBy: child ? "lane-policy" : "root",
+          },
+          { probe: probePort, now },
+        );
+        if (created) {
+          workflow.evidence.push({
+            at: now(),
+            kind: "lease-granted",
+            text: `${child ? "Lane-policy" : "Root"} lease for ${laneId}: ${leaseLines([lease])[0]}`,
+          });
+          workflow.updatedAt = now();
+          await saveManifest(cwd, manifest);
+        }
+        return { kind: "granted" as const, granted: true, created, lease };
+      } finally {
+        await release();
+      }
+    }
+    if (!params.leaseId) throw new Error("leaseId is required to release a lease.");
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const manifest = await loadManifest(cwd);
+      const lease = (manifest.leases ?? []).find((item) => item.id === params.leaseId);
+      if (!lease) throw new Error(`Unknown lease ${params.leaseId}.`);
+      if (child && (lease.workflowId !== workflowId || lease.laneId !== laneId))
+        throw new Error("A lane may release only its own leases.");
+      if (lease.state !== "active") return { kind: "release" as const, released: false, lease };
+      releaseLeases(manifest.leases, (item) => item.id === lease.id, child ? "released by lane" : "released by root", now());
+      const workflow = manifest.workflows.find((item) => item.id === lease.workflowId);
+      if (workflow) {
+        workflow.evidence.push({
+          at: now(),
+          kind: "lease-released",
+          text: `${lease.releaseReason}: ${lease.id} ${lease.resource}=${leaseValue(lease)}`,
+        });
+        workflow.updatedAt = now();
+      }
+      await saveManifest(cwd, manifest);
+      return { kind: "release" as const, released: true, lease };
+    } finally {
+      await release();
+    }
   }
 
   function responseRecord(
@@ -5272,6 +5516,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         scratchDirectory: dirname(manifestPath(cwd)),
       }),
     );
+    const briefLeases = new Map<string, Lease[]>();
     return dispatchTask(
       workflow,
       execute,
@@ -5280,7 +5525,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         source: fileURLToPath(import.meta.url),
         adapter: (kind) => adapters.resolve(kind),
         run: runHerdr,
-        contract,
+        contract: (w, lane) =>
+          contractWithLeases(w, lane, briefLeases.get(lane.id)),
         async update(workflowId, mutate) {
           const release = await acquireManifestLock(cwd, 10_000);
           try {
@@ -5325,15 +5571,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             signal,
           );
           await persistStanding(cwd, w.id, standing);
-          return (
+          const approved =
             standing.granted ||
             (await confirmExecution(
               ctx,
               `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
               confirm,
               signal,
-            ))
-          );
+            ));
+          if (approved)
+            for (const [laneId, leases] of await allocateDispatchLeases(cwd, w))
+              briefLeases.set(laneId, leases);
+          return approved;
         },
         async register(w, options) {
           const configPath = await controllerConfigPath(signal);
@@ -6505,6 +6754,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         for (const lane of stored.lanes)
           if (lane.sessionLog)
             lane.sessionLog = { ...lane.sessionLog, status: "retired" };
+        releaseWorkflowLeases(manifest, stored, "lane tabs retired");
         stored.evidence.push({
           at: timestamp,
           kind: "lane-retirement-completed",
@@ -6551,6 +6801,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             for (const lane of stored.lanes)
               if (lane.sessionLog)
                 lane.sessionLog = { ...lane.sessionLog, status: "retired" };
+            releaseWorkflowLeases(manifest, stored, "lane tabs retired");
             stored.evidence.push({
               at: timestamp,
               kind: "lane-retirement-completed",
@@ -6877,6 +7128,35 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         });
       }
     }
+    // Leases held by finished or vanished workflows. A workflow owned by
+    // another root is never in scope; one missing from the manifest entirely
+    // has no owner left to keep its lease.
+    const leases: CleanupLeaseCandidate[] = [];
+    for (const lease of activeLeases(manifest.leases)) {
+      const owner = manifest.workflows.find((item) => item.id === lease.workflowId);
+      const scoped = workflows.get(lease.workflowId);
+      const reason = !owner
+        ? "workflow no longer in the manifest"
+        : scoped &&
+            (TERMINAL_WORKFLOW_STATUSES.has(scoped.status) ||
+              (scoped.lanes.length > 0 &&
+                scoped.lanes.every(
+                  (lane) =>
+                    Boolean(lane.completionReceipt) ||
+                    TERMINAL_LANE_STATUSES.has(lane.status),
+                )))
+          ? `workflow ${scoped.status}`
+          : undefined;
+      if (reason)
+        leases.push({
+          leaseId: lease.id,
+          workflowId: lease.workflowId,
+          laneId: lease.laneId,
+          resource: lease.resource,
+          value: leaseValue(lease),
+          reason,
+        });
+    }
     return {
       inventory: {
         root: {
@@ -6886,6 +7166,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         },
         laneTabs,
         worktrees,
+        leases,
         issues,
       },
       workflows,
@@ -7017,7 +7298,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   function cleanupSweepSummary(inventory: CleanupInventory): string {
     const lines = [
-      `Cleanup sweep will retire ${inventory.laneTabs.length} lane tab(s) and remove ${inventory.worktrees.length} unopened worktree(s).`,
+      `Cleanup sweep will retire ${inventory.laneTabs.length} lane tab(s), remove ${inventory.worktrees.length} unopened worktree(s) and release ${inventory.leases.length} lease(s).`,
       "Lane tabs:",
       ...(inventory.laneTabs.length
         ? inventory.laneTabs.map(
@@ -7030,6 +7311,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ? inventory.worktrees.map(
             (item) =>
               `- ${item.workflowId}: ${item.path} [branch ${item.branch}]`,
+          )
+        : ["- none"]),
+      "Leases:",
+      ...(inventory.leases.length
+        ? inventory.leases.map(
+            (item) =>
+              `- ${item.workflowId}/${item.laneId}: ${item.resource}=${item.value} (${item.leaseId}; ${item.reason})`,
           )
         : ["- none"]),
     ];
@@ -7234,12 +7522,38 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         }
       }
     }
+    let releasedLeaseIds: string[] = [];
+    if (inventory.leases.length) {
+      const wanted = new Set(inventory.leases.map((item) => item.leaseId));
+      try {
+        releasedLeaseIds = await withManifestTransaction(cwd, (manifest) => {
+          const released = releaseLeases(
+            manifest.leases,
+            (lease) => wanted.has(lease.id),
+            "cleanup sweep",
+            now(),
+          );
+          for (const lease of released) {
+            const owner = manifest.workflows.find((item) => item.id === lease.workflowId);
+            owner?.evidence.push({
+              at: now(),
+              kind: "lease-released",
+              text: `cleanup sweep: ${lease.id} ${lease.resource}=${leaseValue(lease)}`,
+            });
+          }
+          return released.map((lease) => lease.id);
+        });
+      } catch (error) {
+        errors.push({ resource: "leases", error: (error as Error).message });
+      }
+    }
     return {
       swept: true,
       partialFailure: errors.length > 0,
       ...inventory,
       retirementResults,
       worktreeResults,
+      releasedLeaseIds,
       errors,
     };
   }
@@ -7377,6 +7691,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         );
       }
     }
+    releaseWorkflowLeases(manifest, workflow, "workflow closed");
     workflow.status = "closed";
     workflow.outcome = "closed";
     workflow.closedAt = now();
@@ -8610,6 +8925,47 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   ? `Acknowledged${result.ack ? ` at ${result.ack.ackedAt}` : ""}.`
                   : "Not acknowledged: routine operations still ask until the root runs herdr_policy action=ack."
             }`;
+      return { content: [{ type: "text", text }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_lease",
+    label: "Herdr Lease",
+    description:
+      "List, request or release runtime leases (ports, port blocks and service names from runtime.leases in .baa-ton/config.json). Active leases never share a port or name. A lane acts only on its own leases and is granted a free lease immediately when the acknowledged approvalPolicy grants lease; the root may act for any lane it owns.",
+    promptSnippet: "List, request or release runtime port and name leases.",
+    promptGuidelines: [
+      "Use herdr_lease action=list before starting local services, and use only the ports and names leased to your lane. Request more with action=request resource=<name> (label=<name> for a second lease of the same resource). Release leases you no longer need. Never pick ports or database names by hand or negotiate them in chat.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("list"), Type.Literal("request"), Type.Literal("release")]),
+      resource: Type.Optional(Type.String()),
+      label: Type.Optional(Type.String()),
+      workflowId: Type.Optional(Type.String()),
+      laneId: Type.Optional(Type.String()),
+      leaseId: Type.Optional(Type.String()),
+      includeReleased: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const result = await leaseTool(ctx, params);
+      let text: string;
+      if (result.kind === "list")
+        text = result.leases.length
+          ? [
+              ...leaseLines(result.leases).map(
+                (line, index) =>
+                  `${result.leases[index].workflowId}/${result.leases[index].laneId}: ${line}${result.leases[index].state === "released" ? " [released]" : ""}`,
+              ),
+              ...result.conflicts.map((conflict) => `CONFLICT: ${conflict}`),
+            ].join("\n")
+          : "No leases.";
+      else if (result.kind === "granted")
+        text = `${result.created ? "Granted" : "Already held"}: ${leaseLines([result.lease])[0]}`;
+      else if (result.kind === "refused") text = `Not granted: ${result.reason}`;
+      else
+        text = result.released
+          ? `Released ${result.lease.id}.`
+          : `${result.lease.id} was already released.`;
       return { content: [{ type: "text", text }], details: result };
     },
   });

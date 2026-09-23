@@ -377,6 +377,62 @@ test("confirmed cleanup retires tabs, removes the unopened worktree and branch, 
   }
 });
 
+test("cleanup sweep lists and releases leases of finished or vanished workflows only", async () => {
+  const f = await fixture();
+  try {
+    const manifest = JSON.parse(await readFile(f.manifestPath, "utf8"));
+    const tabs = manifest.workflows.find((workflow) => workflow.id === "workflow-tabs");
+    manifest.workflows.push({
+      ...tabs,
+      id: "workflow-live",
+      status: "running",
+      outcome: "running",
+      lanes: [{ id: "lane-live", status: "running", paneId: "live-pane" }],
+      ownership: { ...tabs.ownership, tabIds: [], paneIds: ["live-pane"] },
+      evidence: [],
+    });
+    const lease = (id, workflowId, ports) => ({
+      id, resource: "app", label: "default", kind: "port-block", ports,
+      workflowId, laneId: "lane", state: "active", grantedBy: "dispatch", grantedAt: "t",
+    });
+    manifest.leases = [
+      lease("lease-done", "workflow-tabs", [3600, 3601]),
+      lease("lease-gone", "workflow-vanished", [3602, 3603]),
+      lease("lease-live", "workflow-live", [3604, 3605]),
+    ];
+    await writeFile(f.manifestPath, JSON.stringify(manifest));
+
+    const dryRun = await sweep(f, false);
+    assert.deepEqual(
+      dryRun.details.leases.map((item) => [item.leaseId, item.reason]),
+      [["lease-done", "workflow completed"], ["lease-gone", "workflow no longer in the manifest"]],
+    );
+    assert.equal(
+      JSON.parse(await readFile(f.manifestPath, "utf8")).leases.every((item) => item.state === "active"),
+      true,
+      "a dry run releases nothing",
+    );
+
+    const result = await sweep(f, true, true);
+    assert.equal(result.details.partialFailure, false);
+    const stored = JSON.parse(await readFile(f.manifestPath, "utf8"));
+    const byId = Object.fromEntries(stored.leases.map((item) => [item.id, item]));
+    assert.equal(byId["lease-done"].state, "released");
+    assert.equal(byId["lease-done"].releaseReason, "lane tabs retired", "retiring the lane tabs frees the lease first");
+    assert.equal(byId["lease-gone"].state, "released");
+    assert.equal(byId["lease-gone"].releaseReason, "cleanup sweep");
+    assert.deepEqual(result.details.releasedLeaseIds, ["lease-gone"]);
+    assert.equal(byId["lease-live"].state, "active", "a running workflow keeps its lease");
+    assert.ok(
+      stored.workflows
+        .find((workflow) => workflow.id === "workflow-tabs")
+        .evidence.some((entry) => entry.kind === "lease-released"),
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("cleanup sweep records a dirty worktree and tab close failure without aborting remaining work", async () => {
   const f = await fixture({ dirty: true, failTab: true });
   try {

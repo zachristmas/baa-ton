@@ -131,6 +131,10 @@ isolation or clarity.
   Push, merge, deploy, production, close and sweep always ask. On a headless root,
   acknowledge only after the user has approved the exact policy shown by
   `herdr_policy action=show`.
+- Ports, port blocks and service/database names come from `runtime.leases` in
+  `.baa-ton/config.json` through `herdr_lease`, never from chat negotiation. Writer
+  lanes receive the configured `dispatchLeases` at dispatch; a lane may request more
+  itself when the acknowledged policy grants `lease`.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —
