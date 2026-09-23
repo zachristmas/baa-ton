@@ -3,6 +3,7 @@
     "models": [
       { "id": "claude-fable-5-1", "tier": "flagship" },
       { "id": "claude-fable-5", "tier": "flagship" },
+      { "id": "claude-opus-5-5", "tier": "frontier" },
       { "id": "claude-opus-5", "tier": "frontier" },
       { "id": "claude-opus-4-8", "tier": "frontier" },
       { "id": "claude-opus-4-7", "tier": "frontier" },
@@ -14,7 +15,7 @@
     ],
     "aliases": {
       "sonnet": "claude-sonnet-5",
-      "opus": "claude-opus-5",
+      "opus": "claude-opus-5-5",
       "haiku": "claude-haiku-4-5",
       "fable": "claude-fable-5-1",
       "best": "claude-fable-5-1"

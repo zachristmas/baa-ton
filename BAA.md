@@ -49,7 +49,7 @@ exact task profile; never invent or silently substitute them.
 6. Workers do not spawn workers. The root owns topology and delegation.
 7. Use server-owned waiting, not blind polling. After a timeout or stall, inspect
    the agent before sending anything else; never blindly resend a prompt.
-8. Prefer a reviewer from a different model vendor than the implementer.
+8. Use an independent reviewer; a different model vendor is a plus, not a requirement.
 9. Verify claims against evidence. A worker's claim that tests passed is not proof.
 10. User authorization still controls commits, pushes, merges, PRs, deployments,
     production operations, external messages, and resource closure.
@@ -157,6 +157,9 @@ isolation or clarity.
   exact dry-run inventory and getting explicit approval in this conversation —
   the same bar `herdr_dispatch` already uses. Never set `confirm=true` speculatively
   or reuse an earlier approval for a different inventory.
+- When the root goal reaches a terminal state, close the finished workflow's own lane
+  tabs with evidence, then run a `herdr_sweep` dry-run and show the user what remains
+  before asking whether to execute. `baa-ton-sweep` runs the same check on demand.
 
 ## Anti-patterns
 
@@ -165,5 +168,5 @@ isolation or clarity.
 - Sending a second prompt after a timeout without reading the target agent first.
 - Using UI focus implicitly when another client may control it.
 - Creating a dashboard of empty tabs/panes instead of the smallest useful topology.
-- Shipping without independent evidence or cross-vendor review.
+- Shipping without independent evidence or review.
 - Using Herdr actions as a substitute for user authorization.

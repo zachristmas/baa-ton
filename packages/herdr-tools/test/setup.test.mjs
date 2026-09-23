@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,9 +8,13 @@ import {
   configureSkillContent,
   configureSkillPath,
   installProjectSkills,
+  instructionCandidates,
   managedReferenceBlock,
+  portableBaaReference,
   startSkillContent,
   startSkillPath,
+  sweepSkillContent,
+  sweepSkillPath,
   uninstallSkillContent,
   uninstallSkillPath,
   updateSkillContent,
@@ -24,18 +28,21 @@ test("managed BAA references are idempotent and replace stale paths", async () =
   try {
     const path = join(directory, "AGENTS.md");
     await writeFile(path, "# Project\n\nExisting instructions.\n");
-    updateManagedReference(path, "/one/BAA.md");
+    updateManagedReference(path, join(directory, "one", "BAA.md"));
     const first = await readFile(path, "utf8");
-    assert.match(first, /\/one\/BAA\.md/);
-    updateManagedReference(path, "/two/BAA.md");
+    assert.match(first, /`one\/BAA\.md`/);
+    updateManagedReference(path, join(directory, "BAA.md"));
     const second = await readFile(path, "utf8");
-    assert.match(second, /\/two\/BAA\.md/);
-    assert.doesNotMatch(second, /\/one\/BAA\.md/);
-    updateManagedReference(path, "/two/BAA.md");
+    assert.match(second, /`BAA\.md`/);
+    assert.doesNotMatch(second, /one\/BAA\.md/);
+    assert.doesNotMatch(second, new RegExp(directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    updateManagedReference(path, join(directory, "BAA.md"));
     assert.equal(await readFile(path, "utf8"), second);
     assert.equal(second.match(/baa-ton:start/g).length, 1);
     assert.match(second, /Existing instructions\./);
-    assert.match(second, new RegExp(managedReferenceBlock("/two/BAA.md").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(second, new RegExp(managedReferenceBlock("BAA.md").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(second, /explicitly selected Herdr orchestration session/);
+    assert.match(second, /Otherwise ignore it\./);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -79,14 +86,15 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(first.length, selected.length * 4);
-    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 4).fill(false));
+    assert.equal(first.length, selected.length * 5);
+    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 5).fill(false));
     for (const harness of selected) {
       const skills = [
         [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
         [configureSkillPath(directory, harness), configureSkillContent({ baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-configure"],
         [updateSkillPath(directory, harness), updateSkillContent({ projectRoot: directory }), "baa-ton-update"],
         [uninstallSkillPath(directory, harness), uninstallSkillContent(), "baa-ton-uninstall"],
+        [sweepSkillPath(directory, harness), sweepSkillContent(), "baa-ton-sweep"],
       ];
       for (const [path, expected, name] of skills) {
         const content = await readFile(path, "utf8");
@@ -99,7 +107,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 4).fill(false));
+    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 5).fill(false));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -168,6 +176,60 @@ test("unconfigured task profile fails closed instead of guessing", async () => {
       () => resolveTaskProfile(directory, "sustained"),
       /no exact launchProfile/,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("BAA references stay portable across machines", () => {
+  assert.equal(portableBaaReference("/project/AGENTS.md", "/project/BAA.md"), "BAA.md");
+  assert.equal(portableBaaReference("/project/docs/AGENTS.md", "/project/BAA.md"), "../BAA.md");
+});
+
+test("a CLAUDE.md that imports AGENTS.md does not get a second managed reference", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-candidates-"));
+  try {
+    await writeFile(join(directory, "AGENTS.md"), "# Project\n");
+    await writeFile(join(directory, "CLAUDE.md"), "@AGENTS.md\n");
+    const importing = instructionCandidates(directory, ["claude", "codex"]).filter((path) => path.startsWith(directory));
+    assert.deepEqual(importing, [join(directory, "AGENTS.md")]);
+    await writeFile(join(directory, "CLAUDE.md"), "# Claude-only instructions\n");
+    const separate = instructionCandidates(directory, ["claude", "codex"]).filter((path) => path.startsWith(directory));
+    assert.deepEqual(separate.sort(), [join(directory, "AGENTS.md"), join(directory, "CLAUDE.md")].sort());
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("harness skill directories that alias one another share one start skill", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-skill-alias-"));
+  try {
+    await mkdir(join(directory, ".claude"));
+    await symlink(".claude", join(directory, ".codex"));
+    const written = installProjectSkills({
+      projectRoot: directory,
+      selected: ["claude", "codex"],
+      baaPath: join(directory, "BAA.md"),
+    });
+    assert.equal(written.length, 5);
+    const start = await readFile(startSkillPath(directory, "claude"), "utf8");
+    assert.match(start, /--harness <harness>/);
+    assert.match(start, /`claude` or `codex`/);
+    assert.match(start, /current claude or codex session/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a hand-authored sweep skill without Baa-ton markers is preserved", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-sweep-owned-"));
+  try {
+    const path = sweepSkillPath(directory, "claude");
+    await mkdir(join(directory, ".claude", "skills", "baa-ton-sweep"), { recursive: true });
+    await writeFile(path, "---\nname: baa-ton-sweep\n---\nmine\n");
+    const written = installProjectSkills({ projectRoot: directory, selected: ["claude"], baaPath: join(directory, "BAA.md") });
+    assert.equal(written.find((skill) => skill.path === path).skipped, true);
+    assert.equal(await readFile(path, "utf8"), "---\nname: baa-ton-sweep\n---\nmine\n");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
