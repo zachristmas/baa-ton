@@ -97,6 +97,7 @@ import {
   currentAppliedHerdrIdentity,
   resolveHerdrIdentity,
 } from "./live-identity.mjs";
+import { legacyStateStatus } from "./state-migration.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -787,8 +788,16 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // An empty manifest here would silently orphan a run that an older
+      // Baa-ton recorded under .pi/herdr-orchestrator (renamed in f00b5e5).
+      const legacy = await legacyStateStatus(cwd);
+      if (legacy.needsMigration)
+        throw new Error(
+          `Herdr orchestrator state for ${cwd} is still at ${legacy.legacyDirectory}. Run \`node ${join(dirname(fileURLToPath(import.meta.url)), "state-migration.mjs")} --project-root "${cwd}" --controller-config-dir "$(herdr plugin config-dir herdr-orchestrator-controller)"\` (or rerun Baa-ton setup) to migrate it before using the orchestrator.`,
+        );
       return { version: 2, workflows: [] };
+    }
     throw new Error(`Cannot read Herdr manifest: ${(error as Error).message}`);
   }
 }
@@ -7219,6 +7228,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       status: "ok",
       detail: `Loaded from ${await realpath(fileURLToPath(import.meta.url))}.`,
     }));
+
+    await check("state-location", async () => {
+      const legacy = await legacyStateStatus(cwd);
+      if (legacy.needsMigration)
+        return {
+          status: "fail",
+          detail: `Orchestrator state is still at ${legacy.legacyDirectory}; rerun Baa-ton setup or state-migration.mjs to move it to ${legacy.currentDirectory}.`,
+        };
+      if (legacy.legacyWrittenAfterMigration)
+        return {
+          status: "warn",
+          detail: `${legacy.legacyDirectory} changed after it was migrated; an older Baa-ton may still be running against it.`,
+        };
+      return {
+        status: "ok",
+        detail: legacy.migrated
+          ? `State at ${legacy.currentDirectory}; ${legacy.legacyDirectory} kept as an archive.`
+          : `State at ${legacy.currentDirectory}.`,
+      };
+    });
 
     let configPath: string | undefined;
     await check("native-herdr-connectivity", async () => {

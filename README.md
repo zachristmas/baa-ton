@@ -63,6 +63,8 @@ Invoke `baa-ton-configure` in the project to edit `.baa-ton/config.json`, where 
 
 Invoke `baa-ton-update` in the project to update the shared Baa-ton checkout, install dependency changes, and refresh the project integrations. Your project contract, configuration, instructions, and user-authored skills are preserved.
 
+Older installs kept orchestrator state in `.pi/herdr-orchestrator`. Setup copies it to `.baa-ton/herdr-orchestrator`, rewrites the absolute paths and route ids in it and in the controller's `config.json` and `inbox.json`, and leaves the old directory in place as an archive with a `MIGRATED-TO-BAA-TON.json` marker. Update at a quiet point: an old Baa-ton still running against `.pi` after the copy is reported by `herdr_doctor`. To migrate by hand, run `node packages/herdr-tools/state-migration.mjs --project-root <project> --controller-config-dir "$(herdr plugin config-dir herdr-orchestrator-controller)"`; `--status` only reports.
+
 ## Re-run project setup
 
 If you installed from the wrong directory or want to change harness selections, run the same wizard manually from the project root. Press Enter to keep the current directory, or enter another existing project path when prompted:

@@ -42,6 +42,8 @@ import {
   checkoutDirectory,
 } from "./setup-core.mjs";
 import { readClaudeDefaults, readCodexDefaults, readPiDefaults, readOpencodeDefaults } from "./harness-detect.mjs";
+import { liveHerdrConfigDirectory } from "./live-herdr.mjs";
+import { formatMigrationResult, migrateProjectState } from "./state-migration.mjs";
 import { buildProfileTemplates, defaultLaunchProfiles } from "./profile-defaults.mjs";
 import { bannerLines, bannerText } from "./banner.mjs";
 import { bold, brightCyan, brightGreen, brightMagenta, dim, gray, green, yellow } from "./theme.mjs";
@@ -187,6 +189,26 @@ function performWrites({ projectRoot, detected, selected, instructionFiles, defa
   return { baaPath, skills, configPath, config };
 }
 
+/**
+ * Carry orchestrator state from .pi/herdr-orchestrator to .baa-ton (see
+ * state-migration.mjs). Setup is where an update lands, so this runs after the
+ * writes. Without a reachable Herdr the project state still moves and the
+ * result says the controller mappings were left alone.
+ */
+async function migrateLegacyState(projectRoot, { quiet }) {
+  let controllerConfigDirectory;
+  try {
+    controllerConfigDirectory = await liveHerdrConfigDirectory();
+  } catch {
+    controllerConfigDirectory = undefined;
+  }
+  const result = await migrateProjectState({ projectRoot, controllerConfigDirectory });
+  const noteworthy = result.status === "migrated" || result.legacyWrittenAfterMigration;
+  if (result.status !== "no-legacy-state" && (noteworthy || !quiet))
+    console.log(formatMigrationResult(result));
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Non-interactive / accept-defaults path (also used by the TTY guard)
 // ---------------------------------------------------------------------------
@@ -208,6 +230,7 @@ async function runNonInteractive(options) {
       console.log(`Baa-ton profile defaults refreshed at ${writtenPath}`);
       reportUnconfigured(defaults, computed);
     }
+    await migrateLegacyState(projectRoot, options);
     return;
   }
 
@@ -257,6 +280,7 @@ async function runNonInteractive(options) {
     reportUnconfigured(defaults, computed);
     console.log(`Run from the target Herdr pane for root setup: node ${join(checkoutDirectory, "packages/herdr-tools/root-setup.mjs")} --harness <name>`);
   }
+  await migrateLegacyState(projectRoot, options);
   // install.sh/install.ps1 no longer render their own banner; this keeps it
   // always shown at the end of the non-interactive installer path too,
   // matching the old unconditional welcome()/Welcome call.
@@ -800,6 +824,7 @@ async function runWizard(options) {
     }
     tui.stop();
     if (!options.quiet) console.log(`Baa-ton configuration written to ${writeResult.configPath}`);
+    await migrateLegacyState(projectRoot, options);
     return { aborted: false };
   } finally {
     tui.stop();
