@@ -1,6 +1,6 @@
 # Herdr Orchestrator Controller
 
-A local [Herdr](https://herdr.dev) event controller for Baa-ton workflows. It is an observer and root notifier, never a dispatcher: it records durable lane events and sends a non-waiting notification only to an explicitly mapped root agent.
+A local [Herdr](https://herdr.dev) event controller for Baa-ton workflows. It records durable lane events and child messages and delivers them to an explicitly mapped root agent as batched, non-waiting digests. It never dispatches work.
 
 ## Supported hook
 
@@ -40,7 +40,15 @@ Replace all placeholders with real opaque IDs and the absolute workflow manifest
 - The optional parent-goal supervisor sends one non-waiting recovery nudge per durable work transition, only after the mapped Pi root has fully settled. Delivered/uncertain wakes survive restarts without replay; terminal snapshots cannot release an active run. See the [supervisor wake protocol and rollout limits](../herdr-tools/GOAL-ADAPTER-PROTOCOL.md#supervisor-wake-protocol).
 - The controller never dispatches, resumes, closes, creates topology, mutates Git, or contacts external services.
 
-Each supervisor tick compares the latest recorded lane transition against a five-minute wall-clock threshold. A routed lane that remains `working` beyond that threshold emits one durable `stall-suspected` signal per stale period and wakes its root; the signal is advisory, may be a false positive on a genuinely slow turn, and tells the root to inspect rather than declaring the lane dead.
+## Root digests
+
+Lane `done`, `blocked` and `goal-paused` events and child messages are not sent one by one. The dispatcher (`dispatchRootDigest`) sends everything the root has not seen as one `[Baa-ton digest]` prompt:
+
+- **Only when the root is free.** For a Pi root, the extension's settled turn record (`supervisor.rootTurn.state === "idle"`) is required, because Herdr can report idle between tool calls. Live Herdr status vetoes only when it is `working` or `blocked`. A root is never prompted mid-turn.
+- **After a short collection window.** Herdr reports `done` at the end of every child turn, usually beside that lane's child message. Non-urgent items wait until the oldest is `digest_window_seconds` old (default 60), so a burst becomes one wake. `blocked` and `goal-paused` skip the window. Set it per project with `program.digest_window_seconds` (0–3600) in the controller config; `BAA_TON_DIGEST_WINDOW_SECONDS` is a machine-wide override.
+- **Once.** Items are marked `sending` and saved before the prompt; an interrupted send becomes `uncertain` and is never replayed. Deferrals are not counted as attempts.
+
+Hooks attempt delivery immediately; each supervisor tick (every 5 s) delivers whatever became due. There is no wall-clock stall timer: a lane that is `working` is left alone, and a stuck lane shows up as `blocked`.
 
 ## Validate
 

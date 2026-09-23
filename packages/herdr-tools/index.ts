@@ -1748,8 +1748,18 @@ function validateControllerConfig(input: unknown): ControllerConfig {
       record.program,
       `controller config.orchestrators[${index}].program`,
       ["id", "workspace_id"],
-      ["parent_manifest_path"],
+      ["parent_manifest_path", "digest_window_seconds"],
     );
+    const digestWindowSeconds = program.digest_window_seconds;
+    if (
+      digestWindowSeconds !== undefined &&
+      (!Number.isSafeInteger(digestWindowSeconds) ||
+        (digestWindowSeconds as number) < 0 ||
+        (digestWindowSeconds as number) > 3_600)
+    )
+      throw new Error(
+        "controller program.digest_window_seconds must be an integer from 0 to 3600.",
+      );
     if (!Array.isArray(record.workflows))
       throw new Error("controller orchestrator.workflows must be an array.");
     const programId = controllerString(program.id, "controller program.id");
@@ -1780,6 +1790,9 @@ function validateControllerConfig(input: unknown): ControllerConfig {
         workspace_id: workspaceId,
         ...(parentManifestPath
           ? { parent_manifest_path: resolve(parentManifestPath) }
+          : {}),
+        ...(digestWindowSeconds !== undefined
+          ? { digest_window_seconds: digestWindowSeconds as number }
           : {}),
       },
       workflows: record.workflows.map((workflow, workflowIndex) =>

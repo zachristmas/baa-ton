@@ -19,6 +19,10 @@ import {
 import { configureSidebar } from "../sidebar-configure.mjs";
 import { readStore, storePath } from "../../herdr-tools/inbox/index.mjs";
 
+// These tests pin routing and delivery, not timing: deliver each digest as
+// soon as the root is ready. The window has its own tests.
+process.env.BAA_TON_DIGEST_WINDOW_SECONDS = "0";
+
 const ROOT = {
   target: "bb029-root",
   target_kind: "name",
@@ -865,7 +869,7 @@ test("post-completion done and idle transitions are observational and never wake
   }
 });
 
-test("durable child messages wake the root after lane completion and remain distinct", async () => {
+test("durable child messages wake the root after lane completion in one digest and remain distinct", async () => {
   const child = {
     ...CHILD,
     pane_id: "w-root:p5",
@@ -936,10 +940,15 @@ test("durable child messages wake the root after lane completion and remain dist
     });
     assert.equal(first.delivery, "delivered");
     assert.equal(second.delivery, "delivered");
+    // Both messages were pending when the first route ran, so one digest
+    // carries both and the second route finds nothing left to send.
+    assert.equal(first.digest.count, 2);
+    assert.equal(second.digest.status, "empty");
     const prompts = requestsFor(mock, "agent.prompt");
-    assert.equal(prompts.length, 2);
-    assert.match(prompts[0].params.text, /lane lane-child/);
-    assert.match(prompts[0].params.text, /The user asked for more work/);
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0].params.text, /^\[Baa-ton digest\] 2 updates/);
+    assert.match(prompts[0].params.text, /herdr-bb029\/lane-child \(message-late-worktree\): The user asked for more work/);
+    assert.match(prompts[0].params.text, /\(message-late-distinct\): A distinct late fact/);
     const manifest = await fixture.manifest();
     assert.equal(manifest.parentGoal.status, "review-requested");
     assert.doesNotMatch(manifest.parentGoal.nextAction, /action-required/);
@@ -2221,13 +2230,13 @@ test("the supervisor waits one normal interval after startup before nudging rest
   }
 });
 
-test("a stale working lane emits one durable advisory stall signal and wakes its root", async () => {
+test("a long-working lane gets no stall signal, root wake, or lane prompt", async () => {
   const fixture = await createFixture({
     piGoalPauseDetection: false,
     parentGoal: {
       version: 1,
-      id: "parent-stall",
-      objective: "Inspect a stalled lane.",
+      id: "parent-long-turn",
+      objective: "Let a slow lane work.",
       status: "active",
       nextAction: "Continue the lane.",
       signals: [],
@@ -2235,364 +2244,25 @@ test("a stale working lane emits one durable advisory stall signal and wakes its
       updatedAt: "2026-09-14T00:00:00.000Z",
     },
   });
-  const transitionAt = "2026-09-14T00:00:00.000Z";
-  await seedWorkingTransition(fixture, transitionAt);
+  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
   const prompts = [];
   const lanePrompts = [];
   const api = rootWakeApi(prompts, undefined, lanePrompts);
   try {
-    const first = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:06:00.000Z",
-    });
-    assert.deepEqual(first.pendingWakes, [
-      {
-        manifestPath: fixture.manifestPath,
-        workflowId: "herdr-bb029",
-        laneId: CHILD.lane_id,
-        status: "delivered",
-      },
-    ]);
-    let manifest = await fixture.manifest();
-    let stalls = manifest.workflows[0].eventController.events.filter(
-      (event) => event.classification === "stall-suspected",
-    );
-    assert.equal(stalls.length, 1);
-    assert.equal(stalls[0].wake.status, "delivered");
-    assert.equal(stalls[0].received_at, transitionAt);
-    assert.equal(stalls[0].detected_at, "2026-09-14T00:06:00.000Z");
-    assert.equal(stalls[0].nudge.status, "delivered");
-    assert.equal(lanePrompts.length, 1);
-    assert.equal(lanePrompts[0].target, CHILD.target);
-    assert.match(
-      lanePrompts[0].text,
-      /you may be stalled\. Continue your assigned work now \(objective: /,
-    );
-    assert.match(
-      lanePrompts[0].text,
-      /file your herdr_complete receipt\./,
-    );
-    assert.equal(manifest.parentGoal.status, "review-requested");
-    assert.equal(manifest.parentGoal.signals[0].classification, "stall-suspected");
-    assert.match(
-      prompts[0],
-      /\[Herdr Orchestrator stall-suspected\] workflow herdr-bb029, lane lane-child has had no recorded status transition for 6 minutes\./,
-    );
-    assert.match(
-      prompts[0],
-      /advisory only and may be a false positive on a genuinely slow turn; inspect the lane and workflow rather than assuming the lane is dead\./,
-    );
-
-    const second = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:07:00.000Z",
-    });
-    assert.deepEqual(second.pendingWakes, []);
-    manifest = await fixture.manifest();
-    stalls = manifest.workflows[0].eventController.events.filter(
-      (event) => event.classification === "stall-suspected",
-    );
-    assert.equal(stalls.length, 1);
-    assert.equal(prompts.length, 1);
-    assert.equal(lanePrompts.length, 1, "nudge dedupes with the stall period");
-  } finally {
-    await fixture.cleanup();
-  }
-});
-
-test("a stall signal records an uncertain nudge when the lane prompt fails", async () => {
-  const fixture = await createFixture({ piGoalPauseDetection: false });
-  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
-  const prompts = [];
-  const api = {
-    ...rootWakeApi(prompts),
-    async request(method, params = {}) {
-      if (method === "pane.report_metadata") return { result: {} };
-      if (method === "agent.prompt") {
-        if (params.target === ROOT.target) {
-          prompts.push(params.text);
-          return { result: { type: "agent_prompted" } };
-        }
-        throw new Error("socket_timeout after submission");
-      }
-      return {
-        type: "agent_info",
-        agent: {
-          agent: ROOT.agent_kind,
-          name: ROOT.target,
-          pane_id: ROOT.pane_id,
-          workspace_id: ROOT.workspace_id,
-        },
-      };
-    },
-  };
-  try {
-    const result = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:06:00.000Z",
-    });
-    assert.deepEqual(result.pendingWakes, [
-      {
-        manifestPath: fixture.manifestPath,
-        workflowId: "herdr-bb029",
-        laneId: CHILD.lane_id,
-        status: "delivered",
-      },
-    ]);
+    for (const timestamp of ["2026-09-14T00:06:00.000Z", "2026-09-14T02:00:00.000Z"]) {
+      const tick = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp });
+      assert.deepEqual(tick.pendingWakes, []);
+    }
     const manifest = await fixture.manifest();
-    const stalls = manifest.workflows[0].eventController.events.filter(
-      (event) => event.classification === "stall-suspected",
-    );
-    assert.equal(stalls.length, 1);
-    assert.equal(stalls[0].nudge.status, "uncertain");
-    assert.match(stalls[0].nudge.reason, /socket_timeout/);
-  } finally {
-    await fixture.cleanup();
-  }
-});
-
-test("a working lane that transitions before the threshold does not emit a stall signal", async () => {
-  const fixture = await createFixture({ piGoalPauseDetection: false });
-  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
-  const prompts = [];
-  try {
-    const result = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: rootWakeApi(prompts),
-      timestamp: "2026-09-14T00:04:59.000Z",
-    });
-    assert.deepEqual(result.pendingWakes, []);
-    const events = (await fixture.manifest()).workflows[0].eventController.events;
-    assert.equal(events.length, 1);
-    assert.equal(prompts.length, 0);
-  } finally {
-    await fixture.cleanup();
-  }
-});
-
-test("a lane that goes stale, transitions, and goes stale again emits a distinct second signal", async () => {
-  const fixture = await createFixture({ piGoalPauseDetection: false });
-  const prompts = [];
-  const api = rootWakeApi(prompts);
-  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
-  try {
-    await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:06:00.000Z",
-    });
-    await handleHook({
-      eventName: "pane.agent_status_changed",
-      eventJson: statusEvent("blocked"),
-      stateDir: fixture.stateDir,
-      herdr: api,
-    });
-    await handleHook({
-      eventName: "pane.agent_status_changed",
-      eventJson: statusEvent("working"),
-      stateDir: fixture.stateDir,
-      herdr: api,
-    });
-    const manifest = await fixture.manifest();
-    const resumed = manifest.workflows[0].eventController.events.at(-1);
-    resumed.received_at = "2026-09-14T00:08:00.000Z";
-    await writeFile(fixture.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
-    const second = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:14:00.000Z",
-    });
     assert.equal(
-      second.pendingWakes.filter((wake) => wake.status === "delivered").length,
-      1,
-    );
-    const events = (await fixture.manifest()).workflows[0].eventController.events;
-    const stalls = events.filter((event) => event.classification === "stall-suspected");
-    assert.equal(stalls.length, 2);
-    assert.notEqual(stalls[0].identity, stalls[1].identity);
-    assert.equal(
-      prompts.filter((text) => text.includes("stall-suspected")).length,
-      2,
-    );
-  } finally {
-    await fixture.cleanup();
-  }
-});
-
-test("a terminal lane never emits a stall signal from an old working transition", async () => {
-  const fixture = await createFixture({
-    piGoalPauseDetection: false,
-    completionReceipt: {
-      id: "incarnation-stall-terminal",
-      summary: "lane completed",
-      delivery: "delivered",
-    },
-  });
-  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
-  const prompts = [];
-  try {
-    const result = await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: rootWakeApi(prompts),
-      timestamp: "2026-09-14T01:00:00.000Z",
-    });
-    assert.deepEqual(result.pendingWakes, []);
-    const events = (await fixture.manifest()).workflows[0].eventController.events;
-    assert.equal(events.some((event) => event.classification === "stall-suspected"), false);
-    assert.equal(prompts.length, 0);
-  } finally {
-    await fixture.cleanup();
-  }
-});
-
-test("stalls are isolated to each routed root in a multi-root supervisor tick", async () => {
-  const fixture = await createFixture({ piGoalPauseDetection: false });
-  const rootB = {
-    target: "root-b",
-    target_kind: "name",
-    agent_kind: "pi",
-    pane_id: "w-b:p1",
-    workspace_id: "w-b",
-  };
-  const childB = {
-    lane_id: "lane-b",
-    target: "child-b",
-    target_kind: "name",
-    pane_id: "w-b-child:p1",
-    workspace_id: "w-b-child",
-  };
-  await seedWorkingTransition(fixture, "2026-09-14T00:00:00.000Z");
-  const secondManifestPath = join(fixture.directory, "second-stall", "manifest.json");
-  await mkdir(dirname(secondManifestPath), { recursive: true });
-  await writeFile(
-    secondManifestPath,
-    `${JSON.stringify(
-      {
-        version: 2,
-        workflows: [
-          {
-            id: "herdr-b",
-            ownership: { createdBy: "herdr-orchestrator" },
-            lanes: [
-              {
-                id: childB.lane_id,
-                paneId: childB.pane_id,
-                agentName: childB.target,
-              },
-            ],
-            eventController: {
-              version: 1,
-              events: [
-                {
-                  identity: "working-b",
-                  received_at: "2026-09-14T00:00:00.000Z",
-                  event: "pane.agent_status_changed",
-                  workflow_id: "herdr-b",
-                  lane_id: childB.lane_id,
-                  pane_id: childB.pane_id,
-                  workspace_id: childB.workspace_id,
-                  classification: "unclassified",
-                  source: { agent_status: "working" },
-                  wake: { status: "not-required", attempts: 0 },
-                },
-              ],
-            },
-          },
-        ],
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  await writeFile(
-    join(fixture.stateDir, "config.json"),
-    `${JSON.stringify(
-      {
-        version: 2,
-        owner: "herdr-orchestrator",
-        orchestrators: [
-          {
-            id: "root-a",
-            root: ROOT,
-            program: { id: "program-a", workspace_id: ROOT.workspace_id },
-            workflows: [
-              {
-                workflow_id: "herdr-bb029",
-                manifest_path: fixture.manifestPath,
-                pi_goal_pause_detection: false,
-                lanes: [CHILD],
-              },
-            ],
-          },
-          {
-            id: "root-b",
-            root: rootB,
-            program: { id: "program-b", workspace_id: rootB.workspace_id },
-            workflows: [
-              {
-                workflow_id: "herdr-b",
-                manifest_path: secondManifestPath,
-                pi_goal_pause_detection: false,
-                lanes: [childB],
-              },
-            ],
-          },
-        ],
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  const prompts = [];
-  const api = {
-    async request(method, params = {}) {
-      if (method === "pane.report_metadata") return { result: {} };
-      if (method === "agent.prompt") {
-        prompts.push({ target: params.target, text: params.text });
-        return { result: { type: "agent_prompted" } };
-      }
-      const root = params.target === ROOT.target ? ROOT : rootB;
-      return {
-        type: "agent_info",
-        agent: {
-          agent: root.agent_kind,
-          name: root.target,
-          pane_id: root.pane_id,
-          workspace_id: root.workspace_id,
-          agent_status: "idle",
-        },
-      };
-    },
-  };
-  try {
-    await runSupervisorTick({
-      stateDir: fixture.stateDir,
-      herdr: api,
-      timestamp: "2026-09-14T00:06:00.000Z",
-    });
-    assert.deepEqual(
-      prompts.map((prompt) => prompt.target).sort(),
-      [ROOT.target, CHILD.target, rootB.target, childB.target].sort(),
-    );
-    assert.equal(
-      prompts.some((prompt) => prompt.text.includes("workflow herdr-bb029")),
-      true,
-    );
-    assert.equal(
-      prompts.some((prompt) => prompt.text.includes("workflow herdr-b")),
-      true,
-    );
-    const second = JSON.parse(await readFile(secondManifestPath, "utf8"));
-    assert.equal(
-      second.workflows[0].eventController.events.filter(
+      manifest.workflows[0].eventController.events.some(
         (event) => event.classification === "stall-suspected",
-      ).length,
-      1,
+      ),
+      false,
     );
+    assert.equal(prompts.length, 0, "a working lane never wakes the root on a timer");
+    assert.equal(lanePrompts.length, 0, "a working lane is never interrupted on a timer");
+    assert.equal(manifest.parentGoal.status, "active");
   } finally {
     await fixture.cleanup();
   }
@@ -2702,7 +2372,8 @@ test("an unavailable root leaves a durable pending event that an identical hook 
       1,
       "a retry updates the existing durable event record",
     );
-    assert.equal(events[0].wake.attempts, 2);
+    // A deferral is not a send attempt; only the delivered digest counts.
+    assert.equal(events[0].wake.attempts, 1);
   } finally {
     await mock.close();
     await fixture.cleanup();
@@ -2752,17 +2423,22 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
     assert.deepEqual(tick.pendingWakes, [
       {
         manifestPath: fixture.manifestPath,
-        workflowId: "herdr-bb029",
-        laneId: CHILD.lane_id,
+        kind: "digest",
         status: "delivered",
+        count: 1,
+        reason: "agent_prompt_accepted",
       },
     ]);
     assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+    assert.match(
+      requestsFor(mock, "agent.prompt")[0].params.text,
+      /^\[Baa-ton digest\] 1 update since your last turn:\n1\. blocked: herdr-bb029\/lane-child/,
+    );
     const manifest = await fixture.manifest();
     const events = manifest.workflows[0].eventController.events;
     assert.equal(events.length, 1);
     assert.equal(events[0].wake.status, "delivered");
-    assert.equal(events[0].wake.attempts, 2);
+    assert.equal(events[0].wake.attempts, 1);
 
     // A second tick must not redeliver an already-drained wake.
     await runSupervisorTick({
@@ -3194,4 +2870,319 @@ test("supported working and idle status hooks classify an opt-in paused Pi goal"
     await mock.close();
     await fixture.cleanup();
   }
+});
+
+function digestApi({ rootStatus = () => "idle" } = {}) {
+  const prompts = [];
+  return {
+    prompts,
+    async request(method, params = {}) {
+      if (method === "pane.report_metadata") return { result: {} };
+      if (method === "agent.prompt") {
+        prompts.push(params);
+        return { result: { type: "agent_prompted" } };
+      }
+      if (method === "agent.get")
+        return {
+          type: "agent_info",
+          agent: {
+            agent: ROOT.agent_kind,
+            name: ROOT.target,
+            pane_id: ROOT.pane_id,
+            workspace_id: ROOT.workspace_id,
+            agent_status: rootStatus(),
+          },
+        };
+      throw new Error(`Unexpected Herdr method ${method}`);
+    },
+  };
+}
+
+function pendingMessage(id, summary, requestedAt) {
+  return {
+    version: 1,
+    id,
+    workflowId: "herdr-bb029",
+    laneId: CHILD.lane_id,
+    summary,
+    kind: "informational",
+    requestedAt,
+    delivery: { status: "pending", attempts: 0, updatedAt: requestedAt },
+  };
+}
+
+function rootTurn(state) {
+  return {
+    state,
+    runId: `run-${state}`,
+    paneId: ROOT.pane_id,
+    workspaceId: ROOT.workspace_id,
+    updatedAt: "2026-09-14T00:00:00.000Z",
+  };
+}
+
+test("a busy root collects lane events and child messages into one digest when its turn settles", async () => {
+  const messageRequests = [
+    pendingMessage("message-progress", "Typecheck clean, starting E2E.", "2026-09-14T00:01:00.000Z"),
+    pendingMessage("message-port", "Need a second DB for the fixture.", "2026-09-14T00:02:00.000Z"),
+  ];
+  const fixture = await createFixture({ parentGoal: dueParentGoal(), messageRequests });
+  await patchSupervisor(fixture, { rootTurn: rootTurn("active") });
+  const api = digestApi();
+  try {
+    const blocked = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("blocked"),
+      stateDir: fixture.stateDir,
+      herdr: api,
+    });
+    assert.equal(blocked.digest.status, "deferred");
+    assert.equal(blocked.digest.reason, "awaiting_root_idle");
+    await routeChildMessage({
+      configDir: fixture.stateDir,
+      workflowId: "herdr-bb029",
+      laneId: CHILD.lane_id,
+      messageId: "message-progress",
+      herdr: api,
+    });
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr: api,
+    });
+    const busyTick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:03:00.000Z",
+    });
+    assert.deepEqual(busyTick.pendingWakes, [
+      {
+        manifestPath: fixture.manifestPath,
+        kind: "digest",
+        status: "deferred",
+        count: 4,
+        reason: "awaiting_root_idle",
+      },
+    ]);
+    assert.equal(api.prompts.length, 0, "a working root is never prompted");
+    let manifest = await fixture.manifest();
+    assert.equal(manifest.parentGoal.status, "review-requested");
+    assert.ok(
+      manifest.workflows[0].messageRequests.every(
+        (request) => request.delivery.status === "pending" && request.delivery.attempts === 0,
+      ),
+    );
+
+    await patchSupervisor(fixture, { rootTurn: rootTurn("idle") });
+    const settledTick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:04:00.000Z",
+    });
+    assert.equal(api.prompts.length, 1, "four updates arrive as one prompt");
+    assert.equal(api.prompts[0].target, ROOT.target);
+    const text = api.prompts[0].text;
+    assert.match(text, /^\[Baa-ton digest\] 4 updates since your last turn:/);
+    assert.match(text, /\n1\. blocked: herdr-bb029\/lane-child/);
+    assert.match(text, /\n2\. done: herdr-bb029\/lane-child/);
+    assert.match(text, /message-progress\): Typecheck clean, starting E2E\./);
+    assert.match(text, /message-port\): Need a second DB for the fixture\./);
+    assert.doesNotMatch(text, /observational only|do not dispatch/);
+    assert.notEqual(
+      settledTick.results[0].status,
+      "delivered",
+      "the supervisor does not also nudge on the tick that sent a digest",
+    );
+    manifest = await fixture.manifest();
+    const actionable = manifest.workflows[0].eventController.events.filter((event) =>
+      ["blocked", "done"].includes(event.classification),
+    );
+    assert.deepEqual(
+      actionable.map((event) => [event.wake.status, event.wake.attempts]),
+      [["delivered", 1], ["delivered", 1]],
+    );
+    assert.deepEqual(
+      manifest.workflows[0].messageRequests.map((request) => [request.delivery.status, request.delivery.attempts]),
+      [["delivered", 1], ["delivered", 1]],
+    );
+
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:05:00.000Z",
+    });
+    assert.equal(
+      api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]")).length,
+      1,
+      "delivered items are never sent again",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a root Herdr reports as working defers the digest even without a turn record", async () => {
+  const fixture = await createFixture({
+    parentGoal: {
+      version: 1,
+      id: "parent-no-supervisor",
+      objective: "Review lane results.",
+      status: "active",
+      nextAction: "Wait for lanes.",
+      signals: [],
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    },
+  });
+  let status = "working";
+  const api = digestApi({ rootStatus: () => status });
+  try {
+    const hook = await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr: api,
+    });
+    assert.equal(hook.digest.status, "deferred");
+    assert.equal(api.prompts.length, 0);
+    status = "done";
+    const tick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:01:00.000Z",
+    });
+    assert.equal(tick.pendingWakes[0].status, "delivered");
+    assert.equal(api.prompts.length, 1);
+    assert.match(api.prompts[0].text, /1 update since your last turn:\n1\. done: herdr-bb029\/lane-child/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an interrupted digest becomes uncertain and is never replayed", async () => {
+  const messageRequests = [
+    pendingMessage("message-interrupted", "Half-sent before a crash.", "2026-09-14T00:01:00.000Z"),
+  ];
+  const fixture = await createFixture({ parentGoal: dueParentGoal(), messageRequests });
+  const busy = digestApi({ rootStatus: () => "working" });
+  try {
+    await handleHook({
+      eventName: "pane.agent_status_changed",
+      eventJson: statusEvent("done"),
+      stateDir: fixture.stateDir,
+      herdr: busy,
+    });
+    const manifest = await fixture.manifest();
+    const done = manifest.workflows[0].eventController.events.find((event) => event.classification === "done");
+    done.wake = { ...done.wake, status: "sending", attempts: 1 };
+    manifest.workflows[0].messageRequests[0].delivery = {
+      status: "sending",
+      attempts: 1,
+      updatedAt: "2026-09-14T00:02:00.000Z",
+    };
+    await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+
+    const api = digestApi();
+    const tick = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      timestamp: "2026-09-14T00:03:00.000Z",
+    });
+    assert.deepEqual(tick.pendingWakes, []);
+    assert.equal(
+      api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]")).length,
+      0,
+    );
+    const after = await fixture.manifest();
+    assert.equal(
+      after.workflows[0].eventController.events.find((event) => event.classification === "done").wake.status,
+      "uncertain",
+    );
+    assert.equal(after.workflows[0].messageRequests[0].delivery.status, "uncertain");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+async function withDigestWindow(seconds, run) {
+  const saved = process.env.BAA_TON_DIGEST_WINDOW_SECONDS;
+  process.env.BAA_TON_DIGEST_WINDOW_SECONDS = String(seconds);
+  try {
+    return await run();
+  } finally {
+    process.env.BAA_TON_DIGEST_WINDOW_SECONDS = saved;
+  }
+}
+
+test("non-urgent updates wait out the collection window, then arrive as one digest", async () => {
+  const arrivedAt = new Date().toISOString();
+  const later = (seconds) => new Date(Date.parse(arrivedAt) + seconds * 1_000).toISOString();
+  const fixture = await createFixture({
+    parentGoal: dueParentGoal(),
+    messageRequests: [pendingMessage("message-with-done", "Finished the fixture; details in the report.", arrivedAt)],
+  });
+  const api = digestApi();
+  try {
+    await withDigestWindow(60, async () => {
+      const done = await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: statusEvent("done"),
+        stateDir: fixture.stateDir,
+        herdr: api,
+      });
+      assert.equal(done.digest.status, "deferred");
+      assert.equal(done.digest.reason, "collecting_updates");
+      const early = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: later(30) });
+      assert.equal(early.pendingWakes[0].reason, "collecting_updates");
+      assert.equal(api.prompts.length, 0);
+      const due = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: later(61) });
+      assert.equal(due.pendingWakes[0].status, "delivered");
+      assert.equal(api.prompts.length, 1);
+      assert.match(api.prompts[0].text, /2 updates since your last turn:/);
+      assert.match(api.prompts[0].text, /done: herdr-bb029\/lane-child/);
+      assert.match(api.prompts[0].text, /message-with-done\): Finished the fixture/);
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a blocked lane skips the collection window", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const api = digestApi();
+  try {
+    await withDigestWindow(600, async () => {
+      const blocked = await handleHook({
+        eventName: "pane.agent_status_changed",
+        eventJson: statusEvent("blocked"),
+        stateDir: fixture.stateDir,
+        herdr: api,
+      });
+      assert.equal(blocked.digest.status, "delivered");
+      assert.equal(api.prompts.length, 1);
+      assert.match(api.prompts[0].text, /1\. blocked: herdr-bb029\/lane-child/);
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a project digest window is validated and preserved", () => {
+  const orchestrator = (window) => ({
+    id: "root-window",
+    root: ROOT,
+    program: {
+      id: "/project",
+      workspace_id: ROOT.workspace_id,
+      ...(window === undefined ? {} : { digest_window_seconds: window }),
+    },
+    workflows: [],
+  });
+  const config = (window) => ({ version: 2, owner: "herdr-orchestrator", orchestrators: [orchestrator(window)] });
+  assert.equal(validateConfig(config(0)).orchestrators[0].program.digest_window_seconds, 0);
+  assert.equal(validateConfig(config(300)).orchestrators[0].program.digest_window_seconds, 300);
+  assert.equal("digest_window_seconds" in validateConfig(config()).orchestrators[0].program, false);
+  for (const invalid of [-1, 3_601, 1.5, "60"])
+    assert.throws(() => validateConfig(config(invalid)), /digest_window_seconds must be an integer from 0 to 3600/);
 });

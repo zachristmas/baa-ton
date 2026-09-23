@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 
+// These tests pin routing and delivery, not timing: deliver each digest as
+// soon as the root is ready. The window has its own tests.
+process.env.BAA_TON_DIGEST_WINDOW_SECONDS = "0";
+
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
@@ -147,7 +151,7 @@ test("registered children can send distinct and deduplicated messages after comp
     assert.equal(duplicate.details.request.id, first.details.request.id);
     assert.equal(distinct.details.delivery, "delivered");
     assert.equal(prompts.length, 2);
-    assert.match(prompts[0], /lane lane-message/);
+    assert.match(prompts[0], /message from workflow-message\/lane-message/);
     assert.match(prompts[0], /The completed lane has a late fact/);
     const stored = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.equal(stored.parentGoal.status, "review-requested");

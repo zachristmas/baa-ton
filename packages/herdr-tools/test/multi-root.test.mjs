@@ -12,6 +12,10 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { handleHook, validateConfig } from "../../controller/controller.mjs";
 
+// These tests pin routing and delivery, not timing: deliver each digest as
+// soon as the root is ready. The window has its own tests.
+process.env.BAA_TON_DIGEST_WINDOW_SECONDS = "0";
+
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
