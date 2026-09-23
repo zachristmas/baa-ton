@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test stub: the hermetic test runner puts this first on PATH so no test can
+# reach a live codex install. Tests that need codex behavior inject their own fake.
+echo "baa-ton test stub: live codex is blocked during tests ($*)" >&2
+exit 97

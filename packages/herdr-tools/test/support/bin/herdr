@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test stub: the hermetic test runner puts this first on PATH so no test can
+# reach a live herdr install. Tests that need herdr behavior inject their own fake.
+echo "baa-ton test stub: live herdr is blocked during tests ($*)" >&2
+exit 97

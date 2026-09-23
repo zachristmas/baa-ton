@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, writeFile, rm, mkdir, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, mkdir, readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
@@ -8,7 +8,9 @@ import { resolvePiSessionIdentity, registerPiIdentityBridge, PI_ROOT_IDENTITY_CH
 
 const id = "01a0b04d-0bef-7207-b486-d51d62f0e3dc";
 async function fixture() {
-  const cwd = await mkdtemp(join(tmpdir(), "baa-pi-identity-"));
+  // realpath: macOS tmpdir() is a /var symlink to /private/var, and the proof
+  // canonicalizes session paths.
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), "baa-pi-identity-")));
   // Deliberately not a UUID filename: header and live runtime are the proof.
   const sessionFile = join(cwd, "session.jsonl");
   await writeFile(sessionFile, JSON.stringify({ type: "session", version: 3, id, cwd }) + "\n");

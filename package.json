@@ -8,9 +8,9 @@
     "extensions": ["./packages/herdr-tools/index.ts"]
   },
   "scripts": {
-    "test": "npm run test:extension && npm run test:controller",
-    "test:extension": "node packages/herdr-tools/smoke-check.mjs && node --test packages/herdr-tools/test/*.test.mjs",
-    "test:controller": "npm --prefix packages/controller test"
+    "test": "node packages/herdr-tools/test/support/run-hermetic.mjs",
+    "test:extension": "node packages/herdr-tools/test/support/run-hermetic.mjs extension",
+    "test:controller": "node packages/herdr-tools/test/support/run-hermetic.mjs controller"
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.85.1",

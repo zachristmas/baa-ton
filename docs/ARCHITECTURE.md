@@ -29,3 +29,5 @@ The workflow tools run through the local MCP bridge. The controller installs wit
 ## Validation
 
 Run `npm test` from the repository root. The workflow smoke check is deterministic and mocks Herdr CLI interactions; the controller test suite uses a temporary JSON-line socket. Neither test creates a live Herdr workspace, tab, pane, or agent.
+
+`npm test` runs through `packages/herdr-tools/test/support/run-hermetic.mjs`. It removes session variables (`CLAUDE_CODE_*`, `HERDR_*`, `PI_*`, `BAA_*`, `CODEX_*`, `OPENCODE_*`) and puts stub `herdr`, `claude`, `codex`, `opencode` and `pi` binaries first on `PATH`, so results are the same in a terminal, inside a Claude or Pi session in a Herdr pane, and in CI. Running `node --test` directly from an agent session inherits that session's identity and can take live-identity paths the fakes do not model.
