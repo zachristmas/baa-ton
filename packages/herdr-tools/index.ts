@@ -24,6 +24,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
+import { ConfirmQueue } from "./confirm-queue.js";
 import { resolvePiSessionIdentity, registerPiIdentityBridge } from "./pi-session-identity.mjs";
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -3135,10 +3136,14 @@ async function persistParentMessage(
   }
 }
 
+// Process-wide: Pi renders one extension dialog at a time.
+const nativeConfirms = new ConfirmQueue();
+
 async function confirmExecution(
   ctx: ExtensionContext,
   label: string,
   explicitConfirm = false,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   if (!isRootOrchestrator())
     throw new Error(
@@ -3155,9 +3160,11 @@ async function confirmExecution(
       `${label} requires TUI confirmation from the designated root orchestrator.`,
     );
   }
-  return ctx.ui.confirm(
+  return nativeConfirms.confirm(
+    ctx.ui,
     "Herdr orchestrator",
     `${label}? Only extension-owned resources will be changed.`,
+    signal,
   );
 }
 
@@ -4094,7 +4101,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         : "Claim this manually started Baa-ton root";
     if (
       confirm &&
-      !(await ctx.ui.confirm(
+      !(await nativeConfirms.confirm(
+        ctx.ui,
         "Herdr orchestrator",
         `${label}? ${reset ? "This retires the existing controller mapping and parent manifest state." : add ? "This appends a controller mapping for the distinct current pane/workspace and leaves all existing roots and manifests intact." : "This records the verified current pane/workspace and a clean parent manifest."} It does not create lanes or enable the controller.`,
       ))
@@ -5186,6 +5194,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               ctx,
               `Dispatch ${w.id} in task workspace ${w.taskBinding?.workspaceId}`,
               confirm,
+              signal,
             ))
           );
         },
@@ -5578,6 +5587,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           return confirmExecution(
             ctx,
             `Resume native sessions for ${w.id}`,
+            false,
+            signal,
           );
         },
         async register(w, options) {
@@ -5700,6 +5711,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const approved = await confirmExecution(
         ctx,
         `Resume paused Pi goals for ${id}`,
+        false,
+        signal,
       );
       resolveParentApproval(
         workflow,
@@ -6058,7 +6071,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
     if (sameControllerRoot(registration.root!, nextRoot))
       return { reparented: false, unchanged: true, workflow };
-    if (!(await confirmExecution(ctx, `Reparent controller root for ${id}`)))
+    if (!(await confirmExecution(ctx, `Reparent controller root for ${id}`, false, signal)))
       return { cancelled: true, workflow };
     await saveControllerConfig(registration.configPath!, {
       ...config,
@@ -6900,9 +6913,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         );
       approved = true;
     } else {
-      approved = await ctx.ui.confirm(
+      approved = await nativeConfirms.confirm(
+        ctx.ui,
         "Herdr cleanup sweep",
         `${cleanupSweepSummary(inventory)}\n\nProceed?`,
+        signal,
       );
     }
     if (!approved) return { cancelled: true, ...inventory };
@@ -7123,7 +7138,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await saveManifest(cwd, manifest);
       return { parentApprovalRequired: true, approvalRequest, workflow };
     }
-    const approved = await confirmExecution(ctx, `Close ${id}`);
+    const approved = await confirmExecution(ctx, `Close ${id}`, false, signal);
     resolveParentApproval(
       workflow,
       "close",
