@@ -19,6 +19,7 @@ import {
   postDirective,
 } from "../controller.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
+import { validateParentGoal as validateParentGoal974a77d } from "./fixtures/controller-974a77d-goal-validation.mjs";
 import { readStore, storePath } from "../../herdr-tools/inbox/index.mjs";
 
 // These tests pin routing and delivery, not timing: deliver each digest as
@@ -2429,27 +2430,112 @@ test("a lane that is working on its own request does not count as waiting", asyn
   }
 });
 
+async function markChosenInterval(fixture) {
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  const manifest = await fixture.manifest();
+  manifest.rootSupervision = [{ rootId: config.orchestrators[0].id, alerts: [], nudgeIntervalPolicy: 2 }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+}
+
+const longGoal = (extra = {}) => ({
+  ...statusGoal("active"),
+  supervisor: { ...statusGoal("active").supervisor, intervalSeconds: 1200, nextNudgeAt: "2026-09-14T00:20:00.000Z", ...extra },
+});
+
 test("a pre-repeat goal with a long interval is capped to 300 s once; a chosen interval is kept", async () => {
-  const legacy = await createFixture({
-    parentGoal: { ...statusGoal("active"), supervisor: { ...statusGoal("active").supervisor, intervalSeconds: 1200, nextNudgeAt: "2026-09-14T00:20:00.000Z" } },
-  });
-  const chosen = await createFixture({
-    parentGoal: { ...statusGoal("active"), supervisor: { ...statusGoal("active").supervisor, intervalSeconds: 1200, intervalPolicy: 2, nextNudgeAt: "2026-09-14T00:20:00.000Z" } },
-  });
+  const legacy = await createFixture({ parentGoal: longGoal() });
+  const chosen = await createFixture({ parentGoal: longGoal() });
+  await markChosenInterval(chosen);
   const api = recoveryApi();
   try {
     await runSupervisorTick({ stateDir: legacy.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
     await runSupervisorTick({ stateDir: chosen.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
-    const legacyControl = (await legacy.manifest()).parentGoal.supervisor;
+    const legacyManifest = await legacy.manifest();
     assert.deepEqual(
-      [legacyControl.intervalSeconds, legacyControl.intervalPolicy, legacyControl.nextNudgeAt],
-      [300, 2, "2026-09-14T00:05:00.000Z"],
+      [legacyManifest.parentGoal.supervisor.intervalSeconds, legacyManifest.parentGoal.supervisor.nextNudgeAt],
+      [300, "2026-09-14T00:05:00.000Z"],
     );
+    assert.equal(legacyManifest.rootSupervision[0].nudgeIntervalPolicy, 2, "the marker lives in rootSupervision");
+    assert.equal("intervalPolicy" in legacyManifest.parentGoal.supervisor, false);
     const chosenControl = (await chosen.manifest()).parentGoal.supervisor;
     assert.deepEqual([chosenControl.intervalSeconds, chosenControl.nextNudgeAt], [1200, "2026-09-14T00:20:00.000Z"]);
   } finally {
     await legacy.cleanup();
     await chosen.cleanup();
+  }
+});
+
+test("a goal written by #28 loses supervisor.intervalPolicy and keeps its chosen interval", async () => {
+  const fixture = await createFixture({ parentGoal: longGoal({ intervalPolicy: 2 }) });
+  const manifest = await fixture.manifest();
+  // #28 also wrote the key into the per-root store and goal history copies.
+  manifest.parentGoals = { "root-x": { ...structuredClone(manifest.parentGoal), rootId: "root-x", root: ROOT } };
+  manifest.goalHistory = [{ goal: structuredClone(manifest.parentGoal), archivedAt: "t" }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const api = recoveryApi();
+  try {
+    await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
+    const stored = await fixture.manifest();
+    assert.equal(JSON.stringify(stored).includes("intervalPolicy"), false, "no copy keeps the key");
+    assert.equal(stored.parentGoal.supervisor.intervalSeconds, 1200, "the marker moved, so the interval is kept");
+    assert.equal(stored.rootSupervision[0].nudgeIntervalPolicy, 2);
+    assert.doesNotThrow(() => validateParentGoal974a77d(stored.parentGoal));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("forward compatibility: goals written by current code pass the 974a77d strict validators", async () => {
+  // Lanes dispatched before an upgrade run bridges loaded from older code,
+  // whose controller validates every parent goal with a strict key allowlist
+  // (test/fixtures/controller-974a77d-goal-validation.mjs). Exercise every
+  // current writer that touches parent goals, then validate each copy.
+  const fixture = await createFixture({
+    parentGoal: statusGoal("waiting-for-event"),
+    messageRequests: [pendingMessage("message-compat", "Ready for review.", "2026-09-14T00:00:00.000Z")],
+  });
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  await postDirective({ manifestPath: fixture.manifestPath, rootId: config.orchestrators[0].id, from: "zach", text: "Sweep.", timestamp: "2026-09-14T00:00:00.000Z" });
+  const manifest = await fixture.manifest();
+  manifest.rootSupervision = [{
+    rootId: config.orchestrators[0].id,
+    alerts: [],
+    capacityGate: { id: "capacity-1", status: "waiting", reason: "r", minFreeMemoryGb: 1, createdAt: "2026-09-14T00:00:00.000Z" },
+  }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const api = recoveryApi();
+  // Check after every write: a key written late in one tick and stripped
+  // early in the next is exactly what an old lane reads in between.
+  const assertReadableByOldBridges = async (step) => {
+    const stored = await fixture.manifest();
+    const goals = [stored.parentGoal, ...Object.values(stored.parentGoals ?? {})].filter(Boolean);
+    assert.ok(goals.length > 0);
+    for (const goal of goals)
+      assert.doesNotThrow(() => validateParentGoal974a77d(goal), `after ${step}`);
+  };
+  try {
+    for (const second of [0, 5, 10, 40 * 60]) {
+      await runSupervisorTick({
+        stateDir: fixture.stateDir,
+        herdr: api,
+        notify: async () => ({ status: "sent" }),
+        sample: async () => ({ freeMemoryGb: 2, swapUsedGb: 0, load1PerCpu: 0.1 }),
+        topUsers: async () => [],
+        timestamp: new Date(Date.parse("2026-09-14T00:00:00.000Z") + second * 1000).toISOString(),
+      });
+      await assertReadableByOldBridges(`tick +${second}s`);
+    }
+    await routeChildMessage({
+      configDir: fixture.stateDir,
+      workflowId: "herdr-bb029",
+      laneId: CHILD.lane_id,
+      messageId: "message-compat",
+      herdr: api,
+    }).catch(() => {});
+    await assertReadableByOldBridges("child message routing");
+    assert.ok(api.prompts > 0, "the scenario really exercised the supervisor writers");
+  } finally {
+    await fixture.cleanup();
   }
 });
 

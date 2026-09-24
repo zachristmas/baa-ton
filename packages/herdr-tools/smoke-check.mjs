@@ -14,6 +14,8 @@ import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { handleHook, runSupervisorTick } from "../controller/controller.mjs";
+// Pre-upgrade lanes validate parent goals with this strict allowlist.
+import { validateParentGoal as validateParentGoal974a77d } from "../controller/test/fixtures/controller-974a77d-goal-validation.mjs";
 
 // This check simulates its own session_start events against synthetic
 // fixtures; it never dispatches a real lane. BAA_STARTUP_INTENT is set only
@@ -772,7 +774,7 @@ try {
     );
   assert.equal(initializedGoal.details.goal.supervisor.state, "stopped");
   assert.equal(initializedGoal.details.goal.supervisor.intervalSeconds, 300, "default nudge interval");
-  assert.equal(initializedGoal.details.goal.supervisor.intervalPolicy, 2);
+  assert.equal("intervalPolicy" in initializedGoal.details.goal.supervisor, false, "older bridges reject unknown supervisor keys");
   assert.deepEqual(calls.at(-1), [
     "pane",
     "report-metadata",
@@ -1086,6 +1088,11 @@ try {
       undefined,
       headlessRootCtx,
     );
+  const compatGoal = JSON.parse(await readFile(manifestPath, "utf8")).parentGoal;
+  assert.doesNotThrow(
+    () => validateParentGoal974a77d(compatGoal),
+    "goals written by the extension and controller stay readable by pre-upgrade bridges",
+  );
 
   const lifecycleLockPath = join(
     dirname(manifestPath),

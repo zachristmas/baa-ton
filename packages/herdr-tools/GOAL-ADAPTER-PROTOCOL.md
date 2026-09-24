@@ -47,15 +47,17 @@ The supervisor is a **repeating nudge while work waits on the root**. It exists 
   - Before prompting, the controller durably writes `lastDelivery: sending` under the shared manifest lock.
   - An interrupted `sending` record becomes `uncertain` and is never replayed. The next nudge is a new one, a full interval later.
 - **Interval:**
-  - The default is 300 s and is still configurable per goal (`nudgeIntervalSeconds`, 5-86400); a newer extension records it with `intervalPolicy: 2`.
+  - The default is 300 s and is still configurable per goal (`nudgeIntervalSeconds`, 5-86400); a newer extension records the choice as `nudgeIntervalPolicy: 2` in this root's `rootSupervision` entry. It is never stored inside the supervisor, because older bridges validate supervisor keys strictly.
   - Goals written before this policy have no marker. The controller lowers an interval above 300 s to 300 once, pulls `nextNudgeAt` in accordingly and records the marker. Goals with the marker keep their chosen interval.
+  - Pre-upgrade extensions drop unknown top-level keys when they save, so the marker can be lost. The only effect is that an interval deliberately set above 300 s is capped to 300 again.
+  - The key `supervisor.intervalPolicy`, briefly written by #28, is removed from every goal copy on load by the extension and on each tick by the controller.
 - **Goal-state writes:** `set-state` to `blocked` no longer stops the supervisor; only `completed` does, and `pause` still clears the due time. A material `set-state` change reschedules the next nudge for any status other than `completed` or `paused`. Identical `set-state` and repeated `start` on a running supervisor are idempotent.
 
 Lifecycle writes use the existing sibling manifest lock and atomic rename. They wait at most 10 seconds for lock contention, without polling agents or starting background jobs. Failure to persist active authority aborts the Pi run rather than silently continuing with stale idle evidence. A failed idle write leaves supervision suppressed.
 
 ### Rollout and limits
 
-Update the controller and reload the root extension together, controller first: an old controller strictly rejects the new optional `intervalPolicy` field (fail-closed); this source change does not install, enable, or reload either live component. Old controllers strictly reject the new optional fields. After reload a real root run must settle before recovery nudges become eligible. A crashed run does not become idle on a timeout; restart plus fresh lifecycle evidence is required, and uncertain sends still require explicit review.
+Update the controller and reload the root extension together, controller first; this source change does not install, enable, or reload either live component. Lanes dispatched earlier keep their old bridges, so parent goals must stay valid under the oldest supported release's strict validators (see `docs/ARCHITECTURE.md`, forward-compatible manifests). After reload a real root run must settle before recovery nudges become eligible. A crashed run does not become idle on a timeout; restart plus fresh lifecycle evidence is required, and uncertain sends still require explicit review.
 
 The native `agent.prompt` transport is not an atomic compare-and-submit against Pi lifecycle or editor contents. The final live readiness check, the idle-only gate and the one-interval floor after each send limit interruption, but cannot eliminate the narrow race with a newly submitted user turn or protect unsent editor text. A draft-safe conditional prompt API would be needed for that stronger guarantee. A prompt already submitted before pause cannot be recalled.
 
