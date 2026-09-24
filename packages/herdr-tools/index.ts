@@ -134,6 +134,7 @@ import { classifyLocalValidation } from "./known-safe.mjs";
 import {
   SPEC_PATH,
   SPEC_STATE_PATH,
+  gitAncestor,
   loadSpec,
   loadSpecState,
   specStatusTable,
@@ -141,7 +142,7 @@ import {
   validateSpecState,
   verifySpec,
 } from "./spec.mjs";
-import { advanceSpec, buildObjective, reviewObjective } from "./spec-driver.mjs";
+import { advanceSpec, buildObjective, integrateObjective, reviewObjective } from "./spec-driver.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -1681,6 +1682,7 @@ function normalizedLanes(
       id: laneId,
       objective: input.objective,
       readOnly: defaultReadOnly || configuredProfile?.readOnly === true || input.readOnly === true,
+      ...(input.specStage ? { specStage: input.specStage } : {}),
       agentKind: validateAgentKind(
         input.agentKind ?? configuredProfile?.agentKind ?? defaultAgentKind,
       ),
@@ -2677,6 +2679,11 @@ function goneAgentError(error: unknown): boolean {
   );
 }
 
+/** The lane assignment contract (exported for tests). */
+export function laneContract(workflow: Workflow, lane: Lane): string {
+  return contract(workflow, lane);
+}
+
 function contract(workflow: Workflow, lane: Lane): string {
   const agentKind = laneAgentKind(workflow, lane);
   return [
@@ -2695,7 +2702,9 @@ function contract(workflow: Workflow, lane: Lane): string {
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
     "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
     "Ask for ports, database names, runtime launches and approvals with herdr_request (lease, runtime-launch, approval), never in chat; policy-matching requests are answered at once and the rest stay open until the root answers.",
-    "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
+    lane.specStage === "integrate"
+      ? "Spec integration lane: you may merge spec/* branches and commit on this worktree's integration branch (local only). Never push, deploy, create a PR, mutate production or external services, or close Herdr resources."
+      : "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
     `Before ending, you MUST call herdr_complete({ workflowId: "${workflow.id}", summary: "<outcome, evidence, blockers>" }) exactly once after verifying the work. A chat-only outcome is insufficient and does not complete this lane.`,
     "Then state the same outcome/evidence clearly. Generic Herdr done events are fallback-only; the durable herdr_complete receipt is required for normal completion.",
   ].join("\n");
@@ -4485,10 +4494,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const workflow = workflowFor(manifest, candidate.workflowId);
       const lane = workflow.lanes.find((item) => item.id === candidate.laneId);
       if (!lane) return;
+      // A sequence number (a migration slot) is in the lane's commit: it stays
+      // held until the spec loop integrates the item, not until retire.
       const released = stopsOk
         ? releaseLeases(
             manifest.leases,
-            (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id,
+            (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id && lease.kind !== "sequence",
             "lane retired",
             now(),
           )
@@ -4531,8 +4542,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   type SpecDriverPorts = {
     /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
-    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree: string }): Promise<Workflow>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree: string; specStage: "build" | "review" | "integrate" }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
+    /** Whether `ancestor` is contained in `descendant` (git merge-base --is-ancestor). */
+    ancestor?(repo: string, ancestor: string, descendant: string): Promise<boolean>;
     now(): string;
   };
 
@@ -4569,8 +4582,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           await mkdir(dirname(path), { recursive: true });
           await execFile("git", ["-C", repoPath, "worktree", "add", ...(existing ? [path, branch] : ["-b", branch, path, base])], { signal: abort, timeout: 120_000 });
         },
-        plan: ({ objective, laneObjective, readOnly, taskProfile, worktree }) =>
-          plan(ctx.cwd, objective, [{ objective: laneObjective, readOnly, taskProfile }], worktree, undefined, undefined, undefined, undefined, taskProfile, headless),
+        plan: ({ objective, laneObjective, readOnly, taskProfile, worktree, specStage }) =>
+          plan(ctx.cwd, objective, [{ objective: laneObjective, readOnly, taskProfile, specStage }], worktree, undefined, undefined, undefined, undefined, taskProfile, headless),
         dispatch: (workflowId) => dispatch(ctx.cwd, workflowId, true, headless, signal),
         now,
         ...ports,
@@ -4586,24 +4599,38 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         };
       };
       const supervision = manifest.rootSupervision?.find((item) => item.rootId === scope.rootId);
+      const targetRef = `refs/remotes/${spec.target.remote}/${spec.target.branch}`;
+      const pushed = new Set<string>();
+      for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; integration?: { sha?: string } }>)
+        if (record.state === "awaiting-push" && record.integration?.sha)
+          if (await (ports?.ancestor ?? gitAncestor)(repo, record.integration.sha, targetRef).catch(() => false)) pushed.add(record.integration.sha);
       const step = advanceSpec({
         spec,
         state,
         lane: laneView,
         capacityWaiting: supervision?.capacityGate?.status === "waiting",
+        pushed,
         now: use.now(),
       });
+      const integrationWorktree = join(homedir(), ".herdr", "worktrees", basename(repo), "spec-integration");
       const next = step.state;
       const done: string[] = [];
       for (const action of step.actions) {
         const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
         const record = next.items[item.id];
         const branch = `spec/${item.id}`;
-        const worktree = record.worktree ?? join(homedir(), ".herdr", "worktrees", basename(repo), `spec-${item.id}`);
+        const worktree =
+          action.kind === "integrate"
+            ? integrationWorktree
+            : record.worktree ?? join(homedir(), ".herdr", "worktrees", basename(repo), `spec-${item.id}`);
         try {
           let profile: string;
           let objective: string;
-          if (action.kind === "build") {
+          if (action.kind === "integrate") {
+            profile = spec.stages.integrate?.profile ?? "balanced";
+            await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
+            objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch });
+          } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
             await use.worktree({ repo, path: worktree, branch, base: `refs/remotes/${spec.target.remote}/${spec.target.branch}` }, signal);
             objective = buildObjective(spec, item, { branch, findings: action.findings });
@@ -4628,9 +4655,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             readOnly: action.kind === "review",
             taskProfile: profile,
             worktree,
+            specStage: action.kind,
           });
-          record.worktree = worktree;
-          record.branch = branch;
+          if (action.kind !== "integrate") {
+            record.worktree = worktree;
+            record.branch = branch;
+          }
+          if (action.kind === "build") record.buildWorkflows = [...(record.buildWorkflows ?? []), workflow.id];
           record.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
           delete record.note;
           const result = await use.dispatch(workflow.id);
@@ -4651,8 +4682,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
         await writeFile(temporary, `${jsonText(next)}\n`, { mode: 0o600 });
         await rename(temporary, path);
-        if (step.rootAsks.length) {
+        // Integrated items no longer need their build-time sequence
+        // reservations (migration slots): the numbers are on the branch now.
+        const integrated = spec.items
+          .filter((item) => next.items[item.id]?.state === "awaiting-push" && state.items?.[item.id]?.state !== "awaiting-push")
+          .flatMap((item) => (next.items[item.id].buildWorkflows ?? []) as string[]);
+        if (step.rootAsks.length || integrated.length) {
           const current = await loadManifest(ctx.cwd);
+          releaseLeases(
+            current.leases,
+            (lease) => lease.kind === "sequence" && integrated.includes(lease.workflowId),
+            "spec item integrated",
+            use.now(),
+          );
           const entries = (current.rootSupervision ??= []);
           let entry = entries.find((item) => item.rootId === scope.rootId);
           if (!entry) {
@@ -4663,8 +4705,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           for (const ask of step.rootAsks)
             alerts.push({
               id: `alert-${randomUUID().slice(0, 8)}`,
-              kind: "spec-needs-root",
-              text: ask.reason,
+              kind: ask.kind === "push" ? "spec-push-ready" : "spec-needs-root",
+              text:
+                ask.kind === "push"
+                  ? `${ask.items!.length} integrated spec item(s) ready to push: ${ask.items!.join(", ")} (spec-integration at ${ask.sha!.slice(0, 12)}). Ask the user; pushing always needs their approval. Then run: git -C ${integrationWorktree} push ${spec.target.remote} ${ask.sha}:refs/heads/${spec.target.branch} and fetch ${spec.target.remote}; the driver moves the items to verification once ${targetRef} contains ${ask.sha!.slice(0, 12)}.`
+                  : ask.reason,
               createdAt: use.now(),
               delivery: { status: "pending", attempts: 0, updatedAt: use.now() },
             });

@@ -18,8 +18,10 @@
  * - A lane that ends without a receipt counts as a failed attempt.
  */
 
+/** States that hold a lane (and a maxParallel slot). */
 export const ACTIVE_STATES = new Set(["building", "reviewing", "integrating", "verifying"]);
-const AFTER_INTEGRATION = new Set(["integrating", "verifying", "done"]);
+const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", "done"]);
+const INTEGRATED = new Set(["awaiting-push", "verifying", "done"]);
 const LANE_ENDED = new Set(["operator-closed", "superseded", "dispatch-failed", "failed", "closed"]);
 
 /** Static prefix of a glob (everything before the first wildcard). */
@@ -46,16 +48,25 @@ export function reviewVerdict(summary) {
   return match ? match[1].toLowerCase() : undefined;
 }
 
+/** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
+export function integrationResult(summary) {
+  const text = String(summary ?? "");
+  const sha = /^\s*INTEGRATED\s*:\s*([0-9a-f]{40})\s*$/im.exec(text)?.[1];
+  const suite = /^\s*SUITE\s*:\s*(pass|fail)\b/im.exec(text)?.[1]?.toLowerCase();
+  return { sha, suite };
+}
+
 /**
  * @param {object} input
  * @param {object} input.spec       validated spec
  * @param {object} input.state      spec-state (not mutated)
  * @param {(ref: {workflowId: string, laneId: string}) => {status?: string, receipt?: {summary: string}} | undefined} input.lane
  * @param {boolean} [input.capacityWaiting] the root has a capacity gate waiting
+ * @param {Set<string>} [input.pushed] integration SHAs the target branch already contains
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
  */
-export function advanceSpec({ spec, state, lane, capacityWaiting = false, now }) {
+export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), now }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
   next.items ??= {};
   const actions = [];
@@ -74,6 +85,44 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, now })
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {
     const current = record(item.id);
+    if (current.state === "integrating") {
+      const view = current.lane ? lane(current.lane) : undefined;
+      if (!view) continue;
+      if (view.receipt) {
+        const result = integrationResult(view.receipt.summary);
+        if (result.sha && result.suite === "pass") {
+          next.integrationCounter = (next.integrationCounter ?? 0) + 1;
+          move(
+            item.id,
+            "awaiting-push",
+            {
+              integrateLane: current.lane,
+              lane: undefined,
+              integration: { sha: result.sha, order: next.integrationCounter, at: now },
+              tests: [
+                ...(Array.isArray(current.tests) ? current.tests : []),
+                ...item.acceptance.tests.map((command) => ({ command, sha: result.sha, result: "pass", at: now, by: "integrate" })),
+              ],
+            },
+            "integrated",
+          );
+        } else if (result.suite === "fail") {
+          const attempts = current.attempts ?? 1;
+          const findings = `Integration onto spec-integration failed its suite. Rebase spec/${item.id} onto spec-integration and fix:\n${view.receipt.summary}`;
+          if (attempts >= spec.defaults.maxBuildAttempts) {
+            move(item.id, "failed", { findings, lane: undefined }, "integration suite failed");
+            rootAsks.push({ itemId: item.id, reason: `${item.id} failed integration after ${attempts} build attempt(s)` });
+          } else move(item.id, "ready", { findings, lane: undefined }, "integration suite failed");
+        } else {
+          move(item.id, "blocked", { blockedReason: "human-gate", lane: undefined, note: "integration receipt has no INTEGRATED: <sha> and SUITE: pass|fail lines" });
+          rootAsks.push({ itemId: item.id, reason: `${item.id}: the integration receipt is unclear; check spec-integration and set the outcome` });
+        }
+      } else if (LANE_ENDED.has(view.status)) {
+        // The merge is retried by a fresh integration lane; it is not a build attempt.
+        delete current.lane;
+      }
+      continue;
+    }
     if (current.state !== "building" && current.state !== "reviewing") continue;
     const view = current.lane ? lane(current.lane) : undefined;
     const attempts = current.attempts ?? 1;
@@ -101,6 +150,48 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, now })
     // A stage whose dispatch never produced a lane is retried.
     else if (!current.lane)
       actions.push({ kind: current.state === "building" ? "build" : "review", itemId: item.id, attempt: attempts, ...(current.findings ? { findings: current.findings } : {}) });
+  }
+
+  // 1b. Pushed integrations move on to verification.
+  for (const item of spec.items) {
+    const current = record(item.id);
+    if (current.state === "awaiting-push" && current.integration?.sha && pushed.has(current.integration.sha))
+      move(item.id, "verifying", { integratedSha: current.integration.sha }, "pushed to the target branch");
+  }
+
+  // 1c. One serial integration queue, in dependency order.
+  if (!spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane)) {
+    const head = spec.items.find(
+      (item) =>
+        next.items[item.id]?.state === "integrating" &&
+        item.dependsOn.every((dependency) => INTEGRATED.has(next.items[dependency]?.state)),
+    );
+    if (head) actions.push({ kind: "integrate", itemId: head.id, attempt: next.items[head.id].attempts ?? 1 });
+    for (const item of spec.items)
+      if (next.items[item.id]?.state === "integrating" && item.id !== head?.id)
+        waits[item.id] = head ? `integration queue: after ${head.id}` : "integration queue: waits on a dependency's integration";
+  } else
+    for (const item of spec.items)
+      if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane) waits[item.id] = "integration queue: one merge at a time";
+
+  // 1d. The push gate: a person pushes; ask once per round (or per item).
+  const awaiting = spec.items
+    .filter((item) => next.items[item.id]?.state === "awaiting-push")
+    .sort((a, b) => (next.items[a.id].integration?.order ?? 0) - (next.items[b.id].integration?.order ?? 0));
+  if (awaiting.length) {
+    if (spec.defaults.pushGate === "item") {
+      for (const item of awaiting)
+        if (!next.items[item.id].pushAskedAt) {
+          next.items[item.id].pushAskedAt = now;
+          rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: next.items[item.id].integration.sha, reason: `push ${item.id}` });
+        }
+    } else if (!spec.items.some((item) => next.items[item.id]?.state === "integrating")) {
+      const head = next.items[awaiting.at(-1).id].integration.sha;
+      if (next.pushGate?.askedSha !== head) {
+        next.pushGate = { askedSha: head, items: awaiting.map((item) => item.id), at: now };
+        rootAsks.push({ itemId: awaiting.at(-1).id, kind: "push", items: awaiting.map((item) => item.id), sha: head, reason: `push round of ${awaiting.length}` });
+      }
+    }
   }
 
   // 2. Readiness from dependencies.
@@ -161,6 +252,21 @@ export function buildObjective(spec, item, { branch, findings }) {
 }
 
 /** The review lane's objective: read-only, verdict first. */
+/** The integration lane's objective: merge locally, renumber, run the suite, never push. */
+export function integrateObjective(spec, item, { integrationBranch, itemBranch }) {
+  return [
+    `Integrate spec item ${item.id}: ${item.title}.`,
+    `This worktree is on ${integrationBranch}: the target tip plus the items already integrated. Merge ${itemBranch} into it (git merge --no-ff ${itemBranch}) and resolve any conflicts.`,
+    item.migrations
+      ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference.`
+      : "",
+    spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
+    item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
+    `Commit the result on ${integrationBranch}. Local only: never push, and never touch any other branch.`,
+    "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then what you changed and the suite output for a failure.",
+  ].filter(Boolean).join("\n");
+}
+
 export function reviewObjective(spec, item, { branch, buildSummary }) {
   return [
     `Review spec item ${item.id}: ${item.title}. Read-only: do not edit files or Git state.`,

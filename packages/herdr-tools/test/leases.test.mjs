@@ -142,3 +142,26 @@ test("the real probe sees a listener", async () => {
   }
   assert.equal(await probePort(port), true);
 });
+
+test("sequence leases hand out the lowest free number, padded, and never share one", async () => {
+  const config = validateRuntimeConfig({ leases: { migration: { kind: "sequence", start: 56, digits: 4 } }, maxPerLane: { migration: 3 } });
+  const ports = { probe: async () => true, now: () => "t" };
+  const ledger = [];
+  const ask = (laneId, label) => allocateLease(ledger, config, { resource: "migration", label, workflowId: "herdr-seq", laneId, grantedBy: "lane-policy" }, ports);
+  const a = await ask("lane-a");
+  const b = await ask("lane-b");
+  const a2 = await ask("lane-a", "second");
+  assert.deepEqual([a.lease.number, b.lease.number, a2.lease.number], [56, 57, 58]);
+  assert.deepEqual(leaseLines([a.lease, a2.lease]), [`migration = 0056 (${a.lease.id})`, `migration:second = 0058 (${a2.lease.id})`]);
+  releaseLeases(ledger, (lease) => lease.id === b.lease.id, "item integrated", "t");
+  assert.equal((await ask("lane-c")).lease.number, 57, "a released number is reused");
+  ledger.push({ ...a.lease, id: "lease-dup" });
+  assert.deepEqual(ledgerConflicts(ledger), [`migration 56 is held by ${a.lease.id}, lease-dup`]);
+  for (const [bad, pattern] of [
+    [{ leases: { migration: { kind: "sequence", start: -1 } } }, /start must be/],
+    [{ leases: { migration: { kind: "sequence", digits: 9 } } }, /digits must be/],
+    [{ leases: { migration: { kind: "sequence", range: [1, 2] } } }, /unsupported keys: range/],
+  ])
+    assert.throws(() => validateRuntimeConfig(bad), pattern);
+  assert.equal(validateRuntimeConfig({ leases: { m: { kind: "sequence" } } }).leases.m.start, 1);
+});

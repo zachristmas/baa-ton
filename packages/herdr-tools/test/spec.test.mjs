@@ -62,7 +62,7 @@ test("a spec validates strictly", () => {
     item("I08"),
     item("I10", { dependsOn: ["I08"], owns: ["src/a/**"], migrations: 1, acceptance: { tests: ["npm test"], evidence: { report: "artifacts/i10.docx", minImages: 2 } } }),
   ]));
-  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3 });
+  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round" });
   assert.equal(spec.items[1].acceptance.evidence.minImages, 2);
   assert.deepEqual(spec.items[0].acceptance.tests, []);
   for (const [bad, pattern] of [

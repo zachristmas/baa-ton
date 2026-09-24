@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { validateSpec } from "../spec.mjs";
-import { advanceSpec, buildObjective, globsOverlap, reviewObjective, reviewVerdict } from "../spec-driver.mjs";
+import { advanceSpec, buildObjective, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict } from "../spec-driver.mjs";
 
 const spec = (items, defaults = {}) =>
   validateSpec({
@@ -69,7 +69,7 @@ test("build receipt -> review; review PASS -> integrating; dependents become rea
   step = advanceSpec({ spec: s, state, lane: lanes({ "herdr-r1/lane-1": { status: "completed", receipt: { summary: "VERDICT: PASS\nMatches acceptance." } } }), now: at(9) });
   assert.equal(step.state.items.A.state, "integrating");
   assert.equal(step.state.items.C.state, "building", "the dependent starts once A is integrating");
-  assert.deepEqual(step.actions, [{ kind: "build", itemId: "C", attempt: 1 }]);
+  assert.deepEqual(step.actions, [{ kind: "integrate", itemId: "A", attempt: 1 }, { kind: "build", itemId: "C", attempt: 1 }]);
 });
 
 test("review FAIL rebuilds with findings until maxBuildAttempts, then the root is asked", () => {
@@ -129,4 +129,79 @@ test("a stage whose dispatch left no lane is retried; objectives carry the spec'
   assert.match(review, /Read-only/);
   assert.match(review, /git diff origin\/feature\/release\.\.\.spec\/A/);
   assert.match(review, /first line must be exactly VERDICT: PASS or VERDICT: FAIL/);
+});
+
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+
+test("integration receipts are parsed from their INTEGRATED and SUITE lines", () => {
+  assert.deepEqual(integrationResult(`INTEGRATED: ${SHA_A}\nSUITE: pass\nmerged cleanly`), { sha: SHA_A, suite: "pass" });
+  assert.deepEqual(integrationResult("SUITE: FAIL\n3 tests failed"), { sha: undefined, suite: "fail" });
+  assert.deepEqual(integrationResult("INTEGRATED: abc\nSUITE: pass"), { sha: undefined, suite: "pass" }, "a short SHA is not accepted");
+});
+
+test("one serial integration queue in dependency order, then one push prompt per round", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a", tests: ["npm test"] } }, { id: "B", dependsOn: ["A"] }, { id: "C" }]);
+  const state = { version: 1, items: { A: { state: "integrating", attempts: 1 }, B: { state: "integrating", attempts: 1 }, C: { state: "integrating", attempts: 1 } } };
+  let step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
+  assert.deepEqual(step.actions, [{ kind: "integrate", itemId: "A", attempt: 1 }]);
+  assert.equal(step.waits.B, "integration queue: after A");
+  assert.equal(step.waits.C, "integration queue: after A");
+
+  // A merges; B (which depends on A) is next, C after it; no push prompt while the queue runs.
+  step.state.items.A.lane = { workflowId: "wi1", laneId: "l1" };
+  step = advanceSpec({ spec: s, state: step.state, lane: lanes({ "wi1/l1": { status: "completed", receipt: { summary: `INTEGRATED: ${SHA_A}\nSUITE: pass` } } }), now: at(1) });
+  assert.equal(step.state.items.A.state, "awaiting-push");
+  assert.deepEqual(step.state.items.A.integration, { sha: SHA_A, order: 1, at: at(1) });
+  assert.deepEqual(step.state.items.A.tests, [{ command: "npm test", sha: SHA_A, result: "pass", at: at(1), by: "integrate" }]);
+  assert.deepEqual(step.actions, [{ kind: "integrate", itemId: "B", attempt: 1 }]);
+  assert.equal(step.rootAsks.length, 0, "the round is still running");
+
+  step.state.items.B.lane = { workflowId: "wi2", laneId: "l1" };
+  step.state.items.C.state = "failed";
+  step = advanceSpec({ spec: s, state: step.state, lane: lanes({ "wi2/l1": { status: "completed", receipt: { summary: `INTEGRATED: ${SHA_B}\nSUITE: pass` } } }), now: at(2) });
+  assert.deepEqual(step.rootAsks, [{ itemId: "B", kind: "push", items: ["A", "B"], sha: SHA_B, reason: "push round of 2" }]);
+  const again = advanceSpec({ spec: s, state: step.state, lane: lanes({}), now: at(3) });
+  assert.equal(again.rootAsks.length, 0, "a round is asked once");
+
+  // After the push the target contains B's commit (and so A's).
+  const pushed = advanceSpec({ spec: s, state: again.state, lane: lanes({}), pushed: new Set([SHA_A, SHA_B]), now: at(4) });
+  assert.equal(pushed.state.items.A.state, "verifying");
+  assert.equal(pushed.state.items.A.integratedSha, SHA_A);
+  assert.equal(pushed.state.items.B.integratedSha, SHA_B);
+});
+
+test("per-item push gate, suite failures rebuild, unclear receipts go to the root", () => {
+  const s = spec([{ id: "A" }, { id: "B" }], { pushGate: "item", maxBuildAttempts: 2 });
+  let step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1 } }, B: { state: "integrating", attempts: 1, lane: { workflowId: "w", laneId: "l" } } } },
+    lane: lanes({ "w/l": { status: "completed", receipt: { summary: "SUITE: fail\norders.test.ts: 2 failures" } } }),
+    now: at(0),
+  });
+  assert.deepEqual(step.rootAsks.map((ask) => [ask.kind, ask.items]), [["push", ["A"]]], "per-item: asked even while other work runs");
+  assert.equal(step.state.items.B.state, "building", "a failed suite rebuilds the item");
+  assert.match(step.actions.find((action) => action.itemId === "B").findings, /Rebase spec\/B onto spec-integration[\s\S]*2 failures/);
+
+  step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { B: { state: "integrating", attempts: 1, lane: { workflowId: "w", laneId: "l" } } } },
+    lane: lanes({ "w/l": { status: "completed", receipt: { summary: "Merged it, looks good." } } }),
+    now: at(1),
+  });
+  assert.equal(step.state.items.B.state, "blocked");
+  assert.match(step.rootAsks[0].reason, /integration receipt is unclear/);
+
+  step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { B: { state: "integrating", attempts: 1, lane: { workflowId: "w", laneId: "l" } } } },
+    lane: lanes({ "w/l": { status: "operator-closed" } }),
+    now: at(2),
+  });
+  assert.deepEqual(step.actions.filter((action) => action.itemId === "B"), [{ kind: "integrate", itemId: "B", attempt: 1 }], "a lost integration lane is simply retried");
+  assert.equal(step.state.items.B.attempts, 1, "not counted as a build attempt");
+  const objective = integrateObjective(s, s.items[1], { integrationBranch: "spec-integration", itemBranch: "spec/B" });
+  assert.match(objective, /git merge --no-ff spec\/B/);
+  assert.match(objective, /never push/);
+  assert.match(objective, /INTEGRATED: <full 40-character SHA/);
 });

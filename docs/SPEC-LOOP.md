@@ -188,6 +188,18 @@ These refine the design where it meets existing invariants:
   - **Grants:** the driver acts only when the acknowledged policy grants `dispatch` and the new `integrate` grant. `integrate` is the ARCHITECTURE invariant 4 exception for these local worktrees (and, in PR 3, integration merges). It is appended last, so existing policies keep their hash.
   - **Not verified live:** that Herdr's `worktree list` registers a worktree created with `git worktree add`, which `herdr_plan` requires.
 
+- **PR 3 (built):** the integration queue, `sequence` leases and the batched push gate.
+  - **Queue:** a reviewed item waits in `integrating`. One integration lane at a time, in dependency order, runs on the integrate stage's profile (default `balanced`) in `~/.herdr/worktrees/<repo>/spec-integration` on branch `spec-integration`, created from the target tip.
+  - **The lane's job:** merge `spec/<id>` (`--no-ff`), renumber colliding migrations in integration order, run `target.suite` and the item's tests, commit, and never push. Its receipt starts with `INTEGRATED: <40-char SHA>` and `SUITE: pass|fail`.
+  - **Lane rules:** it is the only lane whose contract allows local merges, and only its Claude settings drop the `git merge` deny. Push, PR and the rest stay denied. The stage is set by the driver through `specStage`, which `herdr_plan` does not accept.
+  - **Outcomes:**
+    - A pass moves the item to `awaiting-push` and records its tests green at that SHA.
+    - A failed suite rebuilds the item, with rebase-and-fix findings, as a build attempt.
+    - An unclear receipt goes to the root.
+    - A lost integration lane is retried without counting an attempt.
+  - **Sequence leases:** the `sequence` lease kind (`{ kind: "sequence", start, digits }`) hands out the lowest free number (for example `migration = 0056`). A retire does not release it. The driver releases an item's reservations once the item is integrated.
+  - **Push gate:** when the queue drains, one `spec-push-ready` alert offers the round (`defaults.pushGate: "round"`, the default; `"item"` asks per item). It names the items and the exact `git push <remote> <sha>:refs/heads/<branch>` for the root to run after the user approves. Pushing is never automatic. Items move to `verifying` (with `integratedSha`) once `refs/remotes/<remote>/<branch>` contains their SHA.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?

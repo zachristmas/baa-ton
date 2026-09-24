@@ -196,3 +196,7 @@ Services started through a granted runtime-launch template are stopped on retire
 - Agents and Herdr/Baa-ton processes (and a lane's own agent pane) cannot be registered.
 - `release` unregisters without stopping.
 - Capacity reports (`herdr_capacity`, and the controller's escalation notice and digest alert) **name** services still held by finished, unretired lanes. That covers registered services and granted runtime templates. Naming never stops anything; retiring the lane does.
+
+## Sequence leases (ordered numbers)
+
+`runtime.leases.<name> = { "kind": "sequence", "start": 1, "digits": 4 }` hands out ordered numbers, such as migration slots, the same way as ports: `herdr_lease` or `herdr_request kind=lease`, under the `lease` grant. Each active lease holds the lowest free number at or above `start`, shown zero-padded (`migration = 0056`). Two active leases never share a number (a shared one is a ledger conflict). Retiring a lane keeps its sequence leases, because the number is in the lane's commit. The spec loop releases them when the item is integrated.

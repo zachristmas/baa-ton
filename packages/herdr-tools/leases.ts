@@ -12,7 +12,10 @@ export type PortBlockResource = {
   range: [number, number];
 };
 export type NameResource = { kind: "name"; prefix: string; maxLength: number };
-export type LeaseResource = PortResource | PortBlockResource | NameResource;
+/** Ordered numbers, such as migration slots: each active lease holds the
+ * lowest free number >= start, zero-padded to `digits`. */
+export type SequenceResource = { kind: "sequence"; start: number; digits: number };
+export type LeaseResource = PortResource | PortBlockResource | NameResource | SequenceResource;
 export type RuntimeConfig = {
   leases: Record<string, LeaseResource>;
   dispatchLeases: string[];
@@ -26,6 +29,9 @@ export type Lease = {
   kind: LeaseResource["kind"];
   ports?: number[];
   name?: string;
+  number?: number;
+  /** Zero-padding width of a sequence number. */
+  digits?: number;
   workflowId: string;
   laneId: string;
   state: "active" | "released";
@@ -97,10 +103,20 @@ export function validateRuntimeConfig(input: unknown): RuntimeConfig {
       if (!Number.isInteger(maxLength) || (maxLength as number) < 24 || (maxLength as number) > 63)
         throw new Error(`${label}.maxLength must be an integer from 24 to 63.`);
       leases[name] = { kind: "name", prefix: raw.prefix, maxLength: maxLength as number };
-    } else throw new Error(`${label}.kind must be port, port-block or name.`);
+    } else if (raw.kind === "sequence") {
+      onlyKeys(raw, ["kind", "start", "digits"], label);
+      const start = raw.start ?? 1;
+      const digits = raw.digits ?? 4;
+      if (!Number.isSafeInteger(start) || (start as number) < 0 || (start as number) > 999_999)
+        throw new Error(`${label}.start must be an integer from 0 to 999999.`);
+      if (!Number.isInteger(digits) || (digits as number) < 1 || (digits as number) > 8)
+        throw new Error(`${label}.digits must be an integer from 1 to 8.`);
+      leases[name] = { kind: "sequence", start: start as number, digits: digits as number };
+    } else throw new Error(`${label}.kind must be port, port-block, name or sequence.`);
   }
   const ported = Object.entries(leases).filter(
-    (entry): entry is [string, PortResource | PortBlockResource] => entry[1].kind !== "name",
+    (entry): entry is [string, PortResource | PortBlockResource] =>
+      entry[1].kind === "port" || entry[1].kind === "port-block",
   );
   for (let i = 0; i < ported.length; i += 1)
     for (let j = i + 1; j < ported.length; j += 1) {
@@ -140,7 +156,9 @@ export function ledgerConflicts(ledger: Lease[] | undefined): string[] {
   for (const lease of activeLeases(ledger)) {
     const keys = lease.name !== undefined
       ? [`name ${lease.name}`]
-      : (lease.ports ?? []).map((port) => `port ${port}`);
+      : lease.number !== undefined
+        ? [`${lease.resource} ${lease.number}`]
+        : (lease.ports ?? []).map((port) => `port ${port}`);
     for (const key of keys) holders.set(key, [...(holders.get(key) ?? []), lease.id]);
   }
   return [...holders]
@@ -238,6 +256,18 @@ export async function allocateLease(
     ledger.push(lease);
     return { lease, created: true };
   }
+  if (resource.kind === "sequence") {
+    const held = new Set(
+      activeLeases(ledger)
+        .filter((lease) => lease.resource === request.resource && lease.number !== undefined)
+        .map((lease) => lease.number as number),
+    );
+    let number = resource.start;
+    while (held.has(number)) number += 1;
+    const lease: Lease = { ...base, number, digits: resource.digits };
+    ledger.push(lease);
+    return { lease, created: true };
+  }
   const taken = new Set(activeLeases(ledger).flatMap((lease) => lease.ports ?? []));
   for (const slot of slots(resource)) {
     if (slot.some((port) => taken.has(port))) continue;
@@ -277,6 +307,7 @@ export function releaseLeases(
 
 export function leaseValue(lease: Lease): string {
   if (lease.name !== undefined) return lease.name;
+  if (lease.number !== undefined) return String(lease.number).padStart(lease.digits ?? 1, "0");
   const ports = lease.ports ?? [];
   return ports.length > 1 ? `${ports[0]}-${ports.at(-1)}` : String(ports[0]);
 }

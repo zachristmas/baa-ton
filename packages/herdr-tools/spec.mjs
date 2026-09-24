@@ -28,6 +28,7 @@ export const ITEM_STATES = [
   "building",
   "reviewing",
   "integrating",
+  "awaiting-push",
   "verifying",
   "done",
   "blocked",
@@ -79,13 +80,15 @@ export function validateSpec(input) {
   onlyKeys(input, ["version", "target", "defaults", "stages", "items"], "spec");
   if (input.version !== 1) throw new Error("spec.version must be 1.");
   if (!isRecord(input.target)) throw new Error("spec.target must be an object.");
-  onlyKeys(input.target, ["repo", "remote", "branch", "preview"], "spec.target");
+  onlyKeys(input.target, ["repo", "remote", "branch", "preview", "suite"], "spec.target");
   const target = {
     repo: text(input.target.repo, "spec.target.repo", { max: 500 }),
     remote: text(input.target.remote, "spec.target.remote", { max: 100 }),
     branch: text(input.target.branch, "spec.target.branch", { max: 200 }),
   };
   if (!/^[\w.-]+$/.test(target.remote)) throw new Error("spec.target.remote must be a remote name.");
+  // The full suite the integration stage runs after each merge.
+  target.suite = strings(input.target.suite, "spec.target.suite") ?? [];
   if (!/^[\w./-]+$/.test(target.branch) || target.branch.includes("..")) throw new Error("spec.target.branch must be a branch name.");
   if (input.target.preview !== undefined) {
     if (!isRecord(input.target.preview)) throw new Error("spec.target.preview must be an object.");
@@ -97,10 +100,15 @@ export function validateSpec(input) {
         : {}),
     };
   }
-  const defaults = { maxParallel: 4, maxBuildAttempts: 3 };
+  const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round" };
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate"], "spec.defaults");
+    if (input.defaults.pushGate !== undefined) {
+      if (!["round", "item"].includes(input.defaults.pushGate))
+        throw new Error('spec.defaults.pushGate must be "round" (one push prompt per integration round) or "item".');
+      defaults.pushGate = input.defaults.pushGate;
+    }
     defaults.maxParallel = positiveInteger(input.defaults.maxParallel, "spec.defaults.maxParallel", { max: 32 }) ?? defaults.maxParallel;
     defaults.maxBuildAttempts = positiveInteger(input.defaults.maxBuildAttempts, "spec.defaults.maxBuildAttempts", { max: 20 }) ?? defaults.maxBuildAttempts;
   }
@@ -259,7 +267,7 @@ export function reportImageCount(path, buffer) {
   return (body.match(/!\[[^\]]*\]\([^)]+\)/g)?.length ?? 0) + (body.match(/<img\b/gi)?.length ?? 0);
 }
 
-async function gitAncestor(repo, ancestor, descendant) {
+export async function gitAncestor(repo, ancestor, descendant) {
   try {
     await execFile("git", ["-C", repo, "merge-base", "--is-ancestor", ancestor, descendant], { timeout: 20_000 });
     return true;

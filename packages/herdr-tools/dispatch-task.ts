@@ -817,6 +817,7 @@ export async function dispatchTask(
               ...adapters[i].launchArguments(profile, port.source, {
                 startupIntentPath: lane.startupIntentPath!,
                 extraMcpServers: lane.mcpServers,
+                allowLocalMerge: lane.specStage === "integrate",
               }),
             ], signal);
           } catch (error) {
@@ -1374,7 +1375,7 @@ export async function resumeTask(
           profile,
           info.session,
           port.source,
-          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers },
+          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers, allowLocalMerge: lane.specStage === "integrate" },
         );
         await startWhenShellReady(port, lane.paneId!,
           [
