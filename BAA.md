@@ -146,6 +146,11 @@ isolation or clarity.
   arrive in the root digest and stay open until the root answers with
   `herdr_request action=answer`. Every digest lists the requests still open. Treat
   a chat-only ask from a lane as a request to reroute through `herdr_request`.
+- Message a lane you dispatched with `herdr_tell` (answers, decisions, corrections,
+  go-aheads) instead of refusing or asking the user to type into its pane. It is
+  typed in while the lane is idle and otherwise queued; the supervisor delivers it
+  when the lane goes idle and never retypes an uncertain send. Answers to
+  `herdr_request` records reach the lane the same way on their own.
 - Retire finished lanes so they stop holding memory: `herdr_retire` runs the lane's
   granted runtime `stop` commands, closes its tab (ending the session, MCP bridge,
   LSP and tsserver processes) and releases its leases. It never removes a worktree.

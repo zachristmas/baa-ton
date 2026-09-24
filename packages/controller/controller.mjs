@@ -3220,6 +3220,61 @@ async function observeRootActivity(root, herdr, timestamp) {
   }
 }
 
+const LANE_DELIVERY_BUSY = new Set(["working", "blocked"]);
+
+/**
+ * Deliver what the root left queued for its lanes: herdr_tell messages and
+ * lane-request answers whose first delivery found the lane busy. Text is
+ * typed only into an idle lane and only while nothing was typed before
+ * (pending); a prompt that may have landed becomes uncertain and is never
+ * retyped. Returns whether the manifest changed.
+ */
+export async function deliverLaneQueue({ workflow, herdr, timestamp = now() }) {
+  const lanes = new Map((Array.isArray(workflow?.lanes) ? workflow.lanes : []).map((lane) => [lane.id, lane]));
+  const queued = [];
+  for (const message of Array.isArray(workflow?.laneMessages) ? workflow.laneMessages : [])
+    if (isRecord(message) && message.delivery?.status === "pending")
+      queued.push({ laneId: message.laneId, record: message, key: "delivery", text: message.delivery.text ?? `[Baa-ton root message] ${message.id}: ${message.text}` });
+  for (const request of Array.isArray(workflow?.laneRequests) ? workflow.laneRequests : [])
+    if (isRecord(request) && request.status !== "open" && request.answerDelivery?.status === "pending" && typeof request.answerDelivery.text === "string")
+      queued.push({ laneId: request.laneId, record: request, key: "answerDelivery", text: request.answerDelivery.text });
+  let changed = false;
+  const busy = new Set();
+  for (const item of queued) {
+    const paneId = lanes.get(item.laneId)?.paneId;
+    if (!paneId || busy.has(paneId)) continue;
+    const previous = item.record[item.key];
+    let agent;
+    try {
+      const info = await herdr.request("agent.get", { target: paneId });
+      agent = isRecord(info?.agent) && info.agent.pane_id === paneId ? info.agent : undefined;
+    } catch {
+      agent = undefined;
+    }
+    if (!agent || LANE_DELIVERY_BUSY.has(agent.agent_status)) {
+      busy.add(paneId);
+      continue;
+    }
+    const attempts = (previous.attempts ?? 0) + 1;
+    try {
+      await herdr.request("agent.prompt", { target: paneId, text: item.text });
+      item.record[item.key] = { status: "delivered", updatedAt: timestamp, attempts, by: "supervisor" };
+    } catch (error) {
+      item.record[item.key] = {
+        status: error?.sent || !unavailable(error) ? "uncertain" : "pending",
+        updatedAt: timestamp,
+        attempts,
+        reason: error instanceof Error ? error.message : String(error),
+        ...(error?.sent || !unavailable(error) ? {} : { text: item.text }),
+      };
+    }
+    // One prompt per lane per tick: the lane is busy with it now.
+    busy.add(paneId);
+    changed = true;
+  }
+  return changed;
+}
+
 export async function runSupervisorTick({
   stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
@@ -3302,6 +3357,11 @@ export async function runSupervisorTick({
             status: queueWake.status,
           });
       }
+      // Root-to-lane deliveries the lane was too busy to take earlier.
+      let laneQueueChanged = false;
+      for (const stored of matchedWorkflows)
+        if (await deliverLaneQueue({ workflow: stored, herdr: api, timestamp })) laneQueueChanged = true;
+      if (laneQueueChanged) await atomicWriteJson(manifestPath, manifest);
       // Herdr's sidebar rows are selected by canonical agent kind, while
       // pane.report_metadata supplies the per-pane role/workflow breadcrumb.
       // The display-only publication runs in finally, after lifecycle work,

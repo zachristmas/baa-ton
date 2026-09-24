@@ -247,6 +247,7 @@ const ROOT_EXECUTOR_TOOLS = new Set([
   "herdr_operator_close",
   "herdr_plan",
   "herdr_reconcile_root",
+  "herdr_tell",
 ]);
 
 function isRecord(value) {

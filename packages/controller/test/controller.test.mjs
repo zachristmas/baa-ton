@@ -21,6 +21,7 @@ import {
   runSupervisorLauncher,
   SUPERVISOR_RESTART_EXIT_CODE,
   nudgeDecision,
+  deliverLaneQueue,
 } from "../controller.mjs";
 import { codeChangeWatcher, codeFingerprint, codeStamp, listRuntime, loadedCode, recordRuntime } from "../code-version.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
@@ -4090,4 +4091,57 @@ test("a permission request wakes the root even while Herdr reports the lane work
   const text = JSON.stringify(decision);
   assert.match(text, /lane herdr-perm\/lane-1 \(working\) waits on permission request-perm: permission: Bash docker compose up -d db/);
   assert.doesNotMatch(text, /request-lease/, "other requests from a working lane still wait for the lane to stop");
+});
+
+test("the supervisor delivers queued root messages and held answers once a lane is idle, never retyping", async () => {
+  const status = { "w:p2": "working", "w:p3": "idle", "w:p4": "idle" };
+  const prompts = [];
+  const failures = {};
+  const herdr = {
+    async request(method, params) {
+      if (method === "agent.get") return { type: "agent_info", agent: { pane_id: params.target, agent_status: status[params.target] } };
+      if (method === "agent.prompt") {
+        if (failures[params.target]) throw failures[params.target];
+        prompts.push(params);
+        return {};
+      }
+      throw new Error(method);
+    },
+  };
+  const pending = (id, laneId, text) => ({ id, laneId, from: "root", text, createdAt: "t", delivery: { status: "pending", updatedAt: "t", text: `[Baa-ton root message] ${id}: ${text}` } });
+  const workflow = {
+    id: "herdr-q",
+    lanes: [{ id: "lane-busy", paneId: "w:p2" }, { id: "lane-idle", paneId: "w:p3" }, { id: "lane-flaky", paneId: "w:p4" }],
+    laneMessages: [
+      pending("m-1", "lane-busy", "wait for me"),
+      pending("m-2", "lane-idle", "go ahead"),
+      pending("m-3", "lane-idle", "second note"),
+      { ...pending("m-4", "lane-idle", "already sent"), delivery: { status: "uncertain", updatedAt: "t" } },
+      pending("m-5", "lane-flaky", "may land"),
+    ],
+    laneRequests: [
+      { id: "request-1", laneId: "lane-busy", status: "granted", answerDelivery: { status: "pending", updatedAt: "t", text: "[Baa-ton request answer] request-1: granted." } },
+    ],
+  };
+  failures["w:p4"] = Object.assign(new Error("socket timeout after write"), { sent: true });
+
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t1" }), true);
+  assert.deepEqual(prompts, [{ target: "w:p3", text: "[Baa-ton root message] m-2: go ahead" }], "one prompt per idle lane per tick; nothing into the working lane");
+  assert.equal(workflow.laneMessages[1].delivery.status, "delivered");
+  assert.equal(workflow.laneMessages[2].delivery.status, "pending", "the second note waits for the next tick");
+  assert.equal(workflow.laneMessages[0].delivery.status, "pending");
+  assert.equal(workflow.laneMessages[4].delivery.status, "uncertain", "a prompt that may have landed is never retyped");
+  assert.equal(workflow.laneRequests[0].answerDelivery.status, "pending");
+
+  status["w:p2"] = "idle";
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t2" }), true);
+  assert.deepEqual(prompts.slice(1).map((prompt) => prompt.target).sort(), ["w:p2", "w:p3"]);
+  assert.equal(workflow.laneMessages[2].delivery.status, "delivered");
+  assert.equal(workflow.laneMessages[3].delivery.status, "uncertain", "uncertain records are left alone");
+
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t3" }), true, "the held answer goes out next");
+  assert.equal(workflow.laneRequests[0].answerDelivery.status, "delivered");
+  assert.equal(prompts.at(-1).text, "[Baa-ton request answer] request-1: granted.");
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t4" }), false, "nothing left to deliver");
+  assert.equal(prompts.filter((prompt) => prompt.target === "w:p4").length, 0);
 });
