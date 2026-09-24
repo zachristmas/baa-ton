@@ -866,9 +866,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         ...(parsed.queue !== undefined
           ? { queue: queueStore(parsed.queue) }
           : {}),
-        ...(parsed.approvalPolicyAck
-          ? { approvalPolicyAck: parsed.approvalPolicyAck }
-          : {}),
+        ...(await durableApprovalAck(cwd, parsed.approvalPolicyAck)),
         ...(Array.isArray(parsed.leases) ? { leases: parsed.leases } : {}),
         ...(Array.isArray(parsed.directives) ? { directives: parsed.directives } : {}),
         ...(Array.isArray(parsed.rootSupervision) ? { rootSupervision: parsed.rootSupervision } : {}),
@@ -921,12 +919,70 @@ function markNudgeIntervalPolicy(manifest: ManifestWithQueue, rootId: string): v
   entry.nudgeIntervalPolicy = 2;
 }
 
+const APPROVAL_ACK_NAME = "approval-policy-ack.json";
+const writtenApprovalAcks = new Map<string, string>();
+
+function approvalAckPath(cwd: string): string {
+  return join(dirname(manifestPath(cwd)), APPROVAL_ACK_NAME);
+}
+
+function isApprovalAck(value: unknown): value is ApprovalPolicyAck {
+  return (
+    isRecord(value) &&
+    typeof value.hash === "string" &&
+    /^[0-9a-f]{64}$/.test(value.hash) &&
+    Array.isArray(value.grants) &&
+    typeof value.ackedAt === "string" &&
+    typeof value.rootPaneId === "string"
+  );
+}
+
+/**
+ * The standing-policy acknowledgement is also kept in its own file beside
+ * the manifest. Manifest writers from before #21 (still running in lanes
+ * dispatched before an upgrade) rebuild the manifest from the top-level keys
+ * they know and drop approvalPolicyAck, and a stale in-memory manifest saved
+ * late can do the same. The newer of the two copies wins.
+ */
+async function durableApprovalAck(
+  cwd: string,
+  inManifest: unknown,
+): Promise<{ approvalPolicyAck?: ApprovalPolicyAck }> {
+  let inFile: ApprovalPolicyAck | undefined;
+  try {
+    const parsed = JSON.parse(await readFile(approvalAckPath(cwd), "utf8"));
+    if (isApprovalAck(parsed)) inFile = parsed;
+  } catch {
+    // Missing or unreadable: fall back to the manifest copy.
+  }
+  const fromManifest = isApprovalAck(inManifest) ? inManifest : undefined;
+  const ack =
+    inFile && fromManifest
+      ? Date.parse(fromManifest.ackedAt) > Date.parse(inFile.ackedAt)
+        ? fromManifest
+        : inFile
+      : (inFile ?? fromManifest);
+  return ack ? { approvalPolicyAck: ack } : {};
+}
+
+async function persistApprovalAck(cwd: string, ack: ApprovalPolicyAck | undefined): Promise<void> {
+  if (!ack) return;
+  const path = approvalAckPath(cwd);
+  const text = `${jsonText(ack)}\n`;
+  if (writtenApprovalAcks.get(path) === text) return;
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, text, { mode: 0o600 });
+  await rename(temporary, path);
+  writtenApprovalAcks.set(path, text);
+}
+
 async function saveManifest(cwd: string, manifest: Manifest): Promise<void> {
   const path = manifestPath(cwd);
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${jsonText(manifest)}\n`, { mode: 0o600 });
   await rename(temporary, path);
+  await persistApprovalAck(cwd, (manifest as ManifestWithQueue).approvalPolicyAck);
 }
 
 async function acquireManifestLock(
@@ -5169,12 +5225,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           // there is otherwise no prior root identity to preserve.
           const persistResetSession =
             !reset || Boolean(latestManifest.sessionLog) || !manifestHasState(latestManifest);
-          if (reset)
+          if (reset) {
             await saveManifest(cwd, {
               version: 2,
               workflows: [],
               ...(persistResetSession ? { sessionLog: refreshedRootSession } : {}),
             });
+            // A destructive root reset retires the standing-policy
+            // acknowledgement too; the next routine operation asks again.
+            await rm(approvalAckPath(cwd), { force: true });
+            writtenApprovalAcks.delete(approvalAckPath(cwd));
+          }
           else if (add && useScopedSession)
             // A co-root gets a durable root-owned trace while every existing
             // workflow, goal, queue, and legacy projection remains intact.
