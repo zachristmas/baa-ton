@@ -140,10 +140,15 @@ Updated 2026-09-23 with Zach's five additions (items 1-5 in his note), each from
 1. **Confirmation queue + deadlock test.** Merged as #20.
 2. **`approvalPolicy` v2**: the validator, hash acknowledgement, `herdr_policy` (show/ack), standing grants for dispatch/retry/resume, BB-029 legacy path and docs.
 3. **Leases**: config validation, ledger, allocator, bind probe, dispatch allocation for writer lanes, release on close, retire and sweep, `herdr_lease` in the extension and bridge.
-4. **Formal lane requests (goal 3 + item 5)**: a `herdr_request` tool (lease, runtime-launch, approval, permission), tracked in the manifest until answered.
-   - Policy-matching requests are answered automatically.
-   - Other requests appear in every root digest until they are answered.
-   - `herdr_permission_prompt` uses the same path.
+4. **Formal lane requests (goal 3 + item 5)**: a `herdr_request` tool (lease, runtime-launch, approval, permission), tracked in `workflow.laneRequests` until answered. As built:
+   - **Answered by policy**, once the policy is acknowledged:
+     - `lease`: needs the `lease` grant and a free slot.
+     - `runtime-launch`: needs the `runtime-launch` grant, and the exact command must match a template's `start` or `stop` token for token, with every `{lease.*}` placeholder resolved from this lane's own leases.
+     - `approval` requests always go to the root.
+   - **Open requests** are one urgent digest item each, skipping the window. Every later digest lists them in a footer until answered, without waking the root again.
+     - Identical open requests from a lane are not duplicated.
+     - The root answers with `action=answer decision=grant|deny`. Granting a lease allocates it. The answer is delivered to the lane pane with one non-waiting prompt, recorded as `answerDelivery`, and never retyped.
+   - **`herdr_permission_prompt`** first asks `herdr_request` in policy-only mode. A matching Bash command is allowed and recorded; anything else keeps the existing deny-by-default broker path, with no second record.
 5. **Auto-retire (item 2)**: when a lane's completion is accepted and the policy grants `retire`, close its session, run its runtime `stop` commands and release its leases. The worktree stays.
 6. **Directives with ack (item 4)**: directives to the root are stored in the manifest and delivered as urgent digest items.
    - They stay open until the root runs `herdr_directive ack`.

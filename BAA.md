@@ -135,6 +135,11 @@ isolation or clarity.
   `.baa-ton/config.json` through `herdr_lease`, never from chat negotiation. Writer
   lanes receive the configured `dispatchLeases` at dispatch; a lane may request more
   itself when the acknowledged policy grants `lease`.
+- Lanes ask for leases, runtime launches and approvals with `herdr_request`, not in
+  chat. Requests the acknowledged policy covers are answered at once; the rest
+  arrive in the root digest and stay open until the root answers with
+  `herdr_request action=answer`. Every digest lists the requests still open. Treat
+  a chat-only ask from a lane as a request to reroute through `herdr_request`.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —

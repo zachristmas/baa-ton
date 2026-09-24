@@ -3186,3 +3186,58 @@ test("a project digest window is validated and preserved", () => {
   for (const invalid of [-1, 3_601, 1.5, "60"])
     assert.throws(() => validateConfig(config(invalid)), /digest_window_seconds must be an integer from 0 to 3600/);
 });
+
+test("open lane requests skip the collection window and every digest lists what is still unanswered", async () => {
+  const arrivedAt = new Date().toISOString();
+  const later = (seconds) => new Date(Date.parse(arrivedAt) + seconds * 1_000).toISOString();
+  const laneRequest = (id, summary, extra = {}) => ({
+    id,
+    workflowId: "herdr-bb029",
+    laneId: CHILD.lane_id,
+    kind: "runtime-launch",
+    payload: { command: summary },
+    summary: `runtime launch: ${summary}`,
+    status: "open",
+    requestedAt: arrivedAt,
+    delivery: { status: "pending", updatedAt: arrivedAt },
+    ...extra,
+  });
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const manifest = await fixture.manifest();
+  manifest.workflows[0].laneRequests = [
+    laneRequest("request-new", "use ports 3610/3611 and launch", { note: "not answered by policy: no template" }),
+    laneRequest("request-earlier", "npm run seed", {
+      delivery: { status: "delivered", attempts: 1, updatedAt: arrivedAt },
+    }),
+    laneRequest("request-done", "npm run dev", { status: "granted", answeredBy: "policy" }),
+  ];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const api = digestApi();
+  try {
+    await withDigestWindow(60, async () => {
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: later(1) });
+    });
+    const digests = api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]"));
+    assert.equal(digests.length, 1, "a lane waiting on an answer is urgent");
+    const text = digests[0].text;
+    assert.match(
+      text,
+      /\n1\. request from herdr-bb029\/lane-child \(request-new\): runtime launch: use ports 3610\/3611 and launch \[not answered by policy: no template\]/,
+    );
+    assert.match(text, /Open lane requests awaiting your answer \(herdr_request action=answer\): request-new .*; request-earlier /);
+    assert.doesNotMatch(text, /request-done/);
+    const stored = await fixture.manifest();
+    const byId = Object.fromEntries(stored.workflows[0].laneRequests.map((request) => [request.id, request]));
+    assert.deepEqual([byId["request-new"].delivery.status, byId["request-new"].delivery.attempts], ["delivered", 1]);
+    assert.equal(byId["request-earlier"].delivery.attempts, 1, "an already delivered request is listed, not re-sent");
+
+    await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: later(10) });
+    assert.equal(
+      api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]")).length,
+      1,
+      "an open request wakes the root once; later digests only list it",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
