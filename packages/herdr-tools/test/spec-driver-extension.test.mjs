@@ -12,7 +12,7 @@ const { validateApprovalPolicy, approvalPolicyHash } = await jiti.import("../app
 
 const launch = (provider, model) => ({ provider, model, thinking: "high", auth: "subscription" });
 
-async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b" } = {}) {
+async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b", decide = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-spec-driver-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
@@ -44,7 +44,7 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     JSON.stringify({
       version: 1,
       target: { repo: ".", remote: "origin", branch: "feature/release" },
-      stages: { build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
+      stages: { ...(decide ? { decide: { profile: "planning" } } : {}), build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
       items: [
         { id: "A", title: "Shipping discount", owns: ["src/a/**"], acceptance: { text: "Discount applies to shipping only.", tests: ["npm test"] } },
         { id: "B", title: "Report", dependsOn: ["A"], acceptance: { text: "Report lists discounts." } },
@@ -100,6 +100,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     calls,
     pushedShas,
     stateDir,
+    tools,
+    ctx,
     advance: () => tools.get("herdr_spec").execute("spec", { action: "advance" }, undefined, undefined, ctx),
     status: () => tools.get("herdr_spec").execute("spec", { action: "status" }, undefined, undefined, ctx),
     state: async () => JSON.parse(await readFile(join(stateDir, "spec-state.json"), "utf8")),
@@ -259,4 +261,31 @@ test("only a spec integration lane's contract allows local merges", async () => 
   assert.match(integrate, /you may merge spec\/\* branches and commit on this worktree's integration branch \(local only\)\. Never push, deploy, create a PR/);
   assert.doesNotMatch(integrate, /Never push, merge/);
   assert.match(laneContract(workflow, { ...lane, specStage: "build" }), /Never push, merge/);
+});
+
+test("decide lanes read the project; answers recorded by the root unblock the build", async () => {
+  const f = await fixture({ decide: true });
+  try {
+    await f.advance();
+    const decide = f.calls.plan.filter((call) => call.specStage === "decide");
+    assert.deepEqual(decide.map((call) => [call.taskProfile, call.readOnly, call.worktree]), [["planning", true, undefined], ["planning", true, undefined]]);
+    assert.equal(f.calls.worktree.length, 0, "deciding creates no worktree");
+    await f.laneReceipt("herdr-spec1", "QUESTION: Apply the discount before or after tax?");
+    await f.laneReceipt("herdr-spec2", "Settled.");
+    await f.advance();
+    const alerts = (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-decisions");
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0].text, /ask the user all of these in one round:\n- A: Apply the discount before or after tax\?/);
+    await assert.rejects(
+      f.tools.get("herdr_spec").execute("spec", { action: "answer", itemId: "B", text: "x" }, undefined, undefined, f.ctx),
+      /not waiting on a decision/,
+    );
+    const answered = await f.tools.get("herdr_spec").execute("spec", { action: "answer", itemId: "A", text: "After tax." }, undefined, undefined, f.ctx);
+    assert.match(answered.content[0].text, /Recorded answers for A/);
+    await f.advance();
+    const build = f.calls.plan.find((call) => call.specStage === "build");
+    assert.match(build.laneObjective, /answers to its open questions:\nAfter tax\./);
+  } finally {
+    await f.cleanup();
+  }
 });

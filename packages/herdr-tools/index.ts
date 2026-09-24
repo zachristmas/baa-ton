@@ -142,7 +142,7 @@ import {
   validateSpecState,
   verifySpec,
 } from "./spec.mjs";
-import { advanceSpec, buildObjective, integrateObjective, reviewObjective } from "./spec-driver.mjs";
+import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective } from "./spec-driver.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -4542,7 +4542,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   type SpecDriverPorts = {
     /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
-    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree: string; specStage: "build" | "review" | "integrate" }): Promise<Workflow>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** Whether `ancestor` is contained in `descendant` (git merge-base --is-ancestor). */
     ancestor?(repo: string, ancestor: string, descendant: string): Promise<boolean>;
@@ -4626,14 +4626,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         try {
           let profile: string;
           let objective: string;
-          if (action.kind === "integrate") {
+          if (action.kind === "decide") {
+            profile = spec.stages.decide?.profile ?? "planning";
+            objective = decideObjective(spec, item);
+          } else if (action.kind === "integrate") {
             profile = spec.stages.integrate?.profile ?? "balanced";
             await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
             objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch });
           } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
             await use.worktree({ repo, path: worktree, branch, base: `refs/remotes/${spec.target.remote}/${spec.target.branch}` }, signal);
-            objective = buildObjective(spec, item, { branch, findings: action.findings });
+            objective = buildObjective(spec, item, { branch, findings: action.findings, decided: record.decided, answers: record.answers });
           } else {
             profile = spec.stages.review?.profile ?? "review";
             const against = spec.stages.review?.differentFrom;
@@ -4652,12 +4655,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           const workflow = await use.plan({
             objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}: ${item.title}`,
             laneObjective: objective,
-            readOnly: action.kind === "review",
+            readOnly: action.kind === "review" || action.kind === "decide",
             taskProfile: profile,
-            worktree,
+            // The decide stage reads the project, not an item worktree.
+            ...(action.kind === "decide" ? {} : { worktree }),
             specStage: action.kind,
           });
-          if (action.kind !== "integrate") {
+          if (action.kind === "build" || action.kind === "review") {
             record.worktree = worktree;
             record.branch = branch;
           }
@@ -4705,9 +4709,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           for (const ask of step.rootAsks)
             alerts.push({
               id: `alert-${randomUUID().slice(0, 8)}`,
-              kind: ask.kind === "push" ? "spec-push-ready" : "spec-needs-root",
+              kind: ask.kind === "push" ? "spec-push-ready" : ask.kind === "decisions" ? "spec-decisions" : "spec-needs-root",
               text:
-                ask.kind === "push"
+                ask.kind === "decisions"
+                  ? `Spec decision round (${ask.items!.length} item(s)); ask the user all of these in one round:\n${ask.questions!.map((question) => `- ${question}`).join("\n")}\nThen record each item's answers with herdr_spec action=answer itemId=<id> text=<answers>.`
+                  : ask.kind === "push"
                   ? `${ask.items!.length} integrated spec item(s) ready to push: ${ask.items!.join(", ")} (spec-integration at ${ask.sha!.slice(0, 12)}). Ask the user; pushing always needs their approval. Then run: git -C ${integrationWorktree} push ${spec.target.remote} ${ask.sha}:refs/heads/${spec.target.branch} and fetch ${spec.target.remote}; the driver moves the items to verification once ${targetRef} contains ${ask.sha!.slice(0, 12)}.`
                   : ask.reason,
               createdAt: use.now(),
@@ -10560,10 +10566,40 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       "Use herdr_spec action=status as the burn-down instead of counting items by hand; an item is done only when the verifier says so, never by judgment.",
     ],
     parameters: Type.Object(
-      { action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance")]) },
+      {
+        action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance"), Type.Literal("answer")]),
+        itemId: Type.Optional(Type.String()),
+        text: Type.Optional(Type.String({ maxLength: 8000 })),
+      },
       { additionalProperties: false },
     ),
     async execute(_id, params, signal, _update, ctx) {
+      if (params.action === "answer") {
+        requireRootManifestExecutor(ctx.cwd);
+        if (!params.itemId || !params.text?.trim()) throw new Error("itemId and text are required to record answers.");
+        const release = await acquireManifestLock(ctx.cwd, 10_000);
+        try {
+          const state = await loadSpecState(ctx.cwd);
+          const record = state.items[params.itemId];
+          if (!record || record.state !== "blocked" || record.blockedReason !== "decision")
+            throw new Error(`Spec item ${params.itemId} is not waiting on a decision.`);
+          const at = now();
+          record.answers = [...(record.answers ?? []), { at, text: params.text.trim() }];
+          record.history = [...(record.history ?? []), { at, from: "blocked", to: "pending", note: "user answered the decision round" }];
+          Object.assign(record, { state: "pending", since: at });
+          delete record.blockedReason;
+          delete record.questions;
+          delete record.questionsAskedAt;
+          delete record.note;
+          const path = join(ctx.cwd, SPEC_STATE_PATH);
+          const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+          await writeFile(temporary, `${jsonText(state)}\n`, { mode: 0o600 });
+          await rename(temporary, path);
+        } finally {
+          await release();
+        }
+        return { content: [{ type: "text", text: `Recorded answers for ${params.itemId}; it builds on the next driver pass.` }], details: { itemId: params.itemId } };
+      }
       if (params.action === "advance") {
         // Tests inject fake worktree/plan/dispatch ports through the context.
         const result = await runSpecDriver(ctx, (ctx as { specDriverPorts?: Partial<SpecDriverPorts> }).specDriverPorts, signal);
