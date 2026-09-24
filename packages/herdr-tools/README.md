@@ -53,6 +53,29 @@ is not an instruction to reset registration. This interface addresses
 [Baa-ton #9](https://github.com/zachristmas/baa-ton/issues/9) and the downstream
 [Forge Windows report](https://github.com/BrandedTamarasu-glitch/baa-ton-forge/issues/5).
 
+## Startup approval waits
+
+A harness can stop at a folder-trust or other interactive startup prompt after
+Herdr creates the lane. Baa-ton does not answer that prompt. Keep the pane and
+workflow intact while the user reviews it; do not launch a replacement agent.
+
+After the user resolves the prompt, retry `herdr_dispatch` for the **same**
+workflow. A controller-observed `blocked` workflow can resume startup only if its
+recorded failure was `agent-start` / `agent_not_ready`, no assignment or receipt
+exists, and each previously attempted agent is now natively ready with matching
+startup identity, session, exact profile and protocol-tool proof. Missing or
+mismatched proof and a still-blocked agent refuse recovery before changing the
+workflow. Ordinary blocked/unknown work and uncertain assignment submissions remain
+ineligible. An `unknown` workflow with a retryable failure also re-enters dispatch
+through the stalled-assignment recovery; the same readiness and proof checks apply
+to an `agent_not_ready` startup, and an uncertain assignment is still never
+resubmitted. The existing startup adoption path reuses the blocked agent; later,
+previously unstarted lanes may start normally after qualification.
+
+This path performs no approval keystrokes and does not infer permission from
+elapsed time. `herdr_resume` remains native-session reattachment for done/gone
+lanes, not recovery of a live agent awaiting startup approval.
+
 ## Messaging the parent
 
 A registered child uses `herdr_message` for durable informational context the root should review, including late facts after `herdr_complete`; use the question flow when Zach must decide something, and use `herdr_complete` for the lane's one completion receipt. Messages are not approval requests and are controller-routed to wake the mapped root.
