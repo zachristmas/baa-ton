@@ -206,6 +206,14 @@ These refine the design where it meets existing invariants:
   - The root records each item's answers with `herdr_spec action=answer itemId=<id> text=<answers>`. The item then builds, with the decide record and the answers in its lane objective.
   - Without `stages.decide`, items skip the stage as before.
 
+- **PR 5 (built):** preview verification.
+  - **Waiting for the deploy:** a pushed item (`verifying`, with `integratedSha`) that has preview specs waits until `target.preview.releaseCheck` reports a deployed SHA containing its commit. That's one GET per driver pass; the SHA is read from a JSON field (`sha`, `commit`, `gitSha`, `revision`, `version`, including nested `build`/`git`/`release`) or the first SHA in a text body. A verifying item waiting for a deploy holds no `maxParallel` slot.
+  - **Verify lane:** runs on the verify stage's profile (default `quick`) in the integration worktree. It runs the item's preview specs against `target.preview.url`, writes the final evidence report, and reports `PREVIEW: <spec> pass|fail` lines and `REPORT: <path>`. By default the final report sits alongside the build lane's (`<name>.final.<ext>`); with `defaults.finalReport: "replace"` it uses the spec's path. Both options exist because this was open question 3.
+  - **Recording:** the driver records the preview runs (with the release SHA) and the report's path, SHA-256 and image count. The verifier then decides: only a pass moves the item to `done`.
+  - **Failures:** a failed or missing preview run blocks the item (human-gate) and asks the root whether to fix forward. An item with no preview specs and no evidence report goes straight to the verifier after the push.
+  - **Digest line:** every root digest now starts with the burn-down line (`spec N/M done · 2 building · 1 awaiting-push · 1 blocked(decision)`), computed by the controller from `spec.json` and `spec-state.json`.
+  - **Not verified live:** the release-check formats beyond these parsers; a real preview run.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?

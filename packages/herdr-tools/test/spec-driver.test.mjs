@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { validateSpec } from "../spec.mjs";
-import { advanceSpec, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict } from "../spec-driver.mjs";
+import { advanceSpec, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict, verifyObjective, verifyResult } from "../spec-driver.mjs";
 
-const spec = (items, defaults = {}, stages) =>
+const spec = (items, defaults = {}, stages, preview) =>
   validateSpec({
     version: 1,
-    target: { repo: ".", remote: "origin", branch: "feature/release" },
+    target: { repo: ".", remote: "origin", branch: "feature/release", ...(preview ? { preview } : {}) },
     defaults,
     ...(stages ? { stages } : {}),
     items: items.map(({ id, ...rest }) => ({ id, title: `Item ${id}`, acceptance: { text: `Accept ${id}.` }, ...rest })),
@@ -260,4 +260,63 @@ test("the decide stage runs first; leftover questions go to the user in one roun
   assert.match(objective, /The decide stage recorded:\nQUESTION: Which store/);
   assert.match(objective, /answers to its open questions:\nStore admins approve their own store\./);
   assert.match(decideObjective(s, s.items[0]), /Read-only[\s\S]*QUESTION:[\s\S]*OWNS:[\s\S]*MIGRATIONS:/);
+});
+
+test("verify receipts list preview specs and the report path", () => {
+  assert.deepEqual(verifyResult("PREVIEW: e2e/a.spec.ts pass\nPREVIEW: e2e/b.spec.ts FAIL (timeout)\nREPORT: artifacts/a.final.docx"), {
+    previews: [{ spec: "e2e/a.spec.ts", result: "pass" }, { spec: "e2e/b.spec.ts", result: "fail" }],
+    report: "artifacts/a.final.docx",
+  });
+});
+
+test("verification waits for a deploy containing the commit, then one verify lane records the preview runs", () => {
+  const preview = { url: "https://preview.example.test", releaseCheck: "https://preview.example.test/api/version" };
+  const s = spec(
+    [
+      { id: "A", acceptance: { text: "a", preview: ["e2e/a.spec.ts"], evidence: { report: "artifacts/a.docx", minImages: 2 } } },
+      { id: "B" },
+      { id: "C", acceptance: { text: "c", preview: ["e2e/c.spec.ts"] } },
+    ],
+    { maxParallel: 1 },
+    undefined,
+    preview,
+  );
+  const state = {
+    version: 1,
+    items: {
+      A: { state: "verifying", integratedSha: SHA_A },
+      B: { state: "verifying", integratedSha: SHA_B },
+      C: { state: "ready" },
+    },
+  };
+  let step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
+  assert.match(step.waits.A, /release check does not report a deploy containing this commit yet/);
+  assert.equal(step.state.items.B.verified, at(0), "nothing to verify on the preview: straight to the verifier");
+  assert.deepEqual(step.actions.map((action) => [action.kind, action.itemId]), [["build", "C"]], "a verifying item waiting for a deploy holds no slot");
+
+  step = advanceSpec({ spec: s, state, lane: lanes({}), released: new Map([["A", SHA_B]]), now: at(1) });
+  assert.deepEqual(step.actions.filter((action) => action.itemId === "A"), [{ kind: "verify", itemId: "A", attempt: 1 }]);
+  assert.equal(step.state.items.A.releaseSha, SHA_B);
+  assert.match(verifyObjective(s, s.items[0], { releaseSha: SHA_B, reportPath: "artifacts/a.final.docx" }), /against the preview at https:\/\/preview\.example\.test: e2e\/a\.spec\.ts[\s\S]*artifacts\/a\.final\.docx[\s\S]*PREVIEW: <spec path> pass/);
+
+  step.state.items.A.lane = { workflowId: "wv", laneId: "l1" };
+  const passed = advanceSpec({
+    spec: s,
+    state: step.state,
+    lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx" } } }),
+    now: at(2),
+  });
+  assert.equal(passed.state.items.A.verified, at(2));
+  assert.deepEqual(passed.state.items.A.preview, [{ spec: "e2e/a.spec.ts", result: "pass", sha: SHA_A, releaseSha: SHA_B, at: at(2) }]);
+  assert.equal(passed.state.items.A.finalReport, "artifacts/a.final.docx");
+
+  const failed = advanceSpec({
+    spec: s,
+    state: step.state,
+    lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: "PREVIEW: e2e/a.spec.ts fail\nREPORT: artifacts/a.final.docx" } } }),
+    now: at(2),
+  });
+  assert.equal(failed.state.items.A.state, "blocked");
+  assert.match(failed.state.items.A.note, /preview failed: e2e\/a\.spec\.ts/);
+  assert.match(failed.rootAsks[0].reason, /verification on the preview failed after the push/);
 });

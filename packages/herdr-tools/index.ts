@@ -134,15 +134,19 @@ import { classifyLocalValidation } from "./known-safe.mjs";
 import {
   SPEC_PATH,
   SPEC_STATE_PATH,
+  finalReportPath,
   gitAncestor,
   loadSpec,
+  releaseShaFrom,
+  reportImageCount,
+  verifyItem,
   loadSpecState,
   specStatusTable,
   targetRepo,
   validateSpecState,
   verifySpec,
 } from "./spec.mjs";
-import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective } from "./spec-driver.mjs";
+import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -4542,8 +4546,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   type SpecDriverPorts = {
     /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
-    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" }): Promise<Workflow>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
+    /** Directory holding the spec worktrees (default ~/.herdr/worktrees/<repo>). */
+    worktreeRoot?: string;
+    /** GET the preview's release check and return the response body. */
+    fetchRelease?(url: string): Promise<string>;
     /** Whether `ancestor` is contained in `descendant` (git merge-base --is-ancestor). */
     ancestor?(repo: string, ancestor: string, descendant: string): Promise<boolean>;
     now(): string;
@@ -4604,15 +4612,39 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; integration?: { sha?: string } }>)
         if (record.state === "awaiting-push" && record.integration?.sha)
           if (await (ports?.ancestor ?? gitAncestor)(repo, record.integration.sha, targetRef).catch(() => false)) pushed.add(record.integration.sha);
+      // Which verifying items the preview already runs: one release check per pass.
+      const released = new Map<string, string>();
+      const waitingForDeploy = spec.items.filter((item) => {
+        const record = state.items?.[item.id];
+        return record?.state === "verifying" && !record.lane && !record.verified && item.acceptance.preview.length > 0 && record.integratedSha;
+      });
+      if (waitingForDeploy.length && spec.target.preview?.releaseCheck) {
+        const fetchRelease =
+          ports?.fetchRelease ??
+          (async (url: string) => {
+            const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+            if (!response.ok) throw new Error(`release check returned ${response.status}`);
+            return response.text();
+          });
+        const releaseSha = await fetchRelease(spec.target.preview.releaseCheck).then(releaseShaFrom, () => undefined);
+        if (releaseSha)
+          for (const item of waitingForDeploy) {
+            const itemSha = state.items[item.id].integratedSha as string;
+            if (itemSha.startsWith(releaseSha) || releaseSha.startsWith(itemSha) || (await (ports?.ancestor ?? gitAncestor)(repo, itemSha, releaseSha).catch(() => false)))
+              released.set(item.id, releaseSha);
+          }
+      }
       const step = advanceSpec({
         spec,
         state,
         lane: laneView,
         capacityWaiting: supervision?.capacityGate?.status === "waiting",
         pushed,
+        released,
         now: use.now(),
       });
-      const integrationWorktree = join(homedir(), ".herdr", "worktrees", basename(repo), "spec-integration");
+      const worktreeRoot = ports?.worktreeRoot ?? join(homedir(), ".herdr", "worktrees", basename(repo));
+      const integrationWorktree = join(worktreeRoot, "spec-integration");
       const next = step.state;
       const done: string[] = [];
       for (const action of step.actions) {
@@ -4620,15 +4652,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const record = next.items[item.id];
         const branch = `spec/${item.id}`;
         const worktree =
-          action.kind === "integrate"
+          action.kind === "integrate" || action.kind === "verify"
             ? integrationWorktree
-            : record.worktree ?? join(homedir(), ".herdr", "worktrees", basename(repo), `spec-${item.id}`);
+            : record.worktree ?? join(worktreeRoot, `spec-${item.id}`);
         try {
           let profile: string;
           let objective: string;
           if (action.kind === "decide") {
             profile = spec.stages.decide?.profile ?? "planning";
             objective = decideObjective(spec, item);
+          } else if (action.kind === "verify") {
+            profile = spec.stages.verify?.profile ?? "quick";
+            await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
+            objective = verifyObjective(spec, item, {
+              releaseSha: record.releaseSha,
+              reportPath: item.acceptance.evidence ? finalReportPath(spec, item.acceptance.evidence.report) : "",
+            });
           } else if (action.kind === "integrate") {
             profile = spec.stages.integrate?.profile ?? "balanced";
             await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
@@ -4676,6 +4715,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           if (!record.lane?.workflowId || record.lane.workflowId === undefined) delete record.lane;
           done.push(`${action.kind} ${item.id} failed: ${clip((error as Error).message, 120)}`);
         }
+      }
+      // Record the final report the verify lane wrote, then let the verifier
+      // decide: only it moves an item to done.
+      for (const item of spec.items) {
+        const record = next.items[item.id];
+        if (record?.state !== "verifying" || !record.verified) continue;
+        if (item.acceptance.evidence && record.finalReport && record.evidence?.reportAt !== record.verified) {
+          const path = isAbsolute(record.finalReport) ? record.finalReport : join(integrationWorktree, record.finalReport);
+          const buffer = await readFile(path).catch(() => undefined);
+          if (buffer)
+            record.evidence = {
+              path,
+              sha256: createHash("sha256").update(buffer).digest("hex"),
+              images: reportImageCount(path, buffer),
+              reportAt: record.verified,
+            };
+        }
+        const verdict = await verifyItem(spec, next, item, { repo, ...(ports?.ancestor ? { ancestor: ports.ancestor } : {}) });
+        if (verdict.done) {
+          record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "done", note: "verifier passed" }];
+          Object.assign(record, { state: "done", since: use.now() });
+          done.push(`done ${item.id}`);
+        } else record.note = `verifier: ${verdict.failing!.name}: ${verdict.failing!.detail}`;
       }
       for (const [id, reason] of Object.entries(step.waits)) if (next.items[id]) next.items[id].wait = reason;
       for (const item of spec.items) if (!step.waits[item.id] && next.items[item.id]) delete next.items[item.id].wait;
