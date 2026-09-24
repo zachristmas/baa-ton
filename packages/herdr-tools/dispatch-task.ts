@@ -17,6 +17,7 @@ import {
   STARTUP_PROOF_REQUIRED_OPERATIONS,
   missingRequiredAdapterCapabilities,
   type HarnessLaunchAdapter,
+  type StartupProof,
 } from "./harness-adapter.js";
 
 export type DispatchPorts = {
@@ -33,6 +34,10 @@ export type DispatchPorts = {
   ): Promise<void>;
   contract(workflow: Workflow, lane: Lane): string;
   busyRetryDelayMs?: number;
+  /** Poll interval while Herdr has not yet registered a started agent's session. */
+  sessionPollMs?: number;
+  /** Upper bound for that wait (default 60 s). */
+  sessionWaitMs?: number;
 };
 
 export type ResumePorts = Omit<DispatchPorts, "contract">;
@@ -286,6 +291,32 @@ async function startWhenShellReady(
       if (attempt >= 2 || !/agent_pane_busy/.test(String(error))) throw error;
       await delay(port.busyRetryDelayMs ?? 1_500, { signal });
     }
+  }
+}
+
+/**
+ * Verify a startup proof against a fresh `agent get`. Herdr can register a
+ * newly started agent's session reference (agent_session) a little after the
+ * pane is ready, so a proof that fails while the snapshot still has no
+ * session is retried, bounded, instead of failing the lane. A harness whose
+ * proof needs no Herdr session (codex) passes on the first read and never
+ * waits; any failure with a session present is final.
+ */
+async function proveStartupWhenSessionReady(
+  port: Pick<DispatchPorts, "run" | "sessionPollMs" | "sessionWaitMs">,
+  paneId: string,
+  verify: (agent: any) => StartupProof,
+  signal?: AbortSignal,
+): Promise<{ agent: any; proof: StartupProof }> {
+  const deadline = Date.now() + (port.sessionWaitMs ?? 60_000);
+  for (;;) {
+    const agent = nativeAgent(await port.run(["agent", "get", paneId], signal));
+    try {
+      return { agent, proof: verify(agent) };
+    } catch (error) {
+      if (nativeSession(agent) || Date.now() >= deadline) throw error;
+    }
+    await delay(port.sessionPollMs ?? 1_000, { signal });
   }
 }
 
@@ -819,8 +850,9 @@ export async function dispatchTask(
       }
       stage = "startup-proof";
       lane = workflow.lanes[i];
-      const raw = await port.run(["agent", "get", lane.paneId!], signal);
-      const agent = (raw.result ?? raw).agent;
+      // Fail fast on a vanished agent (agent_not_found) before waiting for
+      // its attestation; the proof itself uses a fresh read below.
+      await port.run(["agent", "get", lane.paneId!], signal);
       // Some harnesses attest asynchronously (e.g. a handshake turn completing,
       // or an MCP server merging operations — codex may spawn it lazily). Wait
       // for a COMPLETE attestation: identity fields plus merged operations.
@@ -841,7 +873,12 @@ export async function dispatchTask(
         throw new Error(
           "Startup attestation incomplete or unavailable; no work assigned. Verify the harness handshake and MCP bridge serve the protocol tools.",
         );
-      const proof = adapters[i].verifyStartup(agent, hello);
+      const { agent, proof } = await proveStartupWhenSessionReady(
+        port,
+        lane.paneId!,
+        (native) => adapters[i].verifyStartup(native, hello),
+        signal,
+      );
       const startupMismatches = [
         agent?.pane_id !== lane.paneId ? "native pane" : undefined,
         agent?.workspace_id !== workspaceId ? "native workspace" : undefined,
@@ -1375,8 +1412,7 @@ export async function resumeTask(
         lane = currentWorkflow.lanes[index];
       }
       stage = "resume-startup-proof";
-      const raw = await port.run(["agent", "get", lane.paneId!], signal);
-      const agent = nativeAgent(raw);
+      await port.run(["agent", "get", lane.paneId!], signal);
       let hello: any = null;
       const deadline = Date.now() + 90_000;
       const complete = (value: unknown) => adapter.attestationComplete?.(value) ?? true;
@@ -1389,7 +1425,12 @@ export async function resumeTask(
       }
       if (!hello || !complete(hello))
         throw new Error(`Lane ${lane.id} resume startup attestation is incomplete; native reattachment is refused.`);
-      const proof = adapter.verifyStartup(agent, hello);
+      const { agent, proof } = await proveStartupWhenSessionReady(
+        port,
+        lane.paneId!,
+        (native) => adapter.verifyStartup(native, hello),
+        signal,
+      );
       const proofPersistence = toPersistenceHandle(
         proof.persistence ?? proof.session,
         profile.provider,
