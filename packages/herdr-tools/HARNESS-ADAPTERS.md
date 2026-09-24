@@ -37,6 +37,12 @@ explicitly unsupported and the root executor fails closed before creating a
 tab. No provider uses `--last`, most-recent, a picker, a transcript-path
 substitution, or an inferred different worktree.
 
+## Claude lanes: known-safe permission prompts
+
+A Claude lane runs with the operator's own settings underneath the generated ones, so an operator `ask` rule such as `Bash(rm *)` or `Bash(git checkout *)` still prompts inside a lane, and nobody is at a dispatched lane to answer. The generated settings add a `PermissionRequest` hook (`known-safe-hook.mjs`) that answers those prompts for commands `known-safe.mjs` accepts: removing temp files the same command created, a `mktemp -d` directory, one file in a session scratchpad, a relative output directory the command recreates, self-test directories, and creating or detaching a feature branch at `origin/main`. Every other segment of the command must be inert (read-only, or confined to creating files in the working tree or a scratchpad), or the hook stays silent and the prompt stays up. Approvals are logged to `.baa-ton/herdr-orchestrator/known-safe-approvals.jsonl`.
+
+Why PermissionRequest and not PreToolUse: per the Claude Code hooks and permission-mode docs, a PreToolUse `"allow"` only means "no objection" and ask rules are still evaluated after it, while a PermissionRequest decision answers the prompt an ask rule forces, in every mode that prompts (including auto). Deny rules win over both, so the lane's push, merge and PR denies are unchanged; the classifier's push and merge-by-branch rules exist for operator sessions and are off for lanes. No hook approves an `rm` of a critical path (such as `/` or `~`). Not verified live: whether a PermissionRequest decision also answers an ask-rule prompt in `bypassPermissions` mode, where the docs say ask rules still prompt.
+
 ## Current evidence
 
 | Adapter | Source/local tests | Live qualification |

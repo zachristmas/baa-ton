@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { delimiter, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { LaunchProfile } from "./launch-profile.js";
 import type { PersistenceHandle } from "./contract.js";
 import {
@@ -145,6 +146,11 @@ const LANE_PERMISSIONS = {
   ],
 };
 
+/** PermissionRequest hook that approves known-safe Bash commands. */
+export const KNOWN_SAFE_HOOK = fileURLToPath(new URL("./known-safe-hook.mjs", import.meta.url));
+/** Audit log of the hook's approvals, next to the manifest. */
+export const KNOWN_SAFE_LOG = "known-safe-approvals.jsonl";
+
 /** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
 export const LANE_AUTO_MODE_ALLOW =
   "This session is a Baa-ton child lane dispatched by the user's registered root. Calling its herdr-orchestrator MCP tools (herdr_complete, herdr_message, herdr_request, herdr_lease, herdr_permission_prompt) to report this lane's own progress, receipt, questions and resource requests to that parent root is the assigned contract and is expected; it does not bypass auto mode, grant new authority or reach external services.";
@@ -184,6 +190,22 @@ function buildClaudeLaunchArguments(
             {
               type: "command",
               command: `node ${JSON.stringify(paths.attestHelper)}`,
+            },
+          ],
+        },
+      ],
+      // Answer permission prompts for commands the known-safe classifier
+      // accepts (temp-file cleanup, feature-branch setup). This must be a
+      // PermissionRequest hook: a PreToolUse "allow" does not override an
+      // ask rule in the operator's settings, a PermissionRequest decision
+      // does. Deny rules still apply, and anything else stays a prompt.
+      PermissionRequest: [
+        {
+          matcher: "Bash",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${JSON.stringify(KNOWN_SAFE_HOOK)} --log ${JSON.stringify(join(paths.scratchDirectory, KNOWN_SAFE_LOG))}`,
             },
           ],
         },
