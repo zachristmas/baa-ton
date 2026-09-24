@@ -48,6 +48,24 @@ export function reviewVerdict(summary) {
   return match ? match[1].toLowerCase() : undefined;
 }
 
+/** Parse a decide lane's receipt: QUESTION:, OWNS: and MIGRATIONS: lines. */
+export function decideResult(summary) {
+  const lines = String(summary ?? "").split("\n");
+  const questions = lines
+    .map((line) => /^\s*(?:[-*]\s*)?QUESTION\s*:\s*(.+)$/i.exec(line)?.[1]?.trim())
+    .filter(Boolean);
+  const owns = lines
+    .map((line) => /^\s*OWNS\s*:\s*(.+)$/i.exec(line)?.[1])
+    .filter(Boolean)
+    .flatMap((value) => value.split(",").map((part) => part.trim()).filter(Boolean));
+  const migrations = lines.map((line) => /^\s*MIGRATIONS\s*:\s*(\d+)\s*$/i.exec(line)?.[1]).find(Boolean);
+  return {
+    questions,
+    ...(owns.length ? { owns } : {}),
+    ...(migrations !== undefined ? { migrations: Number(migrations) } : {}),
+  };
+}
+
 /** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
 export function integrationResult(summary) {
   const text = String(summary ?? "");
@@ -85,6 +103,18 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {
     const current = record(item.id);
+    if (current.state === "deciding") {
+      const view = current.lane ? lane(current.lane) : undefined;
+      if (!view) continue;
+      if (view.receipt) {
+        const result = decideResult(view.receipt.summary);
+        const decided = { summary: view.receipt.summary, at: now, ...(result.owns ? { owns: result.owns } : {}), ...(result.migrations !== undefined ? { migrations: result.migrations } : {}) };
+        if (result.questions.length)
+          move(item.id, "blocked", { blockedReason: "decision", lane: undefined, decided, questions: result.questions, note: `${result.questions.length} open question(s)` }, "decide stage left questions");
+        else move(item.id, "pending", { lane: undefined, decided }, "decided");
+      } else if (LANE_ENDED.has(view.status)) delete current.lane;
+      continue;
+    }
     if (current.state === "integrating") {
       const view = current.lane ? lane(current.lane) : undefined;
       if (!view) continue;
@@ -194,10 +224,42 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
     }
   }
 
+  // 1e. The decide stage (when configured) runs before an item can build,
+  // and its leftover questions go to the user in one batched round.
+  const decideStage = Boolean(spec.stages.decide);
+  if (decideStage) {
+    const deciding = () => spec.items.filter((item) => next.items[item.id]?.state === "deciding").length;
+    for (const item of spec.items) {
+      const current = record(item.id);
+      if (current.state === "deciding" && !current.lane) actions.push({ kind: "decide", itemId: item.id, attempt: 1 });
+      else if (current.state === "pending" && !current.decided && deciding() < spec.defaults.maxParallel) {
+        move(item.id, "deciding", {}, "decide");
+        actions.push({ kind: "decide", itemId: item.id, attempt: 1 });
+      }
+    }
+    const unasked = spec.items.filter(
+      (item) => next.items[item.id]?.state === "blocked" && next.items[item.id].blockedReason === "decision" && !next.items[item.id].questionsAskedAt,
+    );
+    if (unasked.length && !deciding()) {
+      for (const item of unasked) next.items[item.id].questionsAskedAt = now;
+      rootAsks.push({
+        itemId: unasked[0].id,
+        kind: "decisions",
+        items: unasked.map((item) => item.id),
+        questions: unasked.flatMap((item) => next.items[item.id].questions.map((question) => `${item.id}: ${question}`)),
+        reason: `decision round: ${unasked.length} item(s)`,
+      });
+    }
+  }
+
   // 2. Readiness from dependencies.
   for (const item of spec.items) {
     const current = record(item.id);
     if (current.state !== "pending" && current.state !== "ready") continue;
+    if (decideStage && !current.decided) {
+      waits[item.id] = "decide: waits for the decide stage";
+      continue;
+    }
     const waiting = item.dependsOn.filter((dependency) => !AFTER_INTEGRATION.has(next.items[dependency]?.state));
     if (waiting.length) {
       if (current.state === "ready") move(item.id, "pending", {}, `waits on ${waiting.join(", ")}`);
@@ -222,7 +284,8 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
       continue;
     }
     const builders = spec.items.filter((other) => other.id !== item.id && next.items[other.id]?.state === "building");
-    const clash = builders.find((other) => anyOverlap([...item.owns, ...item.sharedTouch], byId.get(other.id).owns));
+    const owns = (id) => next.items[id]?.decided?.owns ?? byId.get(id).owns;
+    const clash = builders.find((other) => anyOverlap([...owns(item.id), ...item.sharedTouch], owns(other.id)));
     if (clash) {
       waits[item.id] = `ownership: overlaps ${clash.id}'s files`;
       continue;
@@ -236,10 +299,12 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
 }
 
 /** The build lane's objective, generated from the spec item. */
-export function buildObjective(spec, item, { branch, findings }) {
+export function buildObjective(spec, item, { branch, findings, decided, answers }) {
   return [
     `Implement spec item ${item.id}: ${item.title}`,
     `Acceptance: ${item.acceptance.text}`,
+    decided?.summary ? `The decide stage recorded:\n${decided.summary}` : "",
+    answers?.length ? `The user's answers to its open questions:\n${answers.map((answer) => answer.text).join("\n")}` : "",
     item.decisions.length ? `Read these decisions first; they are settled, do not re-ask them: ${item.decisions.join(", ")}.` : "",
     item.owns.length ? `You own: ${item.owns.join(", ")}.${item.sharedTouch.length ? ` Shared (edit minimally): ${item.sharedTouch.join(", ")}.` : ""}` : "",
     item.migrations ? `It needs ${item.migrations} migration(s); ask for the slot with herdr_request instead of picking a number.` : "",
@@ -252,6 +317,18 @@ export function buildObjective(spec, item, { branch, findings }) {
 }
 
 /** The review lane's objective: read-only, verdict first. */
+/** The decide lane's objective: settle what the linked decisions settle, list the rest. */
+export function decideObjective(spec, item) {
+  return [
+    `Prepare spec item ${item.id}: ${item.title}. Read-only: do not edit files or Git state.`,
+    `Acceptance: ${item.acceptance.text}`,
+    item.decisions.length ? `Read these decisions and notes: ${item.decisions.join(", ")}.` : "",
+    item.owns.length ? `Proposed ownership: ${item.owns.join(", ")}.` : "",
+    "Answer every design question the decisions, notes and scope rules already settle. List only what a person still has to decide.",
+    "Finish with herdr_complete. In the summary, put each open question on its own line starting QUESTION:, the files the build will own on a line OWNS: glob, glob (if different from the proposal), and MIGRATIONS: <n> if the item needs migrations. No QUESTION: lines means it is ready to build.",
+  ].filter(Boolean).join("\n");
+}
+
 /** The integration lane's objective: merge locally, renumber, run the suite, never push. */
 export function integrateObjective(spec, item, { integrationBranch, itemBranch }) {
   return [

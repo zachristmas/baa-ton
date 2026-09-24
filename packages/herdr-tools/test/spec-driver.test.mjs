@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { validateSpec } from "../spec.mjs";
-import { advanceSpec, buildObjective, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict } from "../spec-driver.mjs";
+import { advanceSpec, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict } from "../spec-driver.mjs";
 
-const spec = (items, defaults = {}) =>
+const spec = (items, defaults = {}, stages) =>
   validateSpec({
     version: 1,
     target: { repo: ".", remote: "origin", branch: "feature/release" },
     defaults,
+    ...(stages ? { stages } : {}),
     items: items.map(({ id, ...rest }) => ({ id, title: `Item ${id}`, acceptance: { text: `Accept ${id}.` }, ...rest })),
   });
 const lanes = (views) => (ref) => views[`${ref.workflowId}/${ref.laneId}`];
@@ -204,4 +205,59 @@ test("per-item push gate, suite failures rebuild, unclear receipts go to the roo
   assert.match(objective, /git merge --no-ff spec\/B/);
   assert.match(objective, /never push/);
   assert.match(objective, /INTEGRATED: <full 40-character SHA/);
+});
+
+test("decide receipts yield questions and ownership corrections", () => {
+  assert.deepEqual(decideResult("Settled by the board.\nQUESTION: Which store may approve?\n- QUESTION: Keep the old endpoint?\nOWNS: src/a/**, src/b/**\nMIGRATIONS: 2"), {
+    questions: ["Which store may approve?", "Keep the old endpoint?"],
+    owns: ["src/a/**", "src/b/**"],
+    migrations: 2,
+  });
+  assert.deepEqual(decideResult("All settled."), { questions: [] });
+});
+
+test("the decide stage runs first; leftover questions go to the user in one round", () => {
+  const s = spec([{ id: "A", owns: ["src/a/**"] }, { id: "B" }, { id: "C" }], {}, { decide: { profile: "planning" } });
+  let step = advanceSpec({ spec: s, state: undefined, lane: lanes({}), now: at(0) });
+  assert.deepEqual(step.actions.map((action) => [action.kind, action.itemId]), [["decide", "A"], ["decide", "B"], ["decide", "C"]]);
+  assert.equal(step.state.items.A.state, "deciding");
+
+  for (const id of ["A", "B", "C"]) step.state.items[id].lane = { workflowId: `wd-${id}`, laneId: "l1" };
+  const receipts = {
+    "wd-A/l1": { status: "completed", receipt: { summary: "QUESTION: Which store may approve?\nOWNS: src/orders/**" } },
+    "wd-B/l1": { status: "completed", receipt: { summary: "Everything is settled by the board.\nMIGRATIONS: 1" } },
+  };
+  step = advanceSpec({ spec: s, state: step.state, lane: lanes(receipts), now: at(1) });
+  assert.equal(step.state.items.A.state, "blocked");
+  assert.equal(step.state.items.A.blockedReason, "decision");
+  assert.deepEqual(step.state.items.A.decided.owns, ["src/orders/**"]);
+  assert.equal(step.state.items.B.state, "building", "a settled item builds right away");
+  assert.equal(step.state.items.B.decided.migrations, 1);
+  assert.equal(step.rootAsks.length, 0, "no round while C is still deciding");
+
+  step.state.items.C.lane = { workflowId: "wd-C", laneId: "l1" };
+  step = advanceSpec({
+    spec: s,
+    state: step.state,
+    lane: lanes({ "wd-C/l1": { status: "completed", receipt: { summary: "QUESTION: Show tax in the report?" } } }),
+    now: at(2),
+  });
+  assert.deepEqual(step.rootAsks, [{
+    itemId: "A",
+    kind: "decisions",
+    items: ["A", "C"],
+    questions: ["A: Which store may approve?", "C: Show tax in the report?"],
+    reason: "decision round: 2 item(s)",
+  }]);
+  const again = advanceSpec({ spec: s, state: step.state, lane: lanes({}), now: at(3) });
+  assert.equal(again.rootAsks.length, 0, "a round is asked once");
+
+  // Once answered (herdr_spec action=answer sets pending plus answers), A builds.
+  again.state.items.A = { ...again.state.items.A, state: "pending", answers: [{ text: "Store admins approve their own store." }] };
+  const built = advanceSpec({ spec: s, state: again.state, lane: lanes({}), now: at(4) });
+  assert.deepEqual(built.actions.filter((action) => action.itemId === "A").map((action) => action.kind), ["build"]);
+  const objective = buildObjective(s, s.items[0], { branch: "spec/A", decided: again.state.items.A.decided, answers: again.state.items.A.answers });
+  assert.match(objective, /The decide stage recorded:\nQUESTION: Which store/);
+  assert.match(objective, /answers to its open questions:\nStore admins approve their own store\./);
+  assert.match(decideObjective(s, s.items[0]), /Read-only[\s\S]*QUESTION:[\s\S]*OWNS:[\s\S]*MIGRATIONS:/);
 });

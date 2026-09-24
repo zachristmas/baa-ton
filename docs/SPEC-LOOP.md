@@ -200,6 +200,12 @@ These refine the design where it meets existing invariants:
   - **Sequence leases:** the `sequence` lease kind (`{ kind: "sequence", start, digits }`) hands out the lowest free number (for example `migration = 0056`). A retire does not release it. The driver releases an item's reservations once the item is integrated.
   - **Push gate:** when the queue drains, one `spec-push-ready` alert offers the round (`defaults.pushGate: "round"`, the default; `"item"` asks per item). It names the items and the exact `git push <remote> <sha>:refs/heads/<branch>` for the root to run after the user approves. Pushing is never automatic. Items move to `verifying` (with `integratedSha`) once `refs/remotes/<remote>/<branch>` contains their SHA.
 
+- **PR 4 (built):** the decide stage and batched decision rounds. With `stages.decide` configured, every item first gets a read-only decide lane in the project (profile default `planning`). The lane reads the item, its linked decisions and the scope rules, answers what they settle, and reports each leftover as a `QUESTION:` line, plus `OWNS:` and `MIGRATIONS:` when the build's files or migration count differ from the spec.
+  - An item with no questions goes straight to the build queue. `OWNS:` replaces the item's `owns` for the overlap check.
+  - Items with questions are `blocked(decision)`. Once no decide lane is running, all of their questions go to the root in one `spec-decisions` alert, to be asked in a single round.
+  - The root records each item's answers with `herdr_spec action=answer itemId=<id> text=<answers>`. The item then builds, with the decide record and the answers in its lane objective.
+  - Without `stages.decide`, items skip the stage as before.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?
