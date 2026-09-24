@@ -38,7 +38,8 @@ bootstrap with reset or discard previous workflows.
    afterward; do not infer dispatch readiness from migration alone.
 
 Recovery retains other roots and routes. It migrates the selected root's scoped
-goal/queue ownership and session log, and updates its workflow controller-root
+goal/queue ownership, session log, pending directives and supervision state
+(capacity gate, alerts, watchdog), and updates its workflow controller-root
 references. Workflow receipts and original `taskBinding` provenance are retained;
 this is not an adoption, verification, resume, or cleanup of historical workflows.
 Only completed workflows with durable receipts and untouched, unrouted plans

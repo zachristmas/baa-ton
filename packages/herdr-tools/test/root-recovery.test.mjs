@@ -123,3 +123,23 @@ test('native tool verifies live identity, previews without writes, rejects stale
   assert.ok(calls.every(args => ['agent', 'plugin', 'workspace'].includes(args[0])));
   await assert.rejects(run({}), /does not exist/);
 });
+
+test('migration moves the root\'s directives and supervision state and keeps other roots\' own', async t => {
+  const f = await fixture(t);
+  f.manifest.directives = [
+    { id: 'directive-1', rootId: 'old-root', from: 'operator', text: 'Pause new dispatch.', createdAt: 't', status: 'open' },
+    { id: 'directive-2', rootId: 'other-root', from: 'operator', text: 'Other root only.', createdAt: 't', status: 'open' },
+  ];
+  f.manifest.rootSupervision = [
+    { rootId: 'old-root', nudgeIntervalPolicy: 2, capacityGate: { id: 'gate-1', status: 'waiting', reason: 'low memory', createdAt: 't' } },
+    { rootId: 'other-root', alerts: [] },
+  ];
+  const plan = rootRecoveryPlan(f);
+  assert.deepEqual(plan.manifest.directives.map((item) => item.rootId), [plan.newRootId, 'other-root']);
+  assert.deepEqual(plan.manifest.rootSupervision.map((item) => item.rootId), [plan.newRootId, 'other-root']);
+  assert.equal(plan.manifest.rootSupervision[0].capacityGate.id, 'gate-1');
+  assert.equal(f.manifest.directives[0].rootId, 'old-root', 'the input is not mutated');
+
+  f.manifest.rootSupervision.push({ rootId: plan.newRootId });
+  assert.throws(() => rootRecoveryPlan(f), /Destination root supervision already exists/);
+});

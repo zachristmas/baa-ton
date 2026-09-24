@@ -62,6 +62,13 @@ export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, sessi
     if (entry.rootId === newId) throw new Error('Destination root queue already exists');
     if (entry.rootId === oldRootId) Object.assign(entry, { rootId: newId, root: structuredClone(root) });
   }
+  // Per-root lane-admin state: pending directives and the capacity gate,
+  // alerts and watchdog follow the root, or they would be orphaned under the
+  // old id and never reach the recovered root.
+  const supervision = nextManifest.rootSupervision ?? [];
+  if (supervision.some(entry => entry.rootId === newId)) throw new Error('Destination root supervision already exists');
+  for (const entry of supervision) if (entry.rootId === oldRootId) entry.rootId = newId;
+  for (const directive of nextManifest.directives ?? []) if (directive.rootId === oldRootId) directive.rootId = newId;
   const sessions = nextManifest.rootSessionLogs ??= [];
   if (sessions.some(entry => entry.rootId === newId)) throw new Error('Destination root session already exists');
   const oldIndex = sessions.findIndex(entry => entry.rootId === oldRootId);
