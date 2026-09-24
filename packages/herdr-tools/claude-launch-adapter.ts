@@ -148,8 +148,10 @@ const LANE_PERMISSIONS = {
 
 /** PermissionRequest hook that approves known-safe Bash commands. */
 export const KNOWN_SAFE_HOOK = fileURLToPath(new URL("./known-safe-hook.mjs", import.meta.url));
-/** Audit log of the hook's approvals, next to the manifest. */
+/** Audit log of the hook's decisions, next to the manifest. */
 export const KNOWN_SAFE_LOG = "known-safe-approvals.jsonl";
+/** How long a routed prompt waits for the root before the normal prompt shows. */
+export const PERMISSION_ROUTE_WAIT_SECONDS = 600;
 
 /** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
 export const LANE_AUTO_MODE_ALLOW =
@@ -194,18 +196,28 @@ function buildClaudeLaunchArguments(
           ],
         },
       ],
-      // Answer permission prompts for commands the known-safe classifier
-      // accepts (temp-file cleanup, feature-branch setup). This must be a
+      // Answer permission prompts without a person at the pane: approve
+      // commands the known-safe classifier accepts (temp-file cleanup,
+      // feature-branch setup), and route everything else to the root as a
+      // lane request, waiting a bounded time for its answer. This must be a
       // PermissionRequest hook: a PreToolUse "allow" does not override an
       // ask rule in the operator's settings, a PermissionRequest decision
-      // does. Deny rules still apply, and anything else stays a prompt.
+      // does, and --permission-prompt-tool only applies to `-p` runs. Deny
+      // rules still apply; on timeout the normal prompt shows.
       PermissionRequest: [
         {
-          matcher: "Bash",
+          matcher: "*",
           hooks: [
             {
               type: "command",
-              command: `node ${JSON.stringify(KNOWN_SAFE_HOOK)} --log ${JSON.stringify(join(paths.scratchDirectory, KNOWN_SAFE_LOG))}`,
+              command: [
+                `node ${JSON.stringify(KNOWN_SAFE_HOOK)}`,
+                `--log ${JSON.stringify(join(paths.scratchDirectory, KNOWN_SAFE_LOG))}`,
+                `--bridge ${JSON.stringify(paths.bridge)}`,
+                `--intent ${JSON.stringify(intentPath)}`,
+                `--wait-seconds ${PERMISSION_ROUTE_WAIT_SECONDS}`,
+              ].join(" "),
+              timeout: PERMISSION_ROUTE_WAIT_SECONDS + 60,
             },
           ],
         },

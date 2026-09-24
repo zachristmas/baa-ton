@@ -735,9 +735,12 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
     for (const request of Array.isArray(workflow.laneRequests) ? workflow.laneRequests : []) {
       if (!isRecord(request) || request.status !== "open") continue;
       const status = latestLaneStatus(workflow, request.laneId);
-      if (status === "working") continue;
+      // A permission request is filed by the lane's PermissionRequest hook,
+      // which holds the tool call while it waits, so Herdr can report the
+      // lane as working even though it is stopped on the root's answer.
+      if (status === "working" && request.kind !== "permission") continue;
       reasons.push(
-        `lane ${workflow.id}/${request.laneId} (${status ?? "status unknown"}) waits on ${request.kind === "lease" ? "lease ask" : "request"} ${request.id}: ${clipText(request.summary ?? request.kind, 160)}`,
+        `lane ${workflow.id}/${request.laneId} (${status ?? "status unknown"}) waits on ${request.kind === "lease" ? "lease ask" : request.kind === "permission" ? "permission" : "request"} ${request.id}: ${clipText(request.summary ?? request.kind, 160)}`,
       );
     }
     for (const message of Array.isArray(workflow.messageRequests) ? workflow.messageRequests : []) {
