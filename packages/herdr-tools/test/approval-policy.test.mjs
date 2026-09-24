@@ -10,6 +10,7 @@ const {
   outsidePolicyReason,
   standingDecision,
   authorizeStanding,
+  approvalPolicySummary,
 } = await jiti.import("../approval-policy.ts");
 
 const policy = {
@@ -26,7 +27,7 @@ const profiled = { taskProfile: "implementation", lanes: [{ id: "lane-1" }] };
 
 test("a full policy validates and grants come back in canonical order", () => {
   const validated = validateApprovalPolicy({ ...policy, grants: [...policy.grants].reverse() });
-  assert.deepEqual(validated.grants, [...STANDING_GRANTS]);
+  assert.deepEqual(validated.grants, STANDING_GRANTS.filter((grant) => policy.grants.includes(grant)));
   assert.equal(validated.runtimeLaunch.commands[0].stop, "docker compose -p {lane} down");
 });
 
@@ -203,4 +204,22 @@ test("a dirty worktree keeps the acknowledgement but falls back", async () => {
   assert.equal(result.granted, false);
   assert.ok(result.ack, "the user did confirm the policy");
   assert.match(result.evidence.at(-1).text, /must be clean/);
+});
+
+test("local-validation is grantable, sorts last and leaves existing policy hashes alone", () => {
+  // The hash main computed for this policy before local-validation existed.
+  assert.equal(
+    approvalPolicyHash(validateApprovalPolicy({
+      version: 2,
+      grants: ["runtime-launch", "dispatch", "retry", "resume", "retire", "lease"],
+      runtimeLaunch: { commands: [{ name: "web", start: "npm run dev" }] },
+    })),
+    "c0e48f10d751aff87ae4bcb05a1d9af1929d04767027edbd8555f994a7c7c3ad",
+  );
+  const withValidation = validateApprovalPolicy({ version: 2, grants: ["local-validation", "dispatch"] });
+  assert.deepEqual(withValidation.grants, ["dispatch", "local-validation"]);
+  const summary = approvalPolicySummary(withValidation, approvalPolicyHash(withValidation));
+  assert.match(summary, /Local validation: a lane's frozen install, build, codegen, typecheck, lint and tests/);
+  assert.match(summary, /Always asks: package or lockfile edits, shared databases or services, push, merge/);
+  assert.doesNotMatch(approvalPolicySummary(validateApprovalPolicy(policy), "h"), /Local validation/);
 });

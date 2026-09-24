@@ -275,3 +275,141 @@ export function classifyCommand(command, options = {}) {
   }
   return rules.size ? { decision: "allow", rules: [...rules] } : { decision: "defer", reason: "no known-safe rule applies" };
 }
+
+/*
+ * Local validation (the `local-validation` approval grant): a lane's frozen
+ * install, build, codegen, typecheck, lint and tests in its own worktree,
+ * including headed browser tests. Package and lockfile edits, publish,
+ * deploy, release, production and migrations stay outside it, and so does
+ * any environment assignment that could point a command at a shared
+ * database or service.
+ */
+const VALIDATION_SCRIPT =
+  /^(?:build|compile|codegen|generate|gen|typecheck|type-check|check-types|types|tsc|lint|format:check|prettier:check|check|test|unit|e2e|playwright|storybook:build|(?:build|codegen|generate|gen|typecheck|lint|test|unit|e2e|playwright):[\w:.-]+)$/;
+const OUTSIDE_VALIDATION = /deploy|publish|release|prod|push|migrat|seed|reset|drop|upgrade|update|add|remove/i;
+const SAFE_ENV = /^(?:CI|FORCE_COLOR|NO_COLOR|DEBUG|TZ|HEADED|PWDEBUG|TURBO_FORCE|NODE_OPTIONS)=[\w.:,=/@+-]*$|^NODE_ENV=(?:test|development)$/;
+
+function scriptClass(name) {
+  if (!VALIDATION_SCRIPT.test(name) || OUTSIDE_VALIDATION.test(name)) return undefined;
+  const base = name.split(":")[0];
+  if (/^(build|compile|storybook)/.test(base)) return "build";
+  if (/^(codegen|generate|gen)$/.test(base)) return "codegen";
+  if (/^(typecheck|type-check|check-types|types|tsc|check)$/.test(base)) return "typecheck";
+  if (/^(lint|format|prettier)/.test(base)) return "lint";
+  return "test";
+}
+
+/** Strip a package-manager workspace selector: returns the remaining words. */
+function withoutWorkspaceSelector(manager, words) {
+  const rest = [...words];
+  while (rest.length) {
+    if (manager === "pnpm" && /^(?:--filter|-F)$/.test(rest[0]) && rest[1] && !rest[1].startsWith("-")) rest.splice(0, 2);
+    else if (manager === "pnpm" && /^(?:--filter=\S+|-r|--recursive|--parallel|--stream|--if-present|-w|--workspace-root)$/.test(rest[0])) rest.shift();
+    else if (manager === "npm" && /^(?:--workspace|-w)$/.test(rest[0]) && rest[1]) rest.splice(0, 2);
+    else if (manager === "npm" && /^(?:--workspace=\S+|--workspaces|-ws|--if-present)$/.test(rest[0])) rest.shift();
+    else if (manager === "yarn" && rest[0] === "workspace" && rest[1]) rest.splice(0, 2);
+    else if (manager === "yarn" && rest[0] === "workspaces" && rest[1] === "foreach") rest.splice(0, 2);
+    else break;
+  }
+  return rest;
+}
+
+const DIRECT_TOOLS = [
+  [/^tsc(\s|$)/, "typecheck"],
+  [/^vue-tsc(\s|$)/, "typecheck"],
+  [/^eslint(\s|$)/, "lint"],
+  [/^prettier (?:--check|-c)(\s|$)/, "lint"],
+  [/^biome (?:check|lint|ci)(\s|$)/, "lint"],
+  [/^vitest(?: run)?(\s|$)/, "test"],
+  [/^jest(\s|$)/, "test"],
+  [/^playwright test(\s|$)/, "e2e"],
+  [/^node --test(\s|$)/, "test"],
+  [/^turbo run \S/, "turbo"],
+  [/^turbo (?:build|test|lint|typecheck)(\s|$)/, "turbo"],
+  [/^next (?:build|lint)(\s|$)/, "build"],
+  [/^vite build(\s|$)/, "build"],
+  [/^graphql-codegen(\s|$)/, "codegen"],
+  [/^prisma generate(\s|$)/, "codegen"],
+];
+
+function validationSegment(segment, leasedPorts = []) {
+  let words = segment.split(/\s+/);
+  while (words.length && /^\w+=/.test(words[0])) {
+    const port = /^PORT=(\d+)$/.exec(words[0]);
+    if (port && !leasedPorts.includes(Number(port[1]))) return { reason: `PORT=${port[1]} is not one of this lane's leased ports` };
+    if (!port && !SAFE_ENV.test(words[0])) return { reason: `environment assignment ${words[0].split("=")[0]}` };
+    words.shift();
+  }
+  if (!words.length) return undefined;
+  const [first] = words;
+  let rest = words.slice(1);
+  let manager;
+  if (/^(npm|pnpm|yarn|bun)$/.test(first)) manager = first;
+  else if (first === "npx" || first === "bunx") return directTool(rest.filter((word) => word !== "--no-install").join(" "));
+  else return directTool(words.join(" "));
+  rest = withoutWorkspaceSelector(manager, rest);
+  const [command, ...args] = rest;
+  if (!command) return { reason: `${manager} with no command` };
+  // Frozen installs: never a package argument, never a lockfile rewrite.
+  if ((manager === "npm" && command === "ci") ||
+      (/^(install|i)$/.test(command) && manager !== "npm")) {
+    const frozen = args.some((arg) => /^--(?:frozen-lockfile|immutable)$/.test(arg)) || (manager === "npm" && command === "ci");
+    if (!frozen) return { reason: `${manager} ${command} without --frozen-lockfile` };
+    if (args.some((arg) => !arg.startsWith("-") || /^--(?:no-frozen-lockfile|fix-lockfile|lockfile-only|force)$/.test(arg)))
+      return { reason: `${manager} ${command} ${args.join(" ")}: package arguments or lockfile rewrites` };
+    return { validation: "install" };
+  }
+  if (manager === "pnpm" && command === "exec") return directTool(args.join(" "));
+  if (command === "turbo") return directTool(rest.join(" ")) ?? { reason: `${manager} turbo ${args.join(" ")}` };
+  if (manager === "yarn" && /^(tsc|eslint|vitest|jest|playwright|turbo)$/.test(command)) return directTool(rest.join(" "));
+  const script = command === "run" || command === "run-script" ? args[0] : command === "t" ? "test" : command;
+  if (!script) return { reason: `${manager} run with no script` };
+  const kind = scriptClass(script);
+  if (!kind) return { reason: `${manager} ${script} is not a validation script` };
+  const extra = command === "run" || command === "run-script" ? args.slice(1) : args;
+  if (manager === "pnpm" && extra[0] === "turbo") return directTool(extra.join(" "));
+  return { validation: kind };
+}
+
+function directTool(text) {
+  if (/^turbo /.test(text)) {
+    const tasks = text.replace(/^turbo (?:run )?/, "").split(/\s+/).filter((word) => !word.startsWith("-") && !word.includes("="));
+    const kinds = tasks.map(scriptClass);
+    if (!tasks.length || kinds.some((kind) => !kind)) return { reason: `turbo ${tasks.join(" ")} includes a task outside validation` };
+    return { validation: kinds[0] };
+  }
+  for (const [pattern, kind] of DIRECT_TOOLS) if (pattern.test(text)) return { validation: kind };
+  return undefined;
+}
+
+/**
+ * Classify one command against the local-validation grant.
+ * Options: cwd (the lane's worktree), leasedPorts (ports a PORT= assignment may use).
+ * Returns { matched: true, classes } or { matched: false, reason }.
+ */
+export function classifyLocalValidation(command, options = {}) {
+  if (typeof command !== "string" || !command.trim()) return { matched: false, reason: "empty command" };
+  const { segments, expandingBody } = commandSegments(command);
+  if (expandingBody || /`|\$\(|<\(|>\(/.test(command)) return { matched: false, reason: "command or process substitution" };
+  const classes = new Set();
+  for (const segment of segments) {
+    const redirect = redirectVerdict(segment);
+    if (redirect) return { matched: false, reason: redirect.reason };
+    const plain = stripRedirects(segment);
+    if (/^cd(\s|$)/.test(plain)) {
+      const cd = cdVerdict(plain, options);
+      if (cd) return { matched: false, reason: cd.reason };
+      continue;
+    }
+    const verdict = validationSegment(plain, options.leasedPorts);
+    if (verdict?.validation) {
+      classes.add(verdict.validation);
+      continue;
+    }
+    if (verdict?.reason) return { matched: false, reason: verdict.reason };
+    if (/\s--output\b|^sort\b.*\s-o/.test(plain)) return { matched: false, reason: `writes a file: ${segment.slice(0, 120)}` };
+    if (INERT.some((pattern) => pattern.test(plain)) || sedInert(plain)) continue;
+    return { matched: false, reason: `not a local validation command: ${segment.slice(0, 120)}` };
+  }
+  return classes.size ? { matched: true, classes: [...classes] } : { matched: false, reason: "no validation command" };
+}

@@ -14,6 +14,8 @@ export const STANDING_GRANTS = [
   "retire",
   "lease",
   "runtime-launch",
+  // Last, so adding it never reorders (and re-hashes) an existing policy.
+  "local-validation",
 ] as const;
 export type StandingGrant = (typeof STANDING_GRANTS)[number];
 export type StandingOperation = "dispatch" | "retry" | "resume";
@@ -229,7 +231,15 @@ export function approvalPolicySummary(policy: ApprovalPolicy, hash: string): str
     lines.push(
       `Runtime ${command.name}: ${command.start}${command.stop ? ` (stop: ${command.stop})` : ""}`,
     );
-  lines.push("Always asks: push, merge, deploy, production, close, sweep, reparent.");
+  if (policy.grants.includes("local-validation"))
+    lines.push(
+      "Local validation: a lane's frozen install, build, codegen, typecheck, lint and tests (headed browser tests too) in its own worktree and leased ports.",
+    );
+  lines.push(
+    policy.grants.includes("local-validation")
+      ? "Always asks: package or lockfile edits, shared databases or services, push, merge, deploy, production, close, sweep, reparent."
+      : "Always asks: push, merge, deploy, production, close, sweep, reparent.",
+  );
   return lines.join("\n");
 }
 

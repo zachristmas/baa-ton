@@ -129,6 +129,7 @@ import {
   resolveHerdrIdentity,
 } from "./live-identity.mjs";
 import { legacyStateStatus } from "./state-migration.mjs";
+import { classifyLocalValidation } from "./known-safe.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -2673,6 +2674,7 @@ function contract(workflow: Workflow, lane: Lane): string {
       : "Contract: work only in the assigned cwd; report concise progress, commands, tests, evidence, and blockers.",
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane.",
+    "Frozen installs, builds, codegen, typecheck, lint and tests in this worktree are routine: run them. When the root's policy grants local-validation, a permission prompt for one is answered by policy; never ask for them in chat.",
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
     "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
     "Ask for ports, database names, runtime launches and approvals with herdr_request (lease, runtime-launch, approval), never in chat; policy-matching requests are answered at once and the rest stay open until the root answers.",
@@ -3780,7 +3782,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function laneLeaseRefusal(
     cwd: string,
     ack: ApprovalPolicyAck | undefined,
-    grant: "lease" | "runtime-launch" | "retire" = "lease",
+    grant: "lease" | "runtime-launch" | "retire" | "local-validation" = "lease",
   ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
@@ -3809,12 +3811,46 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const leaveOpen = (why: string) => {
       request.note = `not answered by policy: ${why}`;
     };
+    const grant = () => {
+      request.status = "granted";
+      request.answeredBy = "policy";
+      request.answeredAt = now();
+      delete request.delivery;
+    };
+    // A lane's frozen install, build, codegen, typecheck, lint or tests in
+    // its own worktree, under the local-validation grant.
+    const validationCommand =
+      request.kind === "runtime-launch" && "command" in request.payload
+        ? request.payload.command
+        : request.kind === "permission" &&
+            "toolName" in request.payload &&
+            request.payload.toolName === "Bash" &&
+            typeof request.payload.input.command === "string"
+          ? request.payload.input.command
+          : undefined;
+    let validationReason: string | undefined;
+    if (validationCommand !== undefined) {
+      validationReason = laneLeaseRefusal(cwd, manifest.approvalPolicyAck, "local-validation");
+      if (!validationReason) {
+        const verdict = classifyLocalValidation(validationCommand, {
+          cwd: workflow.worktree ?? workflow.cwd,
+          leasedPorts: activeLeases(manifest.leases)
+            .filter((lease) => lease.workflowId === workflow.id && lease.laneId === request.laneId)
+            .flatMap((lease) => lease.ports ?? []),
+        });
+        if (verdict.matched) {
+          request.note = `local-validation: ${verdict.classes.join(", ")}`;
+          return grant();
+        }
+        validationReason = `not local validation (${verdict.reason})`;
+      }
+    }
     const refusal = laneLeaseRefusal(
       cwd,
       manifest.approvalPolicyAck,
       request.kind === "lease" ? "lease" : "runtime-launch",
     );
-    if (refusal) return leaveOpen(refusal);
+    if (refusal) return leaveOpen(validationReason ? `${validationReason}; ${refusal}` : refusal);
     if (request.kind === "lease" && "resource" in request.payload) {
       const config = runtimeConfigFor(cwd);
       if (!config) return leaveOpen("no runtime leases are configured");
@@ -3860,14 +3896,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               },
             );
       if (!matched)
-        return leaveOpen("the command matches no runtime template for this lane's leases");
+        return leaveOpen(
+          `${validationReason ? `${validationReason}; ` : ""}the command matches no runtime template for this lane's leases`,
+        );
       request.template = `${matched.template.name}:${matched.phase}`;
       request.note = `matches runtime template ${matched.template.name} (${matched.phase})`;
     }
-    request.status = "granted";
-    request.answeredBy = "policy";
-    request.answeredAt = now();
-    delete request.delivery;
+    grant();
   }
 
   type RequestParams = {
@@ -9780,7 +9815,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_policy",
     label: "Herdr Policy",
     description:
-      "Show or acknowledge the project's standing approvalPolicy in .baa-ton/config.json. Once the root acknowledges its hash, routine local dispatch, retry and resume inside it run without a native dialog. Push, merge, deploy, production, close and sweep always ask.",
+      "Show or acknowledge the project's standing approvalPolicy in .baa-ton/config.json. Once the root acknowledges its hash, routine local dispatch, retry and resume inside it run without a native dialog, and a local-validation grant answers lanes' frozen installs, builds, codegen, typecheck, lint and tests in their own worktrees. Push, merge, deploy, production, close and sweep always ask.",
     promptSnippet: "Show or acknowledge the standing approval policy.",
     promptGuidelines: [
       "Use herdr_policy action=show to inspect the standing approvalPolicy and whether its current hash is acknowledged. Use action=ack only from the root after showing the user the policy summary. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
@@ -9857,6 +9892,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet: "Open, check, list or answer formal lane requests.",
     promptGuidelines: [
       "A lane uses herdr_request action=open kind=lease|runtime-launch|approval instead of asking in chat; runtime-launch needs the exact command. Check an open request with action=status. The root uses action=list and action=answer decision=grant|deny for every open request it owes an answer.",
+      "Under a local-validation grant the root does not ask the user about a lane's frozen install, build, codegen, typecheck, lint or tests in its own worktree; policy answers those. The user still decides package or lockfile edits, shared databases or services, push, merge, deploy and production.",
     ],
     parameters: Type.Object({
       action: Type.Union([

@@ -10,7 +10,7 @@ const jiti = require("jiti")(import.meta.url);
 const { default: extension } = await jiti.import("../index.ts");
 const { validateApprovalPolicy, approvalPolicyHash } = await jiti.import("../approval-policy.ts");
 
-const policy = {
+const defaultPolicy = {
   version: 2,
   grants: ["dispatch", "lease", "runtime-launch"],
   runtimeLaunch: {
@@ -24,7 +24,7 @@ const runtime = {
   },
 };
 
-async function fixture() {
+async function fixture(policy = defaultPolicy, workflowFields = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-request-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
@@ -57,6 +57,7 @@ async function fixture() {
           { id: "lane-b", paneId: "w-req:p3", status: "running" },
         ],
         evidence: [],
+        ...workflowFields,
       }],
     }),
     { mode: 0o600 },
@@ -192,6 +193,101 @@ test("lane requests: policy answers what it can, the root answers the rest and t
     const kinds = final.evidence.map((item) => item.kind);
     for (const kind of ["lane-request-granted", "lane-request-opened", "lane-request-denied"])
       assert.ok(kinds.includes(kind), kind);
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("local-validation: policy answers a lane's routine checks in its worktree, so the root never has to ask", async () => {
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map((key) => [key, process.env[key]]),
+  );
+  const f = await fixture({ version: 2, grants: ["dispatch", "lease", "local-validation"] }, { cwd: "/work/tree", worktree: "/work/tree" });
+  const tools = new Map();
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w-req", HERDR_PLUGIN_CONFIG_DIR: f.configDir });
+  extension({
+    on() {},
+    registerCommand() {},
+    registerTool(definition) {
+      tools.set(definition.name, definition);
+    },
+    async exec(command, args) {
+      throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
+    },
+  });
+  const call = (params, pane, cwd) => {
+    process.env.HERDR_PANE_ID = pane;
+    return tools.get("herdr_request").execute("request", params, undefined, undefined, {
+      cwd,
+      mode: "json",
+      hasUI: false,
+      ui: { confirm: async () => false, notify() {} },
+    });
+  };
+  const asLaneA = (params) => call(params, "w-req:p2", join(f.directory, "elsewhere"));
+  const permission = (command) => asLaneA({ action: "open", kind: "permission", toolName: "Bash", input: { command } });
+  try {
+    await asLaneA({ action: "open", kind: "lease", resource: "app" });
+    for (const [command, classes] of [
+      ["pnpm install --frozen-lockfile", "install"],
+      ["cd /work/tree/apps/web && pnpm build && pnpm test", "build, test"],
+      ["pnpm --filter @example/orders codegen", "codegen"],
+      ["CI=1 PORT=47200 npx playwright test --headed", "e2e"],
+    ]) {
+      const result = await permission(command);
+      assert.equal(result.details.request.status, "granted", command);
+      assert.equal(result.details.request.answeredBy, "policy");
+      assert.equal(result.details.request.note, `local-validation: ${classes}`);
+    }
+    const launch = await asLaneA({ action: "open", kind: "runtime-launch", command: "npm run typecheck" });
+    assert.equal(launch.details.request.status, "granted", "a runtime-launch request for a check is covered too");
+
+    for (const [command, reason] of [
+      ["pnpm add lodash", /not local validation \(pnpm add is not a validation script\); approvalPolicy does not grant runtime-launch/],
+      ["DATABASE_URL=postgres://shared/db pnpm test", /environment assignment DATABASE_URL/],
+      ["PORT=5432 pnpm e2e", /PORT=5432 is not one of this lane's leased ports/],
+      ["cd /other/repo && pnpm test", /leaves the working directory/],
+      ["pnpm run deploy", /pnpm deploy is not a validation script/],
+    ]) {
+      const result = await permission(command);
+      assert.equal(result.details.request.status, "open", command);
+      assert.match(result.details.request.note, reason);
+    }
+    // Only the requests outside the grant reach the root.
+    const listed = await call({ action: "list" }, f.rootPane, f.parent);
+    assert.deepEqual(
+      listed.details.requests.map((request) => request.payload.input.command),
+      ["pnpm add lodash", "DATABASE_URL=postgres://shared/db pnpm test", "PORT=5432 pnpm e2e", "cd /other/repo && pnpm test", "pnpm run deploy"],
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("without the local-validation grant a routine check still goes to the root", async () => {
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map((key) => [key, process.env[key]]),
+  );
+  const f = await fixture();
+  const tools = new Map();
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w-req", HERDR_PLUGIN_CONFIG_DIR: f.configDir, HERDR_PANE_ID: "w-req:p2" });
+  extension({ on() {}, registerCommand() {}, registerTool: (definition) => tools.set(definition.name, definition), async exec() { throw new Error("unexpected"); } });
+  try {
+    const result = await tools.get("herdr_request").execute(
+      "request",
+      { action: "open", kind: "permission", toolName: "Bash", input: { command: "pnpm install --frozen-lockfile" } },
+      undefined,
+      undefined,
+      { cwd: join(f.directory, "elsewhere"), mode: "json", hasUI: false, ui: { confirm: async () => false, notify() {} } },
+    );
+    assert.equal(result.details.request.status, "open");
+    assert.match(result.details.request.note, /approvalPolicy does not grant local-validation; the command matches no runtime template/);
   } finally {
     for (const [key, value] of Object.entries(saved))
       if (value === undefined) delete process.env[key];
