@@ -50,3 +50,11 @@ export function codeFingerprint(root?: string): string;
 export function gitCommit(root?: string): string | undefined;
 export function recordRuntime(configDir: string | undefined, record: Record<string, unknown>): () => void;
 export function listRuntime(configDir: string | undefined): RuntimeRecord[];
+
+export type IdleLaneService = { workflowId: string; laneId: string; name: string; kind: string; where: string };
+export function idleLaneServices(workflows: unknown): IdleLaneService[];
+export function describeIdleServices(idle: IdleLaneService[], limit?: number): string;
+export function isHarnessCommand(command: unknown): boolean;
+export function laneFinished(lane: unknown): boolean;
+export function parseProcessIdentity(stdout: string): { start: string; command: string } | undefined;
+export function paneServiceProcesses(paneInfo: unknown): Array<{ pid: number; name: string }>;

@@ -151,6 +151,11 @@ isolation or clarity.
   typed in while the lane is idle and otherwise queued; the supervisor delivers it
   when the lane goes idle and never retypes an uncertain send. Answers to
   `herdr_request` records reach the lane the same way on their own.
+- A stack started outside a runtime-launch template (by hand in another pane, or in
+  the background) belongs to a lane only once it is registered with `herdr_service`
+  (a pane or a pid); then `herdr_retire` stops it, and capacity reports name
+  services still held by finished lanes. A lane registers its own; the root may
+  register for lanes it owns.
 - Retire finished lanes so they stop holding memory: `herdr_retire` runs the lane's
   granted runtime `stop` commands, closes its tab (ending the session, MCP bridge,
   LSP and tsserver processes) and releases its leases. It never removes a worktree.

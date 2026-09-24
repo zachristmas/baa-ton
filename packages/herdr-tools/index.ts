@@ -164,6 +164,11 @@ const {
   listRuntime,
   codeFingerprint,
   gitCommit,
+  describeIdleServices,
+  idleLaneServices,
+  isHarnessCommand,
+  paneServiceProcesses,
+  parseProcessIdentity,
 } = await importRouteChildMessage();
 // What this process loaded, captured once: herdr_doctor compares it (and the
 // other running pieces' records) with the checkout on disk.
@@ -3798,7 +3803,183 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     }
   }
 
-  type WorkflowWithRequests = Workflow & { laneRequests?: LaneRequest[]; laneMessages?: LaneMessage[] };
+  type WorkflowWithRequests = Workflow & {
+    laneRequests?: LaneRequest[];
+    laneMessages?: LaneMessage[];
+    laneServices?: LaneService[];
+  };
+
+  /** A service registered to a lane with herdr_service (see
+   * controller/lane-services.mjs); retire stops it. */
+  type LaneService = {
+    id: string;
+    laneId: string;
+    name: string;
+    kind: "pane" | "process";
+    paneId?: string;
+    pid?: number;
+    start?: string;
+    command?: string;
+    registeredBy: "lane" | "root";
+    registeredAt: string;
+    state: "active" | "stopped" | "released";
+    stoppedAt?: string;
+    stopNote?: string;
+  };
+
+  async function processIdentity(pid: number, signal?: AbortSignal) {
+    try {
+      const result = (await pi.exec("ps", ["-o", "lstart=,command=", "-p", String(pid)], { timeout: 10_000, signal })) as ExecResult;
+      return result.code === 0 ? parseProcessIdentity(result.stdout) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function serviceTool(
+    ctx: ExtensionContext,
+    params: {
+      action: "register" | "list" | "release";
+      workflowId?: string;
+      laneId?: string;
+      name?: string;
+      paneId?: string;
+      pid?: number;
+      serviceId?: string;
+    },
+    signal?: AbortSignal,
+  ) {
+    const child = isRegisteredChildLane() ? currentChildAssignment() : undefined;
+    let cwd: string;
+    let workflowId = params.workflowId;
+    let laneId = params.laneId;
+    let scope: ReturnType<typeof requireRootManifestExecutor> | undefined;
+    if (child) {
+      cwd = child.cwd;
+      if ((workflowId && workflowId !== child.workflow.workflow_id) || (laneId && laneId !== child.lane.lane_id))
+        throw new Error("A lane may register services only for itself.");
+      workflowId = child.workflow.workflow_id;
+      laneId = child.lane.lane_id;
+    } else {
+      scope = requireRootManifestExecutor(ctx.cwd);
+      cwd = ctx.cwd;
+    }
+    if (params.action === "list") {
+      const manifest = await loadManifest(cwd);
+      const services = manifest.workflows
+        .filter((workflow) => !workflowId || workflow.id === workflowId)
+        .flatMap((workflow) =>
+          ((workflow as WorkflowWithRequests).laneServices ?? [])
+            .filter((service) => !child || service.laneId === laneId)
+            .map((service) => ({ workflowId: workflow.id, ...service })),
+        );
+      return { kind: "list" as const, services, idle: child ? [] : idleLaneServices(manifest.workflows) };
+    }
+    if (!workflowId || !laneId) throw new Error("workflowId and laneId are required when the root registers or releases a service.");
+    if (params.action === "release") {
+      if (!params.serviceId) throw new Error("serviceId is required to release a service.");
+      return withManifestTransaction(cwd, (manifest) => {
+        const workflow = workflowFor(manifest, workflowId!) as WorkflowWithRequests;
+        if (scope && !workflowOwnedByRoot(workflow, scope, cwd)) throw new Error(`Workflow ${workflowId} is not owned by this root.`);
+        const service = workflow.laneServices?.find((item) => item.id === params.serviceId && item.laneId === laneId);
+        if (!service) throw new Error(`Unknown service ${params.serviceId} for lane ${laneId}.`);
+        if (service.state === "active") {
+          service.state = "released";
+          service.stoppedAt = now();
+          service.stopNote = "released without stopping";
+          workflow.evidence.push({ at: now(), kind: "lane-service-released", text: `${service.id} ${service.name} (${laneId})` });
+        }
+        return { kind: "service" as const, service: { ...service } };
+      });
+    }
+    const name = params.name?.trim();
+    if (!name || !/^[\w.:@/-]{1,60}$/.test(name)) throw new Error("name must be a short service name (letters, digits and . : @ / - _).");
+    if ((params.paneId === undefined) === (params.pid === undefined)) throw new Error("Give exactly one of paneId or pid.");
+    let identity: { start: string; command: string } | undefined;
+    if (params.pid !== undefined) {
+      const pid = params.pid;
+      if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || pid === process.ppid)
+        throw new Error(`pid ${pid} cannot be registered as a service.`);
+      identity = await processIdentity(pid, signal);
+      if (!identity) throw new Error(`No running process ${pid}.`);
+      if (isHarnessCommand(identity.command))
+        throw new Error(`pid ${pid} is an agent or Herdr/Baa-ton process, not a service.`);
+    } else {
+      const paneId = params.paneId!;
+      try {
+        await runHerdr(["pane", "get", paneId], signal);
+      } catch (error) {
+        throw new Error(`Pane ${paneId} is not available: ${clip((error as Error).message, 200)}`);
+      }
+    }
+    return withManifestTransaction(cwd, (manifest) => {
+      const workflow = workflowFor(manifest, workflowId!) as WorkflowWithRequests;
+      if (scope && !workflowOwnedByRoot(workflow, scope, cwd)) throw new Error(`Workflow ${workflowId} is not owned by this root.`);
+      const lane = workflow.lanes.find((item) => item.id === laneId);
+      if (!lane) throw new Error(`Workflow ${workflowId} has no lane ${laneId}.`);
+      if (params.paneId !== undefined && manifest.workflows.some((flow) => flow.lanes.some((item) => item.paneId === params.paneId)))
+        throw new Error(`Pane ${params.paneId} is a lane's own agent pane, not a service.`);
+      const services = (workflow.laneServices ??= []);
+      const duplicate = manifest.workflows
+        .flatMap((flow) => (flow as WorkflowWithRequests).laneServices ?? [])
+        .find(
+          (item) =>
+            item.state === "active" &&
+            (params.pid !== undefined ? item.pid === params.pid && item.start === identity!.start : item.paneId === params.paneId),
+        );
+      if (duplicate) throw new Error(`Already registered as ${duplicate.id} (${duplicate.name}, lane ${duplicate.laneId}).`);
+      const service: LaneService = {
+        id: `service-${randomUUID().slice(0, 8)}`,
+        laneId: laneId!,
+        name,
+        kind: params.pid !== undefined ? "process" : "pane",
+        ...(params.pid !== undefined ? { pid: params.pid, start: identity!.start, command: clip(identity!.command, 300) } : { paneId: params.paneId }),
+        registeredBy: child ? "lane" : "root",
+        registeredAt: now(),
+        state: "active",
+      };
+      services.push(service);
+      workflow.evidence.push({
+        at: service.registeredAt,
+        kind: "lane-service-registered",
+        text: `${service.id} ${name} for ${laneId}: ${service.kind === "pane" ? `pane ${service.paneId}` : `pid ${service.pid}`}`,
+      });
+      workflow.updatedAt = service.registeredAt;
+      return { kind: "service" as const, service: { ...service } };
+    });
+  }
+
+  /** Stop one registered service; never signals a reused pid or an agent. */
+  async function stopLaneService(service: LaneService, signal?: AbortSignal): Promise<{ ok: boolean; note: string }> {
+    const term = (pid: number) => {
+      try {
+        process.kill(pid, "SIGTERM");
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+    if (service.kind === "process") {
+      const identity = await processIdentity(service.pid!, signal);
+      if (!identity) return { ok: true, note: "already stopped" };
+      if (identity.start !== service.start) return { ok: true, note: `pid ${service.pid} now belongs to another process; not signalled` };
+      return term(service.pid!) ? { ok: true, note: `SIGTERM pid ${service.pid}` } : { ok: false, note: `could not signal pid ${service.pid}` };
+    }
+    let info: unknown;
+    try {
+      const raw = await runHerdr(["pane", "process-info", "--pane", service.paneId!], signal);
+      info = isRecord(raw) && isRecord(raw.result) ? raw.result : raw;
+    } catch (error) {
+      if (/not[ _-]?found|no such pane|unknown pane/i.test((error as Error).message)) return { ok: true, note: "pane is gone" };
+      return { ok: false, note: `pane process-info failed: ${clip((error as Error).message, 200)}` };
+    }
+    const processes = paneServiceProcesses(info);
+    if (!processes.length) return { ok: true, note: `nothing running in pane ${service.paneId}` };
+    const failed = processes.filter((item) => !term(item.pid));
+    return failed.length
+      ? { ok: false, note: `could not signal ${failed.map((item) => item.pid).join(", ")}` }
+      : { ok: true, note: `SIGTERM ${processes.map((item) => `${item.name} (${item.pid})`).join(", ")} in pane ${service.paneId}` };
+  }
 
   /** Root-to-lane message (herdr_tell). */
   type LaneMessage = {
@@ -4173,6 +4354,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     tabId?: string;
     cwd: string;
     stops: string[][];
+    services?: LaneService[];
   };
 
   function acknowledgedPolicy(cwd: string, ack: ApprovalPolicyAck | undefined) {
@@ -4217,6 +4399,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id,
             ),
           }),
+          services: ((workflow as WorkflowWithRequests).laneServices ?? []).filter(
+            (service) => service.laneId === lane.id && service.state === "active",
+          ),
         });
       }
     }
@@ -4265,6 +4450,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         stops.push({ command: tokens.join(" "), code: null, output: clip((error as Error).message, 500) });
       }
     }
+    const serviceStops: Array<{ id: string; ok: boolean; note: string }> = [];
+    for (const service of candidate.services ?? []) {
+      const result = await stopLaneService(service, signal);
+      serviceStops.push({ id: service.id, ...result });
+      stops.push({ command: `service ${service.name} (${service.id}): ${result.note}`, code: result.ok ? 0 : 1 });
+    }
     let tabClosed = false;
     let error: string | undefined;
     if (candidate.tabId)
@@ -4291,6 +4482,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             now(),
           )
         : [];
+      for (const stopped of serviceStops) {
+        const service = (workflow as WorkflowWithRequests).laneServices?.find((item) => item.id === stopped.id);
+        if (!service || service.state !== "active" || !stopped.ok) continue;
+        service.state = "stopped";
+        service.stoppedAt = now();
+        service.stopNote = stopped.note;
+      }
       record = {
         status: tabClosed && stopsOk ? "retired" : "partial",
         reason,
@@ -10141,6 +10339,43 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
+    name: "herdr_service",
+    label: "Herdr Service",
+    description:
+      "Register an existing Herdr pane or process as a lane's service so herdr_retire stops it and capacity reports name it while its lane is finished. Use it for stacks started outside a runtime-launch template (by hand in another pane, or in the background). A lane registers its own services; the root registers for lanes it owns. list shows registered services (and, for the root, services still held by finished lanes); release unregisters without stopping.",
+    promptSnippet: "Register a lane's dev server, database or other stack so retire stops it.",
+    promptGuidelines: [
+      "When a lane starts a long-running service outside herdr_request runtime-launch (a dev server in another pane, a database container, a background watcher), register it with herdr_service action=register name=<short name> and paneId or pid, so retiring the lane stops it. Agents and Herdr/Baa-ton processes cannot be registered.",
+    ],
+    parameters: Type.Object(
+      {
+        action: Type.Union([Type.Literal("register"), Type.Literal("list"), Type.Literal("release")]),
+        workflowId: Type.Optional(Type.String()),
+        laneId: Type.Optional(Type.String()),
+        name: Type.Optional(Type.String()),
+        paneId: Type.Optional(Type.String()),
+        pid: Type.Optional(Type.Integer()),
+        serviceId: Type.Optional(Type.String()),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await serviceTool(ctx, params, signal);
+      const describeService = (service: LaneService & { workflowId?: string }) =>
+        `${service.id} ${service.name} [${service.state}] ${service.workflowId ? `${service.workflowId}/` : ""}${service.laneId}: ${
+          service.kind === "pane" ? `pane ${service.paneId}` : `pid ${service.pid}${service.command ? ` (${clip(service.command, 80)})` : ""}`
+        }`;
+      const text =
+        result.kind === "list"
+          ? [
+              result.services.length ? result.services.map(describeService).join("\n") : "No registered services.",
+              describeIdleServices(result.idle),
+            ].filter(Boolean).join("\n")
+          : describeService(result.service);
+      return { content: [{ type: "text", text }], details: result };
+    },
+  });
+  pi.registerTool({
     name: "herdr_retire",
     label: "Herdr Retire",
     description:
@@ -10256,9 +10491,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ].filter(Boolean).join(", ")}`
           : "No capacity gate.";
       const now_ = `Now: ${JSON.stringify(current)}`;
+      const idleLine = async () => {
+        const idle = idleLaneServices((await loadManifest(ctx.cwd)).workflows);
+        return idle.length ? `\n${describeIdleServices(idle)}` : "";
+      };
       if (params.action === "status") {
         const gate = (await loadManifest(ctx.cwd)).rootSupervision?.find((item) => item.rootId === scope.rootId)?.capacityGate;
-        return { content: [{ type: "text", text: `${describe(gate)}\n${now_}` }], details: { gate, sample: current } };
+        return { content: [{ type: "text", text: `${describe(gate)}\n${now_}${await idleLine()}` }], details: { gate, sample: current } };
       }
       const gate = await withManifestTransaction(ctx.cwd, (manifest) => {
         const entries = (manifest.rootSupervision ??= []);
@@ -10296,7 +10535,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `${describe(gate)}\n${now_}${
+            text: `${describe(gate)}\n${now_}${params.action === "wait" ? await idleLine() : ""}${
               params.action === "wait" ? "\nEnd the turn; a digest reports 'capacity available' when the gate clears." : ""
             }`,
           },

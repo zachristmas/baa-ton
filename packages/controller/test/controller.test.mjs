@@ -4145,3 +4145,37 @@ test("the supervisor delivers queued root messages and held answers once a lane 
   assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t4" }), false, "nothing left to deliver");
   assert.equal(prompts.filter((prompt) => prompt.target === "w:p4").length, 0);
 });
+
+test("capacity escalation names services still held by finished lanes, without stopping them", async () => {
+  const s = await supervisionFixture({ gate: capacityGate, events: [workingEvent("2026-09-14T01:00:00.000Z")] });
+  const api = digestApi();
+  try {
+    const manifest = await s.fixture.manifest();
+    manifest.workflows.push({
+      id: "herdr-finished",
+      lanes: [
+        { id: "lane-done", status: "completed", completionReceipt: { id: "r-1" } },
+        { id: "lane-retired", status: "completed", completionReceipt: { id: "r-2" }, retirement: { status: "retired" } },
+        { id: "lane-live", status: "running" },
+      ],
+      laneServices: [
+        { id: "service-1", laneId: "lane-done", name: "web-dev", kind: "pane", paneId: "w-x:p7", state: "active" },
+        { id: "service-2", laneId: "lane-retired", name: "db", kind: "process", pid: 4242, state: "active" },
+        { id: "service-3", laneId: "lane-live", name: "api", kind: "process", pid: 4343, state: "active" },
+        { id: "service-4", laneId: "lane-done", name: "old", kind: "process", pid: 4444, state: "stopped" },
+      ],
+      laneRequests: [{ id: "request-1", laneId: "lane-done", status: "granted", template: "compose:start" }],
+    });
+    await writeFile(s.fixture.manifestPath, JSON.stringify(manifest));
+    await s.tick(16, api);
+    const notice = s.notices.find((item) => item.title.includes("capacity"));
+    assert.match(notice.body, /Services still held by finished lanes: web-dev \(herdr-finished\/lane-done, pane w-x:p7\); compose \(herdr-finished\/lane-done, runtime template\)\. Retire those lanes/);
+    assert.doesNotMatch(notice.body, /\bdb\b|\bapi\b|\bold\b/, "retired, live and stopped services are not named");
+    const alerts = (await s.supervision()).alerts;
+    assert.ok(alerts.some((alert) => alert.kind === "capacity-idle-services" || JSON.stringify(alert).includes("web-dev")), "the root's digest names them too");
+    const services = (await s.fixture.manifest()).workflows.find((item) => item.id === "herdr-finished").laneServices;
+    assert.equal(services[0].state, "active", "naming never stops a service");
+  } finally {
+    await s.fixture.cleanup();
+  }
+});
