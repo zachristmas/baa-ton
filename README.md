@@ -128,6 +128,7 @@ the current pane's root mapping; it does not reset concurrent roots.
 - Push, merge, deploy, and resource closure remain human-gated.
 - Routine local dispatch, retry and resume run without a dialog only under an `approvalPolicy` in `.baa-ton/config.json` that the root has acknowledged (`herdr_policy`); push, merge, deploy, production, close and sweep always ask.
 - Lanes ask for leases, runtime launches and approvals with `herdr_request`; policy-matching requests are answered at once and the rest stay open in the root digest until answered.
+- Finished lanes are retired (services stopped, tab and session closed, leases released) by `herdr_retire`, automatically under an acknowledged `retire` grant; worktrees are never removed by it.
 - Ports and service names come from `runtime.leases` in `.baa-ton/config.json` through `herdr_lease`; active leases never share a port or name, and close/sweep release them.
 - `herdr_sweep` is dry-run by default; execution requires the native confirmation dialog. A headless MCP caller must show the exact inventory and obtain approval before cleanup.
 

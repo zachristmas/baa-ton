@@ -175,3 +175,29 @@ export function openRequests(requests: LaneRequest[] | undefined): LaneRequest[]
     .filter((request) => request.status === "open")
     .sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
 }
+
+/** The stop commands a retiring lane should run: the `stop` of every runtime
+ * template this lane was granted a `start` for, expanded with its current
+ * leases, de-duplicated, as plain argv tokens. */
+export function retireStopCommands(
+  policy: ApprovalPolicy | undefined,
+  requests: LaneRequest[] | undefined,
+  context: TemplateContext,
+): string[][] {
+  if (!policy?.runtimeLaunch) return [];
+  const seen = new Set<string>();
+  const commands: string[][] = [];
+  for (const request of requests ?? []) {
+    if (request.laneId !== context.laneId || request.status !== "granted") continue;
+    const [name, phase] = (request.template ?? "").split(":");
+    if (phase !== "start") continue;
+    const template = policy.runtimeLaunch.commands.find((item) => item.name === name);
+    if (!template?.stop) continue;
+    const expanded = expandTemplate(template.stop, context);
+    const tokens = expanded === undefined ? undefined : plainCommandTokens(expanded);
+    if (!tokens || seen.has(tokens.join(" "))) continue;
+    seen.add(tokens.join(" "));
+    commands.push(tokens);
+  }
+  return commands;
+}

@@ -149,7 +149,13 @@ Updated 2026-09-23 with Zach's five additions (items 1-5 in his note), each from
      - Identical open requests from a lane are not duplicated.
      - The root answers with `action=answer decision=grant|deny`. Granting a lease allocates it. The answer is delivered to the lane pane with one non-waiting prompt, recorded as `answerDelivery`, and never retyped.
    - **`herdr_permission_prompt`** first asks `herdr_request` in policy-only mode. A matching Bash command is allowed and recorded; anything else keeps the existing deny-by-default broker path, with no second record.
-5. **Auto-retire (item 2)**: when a lane's completion is accepted and the policy grants `retire`, close its session, run its runtime `stop` commands and release its leases. The worktree stays.
+5. **Auto-retire (item 2)**: when a lane's completion is accepted and the policy grants `retire`, close its session, run its runtime `stop` commands and release its leases. The worktree stays. As built:
+   - **"Accepted"** means the lane's `herdr_complete` receipt was delivered to the root and the lane agent is not `working` or `blocked`. There was no explicit acceptance step to hook.
+   - **Who runs it:** the extension on the root side, not the controller, which by its invariants never closes resources. It runs on every `agent_settled` of a Pi root, which includes the turn that ends in a question to Zach. `herdr_retire` is the explicit path for any root, dry-run by default, with a confirmation unless `retire` is granted.
+   - **Stop commands** are the `stop` of every runtime template the lane was granted a `start` for (from `laneRequests`), run as plain argv (no shell) in the workflow's worktree or cwd with a 120 s timeout. `pi.exec` in the MCP bridge now honours `cwd`.
+   - **Closing the lane's tab** ends the agent session and its child processes. A tab shared with an unfinished lane is left alone.
+   - **Leases** are released only when every stop command exits 0. Otherwise the retirement is `partial` and the leases are kept, so the still-running service's ports can't be handed out again. The sweep releases them once the workflow is terminal.
+   - **The session log** records the lane as `retired`. As with any completed lane, `herdr_resume` does not resume it.
 6. **Directives with ack (item 4)**: directives to the root are stored in the manifest and delivered as urgent digest items.
    - They stay open until the root runs `herdr_directive ack`.
    - If the root finishes a turn without acking, the directive is re-sent once. If it is still unacked, Zach gets a `herdr notification show`.

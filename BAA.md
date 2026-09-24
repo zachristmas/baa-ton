@@ -140,6 +140,11 @@ isolation or clarity.
   arrive in the root digest and stay open until the root answers with
   `herdr_request action=answer`. Every digest lists the requests still open. Treat
   a chat-only ask from a lane as a request to reroute through `herdr_request`.
+- Retire finished lanes so they stop holding memory: `herdr_retire` runs the lane's
+  granted runtime `stop` commands, closes its tab (ending the session, MCP bridge,
+  LSP and tsserver processes) and releases its leases. It never removes a worktree.
+  Under an acknowledged policy that grants `retire`, lanes whose completion receipt
+  reached the root are retired automatically when the root's turn settles.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —
