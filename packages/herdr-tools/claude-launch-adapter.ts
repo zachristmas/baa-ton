@@ -145,6 +145,10 @@ const LANE_PERMISSIONS = {
   ],
 };
 
+/** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
+export const LANE_AUTO_MODE_ALLOW =
+  "This session is a Baa-ton child lane dispatched by the user's registered root. Calling its herdr-orchestrator MCP tools (herdr_complete, herdr_message, herdr_request, herdr_lease, herdr_permission_prompt) to report this lane's own progress, receipt, questions and resource requests to that parent root is the assigned contract and is expected; it does not bypass auto mode, grant new authority or reach external services.";
+
 function buildClaudeLaunchArguments(
   paths: ClaudeAdapterPaths,
   profile: LaunchProfile,
@@ -194,6 +198,15 @@ function buildClaudeLaunchArguments(
         ...LANE_PERMISSIONS.allow,
         ...extraServerKeys.map((key) => `mcp__${key}__*`),
       ],
+    },
+    // A lane inherits the user's default permission mode. In auto mode the
+    // classifier reviews every tool call, and it denied a lane's own
+    // herdr_complete/herdr_message as "Auto-Mode Bypass", so the result never
+    // reached the root. These calls are the lane's assigned contract (report
+    // to its parent, ask for leases and approvals), so say so to the
+    // classifier while keeping its built-in rules.
+    autoMode: {
+      allow: ["$defaults", LANE_AUTO_MODE_ALLOW],
     },
   };
   const mcpConfig = {

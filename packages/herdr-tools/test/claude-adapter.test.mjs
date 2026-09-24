@@ -116,6 +116,9 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
     assert.ok(
       settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)),
     );
+    assert.equal(settings.autoMode.allow[0], "$defaults", "built-in classifier rules are kept");
+    assert.match(settings.autoMode.allow[1], /herdr_complete, herdr_message/);
+    assert.match(settings.autoMode.allow[1], /does not bypass auto mode/);
     assert.equal(
       mcp.mcpServers["herdr-orchestrator"].args[0],
       "/bridge/mcp-server.mjs",
