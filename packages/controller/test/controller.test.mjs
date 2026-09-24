@@ -91,6 +91,23 @@ async function createFixture({
   questionRequests,
   messageRequests,
   siblingLane,
+  // Supervisor nudges need actionable work; by default a supervised goal
+  // has one open lane request the root has already seen in a digest.
+  laneRequests = parentGoal?.supervisor
+    ? [
+        {
+          id: "request-waiting",
+          workflowId: "herdr-bb029",
+          laneId: child.lane_id,
+          kind: "runtime-launch",
+          payload: { command: "npm run dev" },
+          summary: "runtime launch: npm run dev",
+          status: "open",
+          requestedAt: "2026-09-14T00:00:00.000Z",
+          delivery: { status: "delivered", attempts: 1, updatedAt: "2026-09-14T00:00:00.000Z" },
+        },
+      ]
+    : undefined,
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "herdr-controller-"));
   const stateDir = join(directory, "state");
@@ -138,6 +155,7 @@ async function createFixture({
         ...(approvalRequests ? { approvalRequests } : {}),
         ...(questionRequests ? { questionRequests } : {}),
         ...(messageRequests ? { messageRequests } : {}),
+        ...(laneRequests ? { laneRequests } : {}),
         ownership: {
           createdBy: "herdr-orchestrator",
           workspaceId: child.workspace_id,
@@ -1474,6 +1492,15 @@ test("a bootstrapped root supervises its parent manifest before any lane exists"
     )}\n`,
     { mode: 0o600 },
   );
+  // No lane yet, but a planned workflow is waiting to be dispatched.
+  const bootstrapManifest = await fixture.manifest();
+  bootstrapManifest.workflows.push({
+    id: "herdr-planned",
+    status: "planned",
+    taskBinding: { workspaceId: ROOT.workspace_id, rootPaneId: ROOT.pane_id, rootSessionPath: "root" },
+    lanes: [],
+  });
+  await writeFile(fixture.manifestPath, JSON.stringify(bootstrapManifest));
   const mock = await startHerdrMock((request) => {
     if (request.method === "agent.get") return rootAgentInfo();
     if (request.method === "agent.prompt") return { result: {} };
@@ -1499,7 +1526,7 @@ test("a bootstrapped root supervises its parent manifest before any lane exists"
   }
 });
 
-test("the Herdr-owned supervisor nudges only a due running parent goal and records delivery", async () => {
+test("the Herdr-owned supervisor nudges a due running parent goal, names why, and repeats each interval", async () => {
   const fixture = await createFixture({
     parentGoal: {
       version: 1,
@@ -1528,12 +1555,10 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
       assert.equal(Object.hasOwn(request.params, "wait"), false);
       assert.match(
         request.params.text,
-        /Parent goal parent-bb029 remains active/,
+        /Parent goal parent-bb029 is active and work is waiting on you:\n1\) lane herdr-bb029\/lane-child \(status unknown\) waits on request request-waiting: runtime launch: npm run dev/,
       );
-      assert.match(
-        request.params.text,
-        /Continue the active goal autonomously through as many safe local actions as needed/,
-      );
+      assert.match(request.params.text, /record a truthful goal state/);
+      assert.doesNotMatch(request.params.text, /observational only/);
       assert.doesNotMatch(
         request.params.text,
         /take at most one allowed parent action/,
@@ -1554,14 +1579,22 @@ test("the Herdr-owned supervisor nudges only a due running parent goal and recor
     const goal = (await fixture.manifest()).parentGoal;
     assert.equal(goal.supervisor.nudgeCount, 1);
     assert.equal(goal.supervisor.lastDelivery.status, "delivered");
-    assert.equal(goal.supervisor.nextNudgeAt, null);
+    assert.equal(goal.supervisor.nextNudgeAt, "2026-09-14T00:00:15.000Z");
     const second = await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr: client(mock),
       timestamp: "2026-09-14T00:00:01.000Z",
     });
-    assert.equal(second.results[0].status, "wake-suppressed");
+    assert.equal(second.results[0].status, "not-due");
     assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+    const third = await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: client(mock),
+      timestamp: "2026-09-14T00:00:15.000Z",
+    });
+    assert.equal(third.results[0].status, "delivered", "repeats one interval later while work waits");
+    assert.equal(requestsFor(mock, "agent.prompt").length, 2);
+    assert.equal((await fixture.manifest()).parentGoal.supervisor.nudgeCount, 2);
   } finally {
     await mock.close();
     await fixture.cleanup();
@@ -1663,7 +1696,8 @@ function dueParentGoal() {
     supervisor: {
       version: 1,
       state: "running",
-      intervalSeconds: 5,
+      // Longer than the 5 s recovery-tick steps: one nudge per window.
+      intervalSeconds: 60,
       nudgeCount: 0,
       nextNudgeAt: timestamp,
       createdAt: timestamp,
@@ -1807,7 +1841,7 @@ test("missing, active, unknown and mismatched root turns fail closed despite idl
   }
 });
 
-test("concurrent overdue ticks and process-style restarts consume exactly one idle wake", async () => {
+test("concurrent overdue ticks and process-style restarts consume exactly one idle wake per interval", async () => {
   const fixture = await createFixture({ parentGoal: dueParentGoal() });
   const api = recoveryApi();
   try {
@@ -1824,7 +1858,8 @@ test("concurrent overdue ticks and process-style restarts consume exactly one id
     );
     assert.equal(
       (await fixture.manifest()).parentGoal.supervisor.nextNudgeAt,
-      null,
+      "2026-09-14T00:01:00.000Z",
+      "the next nudge waits one full interval",
     );
   } finally {
     await fixture.cleanup();
@@ -1847,7 +1882,7 @@ test("a settled but unseen done root gets one wake without requiring user focus"
   }
 });
 
-test("legacy delivered/uncertain and interrupted sending receipts cannot be retried by ticks", async () => {
+test("delivered/uncertain and interrupted sending receipts are never followed within one interval", async () => {
   for (const status of ["delivered", "uncertain", "sending"]) {
     const fixture = await createFixture({ parentGoal: dueParentGoal() });
     const api = recoveryApi();
@@ -1863,14 +1898,16 @@ test("legacy delivered/uncertain and interrupted sending receipts cannot be retr
         control.lastDelivery.status,
         status === "sending" ? "uncertain" : status,
       );
-      if (status === "sending") assert.equal(control.nextNudgeAt, null);
+      if (status === "sending") assert.equal(control.nextNudgeAt, "2026-09-14T00:01:00.000Z");
+      await recoveryTick(fixture, api, 12);
+      assert.equal(api.prompts, 1, `${status}: the next nudge comes one interval later`);
     } finally {
       await fixture.cleanup();
     }
   }
 });
 
-test("definite unavailable-root recovery retries once but ambiguous delivery stays latched", async () => {
+test("an unavailable root is retried after an interval and an ambiguous send is never replayed early", async () => {
   const fixture = await createFixture({ parentGoal: dueParentGoal() });
   const api = recoveryApi();
   try {
@@ -1881,14 +1918,15 @@ test("definite unavailable-root recovery retries once but ambiguous delivery sta
     );
     assert.equal(
       (await fixture.manifest()).parentGoal.supervisor.nextNudgeAt,
-      "2026-09-14T00:00:05.000Z",
+      "2026-09-14T00:01:00.000Z",
     );
     api.available = true;
+    assert.equal((await recoveryTick(fixture, api, 1)).results[0].status, "not-due");
     assert.equal(
-      (await recoveryTick(fixture, api, 1)).results[0].status,
+      (await recoveryTick(fixture, api, 12)).results[0].status,
       "delivered",
     );
-    await recoveryTick(fixture, api, 2);
+    await recoveryTick(fixture, api, 13);
     assert.equal(api.prompts, 1);
     await patchSupervisor(fixture, {
       lastDelivery: {
@@ -1906,11 +1944,12 @@ test("definite unavailable-root recovery retries once but ambiguous delivery sta
         return api.request(method, params);
       },
     };
+    await patchSupervisor(fixture, { nextNudgeAt: "2026-09-14T00:00:00.000Z" });
     assert.equal(
-      (await recoveryTick(fixture, ambiguousApi, 3)).results[0].status,
+      (await recoveryTick(fixture, ambiguousApi, 24)).results[0].status,
       "uncertain",
     );
-    for (let step = 4; step < 8; step += 1)
+    for (let step = 25; step < 30; step += 1)
       await recoveryTick(fixture, ambiguousApi, step);
     assert.equal(
       api.prompts,
@@ -1935,13 +1974,13 @@ test("a real socket timeout after the supervisor nudge is sent yields one logica
     assert.equal(first.results[0].status, "uncertain");
     const supervisor = (await fixture.manifest()).parentGoal.supervisor;
     assert.equal(supervisor.lastDelivery.status, "uncertain");
-    assert.equal(supervisor.nextNudgeAt, null);
+    assert.equal(supervisor.nextNudgeAt, "2026-09-14T00:01:00.000Z");
     const second = await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr,
-      timestamp: "2026-09-14T00:05:00.000Z",
+      timestamp: "2026-09-14T00:00:30.000Z",
     });
-    assert.equal(second.results[0].status, "wake-suppressed");
+    assert.equal(second.results[0].status, "not-due");
     assert.equal(
       mock.prompts,
       1,
@@ -2273,61 +2312,144 @@ test("a long-working lane gets no stall signal, root wake, or lane prompt", asyn
   }
 });
 
-test("the supervisor never overwrites waiting, paused, blocked, or completed parent goals", async () => {
-  for (const status of [
-    "waiting-for-event",
-    "action-required",
-    "paused",
-    "blocked",
-    "completed",
-  ]) {
-    const fixture = await createFixture({
-      parentGoal: {
-        version: 1,
-        id: "parent-bb029",
-        objective: "Complete BB-029 safely.",
-        status,
-        nextAction: "Wait.",
-        signals: [],
-        supervisor: {
-          version: 1,
-          state: status === "paused" ? "paused" : "running",
-          intervalSeconds: 15,
-          nudgeCount: 0,
-          nextNudgeAt: "2026-09-14T00:00:00.000Z",
-          ...(status === "paused" ? { pauseReason: "Waiting for Zach." } : {}),
-          createdAt: "2026-09-14T00:00:00.000Z",
-          updatedAt: "2026-09-14T00:00:00.000Z",
-        },
-        createdAt: "2026-09-14T00:00:00.000Z",
-        updatedAt: "2026-09-14T00:00:00.000Z",
-      },
-    });
+function statusGoal(status) {
+  return {
+    version: 1,
+    id: "parent-bb029",
+    objective: "Complete BB-029 safely.",
+    status,
+    nextAction: "Wait.",
+    signals: [],
+    supervisor: {
+      version: 1,
+      state: status === "paused" ? "paused" : "running",
+      intervalSeconds: 15,
+      nudgeCount: 0,
+      nextNudgeAt: "2026-09-14T00:00:00.000Z",
+      ...(status === "paused" ? { pauseReason: "Waiting for Zach." } : {}),
+      createdAt: "2026-09-14T00:00:00.000Z",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    },
+    createdAt: "2026-09-14T00:00:00.000Z",
+    updatedAt: "2026-09-14T00:00:00.000Z",
+  };
+}
+
+const pendingQuestion = [{
+  id: "question-for-zach",
+  kind: "question",
+  status: "parent-question-required",
+  requestedAt: "2026-09-14T00:00:00.000Z",
+  question: "Which tenant should D19 use?",
+}];
+
+for (const [label, status, options, expected] of [
+  ["active with waiting work", "active", {}, "delivered"],
+  ["waiting-for-event with waiting work", "waiting-for-event", {}, "delivered"],
+  ["review-requested with waiting work", "review-requested", {}, "delivered"],
+  ["blocked with nothing pending for Zach", "blocked", {}, "delivered"],
+  ["action-required with nothing pending for Zach", "action-required", {}, "delivered"],
+  ["action-required while Zach owes an answer", "action-required", { questionRequests: pendingQuestion }, "quiet:awaiting-user"],
+  ["blocked even with a pending question when work waits", "blocked", { questionRequests: pendingQuestion }, "delivered"],
+  ["completed", "completed", {}, "quiet:goal-completed"],
+  ["paused", "paused", {}, "not-running"],
+  ["waiting-for-event with no actionable work", "waiting-for-event", { laneRequests: [] }, "quiet:no-actionable-work"],
+]) {
+  test(`supervisor nudge rule: ${label} -> ${expected}`, async () => {
+    const fixture = await createFixture({ parentGoal: statusGoal(status), ...options });
+    const api = recoveryApi();
     try {
       const result = await runSupervisorTick({
         stateDir: fixture.stateDir,
-        herdr: {
-          async request() {
-            throw new Error("terminal goals must not wake");
-          },
-        },
+        herdr: api,
         timestamp: "2026-09-14T00:00:00.000Z",
       });
-      assert.equal(result.results[0].status, "not-active");
+      const [kind, reason] = expected.split(":");
+      assert.equal(result.results[0].status, kind);
+      if (reason) assert.equal(result.results[0].reason, reason);
+      assert.equal(api.prompts, kind === "delivered" ? 1 : 0);
       const goal = (await fixture.manifest()).parentGoal;
-      assert.equal(
-        goal.status,
-        status,
-        "a stale tick must not overwrite parent lifecycle state",
-      );
-      assert.equal(
-        goal.supervisor.lastDelivery,
-        undefined,
-        "inactive goals are never nudged",
-      );
+      assert.equal(goal.status, status, "a tick never rewrites the goal's lifecycle state");
     } finally {
       await fixture.cleanup();
     }
+  });
+}
+
+test("a nudge names each waiting item: lane requests, lease asks, unread messages, plans, queue and directives", async () => {
+  const fixture = await createFixture({
+    parentGoal: statusGoal("waiting-for-event"),
+    laneRequests: [
+      { id: "request-lease", workflowId: "herdr-bb029", laneId: CHILD.lane_id, kind: "lease", payload: { resource: "app" }, summary: "lease app", status: "open", requestedAt: "t", delivery: { status: "delivered", updatedAt: "t" } },
+    ],
+    messageRequests: [
+      { ...pendingMessage("message-uncertain", "Port 3610 busy.", "2026-09-13T23:00:00.000Z"), delivery: { status: "uncertain", attempts: 1, updatedAt: "2026-09-13T23:00:01.000Z" } },
+    ],
+  });
+  const manifest = await fixture.manifest();
+  manifest.workflows.push({ id: "herdr-next", status: "planned", taskBinding: { workspaceId: ROOT.workspace_id, rootPaneId: ROOT.pane_id, rootSessionPath: "root" }, lanes: [] });
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  manifest.directives = [{ id: "directive-sweep", rootId: config.orchestrators[0].id, from: "zach", text: "Sweep finished lanes.", createdAt: "t", status: "open", sends: 1, sentAt: "2026-09-14T00:00:00.000Z", delivery: { status: "delivered", attempts: 1, updatedAt: "t" } }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const texts = [];
+  const api = recoveryApi();
+  const capture = {
+    async request(method, params) {
+      if (method === "agent.prompt") texts.push(params.text);
+      return api.request(method, params);
+    },
+  };
+  try {
+    await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:00:00.000Z" });
+    const nudge = texts.find((text) => text.startsWith("[Baa-ton supervisor]"));
+    assert.ok(nudge);
+    assert.match(nudge, /is waiting-for-event and work is waiting on you/);
+    assert.match(nudge, /lane herdr-bb029\/lane-child \(status unknown\) waits on lease ask request-lease: lease app/);
+    assert.match(nudge, /child message message-uncertain from herdr-bb029\/lane-child is possibly unseen: Port 3610 busy\./);
+    assert.match(nudge, /workflow herdr-next is planned but not dispatched/);
+    assert.match(nudge, /directive directive-sweep from zach is open: Sweep finished lanes\./);
+    assert.doesNotMatch(nudge, /observational only/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a lane that is working on its own request does not count as waiting", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("active") });
+  const manifest = await fixture.manifest();
+  manifest.workflows[0].eventController = { version: 1, events: [{ identity: "e1", received_at: "2026-09-14T00:00:00.000Z", workflow_id: "herdr-bb029", lane_id: CHILD.lane_id, pane_id: CHILD.pane_id, classification: "unclassified", source: { agent_status: "working" }, wake: { status: "not-required", attempts: 0, updated_at: "t" } }] };
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const api = recoveryApi();
+  try {
+    const result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
+    assert.deepEqual([result.results[0].status, result.results[0].reason], ["quiet", "no-actionable-work"]);
+    assert.equal(api.prompts, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a pre-repeat goal with a long interval is capped to 300 s once; a chosen interval is kept", async () => {
+  const legacy = await createFixture({
+    parentGoal: { ...statusGoal("active"), supervisor: { ...statusGoal("active").supervisor, intervalSeconds: 1200, nextNudgeAt: "2026-09-14T00:20:00.000Z" } },
+  });
+  const chosen = await createFixture({
+    parentGoal: { ...statusGoal("active"), supervisor: { ...statusGoal("active").supervisor, intervalSeconds: 1200, intervalPolicy: 2, nextNudgeAt: "2026-09-14T00:20:00.000Z" } },
+  });
+  const api = recoveryApi();
+  try {
+    await runSupervisorTick({ stateDir: legacy.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
+    await runSupervisorTick({ stateDir: chosen.stateDir, herdr: api, timestamp: "2026-09-14T00:00:00.000Z" });
+    const legacyControl = (await legacy.manifest()).parentGoal.supervisor;
+    assert.deepEqual(
+      [legacyControl.intervalSeconds, legacyControl.intervalPolicy, legacyControl.nextNudgeAt],
+      [300, 2, "2026-09-14T00:05:00.000Z"],
+    );
+    const chosenControl = (await chosen.manifest()).parentGoal.supervisor;
+    assert.deepEqual([chosenControl.intervalSeconds, chosenControl.nextNudgeAt], [1200, "2026-09-14T00:20:00.000Z"]);
+  } finally {
+    await legacy.cleanup();
+    await chosen.cleanup();
   }
 });
 
@@ -2417,14 +2539,14 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
 
     rootAvailable = true;
     // No new hook recurs for this pane; only the root becoming ready again
-    // and a routine tick should be needed to recover the pending wake, even
-    // though the supervisor itself skips a review-requested goal.
+    // and a routine tick should be needed to recover the pending wake. The
+    // digest is this tick's wake, so the supervisor does not also nudge.
     const tick = await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr: client(mock),
       timestamp: "2026-09-14T00:05:00.000Z",
     });
-    assert.equal(tick.results[0].status, "not-active");
+    assert.equal(tick.results[0].status, "digest-delivered");
     assert.deepEqual(tick.pendingWakes, [
       {
         manifestPath: fixture.manifestPath,
@@ -2445,13 +2567,17 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
     assert.equal(events[0].wake.status, "delivered");
     assert.equal(events[0].wake.attempts, 1);
 
-    // A second tick must not redeliver an already-drained wake.
+    // A second tick must not redeliver an already-drained wake. (It may
+    // send a supervisor nudge: the fixture's open lane request still waits.)
     await runSupervisorTick({
       stateDir: fixture.stateDir,
       herdr: client(mock),
       timestamp: "2026-09-14T00:10:00.000Z",
     });
-    assert.equal(requestsFor(mock, "agent.prompt").length, 1);
+    assert.equal(
+      requestsFor(mock, "agent.prompt").filter((request) => request.params.text.startsWith("[Baa-ton digest]")).length,
+      1,
+    );
   } finally {
     await mock.close();
     await fixture.cleanup();
@@ -2787,6 +2913,13 @@ test("shared manifests isolate routed completion signals, mismatch checks, and s
 
     // Re-arm independent supervisors and verify each due nudge is delivered to
     // its own root, not to the root that happened to be processed first.
+    // Each root has one waiting request in its own workflow.
+    for (const [workflowId, laneId] of [["herdr-bb029", CHILD.lane_id], ["herdr-b", childB.lane_id]])
+      after.workflows.find((workflow) => workflow.id === workflowId).laneRequests = [{
+        id: `request-${workflowId}`, workflowId, laneId, kind: "approval", payload: { text: "ok?" },
+        summary: "approval: ok?", status: "open", requestedAt: timestamp,
+        delivery: { status: "delivered", attempts: 1, updatedAt: timestamp },
+      }];
     for (const [key, root] of [["root-a", ROOT], ["root-b", rootB]]) {
       const scopedGoal = after.parentGoals[key];
       scopedGoal.status = "active";
@@ -3627,9 +3760,42 @@ test("an interrupted send in a manifest is not replayed after a neighbouring man
   const api = digestApi();
   try {
     await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:02:00.000Z" });
-    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("message-interrupted")).length, 0);
+    assert.equal(
+      api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]") && prompt.text.includes("message-interrupted")).length,
+      0,
+      "the interrupted digest delivery is not replayed (a supervisor nudge may point at it as possibly unseen)",
+    );
     const stored = await fixture.manifest();
     assert.equal(stored.workflows[0].messageRequests[0].delivery.status, "uncertain");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a due nudge never lands mid-turn and goes out on the first tick after the root settles", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("waiting-for-event") });
+  const api = recoveryApi();
+  try {
+    await patchSupervisor(fixture, { rootTurn: rootTurn("active") });
+    for (const second of [0, 5, 10])
+      assert.equal(
+        (await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: `2026-09-14T00:00:${String(second).padStart(2, "0")}.000Z` })).results[0].status,
+        "root-turn-not-idle",
+      );
+    assert.equal(api.prompts, 0);
+    api.status = "working";
+    await patchSupervisor(fixture, { rootTurn: { ...rootTurn("idle"), updatedAt: "2026-09-14T00:00:12.000Z" } });
+    assert.equal(
+      (await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:00:14.000Z" })).results[0].status,
+      "root-not-idle",
+      "live Herdr working still vetoes",
+    );
+    api.status = "idle";
+    assert.equal(
+      (await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:00:30.000Z" })).results[0].status,
+      "delivered",
+    );
+    assert.equal(api.prompts, 1);
   } finally {
     await fixture.cleanup();
   }

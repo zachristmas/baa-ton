@@ -604,6 +604,100 @@ function configuredMappings(config) {
   );
 }
 
+const DEFAULT_NUDGE_INTERVAL_SECONDS = 300;
+const NUDGE_INTERVAL_POLICY = 2;
+const QUIET_PARENT_GOAL_STATUSES = new Set(["completed", "paused"]);
+
+/**
+ * One-time upgrade for goals written before the repeating nudge: an interval
+ * above the 300 s default is lowered to it. Goals the extension wrote under
+ * the new policy (intervalPolicy 2) keep whatever interval was chosen.
+ */
+function upgradeNudgeInterval(supervisor, timestamp) {
+  if (supervisor.intervalPolicy === NUDGE_INTERVAL_POLICY) return false;
+  supervisor.intervalPolicy = NUDGE_INTERVAL_POLICY;
+  if (supervisor.intervalSeconds > DEFAULT_NUDGE_INTERVAL_SECONDS) {
+    supervisor.intervalSeconds = DEFAULT_NUDGE_INTERVAL_SECONDS;
+    const capped = nextNudgeAt(timestamp, DEFAULT_NUDGE_INTERVAL_SECONDS);
+    if (supervisor.nextNudgeAt && Date.parse(supervisor.nextNudgeAt) > Date.parse(capped))
+      supervisor.nextNudgeAt = capped;
+  }
+  supervisor.updatedAt = timestamp;
+  return true;
+}
+
+function latestLaneStatus(workflow, laneId) {
+  const events = Array.isArray(workflow?.eventController?.events) ? workflow.eventController.events : [];
+  for (let index = events.length - 1; index >= 0; index -= 1)
+    if (events[index].lane_id === laneId) return events[index].source?.agent_status;
+  return undefined;
+}
+
+/** Questions or approvals Zach still owes an answer on, for this root. */
+function pendingForUser(manifest, owned) {
+  const questions = [
+    ...(Array.isArray(manifest.questionRequests) ? manifest.questionRequests : []),
+    ...owned.flatMap((workflow) => (Array.isArray(workflow.questionRequests) ? workflow.questionRequests : [])),
+  ].filter((request) => isRecord(request) && request.status === "parent-question-required");
+  const approvals = owned
+    .flatMap((workflow) => (Array.isArray(workflow.approvalRequests) ? workflow.approvalRequests : []))
+    .filter((request) => isRecord(request) && request.status === "parent-approval-required");
+  return [...questions.map((request) => request.id), ...approvals.map((request) => request.id)];
+}
+
+/**
+ * Whether the supervisor should nudge this root, and why. Quiet for
+ * completed and paused goals, and for action-required while Zach owes an
+ * answer. Otherwise it nudges only when there is actionable work, and the
+ * reasons name it.
+ */
+export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
+  if (QUIET_PARENT_GOAL_STATUSES.has(goal.status)) return { quiet: `goal-${goal.status}` };
+  const routes = orchestrator.workflows.filter(
+    (route) => resolve(route.manifest_path) === resolve(manifestPath),
+  );
+  const routedIds = new Set(routes.map((route) => route.workflow_id));
+  const owned = (Array.isArray(manifest.workflows) ? manifest.workflows : []).filter(
+    (workflow) =>
+      isRecord(workflow) &&
+      (routedIds.has(workflow.id) ||
+        (workflow.taskBinding?.rootPaneId === orchestrator.root.pane_id &&
+          workflow.taskBinding?.workspaceId === orchestrator.root.workspace_id)),
+  );
+  const awaitingUser = pendingForUser(manifest, owned);
+  if (goal.status === "action-required" && awaitingUser.length)
+    return { quiet: "awaiting-user", awaitingUser };
+  const reasons = [];
+  for (const workflow of owned) {
+    for (const request of Array.isArray(workflow.laneRequests) ? workflow.laneRequests : []) {
+      if (!isRecord(request) || request.status !== "open") continue;
+      const status = latestLaneStatus(workflow, request.laneId);
+      if (status === "working") continue;
+      reasons.push(
+        `lane ${workflow.id}/${request.laneId} (${status ?? "status unknown"}) waits on ${request.kind === "lease" ? "lease ask" : "request"} ${request.id}: ${clipText(request.summary ?? request.kind, 160)}`,
+      );
+    }
+    for (const message of Array.isArray(workflow.messageRequests) ? workflow.messageRequests : []) {
+      const status = message?.delivery?.status ?? "pending";
+      if (status === "pending" || status === "uncertain")
+        reasons.push(`child message ${message.id} from ${workflow.id}/${message.laneId} is ${status === "pending" ? "unread" : "possibly unseen"}: ${clipText(message.summary ?? "", 160)}`);
+    }
+    if (workflow.status === "planned")
+      reasons.push(`workflow ${workflow.id} is planned but not dispatched`);
+  }
+  try {
+    const pendingQueue = (queueStore(manifest)?.items ?? []).filter((item) => item.state === "pending");
+    if (pendingQueue.length)
+      reasons.push(`queue items waiting: ${pendingQueue.slice(0, 5).map((item) => item.id).join(", ")}${pendingQueue.length > 5 ? ` (+${pendingQueue.length - 5})` : ""}`);
+  } catch {
+    // A malformed queue is reported by its own readers; it is not a reason to nudge.
+  }
+  for (const directive of openDirectives(manifest, orchestrator))
+    reasons.push(`directive ${directive.id} from ${directive.from} is open: ${clipText(directive.text, 160)}`);
+  if (!reasons.length) return { quiet: "no-actionable-work", awaitingUser };
+  return { reasons, awaitingUser };
+}
+
 const SUPERVISOR_DIAGNOSTICS_NAME = "supervisor-diagnostics.json";
 const MAX_SUPERVISOR_DIAGNOSTICS = 50;
 const DIAGNOSTIC_REFRESH_MS = 60_000;
@@ -903,12 +997,15 @@ function validateSupervisor(supervisor) {
       "lastDelivery",
       "rootActivity",
       "rootTurn",
+      "intervalPolicy",
     ],
   );
   assert(
     value.version === 1,
     "manifest.parentGoal.supervisor.version must be 1.",
   );
+  if ("intervalPolicy" in value)
+    assert(value.intervalPolicy === 2, "manifest.parentGoal.supervisor.intervalPolicy must be 2.");
   assert(
     SUPERVISOR_STATES.has(value.state),
     "manifest.parentGoal.supervisor.state is invalid.",
@@ -2869,16 +2966,17 @@ export async function routeChildMessage(options = {}) {
   }
 }
 
-function supervisorWakeText(goal) {
+function supervisorWakeText(goal, reasons = []) {
   return [
-    `[Herdr Orchestrator supervisor] Parent goal ${goal.id} remains active.`,
+    `[Baa-ton supervisor] Parent goal ${goal.id} is ${goal.status} and work is waiting on you:`,
+    ...reasons.map((reason, index) => `${index + 1}) ${reason}`),
     `Objective: ${goal.objective}`,
     `Next action: ${goal.nextAction}`,
-    "Continue the active goal autonomously through as many safe local actions as needed; update or pause it only when waiting for an external event, blocked, paused, or complete. Do not dispatch, resume, close, push, merge, create a PR, deploy, or mutate production without explicit user approval.",
-  ].join(" ");
+    "Handle these now through safe local actions, or record a truthful goal state: completed, paused, or action-required with the question for Zach. Do not push, merge, create a PR, deploy, or mutate production without explicit user approval.",
+  ].join("\n");
 }
 
-async function deliverSupervisorNudge(goal, root, herdr) {
+async function deliverSupervisorNudge(goal, root, herdr, reasons) {
   try {
     const rootInfo = await herdr.request("agent.get", { target: root.target });
     const agent = rootAgent(rootInfo, root);
@@ -2903,7 +3001,7 @@ async function deliverSupervisorNudge(goal, root, herdr) {
   try {
     await herdr.request("agent.prompt", {
       target: root.target,
-      text: supervisorWakeText(goal),
+      text: supervisorWakeText(goal, reasons),
     });
     return { status: "delivered", reason: "agent_prompt_accepted" };
   } catch (error) {
@@ -2926,7 +3024,14 @@ async function deliverSupervisorNudge(goal, root, herdr) {
 function nudgeDue(supervisor, timestamp) {
   if (supervisor.state !== "running" || supervisor.nextNudgeAt === null)
     return false;
-  const dueAt = Date.parse(supervisor.nextNudgeAt);
+  let dueAt = Date.parse(supervisor.nextNudgeAt);
+  // A delivered or possibly-delivered nudge (including legacy one-shot
+  // records) is never followed by another within one full interval.
+  const last = supervisor.lastDelivery;
+  if (last && (last.status === "delivered" || last.status === "uncertain")) {
+    const earliest = Date.parse(last.attemptedAt) + supervisor.intervalSeconds * 1000;
+    if (Number.isFinite(earliest)) dueAt = Math.max(dueAt, earliest);
+  }
   return Number.isFinite(dueAt) && dueAt <= Date.parse(timestamp);
 }
 
@@ -3181,37 +3286,53 @@ export async function runSupervisorTick({
         continue;
       }
       const supervisor = goal.supervisor;
-      // A supervisor is a nudge for an actively-owned next action only. It
-      // must never revive waiting, paused, blocked, or completed parent goals.
-      if (goal.status !== "active" || supervisor.state !== "running") {
-        results.push({ manifestPath, status: "not-active" });
+      const persist = async () => {
+        supervisor.updatedAt = timestamp;
+        goal.updatedAt = timestamp;
+        await atomicWriteJson(manifestPath, manifest);
+      };
+      if (upgradeNudgeInterval(supervisor, timestamp)) await persist();
+      if (supervisor.state !== "running") {
+        results.push({ manifestPath, status: "not-running" });
         continue;
       }
+      // An interrupted send may have reached the root: it is never replayed,
+      // and the next nudge waits a full interval.
       if (supervisor.lastDelivery?.status === "sending") {
         supervisor.lastDelivery = {
           status: "uncertain",
           attemptedAt: supervisor.lastDelivery.attemptedAt,
           reason: "interrupted_root_delivery_requires_parent_review",
         };
-        supervisor.nextNudgeAt = null;
-        supervisor.updatedAt = timestamp;
-        goal.updatedAt = timestamp;
-        await atomicWriteJson(manifestPath, manifest);
+        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+        await persist();
         results.push({ manifestPath, status: "uncertain" });
         continue;
       }
-      // A successful or ambiguous send consumes this wake authorization forever,
-      // including old manifests that still contain a periodic nextNudgeAt.
-      if (
-        ["delivered", "uncertain"].includes(supervisor.lastDelivery?.status)
-      ) {
-        results.push({ manifestPath, status: "wake-suppressed" });
+      const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath });
+      if (decision.quiet) {
+        results.push({ manifestPath, status: "quiet", reason: decision.quiet });
         continue;
       }
-      // A digest sent on this tick already woke the root; the Pi turn record
-      // has not caught up yet, so a nudge now would be a second prompt.
+      // A digest sent on this tick already woke the root; it counts as this
+      // interval's wake, so the next nudge waits a full interval.
       if (digest.status === "delivered" || digest.status === "uncertain") {
+        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+        await persist();
         results.push({ manifestPath, status: "digest-delivered" });
+        continue;
+      }
+      // A digest still collecting updates will wake the root shortly; a
+      // nudge now would arrive first and repeat the same items.
+      if (digest.status === "deferred" && digest.reason === COLLECTING_UPDATES) {
+        results.push({ manifestPath, status: "digest-collecting" });
+        continue;
+      }
+      // Goals parked under the old rule have no schedule: start one now.
+      if (supervisor.nextNudgeAt === null) {
+        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+        await persist();
+        results.push({ manifestPath, status: "scheduled" });
         continue;
       }
       if (!nudgeDue(supervisor, timestamp)) {
@@ -3310,6 +3431,7 @@ export async function runSupervisorTick({
         goal,
         orchestrator.root,
         api,
+        decision.reasons,
       );
       supervisor.lastDelivery = {
         status: outcome.status,
@@ -3320,13 +3442,10 @@ export async function runSupervisorTick({
       if (outcome.status === "delivered") {
         supervisor.nudgeCount += 1;
         supervisor.lastNudgeAt = supervisor.lastDelivery.deliveredAt;
-      } else if (outcome.status === "pending") {
-        // Only a definite pre-delivery failure is retryable.
-        supervisor.nextNudgeAt = nextNudgeAt(
-          timestamp,
-          supervisor.intervalSeconds,
-        );
       }
+      // Repeat while the condition holds: every outcome, including an
+      // uncertain send, waits one full interval before the next nudge.
+      supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
       supervisor.updatedAt = timestamp;
       goal.updatedAt = supervisor.updatedAt;
       await atomicWriteJson(manifestPath, manifest);

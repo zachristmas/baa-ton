@@ -496,6 +496,8 @@ export type ParentGoalSupervisor = {
   version: 1;
   state: ParentGoalSupervisorState;
   intervalSeconds: number;
+  /** 2: interval chosen under the repeating-nudge policy (default 300 s). */
+  intervalPolicy?: 2;
   nudgeCount: number;
   nextNudgeAt: string | null;
   createdAt: string;

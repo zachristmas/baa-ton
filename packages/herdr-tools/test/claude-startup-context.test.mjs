@@ -34,7 +34,10 @@ async function fixture(run, mutate = () => {}) {
       process.execPath, [helper], {
         env: { ...process.env, HERDR_ENV: "1", BAA_STARTUP_INTENT: intentPath,
           HERDR_PANE_ID: "w22:p6", HERDR_WORKSPACE_ID: "w22", ...env },
-        input: JSON.stringify(input), encoding: "utf8", timeout: 10000,
+        input: JSON.stringify(input), encoding: "utf8",
+        // Generous: the hermetic runner starts test files in parallel, and a
+        // loaded machine can take seconds to boot Node. Status is still asserted.
+        timeout: 30000,
       },
     );
     await run({ invoke, intentPath, lane });
@@ -169,7 +172,7 @@ for (const wrong of ["session", "manifest-pane", "missing-resume"]) {
 test("no startup intent produces no task context", () => {
   const env = { ...process.env };
   delete env.BAA_STARTUP_INTENT;
-  const result = spawnSync(process.execPath, [helper], { env, input: "{}", encoding: "utf8", timeout: 10000 });
+  const result = spawnSync(process.execPath, [helper], { env, input: "{}", encoding: "utf8", timeout: 30000 });
   assert.equal(result.status, 0);
   assert.equal(result.stdout, "");
 });

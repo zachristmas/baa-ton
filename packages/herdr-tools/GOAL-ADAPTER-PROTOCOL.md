@@ -20,24 +20,44 @@ For a deduplicated actionable lane event (`done`, `blocked`, `goal-paused`, or a
 
 ## Supervisor wake protocol
 
-The supervisor is a **one-shot recovery wake**, not a periodic reminder. Its interval controls when eligible work is checked, not how frequently a delivered goal is re-injected.
+The supervisor is a **repeating nudge while work waits on the root**. It exists so a root cannot park itself out of supervision: it keeps nudging, once per interval, for as long as there is actionable work and the goal is not deliberately quiet.
 
-- Eligibility requires an `active` goal, a `running` supervisor, an overdue `nextNudgeAt`, and an identity-matched `rootTurn.state: idle` written by the root Pi extension. Live Herdr identity and `idle`/`done` readiness are checked again before sending. (`done` is Herdr's unseen ready state.)
-- `before_agent_start` / `agent_start` persist `rootTurn: active`, including a run ID and root pane/workspace binding. Every tool and model turn, automatic retry, compaction retry, and queued continuation stays inside that active run. Only `agent_settled` with `ctx.isIdle()` and the matching active run may persist idle.
-- `tool_execution_end`, `turn_end`, `agent_end`, and Herdr `pane.agent_status_changed` hooks do **not** grant idle authority. Herdr activity is retained separately as telemetry. Silence never expires an active run into idle.
-- Startup/reload/shutdown invalidate idle authority to `unknown`; they never re-arm a delivered wake. Missing lifecycle evidence (including older Pi versions without `agent_settled`, and non-Pi/MCP-only roots) fails closed for supervisor nudges. Generic lane-event notifications remain harness-neutral and unchanged.
-- Before prompting, the controller durably writes `lastDelivery: sending` and clears `nextNudgeAt` under the shared manifest lock. Successful delivery stays latched; the next root run records `acknowledgedAt`. Neither acknowledgement, settlement, repeated ticks, nor controller restart clears the latch. Legacy delivered records are suppressed even if they still contain an old periodic due time.
-- A definite pre-delivery unavailability/readiness failure remains `pending` with a later due time. An ambiguous send or interrupted `sending` record becomes/stays `uncertain` and is never automatically replayed.
-- A material root `set-state` change (status, objective, or next action) may authorize another delivered wake when work becomes active. Identical `set-state` and repeated `start` on an already running supervisor are idempotent. Uncertain delivery requires explicit reviewed `stop`/`start` (or pause/start) recovery; work edits alone cannot replay it.
-- Waiting-for-event, action-required, blocked, completed, paused, and stopped states never receive supervisor nudges. Pause clears the due time, and lifecycle activity cannot restart it.
+- **When it stays quiet:**
+  - the goal is `completed` or `paused`, or the supervisor is `stopped`/`paused`;
+  - the goal is `action-required` while Zach actually owes an answer: an open parent question (`parent-question-required`) or approval (`parent-approval-required`) for this root. An open ask dialog shows as Herdr `blocked`, which vetoes delivery below.
+- **When it nudges:** every other status (`active`, `waiting-for-event`, `review-requested`, `blocked`, and `action-required` with nothing pending for Zach), but only when there is actionable work:
+  - an open lane request, including a lease ask, from a lane whose latest recorded event is not `working`;
+  - a child message still `pending` or `uncertain`;
+  - a workflow `planned` but not dispatched;
+  - a pending queue item;
+  - an open directive.
+- **What the nudge says:** it names each waiting item, with request, message, workflow and directive IDs, and asks the root to handle them or record a truthful goal state. There is no "observational only" wording.
+- **Idle-only delivery (unchanged):**
+  - An overdue `nextNudgeAt` and an identity-matched `rootTurn.state: idle` written by the root Pi extension are required.
+  - Live Herdr identity and `idle`/`done` readiness are checked again before sending (`done` is Herdr's unseen ready state). A root that is `working` or `blocked` is never prompted, and a due nudge never lands mid-turn; it waits for the next settled turn.
+  - `before_agent_start`/`agent_start` persist `rootTurn: active`, including a run ID and root pane/workspace binding. Every tool and model turn, automatic retry, compaction retry and queued continuation stays inside that active run.
+  - Only `agent_settled` with `ctx.isIdle()` and the matching active run may persist idle. `tool_execution_end`, `turn_end`, `agent_end` and Herdr `pane.agent_status_changed` hooks do **not** grant idle authority, and silence never expires an active run into idle.
+  - Startup, reload and shutdown invalidate idle authority to `unknown`. Missing lifecycle evidence (older Pi without `agent_settled`, non-Pi/MCP-only roots) fails closed for nudges.
+- **Cadence:**
+  - Each outcome (delivered, pending, or uncertain) schedules the next nudge one full interval later.
+  - After a delivered or uncertain send, including legacy one-shot records, no nudge comes sooner than `lastDelivery.attemptedAt + intervalSeconds`, whatever `nextNudgeAt` says.
+  - A digest delivered on the same tick counts as that interval's wake. A digest still collecting updates suppresses the nudge, because it is about to wake the root.
+  - A running goal with no schedule gets one, starting one interval from now.
+- **Send safety (unchanged):**
+  - Before prompting, the controller durably writes `lastDelivery: sending` under the shared manifest lock.
+  - An interrupted `sending` record becomes `uncertain` and is never replayed. The next nudge is a new one, a full interval later.
+- **Interval:**
+  - The default is 300 s and is still configurable per goal (`nudgeIntervalSeconds`, 5-86400); a newer extension records it with `intervalPolicy: 2`.
+  - Goals written before this policy have no marker. The controller lowers an interval above 300 s to 300 once, pulls `nextNudgeAt` in accordingly and records the marker. Goals with the marker keep their chosen interval.
+- **Goal-state writes:** `set-state` to `blocked` no longer stops the supervisor; only `completed` does, and `pause` still clears the due time. A material `set-state` change reschedules the next nudge for any status other than `completed` or `paused`. Identical `set-state` and repeated `start` on a running supervisor are idempotent.
 
 Lifecycle writes use the existing sibling manifest lock and atomic rename. They wait at most 10 seconds for lock contention, without polling agents or starting background jobs. Failure to persist active authority aborts the Pi run rather than silently continuing with stale idle evidence. A failed idle write leaves supervision suppressed.
 
 ### Rollout and limits
 
-Update the controller and reload the root extension together (controller first is fail-closed); this source change does not install, enable, or reload either live component. Old controllers strictly reject the new optional fields. After reload a real root run must settle before recovery nudges become eligible. A crashed run does not become idle on a timeout; restart plus fresh lifecycle evidence is required, and uncertain sends still require explicit review.
+Update the controller and reload the root extension together, controller first: an old controller strictly rejects the new optional `intervalPolicy` field (fail-closed); this source change does not install, enable, or reload either live component. Old controllers strictly reject the new optional fields. After reload a real root run must settle before recovery nudges become eligible. A crashed run does not become idle on a timeout; restart plus fresh lifecycle evidence is required, and uncertain sends still require explicit review.
 
-The native `agent.prompt` transport is not an atomic compare-and-submit against Pi lifecycle or editor contents. The final live readiness check plus durable one-shot latch prevents repeated interruption, but cannot eliminate the narrow race with a newly submitted user turn or protect unsent editor text. A draft-safe conditional prompt API would be needed for that stronger guarantee. A prompt already submitted before pause cannot be recalled.
+The native `agent.prompt` transport is not an atomic compare-and-submit against Pi lifecycle or editor contents. The final live readiness check, the idle-only gate and the one-interval floor after each send limit interruption, but cannot eliminate the narrow race with a newly submitted user turn or protect unsent editor text. A draft-safe conditional prompt API would be needed for that stronger guarantee. A prompt already submitted before pause cannot be recalled.
 
 ## Parent mediation
 
