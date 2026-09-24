@@ -135,6 +135,7 @@ const LANE_PERMISSIONS = {
     "mcp__herdr-orchestrator__herdr_complete",
     // Leases are enforced by the tool itself (own lane only, policy-gated).
     "mcp__herdr-orchestrator__herdr_lease",
+    "mcp__herdr-orchestrator__herdr_request",
   ],
   deny: [
     "Bash(git push:*)",

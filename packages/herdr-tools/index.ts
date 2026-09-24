@@ -114,6 +114,15 @@ import {
   type Lease,
 } from "./leases.js";
 import {
+  matchRuntimeCommand,
+  openRequests,
+  requestKey,
+  requestPayload,
+  requestSummary,
+  type LaneRequest,
+  type LaneRequestKind,
+} from "./lane-requests.js";
+import {
   applyHerdrIdentity,
   currentAppliedHerdrIdentity,
   resolveHerdrIdentity,
@@ -2466,6 +2475,7 @@ function contract(workflow: Workflow, lane: Lane): string {
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane.",
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
     "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
+    "Ask for ports, database names, runtime launches and approvals with herdr_request (lease, runtime-launch, approval), never in chat; policy-matching requests are answered at once and the rest stay open until the root answers.",
     "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
     `Before ending, you MUST call herdr_complete({ workflowId: "${workflow.id}", summary: "<outcome, evidence, blockers>" }) exactly once after verifying the work. A chat-only outcome is insufficient and does not complete this lane.`,
     "Then state the same outcome/evidence clearly. Generic Herdr done events are fallback-only; the durable herdr_complete receipt is required for normal completion.",
@@ -3567,18 +3577,273 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
 
   /** Why a lane may not take a lease by itself, or undefined when the
    * acknowledged approvalPolicy grants `lease`. */
-  function laneLeaseRefusal(cwd: string, ack: ApprovalPolicyAck | undefined) {
+  function laneLeaseRefusal(
+    cwd: string,
+    ack: ApprovalPolicyAck | undefined,
+    grant: "lease" | "runtime-launch" = "lease",
+  ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
     try {
       const policy = validateApprovalPolicy(raw);
-      if (!policy.grants.includes("lease")) return "approvalPolicy does not grant lease";
+      if (!policy.grants.includes(grant)) return `approvalPolicy does not grant ${grant}`;
       if (ack?.hash !== approvalPolicyHash(policy))
         return "approvalPolicy is not acknowledged by the root";
       return undefined;
     } catch (error) {
       return `approvalPolicy is invalid: ${(error as Error).message}`;
     }
+  }
+
+  type WorkflowWithRequests = Workflow & { laneRequests?: LaneRequest[] };
+
+  /** Answer a new request from the acknowledged policy, or leave it open
+   * with the reason in `note`. */
+  async function answerFromPolicy(
+    cwd: string,
+    manifest: ManifestWithQueue,
+    workflow: WorkflowWithRequests,
+    request: LaneRequest,
+  ): Promise<void> {
+    if (request.kind === "approval") return;
+    const leaveOpen = (why: string) => {
+      request.note = `not answered by policy: ${why}`;
+    };
+    const refusal = laneLeaseRefusal(
+      cwd,
+      manifest.approvalPolicyAck,
+      request.kind === "lease" ? "lease" : "runtime-launch",
+    );
+    if (refusal) return leaveOpen(refusal);
+    if (request.kind === "lease" && "resource" in request.payload) {
+      const config = runtimeConfigFor(cwd);
+      if (!config) return leaveOpen("no runtime leases are configured");
+      try {
+        const { lease } = await allocateLease(
+          (manifest.leases ??= []),
+          config,
+          {
+            resource: request.payload.resource,
+            label: request.payload.label,
+            workflowId: workflow.id,
+            laneId: request.laneId,
+            grantedBy: "lane-policy",
+          },
+          { probe: probePort, now },
+        );
+        request.leaseId = lease.id;
+        request.note = leaseLines([lease])[0];
+      } catch (error) {
+        return leaveOpen((error as Error).message);
+      }
+    } else {
+      const command =
+        "command" in request.payload
+          ? request.payload.command
+          : "toolName" in request.payload &&
+              request.payload.toolName === "Bash" &&
+              typeof request.payload.input.command === "string"
+            ? request.payload.input.command
+            : undefined;
+      const matched =
+        command === undefined
+          ? undefined
+          : matchRuntimeCommand(
+              validateApprovalPolicy(loadTaskProfileConfig(cwd)?.approvalPolicy),
+              command,
+              {
+                workflowId: workflow.id,
+                laneId: request.laneId,
+                leases: activeLeases(manifest.leases).filter(
+                  (lease) => lease.workflowId === workflow.id && lease.laneId === request.laneId,
+                ),
+              },
+            );
+      if (!matched)
+        return leaveOpen("the command matches no runtime template for this lane's leases");
+      request.template = `${matched.template.name}:${matched.phase}`;
+      request.note = `matches runtime template ${matched.template.name} (${matched.phase})`;
+    }
+    request.status = "granted";
+    request.answeredBy = "policy";
+    request.answeredAt = now();
+    delete request.delivery;
+  }
+
+  type RequestParams = {
+    action: "open" | "status" | "list" | "answer";
+    kind?: LaneRequestKind;
+    resource?: string;
+    label?: string;
+    command?: string;
+    text?: string;
+    toolName?: string;
+    input?: Record<string, unknown>;
+    requestId?: string;
+    decision?: "grant" | "deny";
+    note?: string;
+    includeAnswered?: boolean;
+    /** Bridge-only: a permission prompt that no policy matches stays with the
+     * existing permission broker instead of opening a second record. */
+    policyOnly?: boolean;
+  };
+
+  async function requestTool(
+    ctx: ExtensionContext,
+    params: RequestParams,
+    signal?: AbortSignal,
+  ): Promise<
+    | { kind: "list"; requests: LaneRequest[] }
+    | { kind: "request"; request: LaneRequest; created?: boolean }
+    | { kind: "unmatched"; reason: string }
+  > {
+    if (params.action === "open" || params.action === "status") {
+      if (!isRegisteredChildLane())
+        throw new Error(`herdr_request action=${params.action} is for a registered child lane.`);
+      const child = currentChildAssignment();
+      const cwd = child.cwd;
+      const workflowId = child.workflow.workflow_id;
+      const laneId = child.lane.lane_id;
+      const release = await acquireManifestLock(cwd, 10_000);
+      try {
+        const manifest = await loadManifest(cwd);
+        const workflow = workflowFor(manifest, workflowId) as WorkflowWithRequests;
+        if (!workflow.lanes.some((lane) => lane.id === laneId))
+          throw new Error("Child assignment differs from the authoritative manifest.");
+        const requests = (workflow.laneRequests ??= []);
+        if (params.action === "status") {
+          const request = requests.find((item) => item.id === params.requestId);
+          if (!request || request.laneId !== laneId)
+            throw new Error(`Unknown request ${params.requestId} for this lane.`);
+          return { kind: "request", request };
+        }
+        if (!params.kind) throw new Error("kind is required to open a request.");
+        const payload = requestPayload(params.kind, params);
+        const key = requestKey(params.kind, payload);
+        const duplicate = requests.find(
+          (item) =>
+            item.laneId === laneId &&
+            item.status === "open" &&
+            requestKey(item.kind, item.payload) === key,
+        );
+        if (duplicate) return { kind: "request", request: duplicate, created: false };
+        const stamp = now();
+        const request: LaneRequest = {
+          id: `request-${randomUUID().slice(0, 8)}`,
+          workflowId,
+          laneId,
+          kind: params.kind,
+          payload,
+          summary: requestSummary(params.kind, payload),
+          status: "open",
+          requestedAt: stamp,
+          delivery: { status: "pending", updatedAt: stamp },
+        };
+        await answerFromPolicy(cwd, manifest, workflow, request);
+        if (params.policyOnly && request.status === "open")
+          return { kind: "unmatched", reason: request.note ?? "not answered by policy" };
+        requests.push(request);
+        workflow.evidence.push({
+          at: stamp,
+          kind: request.status === "open" ? "lane-request-opened" : "lane-request-granted",
+          text: `${request.id} ${laneId}: ${request.summary}${request.note ? ` (${request.note})` : ""}`,
+        });
+        workflow.updatedAt = stamp;
+        await saveManifest(cwd, manifest);
+        return { kind: "request", request, created: true };
+      } finally {
+        await release();
+      }
+    }
+    requireRootManifestExecutor(ctx.cwd);
+    const cwd = ctx.cwd;
+    if (params.action === "list") {
+      const manifest = await loadManifest(cwd);
+      const all = manifest.workflows.flatMap(
+        (workflow) => (workflow as WorkflowWithRequests).laneRequests ?? [],
+      );
+      return {
+        kind: "list",
+        requests: params.includeAnswered
+          ? all.sort((a, b) => a.requestedAt.localeCompare(b.requestedAt))
+          : openRequests(all),
+      };
+    }
+    if (!params.requestId || !params.decision)
+      throw new Error("requestId and decision are required to answer a request.");
+    let answered: LaneRequest;
+    let paneId: string | undefined;
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const manifest = await loadManifest(cwd);
+      const workflow = manifest.workflows.find((item) =>
+        (item as WorkflowWithRequests).laneRequests?.some((request) => request.id === params.requestId),
+      ) as WorkflowWithRequests | undefined;
+      const request = workflow?.laneRequests?.find((item) => item.id === params.requestId);
+      if (!workflow || !request) throw new Error(`Unknown lane request ${params.requestId}.`);
+      if (request.status !== "open") return { kind: "request", request };
+      let note = params.note?.trim() ?? "";
+      if (params.decision === "grant" && request.kind === "lease" && "resource" in request.payload) {
+        const config = runtimeConfigFor(cwd);
+        if (!config) throw new Error("No runtime leases are configured in .baa-ton/config.json.");
+        const { lease } = await allocateLease(
+          (manifest.leases ??= []),
+          config,
+          {
+            resource: request.payload.resource,
+            label: request.payload.label,
+            workflowId: workflow.id,
+            laneId: request.laneId,
+            grantedBy: "root",
+          },
+          { probe: probePort, now },
+        );
+        request.leaseId = lease.id;
+        note = [note, leaseLines([lease])[0]].filter(Boolean).join("; ");
+      }
+      request.status = params.decision === "grant" ? "granted" : "denied";
+      request.answeredBy = "root";
+      request.answeredAt = now();
+      if (note) request.note = note;
+      else delete request.note;
+      workflow.evidence.push({
+        at: now(),
+        kind: `lane-request-${request.status}`,
+        text: `${request.id} ${request.laneId}: ${request.summary}${request.note ? ` (${request.note})` : ""}`,
+      });
+      workflow.updatedAt = now();
+      paneId = workflow.lanes.find((lane) => lane.id === request.laneId)?.paneId;
+      await saveManifest(cwd, manifest);
+      answered = { ...request };
+    } finally {
+      await release();
+    }
+    // Non-waiting delivery after the durable answer; never retyped on failure.
+    let delivery: NonNullable<LaneRequest["answerDelivery"]>;
+    try {
+      if (!paneId) throw new Error("the lane has no recorded pane");
+      await runHerdr(
+        [
+          "agent",
+          "prompt",
+          paneId,
+          `[Baa-ton request answer] ${answered.id}: ${answered.status}. ${answered.summary}${answered.note ? `. ${answered.note}` : ""}`,
+        ],
+        signal,
+      );
+      delivery = { status: "delivered", updatedAt: now() };
+    } catch (error) {
+      delivery = { status: "uncertain", updatedAt: now(), reason: clip((error as Error).message, 500) };
+    }
+    await withManifestTransaction(cwd, (manifest) => {
+      const stored = (
+        manifest.workflows.find((item) => item.id === answered.workflowId) as
+          | WorkflowWithRequests
+          | undefined
+      )?.laneRequests?.find((item) => item.id === answered.id);
+      if (stored) stored.answerDelivery = delivery;
+    });
+    return { kind: "request", request: { ...answered, answerDelivery: delivery } };
   }
 
   async function leaseTool(
@@ -8966,6 +9231,60 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         text = result.released
           ? `Released ${result.lease.id}.`
           : `${result.lease.id} was already released.`;
+      return { content: [{ type: "text", text }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_request",
+    label: "Herdr Request",
+    description:
+      "Formal lane requests. A lane opens lease, runtime-launch or approval requests (the bridge opens permission requests); requests that match the acknowledged approvalPolicy are answered immediately, the rest reach the root digest and stay open until the root answers. The root lists open requests and answers them.",
+    promptSnippet: "Open, check, list or answer formal lane requests.",
+    promptGuidelines: [
+      "A lane uses herdr_request action=open kind=lease|runtime-launch|approval instead of asking in chat; runtime-launch needs the exact command. Check an open request with action=status. The root uses action=list and action=answer decision=grant|deny for every open request it owes an answer.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([
+        Type.Literal("open"),
+        Type.Literal("status"),
+        Type.Literal("list"),
+        Type.Literal("answer"),
+      ]),
+      kind: Type.Optional(
+        Type.Union([
+          Type.Literal("lease"),
+          Type.Literal("runtime-launch"),
+          Type.Literal("approval"),
+          Type.Literal("permission"),
+        ]),
+      ),
+      resource: Type.Optional(Type.String()),
+      label: Type.Optional(Type.String()),
+      command: Type.Optional(Type.String()),
+      text: Type.Optional(Type.String()),
+      toolName: Type.Optional(Type.String()),
+      input: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+      requestId: Type.Optional(Type.String()),
+      decision: Type.Optional(Type.Union([Type.Literal("grant"), Type.Literal("deny")])),
+      note: Type.Optional(Type.String()),
+      includeAnswered: Type.Optional(Type.Boolean()),
+      policyOnly: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await requestTool(ctx, params, signal);
+      const describe = (request: LaneRequest) =>
+        `${request.id} [${request.status}${request.answeredBy ? ` by ${request.answeredBy}` : ""}] ${request.workflowId}/${request.laneId}: ${request.summary}${request.note ? ` (${request.note})` : ""}`;
+      const text =
+        result.kind === "list"
+          ? result.requests.length
+            ? result.requests.map(describe).join("\n")
+            : "No open lane requests."
+          : result.kind === "unmatched"
+            ? `No policy match: ${result.reason}`
+            : describe(result.request) +
+              (result.request.status === "open"
+                ? "\nOpen: the root will answer; do not repeat the request in chat."
+                : "");
       return { content: [{ type: "text", text }], details: result };
     },
   });

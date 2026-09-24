@@ -42,10 +42,10 @@ Replace all placeholders with real opaque IDs and the absolute workflow manifest
 
 ## Root digests
 
-Lane `done`, `blocked` and `goal-paused` events and child messages are not sent one by one. The dispatcher (`dispatchRootDigest`) sends everything the root has not seen as one `[Baa-ton digest]` prompt:
+Lane `done`, `blocked` and `goal-paused` events, child messages and open lane requests (`laneRequests`, from `herdr_request`) are not sent one by one. The dispatcher (`dispatchRootDigest`) sends everything the root has not seen as one `[Baa-ton digest]` prompt:
 
 - **Only when the root is free.** For a Pi root, the extension's settled turn record (`supervisor.rootTurn.state === "idle"`) is required, because Herdr can report idle between tool calls. Live Herdr status vetoes only when it is `working` or `blocked`. A root is never prompted mid-turn.
-- **After a short collection window.** Herdr reports `done` at the end of every child turn, usually beside that lane's child message. Non-urgent items wait until the oldest is `digest_window_seconds` old (default 60), so a burst becomes one wake. `blocked` and `goal-paused` skip the window. Set it per project with `program.digest_window_seconds` (0–3600) in the controller config; `BAA_TON_DIGEST_WINDOW_SECONDS` is a machine-wide override.
+- **After a short collection window.** Herdr reports `done` at the end of every child turn, usually beside that lane's child message. Non-urgent items wait until the oldest is `digest_window_seconds` old (default 60), so a burst becomes one wake. `blocked`, `goal-paused` and new lane requests skip the window. Every digest ends with the list of lane requests still awaiting an answer, so an unanswered request stays in front of the root without waking it again. Set it per project with `program.digest_window_seconds` (0–3600) in the controller config; `BAA_TON_DIGEST_WINDOW_SECONDS` is a machine-wide override.
 - **Once.** Items are marked `sending` and saved before the prompt; an interrupted send becomes `uncertain` and is never replayed. Deferrals are not counted as attempts.
 
 Hooks attempt delivery immediately; each supervisor tick (every 5 s) delivers whatever became due. There is no wall-clock stall timer: a lane that is `working` is left alone, and a stuck lane shows up as `blocked`.

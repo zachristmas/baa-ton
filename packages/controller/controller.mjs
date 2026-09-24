@@ -1805,11 +1805,15 @@ function clipText(text, max) {
  * whole batch in a single turn instead of one turn per event, and each line
  * names the durable record it came from.
  */
-export function digestText(items) {
+export function digestText(items, open = []) {
   const lines = items.map((item, index) => {
     if (item.kind === "event") {
       const { record } = item;
       return `${index + 1}. ${record.classification}: ${record.workflow_id}/${record.lane_id} (event ${record.identity.slice(0, 12)})`;
+    }
+    if (item.kind === "request") {
+      const { request } = item;
+      return `${index + 1}. request from ${request.workflowId}/${request.laneId} (${request.id}): ${request.summary}${request.note ? ` [${request.note}]` : ""}`;
     }
     const { request } = item;
     const details = request.details
@@ -1820,7 +1824,14 @@ export function digestText(items) {
   return [
     `[Baa-ton digest] ${items.length} update${items.length === 1 ? "" : "s"} since your last turn:`,
     ...lines,
-    "Full records are in the workflow manifest (eventController events and messageRequests). Verify each against the manifest before acting; this digest grants no new authority.",
+    ...(open.length
+      ? [
+          `Open lane requests awaiting your answer (herdr_request action=answer): ${open
+            .map((request) => `${request.id} ${request.workflowId}/${request.laneId} ${request.summary}`)
+            .join("; ")}`,
+        ]
+      : []),
+    "Full records are in the workflow manifest (eventController events, messageRequests and laneRequests). Verify each against the manifest before acting; this digest grants no new authority.",
   ].join("\n");
 }
 
@@ -1911,6 +1922,7 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
     (route) => resolve(route.manifest_path) === resolve(manifestPath),
   );
   const items = [];
+  const open = [];
   let changed = false;
   for (const route of routes) {
     const stored = manifest.workflows.find(
@@ -1963,8 +1975,36 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
       }
       items.push({ kind: "message", request, lane });
     }
+    // Formal lane requests: each new open request is one urgent digest item;
+    // every digest also lists the requests still awaiting an answer.
+    const laneRequests = Array.isArray(stored.laneRequests) ? stored.laneRequests : [];
+    for (const request of laneRequests) {
+      if (!isRecord(request) || request.status !== "open") continue;
+      const lane = laneById.get(request.laneId);
+      if (!lane) continue;
+      open.push(request);
+      const status = request.delivery?.status ?? "pending";
+      if (status === "sending") {
+        const interrupted = interruptedDelivery(timestamp);
+        request.delivery = {
+          status: "uncertain",
+          attempts: Number.isSafeInteger(request.delivery?.attempts) ? request.delivery.attempts : 0,
+          updatedAt: interrupted.timestamp,
+          reason: interrupted.reason,
+        };
+        changed = true;
+        continue;
+      }
+      if (status !== "pending") continue;
+      request.delivery ??= { status: "pending", updatedAt: timestamp };
+      if (!request.delivery.attempts && !request.delivery.reason) {
+        signalParentGoalForMessage(goal, request, timestamp);
+        changed = true;
+      }
+      items.push({ kind: "request", request, lane });
+    }
   }
-  return { items, changed };
+  return { items, changed, open };
 }
 
 /**
@@ -1983,7 +2023,7 @@ export async function dispatchRootDigest({
   herdr,
   timestamp = now(),
 }) {
-  const { items, changed } = collectDigestItems({
+  const { items, changed, open } = collectDigestItems({
     orchestrator,
     manifestPath,
     manifest,
@@ -2000,7 +2040,7 @@ export async function dispatchRootDigest({
       if (item.kind === "event" && item.record.wake.reason !== reason) {
         item.record.wake = { ...item.record.wake, reason, updated_at: timestamp };
         dirty = true;
-      } else if (item.kind === "message" && item.request.delivery.reason !== reason) {
+      } else if (item.kind !== "event" && item.request.delivery.reason !== reason) {
         item.request.delivery = { ...item.request.delivery, reason, updatedAt: timestamp };
         dirty = true;
       }
@@ -2011,8 +2051,9 @@ export async function dispatchRootDigest({
   const windowSeconds = digestWindowSeconds(orchestrator);
   const urgent = items.some(
     (item) =>
-      item.kind === "event" &&
-      URGENT_DIGEST_CLASSIFICATIONS.has(item.record.classification),
+      item.kind === "request" ||
+      (item.kind === "event" &&
+        URGENT_DIGEST_CLASSIFICATIONS.has(item.record.classification)),
   );
   if (!urgent && windowSeconds > 0) {
     const oldest = Math.min(
@@ -2041,6 +2082,19 @@ export async function dispatchRootDigest({
           from: inboxIdentity(record.workspace_id, record.pane_id, record.source?.agent),
           to: rootInboxIdentity(root),
           payload: record,
+          wake: true,
+        }),
+      );
+    } else if (item.kind === "request") {
+      const { request, lane } = item;
+      inbox.push(
+        await persistControllerMessage(configDir, {
+          logicalKey: `lane-request:${scope}:${request.workflowId}/${request.laneId}:${request.id}`,
+          occurrenceId: request.id,
+          kind: "lane-request",
+          from: inboxIdentity(lane.workspace_id, lane.pane_id, lane.target),
+          to: rootInboxIdentity(root),
+          payload: request,
           wake: true,
         }),
       );
@@ -2080,7 +2134,7 @@ export async function dispatchRootDigest({
         attempts: attemptsFor[index],
       });
 
-  const outcome = await deliverRootPrompt(root, herdr, digestText(items));
+  const outcome = await deliverRootPrompt(root, herdr, digestText(items, open));
   const finishedAt = now();
   for (const [index, item] of items.entries()) {
     if (item.kind === "event")

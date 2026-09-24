@@ -596,6 +596,26 @@ async function permissionPrompt(args) {
   const route = await currentRoute();
   if (!route || route.role !== "lane")
     throw new Error("Permission broker requires a registered Herdr child lane.");
+  // A runtime command that matches the acknowledged approvalPolicy for this
+  // lane's own leases is answered here; anything else keeps the deny-by-default
+  // broker path below.
+  let policyAnswer;
+  try {
+    policyAnswer = await tools.get("herdr_request")?.execute(
+      `permission-policy-${randomUUID()}`,
+      { action: "open", kind: "permission", toolName: args.tool_name, input: args.input, policyOnly: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+  } catch {
+    policyAnswer = undefined; // fall back to the broker; never allow on error
+  }
+  if (policyAnswer?.details?.kind === "request" && policyAnswer.details.request.status === "granted")
+    return {
+      content: [{ type: "text", text: JSON.stringify({ behavior: "allow", updatedInput: args.input }) }],
+      details: { policy: true, request: policyAnswer.details.request },
+    };
   const endpoints = bridgeMessageEndpoints(route);
   const path = bridgeStorePath(route);
   if (!endpoints || !path) throw new Error("Permission broker route is unavailable.");

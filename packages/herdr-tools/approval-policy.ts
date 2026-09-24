@@ -70,8 +70,9 @@ function onlyKeys(value: Record<string, unknown>, allowed: string[], label: stri
 }
 
 // Token-for-token templates; placeholders are {lane}, {workflow} and
-// {lease.<resource>...}. No quoting, expansion, redirection or chaining.
-const TEMPLATE = /^(?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.[\]-]+\})+(?: (?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.[\]-]+\})+)*$/;
+// {lease.<resource>[:<label>][[<index>]]}. No quoting, expansion,
+// redirection or chaining.
+const TEMPLATE = /^(?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+(?: (?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+)*$/;
 
 function template(value: unknown, label: string): string {
   if (typeof value !== "string" || !TEMPLATE.test(value))
