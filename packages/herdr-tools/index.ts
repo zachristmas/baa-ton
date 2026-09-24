@@ -119,6 +119,7 @@ import {
   requestKey,
   requestPayload,
   requestSummary,
+  retireStopCommands,
   type LaneRequest,
   type LaneRequestKind,
 } from "./lane-requests.js";
@@ -3580,7 +3581,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function laneLeaseRefusal(
     cwd: string,
     ack: ApprovalPolicyAck | undefined,
-    grant: "lease" | "runtime-launch" = "lease",
+    grant: "lease" | "runtime-launch" | "retire" = "lease",
   ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
@@ -3844,6 +3845,231 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (stored) stored.answerDelivery = delivery;
     });
     return { kind: "request", request: { ...answered, answerDelivery: delivery } };
+  }
+
+  type RetireCandidate = {
+    workflowId: string;
+    laneId: string;
+    paneId?: string;
+    tabId?: string;
+    cwd: string;
+    stops: string[][];
+  };
+
+  function acknowledgedPolicy(cwd: string, ack: ApprovalPolicyAck | undefined) {
+    try {
+      const policy = validateApprovalPolicy(loadTaskProfileConfig(cwd)?.approvalPolicy);
+      return ack?.hash === approvalPolicyHash(policy) ? policy : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Finished lanes that may be retired. `auto` requires a completion receipt
+   * the root has received; an explicit root call also accepts terminal lanes. */
+  function retireCandidates(
+    cwd: string,
+    manifest: ManifestWithQueue,
+    options: { auto: boolean; workflowId?: string; laneId?: string; rootPaneId?: string },
+  ): RetireCandidate[] {
+    const policy = acknowledgedPolicy(cwd, manifest.approvalPolicyAck);
+    const candidates: RetireCandidate[] = [];
+    for (const workflow of manifest.workflows as WorkflowWithRequests[]) {
+      if (options.workflowId && workflow.id !== options.workflowId) continue;
+      if (options.rootPaneId && workflow.taskBinding?.rootPaneId !== options.rootPaneId) continue;
+      if (workflow.ownership?.createdBy !== OWNER) continue;
+      for (const lane of workflow.lanes) {
+        if (options.laneId && lane.id !== options.laneId) continue;
+        if (lane.retirement && lane.retirement.status !== "partial") continue;
+        const finished = options.auto
+          ? lane.completionReceipt?.delivery === "delivered"
+          : Boolean(lane.completionReceipt) || TERMINAL_LANE_STATUSES.has(lane.status);
+        if (!finished) continue;
+        candidates.push({
+          workflowId: workflow.id,
+          laneId: lane.id,
+          paneId: lane.paneId,
+          tabId: lane.tabId,
+          cwd: workflow.worktree ?? workflow.cwd ?? cwd,
+          stops: retireStopCommands(policy, workflow.laneRequests, {
+            workflowId: workflow.id,
+            laneId: lane.id,
+            leases: activeLeases(manifest.leases).filter(
+              (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id,
+            ),
+          }),
+        });
+      }
+    }
+    return candidates;
+  }
+
+  /** Retire one finished lane: stop its runtime services, close its tab (which
+   * ends its agent session and child processes), release its leases once the
+   * services are stopped. The session log records the session as retired;
+   * like any completed lane it is not a herdr_resume candidate. */
+  async function retireLane(
+    cwd: string,
+    candidate: RetireCandidate,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<NonNullable<Lane["retirement"]> | undefined> {
+    const claimed = await withManifestTransaction(cwd, (manifest) => {
+      const workflow = workflowFor(manifest, candidate.workflowId);
+      const lane = workflow.lanes.find((item) => item.id === candidate.laneId);
+      if (!lane || (lane.retirement && lane.retirement.status !== "partial")) return false;
+      const sharing = workflow.lanes.some(
+        (other) =>
+          other.id !== lane.id &&
+          candidate.tabId !== undefined &&
+          other.tabId === candidate.tabId &&
+          !other.retirement &&
+          !other.completionReceipt &&
+          !TERMINAL_LANE_STATUSES.has(other.status),
+      );
+      if (sharing) return false;
+      lane.retirement = { status: "retiring", reason, startedAt: now() };
+      return true;
+    });
+    if (!claimed) return undefined;
+    const stops: NonNullable<NonNullable<Lane["retirement"]>["stops"]> = [];
+    for (const tokens of candidate.stops) {
+      try {
+        const result = (await pi.exec(tokens[0], tokens.slice(1), {
+          cwd: candidate.cwd,
+          timeout: 120_000,
+          signal,
+        })) as ExecResult;
+        const output = clip((result.stderr || result.stdout || "").trim(), 500);
+        stops.push({ command: tokens.join(" "), code: result.code, ...(output ? { output } : {}) });
+      } catch (error) {
+        stops.push({ command: tokens.join(" "), code: null, output: clip((error as Error).message, 500) });
+      }
+    }
+    let tabClosed = false;
+    let error: string | undefined;
+    if (candidate.tabId)
+      try {
+        await runHerdr(["tab", "close", candidate.tabId], signal);
+        tabClosed = true;
+      } catch (closeError) {
+        const message = (closeError as Error).message;
+        if (/not[ _-]?found|no such tab|unknown tab/i.test(message)) tabClosed = true;
+        else error = `tab close failed: ${clip(message, 500)}`;
+      }
+    else error = "lane has no recorded tab";
+    const stopsOk = stops.every((stop) => stop.code === 0);
+    let record: NonNullable<Lane["retirement"]> | undefined;
+    await withManifestTransaction(cwd, (manifest) => {
+      const workflow = workflowFor(manifest, candidate.workflowId);
+      const lane = workflow.lanes.find((item) => item.id === candidate.laneId);
+      if (!lane) return;
+      const released = stopsOk
+        ? releaseLeases(
+            manifest.leases,
+            (lease) => lease.workflowId === workflow.id && lease.laneId === lane.id,
+            "lane retired",
+            now(),
+          )
+        : [];
+      record = {
+        status: tabClosed && stopsOk ? "retired" : "partial",
+        reason,
+        startedAt: lane.retirement?.startedAt ?? now(),
+        completedAt: now(),
+        tabClosed,
+        stops,
+        releasedLeaseIds: released.map((lease) => lease.id),
+        ...(error
+          ? { error }
+          : stopsOk
+            ? {}
+            : { error: "a stop command failed; leases are kept until the service is stopped" }),
+      };
+      lane.retirement = record;
+      if (tabClosed && lane.sessionLog) lane.sessionLog = { ...lane.sessionLog, status: "retired" };
+      workflow.evidence.push({
+        at: now(),
+        kind: record.status === "retired" ? "lane-retired" : "lane-retirement-partial",
+        text: `${lane.id}: ${reason}; tab ${tabClosed ? "closed" : "kept"}; stops ${
+          stops.length ? stops.map((stop) => `${stop.command} => ${stop.code}`).join(", ") : "none"
+        }; leases released ${released.length}${record.error ? `; ${record.error}` : ""}`,
+      });
+      workflow.updatedAt = now();
+    });
+    return record;
+  }
+
+  /** Runs when the root's turn settles: retire lanes whose completion the
+   * root has received, when the acknowledged policy grants retire and the lane
+   * agent is no longer working. Never throws into the Pi lifecycle. */
+  async function autoRetireFinishedLanes(ctx: ExtensionContext): Promise<void> {
+    try {
+      if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
+      const manifest = await loadManifest(ctx.cwd);
+      if (laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire")) return;
+      const candidates = retireCandidates(ctx.cwd, manifest, {
+        auto: true,
+        rootPaneId: process.env[HERDR_PANE_ID_ENV],
+      });
+      for (const candidate of candidates) {
+        if (candidate.paneId) {
+          try {
+            const agent = responseRecord(
+              await runHerdr(["agent", "get", candidate.paneId], ctx.signal),
+              "retiring lane",
+            ).agent;
+            const status = isRecord(agent) ? agent.agent_status : undefined;
+            if (status === "working" || status === "blocked") continue;
+          } catch (error) {
+            if (!/agent_not_found|not[ _-]?found/i.test(String(error))) continue;
+          }
+        }
+        await retireLane(ctx.cwd, candidate, "completion accepted (auto-retire)", ctx.signal);
+      }
+    } catch {
+      // Best effort: the next settled turn retries; herdr_retire is explicit.
+    }
+  }
+
+  async function retireTool(
+    ctx: ExtensionContext,
+    params: { workflowId: string; laneId?: string; execute?: boolean; confirm?: boolean },
+    signal?: AbortSignal,
+  ) {
+    requireRootManifestExecutor(ctx.cwd);
+    const manifest = await loadManifest(ctx.cwd);
+    workflowFor(manifest, params.workflowId);
+    const candidates = retireCandidates(ctx.cwd, manifest, {
+      auto: false,
+      workflowId: params.workflowId,
+      laneId: params.laneId,
+    });
+    if (!params.execute) return { dryRun: true, candidates };
+    if (!candidates.length) return { candidates, results: [] };
+    const granted = !laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire");
+    if (
+      !granted &&
+      !(await confirmExecution(
+        ctx,
+        `Retire ${candidates.length} finished lane(s) of ${params.workflowId} (stop services, close lane tabs, release leases)`,
+        params.confirm ?? false,
+        signal,
+      ))
+    )
+      return { cancelled: true, candidates };
+    const results = [];
+    for (const candidate of candidates)
+      results.push({
+        laneId: candidate.laneId,
+        retirement: await retireLane(
+          ctx.cwd,
+          candidate,
+          granted ? "retired by root under approvalPolicy" : "retired by root",
+          signal,
+        ),
+      });
+    return { candidates, results };
   }
 
   async function leaseTool(
@@ -8458,6 +8684,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   });
   pi.on("agent_settled", async (_event, ctx) => {
     await persistRootTurn(ctx, "idle");
+    await autoRetireFinishedLanes(ctx);
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     rootRunId = randomUUID();
@@ -9286,6 +9513,49 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 ? "\nOpen: the root will answer; do not repeat the request in chat."
                 : "");
       return { content: [{ type: "text", text }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_retire",
+    label: "Herdr Retire",
+    description:
+      "Retire finished lanes: run the stop command of every runtime template the lane was granted, close the lane's tab (ending its agent session, MCP bridge, LSP and tsserver processes) and release its leases once its services are stopped. Only lanes with a completion receipt or a terminal status qualify, and the session log records the retired session. Dry-run by default. Under an acknowledged approvalPolicy that grants retire this needs no dialog, and it also runs automatically when the root's turn settles for lanes whose completion the root has received.",
+    promptSnippet: "Retire finished lanes to free memory; dry-run by default.",
+    promptGuidelines: [
+      "Use herdr_retire after verifying a lane's completion so its session and services stop holding memory. It never removes a worktree or touches Git. Without a retire grant it asks for confirmation; on a headless bridge pass confirm=true only after the user approved this retirement.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      laneId: Type.Optional(Type.String()),
+      execute: Type.Optional(Type.Boolean()),
+      confirm: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await retireTool(ctx, params, signal);
+      const lines =
+        "dryRun" in result
+          ? [
+              result.candidates.length
+                ? `Would retire ${result.candidates.length} lane(s):`
+                : "No finished lanes to retire.",
+              ...result.candidates.map(
+                (candidate) =>
+                  `- ${candidate.laneId}: tab ${candidate.tabId ?? "none"}; stop ${
+                    candidate.stops.length ? candidate.stops.map((stop) => stop.join(" ")).join(", ") : "nothing"
+                  }`,
+              ),
+            ]
+          : "cancelled" in result
+            ? ["Retirement cancelled."]
+            : result.results.length
+              ? result.results.map(
+                  (item) =>
+                    `- ${item.laneId}: ${item.retirement?.status ?? "skipped (already retiring or sharing a tab)"}${
+                      item.retirement?.error ? ` (${item.retirement.error})` : ""
+                    }`,
+                )
+              : ["No finished lanes to retire."];
+      return { content: [{ type: "text", text: lines.join("\n") }], details: result };
     },
   });
   pi.registerTool({

@@ -11,6 +11,7 @@ const {
   matchRuntimeCommand,
   plainCommandTokens,
   openRequests,
+  retireStopCommands,
 } = await jiti.import("../lane-requests.ts");
 const { validateApprovalPolicy } = await jiti.import("../approval-policy.ts");
 
@@ -111,4 +112,18 @@ test("open requests come oldest first", () => {
     { id: "c", status: "granted", requestedAt: "2026-09-23T09:00:00Z" },
   ];
   assert.deepEqual(openRequests(requests).map((request) => request.id), ["a", "b"]);
+});
+
+test("a retiring lane stops exactly the templates it was granted, once each", () => {
+  const granted = (id, template, extra = {}) => ({ id, laneId: "lane-a", status: "granted", template, requestedAt: "t", ...extra });
+  const requests = [
+    granted("r1", "compose:start"),
+    granted("r2", "compose:start"),
+    granted("r3", "web:start"),
+    granted("r4", "compose:stop"),
+    granted("r5", "azurite:start", { laneId: "lane-b" }),
+    { id: "r6", laneId: "lane-a", status: "open", template: "azurite:start", requestedAt: "t" },
+  ];
+  assert.deepEqual(retireStopCommands(policy, requests, context), [["docker", "compose", "-p", "lane-a", "down"]]);
+  assert.deepEqual(retireStopCommands(undefined, requests, context), []);
 });

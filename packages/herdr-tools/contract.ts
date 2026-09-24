@@ -370,6 +370,17 @@ export type OperatorClosure = {
   recordedAt: string;
 };
 
+export type LaneRetirement = {
+  status: "retiring" | "retired" | "partial";
+  reason: string;
+  startedAt: string;
+  completedAt?: string;
+  tabClosed?: boolean;
+  stops?: Array<{ command: string; code: number | null; output?: string }>;
+  releasedLeaseIds?: string[];
+  error?: string;
+};
+
 export type Lane = {
   goalId?: string;
   goalRevision?: number;
@@ -428,6 +439,8 @@ export type Lane = {
   status: string;
   agentName?: string;
   relationshipId?: string;
+  /** Per-lane retirement after an accepted completion (herdr_retire). */
+  retirement?: LaneRetirement;
   tabId?: string;
   paneId?: string;
   resourceCreatedAt?: string;

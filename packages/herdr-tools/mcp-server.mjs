@@ -121,7 +121,7 @@ extension.default({
               stdio: ["ignore", "pipe", "pipe"],
             })
           : require("node:child_process").spawn(command, args, {
-              cwd: process.cwd(),
+              cwd: options.cwd ?? process.cwd(),
               env: process.env,
               stdio: ["ignore", "pipe", "pipe"],
             });
