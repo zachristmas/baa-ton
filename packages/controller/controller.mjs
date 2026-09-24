@@ -79,11 +79,13 @@ const TERMINAL_WORKFLOW_STATES = new Set([
   "completed",
   "closed",
   "operator-closed",
+  "superseded",
 ]);
 const TERMINAL_LANE_STATES = new Set([
   "completion-reported",
   "completed",
   "operator-closed",
+  "superseded",
 ]);
 const USER_ACTIONABLE_REQUEST_STATUSES = new Set([
   "parent-question-required",
@@ -678,6 +680,22 @@ function latestLaneStatus(workflow, laneId) {
   return undefined;
 }
 
+/** Mirrors the extension: a planned workflow bound to a root session other
+ * than the one this root's session log records as current. */
+function plannedByEarlierRootSession(manifest, workflow, rootId) {
+  const bound = workflow.taskBinding?.rootSessionPath;
+  const logs = Array.isArray(manifest.rootSessionLogs) ? manifest.rootSessionLogs : [];
+  const current = logs.find((entry) => isRecord(entry) && entry.rootId === rootId) ?? manifest.sessionLog;
+  const ref = isRecord(current) ? current.sessionRef : undefined;
+  if (typeof bound !== "string" || !isRecord(ref)) return false;
+  const known = [
+    ref.sessionId,
+    isRecord(ref.metadata) ? ref.metadata.sessionPath : undefined,
+    isRecord(ref.nativeHandle) ? ref.nativeHandle.value : undefined,
+  ].filter((value) => typeof value === "string");
+  return known.length > 0 && !known.includes(bound);
+}
+
 /** Questions or approvals Zach still owes an answer on, for this root. */
 function pendingForUser(manifest, owned) {
   const questions = [
@@ -728,7 +746,11 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
         reasons.push(`child message ${message.id} from ${workflow.id}/${message.laneId} is ${status === "pending" ? "unread" : "possibly unseen"}: ${clipText(message.summary ?? "", 160)}`);
     }
     if (workflow.status === "planned")
-      reasons.push(`workflow ${workflow.id} is planned but not dispatched`);
+      reasons.push(
+        plannedByEarlierRootSession(manifest, workflow, orchestrator.id)
+          ? `workflow ${workflow.id} was planned by an earlier root session and cannot be dispatched as is; retire it with herdr_supersede (or re-plan it)`
+          : `workflow ${workflow.id} is planned but not dispatched`,
+      );
   }
   try {
     const pendingQueue = (queueStore(manifest)?.items ?? []).filter((item) => item.state === "pending");

@@ -152,6 +152,10 @@ isolation or clarity.
   gate with `herdr_capacity action=wait` (reason plus memory, swap or load
   thresholds) and end the turn. The digest says when capacity is available, and Zach
   is notified if it stays blocked.
+- Retire planned workflows you will not dispatch with `herdr_supersede` and a reason,
+  especially ones the supervisor flags as planned by an earlier root session. It only
+  applies to workflows that never started a lane; use `herdr_close` for anything
+  that ran.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —
