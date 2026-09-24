@@ -22,7 +22,7 @@ The workflow tools run through the local MCP bridge. The controller installs wit
 1. **Local and durable first.** Persist workflow/event state atomically before a notification or other effect.
 2. **Explicit ownership.** A workflow may operate only resources it created and recorded.
 3. **Root-only authority.** Child lanes report requests and evidence; they do not approve dispatch, resume, or close operations.
-4. **Event-driven control.** Treat lifecycle signals as observations. Never turn them into autonomous Git, PR, deployment, production, or external actions.
+4. **Event-driven control.** Treat lifecycle signals as observations. Never turn them into autonomous Git, PR, deployment, production, or external actions. The one exception is the acknowledged `integrate` grant: the spec loop's driver may create local `spec/<item>` worktrees from the target tip and (from its integration stage) make local commits and merges on its integration branch. Push, PR, deploy and production stay excluded.
 5. **Bounded reads and foreground tests.** No polling loops, detached jobs, or hidden background test workers.
 6. **Fail closed.** Reject malformed mappings, identity drift, ambiguous targets, and unsafe local file permissions before mutation.
 7. **Forward-compatible manifests.** Lanes dispatched before an upgrade keep running MCP bridges loaded from the older release, and they share the manifest with the upgraded root and controller. Two rules follow:

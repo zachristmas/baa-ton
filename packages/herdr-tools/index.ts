@@ -133,12 +133,15 @@ import { legacyStateStatus } from "./state-migration.mjs";
 import { classifyLocalValidation } from "./known-safe.mjs";
 import {
   SPEC_PATH,
+  SPEC_STATE_PATH,
   loadSpec,
   loadSpecState,
   specStatusTable,
   targetRepo,
+  validateSpecState,
   verifySpec,
 } from "./spec.mjs";
+import { advanceSpec, buildObjective, reviewObjective } from "./spec-driver.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -3796,7 +3799,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function laneLeaseRefusal(
     cwd: string,
     ack: ApprovalPolicyAck | undefined,
-    grant: "lease" | "runtime-launch" | "retire" | "local-validation" = "lease",
+    grant: "lease" | "runtime-launch" | "retire" | "local-validation" | "dispatch" | "integrate" = "lease",
   ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
@@ -4523,6 +4526,157 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       workflow.updatedAt = now();
     });
     return record;
+  }
+
+  type SpecDriverPorts = {
+    /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
+    worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree: string }): Promise<Workflow>;
+    dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
+    now(): string;
+  };
+
+  let specDriverRunning = false;
+
+  /**
+   * The spec loop's driver (docs/SPEC-LOOP.md section 4). Runs on every
+   * settled root turn and on herdr_spec action=advance: code decides what to
+   * dispatch; the root is asked only for judgment. It acts only under an
+   * acknowledged policy that grants dispatch and integrate, and it never
+   * opens a dialog: anything outside policy stays waiting with its reason.
+   */
+  async function runSpecDriver(ctx: ExtensionContext, ports?: Partial<SpecDriverPorts>, signal?: AbortSignal) {
+    if (specDriverRunning) return { skipped: "already running" };
+    const spec = await loadSpec(ctx.cwd);
+    if (!spec) return { skipped: `no ${SPEC_PATH}` };
+    const manifest = await loadManifest(ctx.cwd);
+    const refusal =
+      laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "dispatch") ??
+      laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "integrate");
+    if (refusal) return { skipped: `the spec driver needs the dispatch and integrate grants (${refusal})` };
+    specDriverRunning = true;
+    try {
+      const scope = requireRootManifestExecutor(ctx.cwd);
+      const repo = targetRepo(spec, ctx.cwd);
+      const headless = { ...ctx, hasUI: false, mode: "json" } as ExtensionContext;
+      const use: SpecDriverPorts = {
+        async worktree({ repo: repoPath, path, branch, base }, abort) {
+          if ((await stat(path).catch(() => undefined))?.isDirectory()) return;
+          const existing = await execFile("git", ["-C", repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { signal: abort }).then(
+            () => true,
+            () => false,
+          );
+          await mkdir(dirname(path), { recursive: true });
+          await execFile("git", ["-C", repoPath, "worktree", "add", ...(existing ? [path, branch] : ["-b", branch, path, base])], { signal: abort, timeout: 120_000 });
+        },
+        plan: ({ objective, laneObjective, readOnly, taskProfile, worktree }) =>
+          plan(ctx.cwd, objective, [{ objective: laneObjective, readOnly, taskProfile }], worktree, undefined, undefined, undefined, undefined, taskProfile, headless),
+        dispatch: (workflowId) => dispatch(ctx.cwd, workflowId, true, headless, signal),
+        now,
+        ...ports,
+      };
+      const state = await loadSpecState(ctx.cwd);
+      const laneView = (ref: { workflowId: string; laneId: string }) => {
+        const workflow = manifest.workflows.find((item) => item.id === ref.workflowId);
+        const lane = workflow?.lanes.find((item) => item.id === ref.laneId);
+        if (!lane) return undefined;
+        return {
+          status: lane.status,
+          ...(lane.completionReceipt ? { receipt: { summary: lane.completionReceipt.summary } } : {}),
+        };
+      };
+      const supervision = manifest.rootSupervision?.find((item) => item.rootId === scope.rootId);
+      const step = advanceSpec({
+        spec,
+        state,
+        lane: laneView,
+        capacityWaiting: supervision?.capacityGate?.status === "waiting",
+        now: use.now(),
+      });
+      const next = step.state;
+      const done: string[] = [];
+      for (const action of step.actions) {
+        const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
+        const record = next.items[item.id];
+        const branch = `spec/${item.id}`;
+        const worktree = record.worktree ?? join(homedir(), ".herdr", "worktrees", basename(repo), `spec-${item.id}`);
+        try {
+          let profile: string;
+          let objective: string;
+          if (action.kind === "build") {
+            profile = spec.stages.build?.profile ?? "implementation";
+            await use.worktree({ repo, path: worktree, branch, base: `refs/remotes/${spec.target.remote}/${spec.target.branch}` }, signal);
+            objective = buildObjective(spec, item, { branch, findings: action.findings });
+          } else {
+            profile = spec.stages.review?.profile ?? "review";
+            const against = spec.stages.review?.differentFrom;
+            if (against) {
+              const other = spec.stages[against]?.profile ?? (against === "build" ? "implementation" : against);
+              const a = resolveTaskProfile(ctx.cwd, profile);
+              const b = resolveTaskProfile(ctx.cwd, other);
+              if (a.launchProfile.provider === b.launchProfile.provider && a.launchProfile.model === b.launchProfile.model) {
+                Object.assign(record, { state: "blocked", blockedReason: "human-gate", note: `review profile ${profile} uses the same model as ${against} (${a.launchProfile.provider}/${a.launchProfile.model}); set a different one`, since: use.now() });
+                step.rootAsks.push({ itemId: item.id, reason: `${item.id}: the review profile must differ from ${against}` });
+                continue;
+              }
+            }
+            objective = reviewObjective(spec, item, { branch, buildSummary: record.buildSummary });
+          }
+          const workflow = await use.plan({
+            objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}: ${item.title}`,
+            laneObjective: objective,
+            readOnly: action.kind === "review",
+            taskProfile: profile,
+            worktree,
+          });
+          record.worktree = worktree;
+          record.branch = branch;
+          record.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+          delete record.note;
+          const result = await use.dispatch(workflow.id);
+          if (!result.dispatched) record.note = `${action.kind} planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
+          done.push(`${action.kind} ${item.id} -> ${workflow.id}`);
+        } catch (error) {
+          record.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
+          if (!record.lane?.workflowId || record.lane.workflowId === undefined) delete record.lane;
+          done.push(`${action.kind} ${item.id} failed: ${clip((error as Error).message, 120)}`);
+        }
+      }
+      for (const [id, reason] of Object.entries(step.waits)) if (next.items[id]) next.items[id].wait = reason;
+      for (const item of spec.items) if (!step.waits[item.id] && next.items[item.id]) delete next.items[item.id].wait;
+      validateSpecState(next);
+      const release = await acquireManifestLock(ctx.cwd, 10_000);
+      try {
+        const path = join(ctx.cwd, SPEC_STATE_PATH);
+        const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+        await writeFile(temporary, `${jsonText(next)}\n`, { mode: 0o600 });
+        await rename(temporary, path);
+        if (step.rootAsks.length) {
+          const current = await loadManifest(ctx.cwd);
+          const entries = (current.rootSupervision ??= []);
+          let entry = entries.find((item) => item.rootId === scope.rootId);
+          if (!entry) {
+            entry = { rootId: scope.rootId, alerts: [] };
+            entries.push(entry);
+          }
+          const alerts = ((entry as { alerts?: unknown[] }).alerts ??= []);
+          for (const ask of step.rootAsks)
+            alerts.push({
+              id: `alert-${randomUUID().slice(0, 8)}`,
+              kind: "spec-needs-root",
+              text: ask.reason,
+              createdAt: use.now(),
+              delivery: { status: "pending", attempts: 0, updatedAt: use.now() },
+            });
+          await saveManifest(ctx.cwd, current);
+        }
+      } finally {
+        await release();
+      }
+      return { actions: done, rootAsks: step.rootAsks, waits: step.waits };
+    } finally {
+      specDriverRunning = false;
+    }
   }
 
   /** Runs when the root's turn settles: retire lanes whose completion the
@@ -9448,6 +9602,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     await persistRootTurn(ctx, "idle");
     await autoRetireFinishedLanes(ctx);
+    try {
+      if (isRootOrchestrator() && isRootForManifest(ctx.cwd)) await runSpecDriver(ctx);
+    } catch {
+      // The driver records its own failures in spec-state; never throw into Pi.
+    }
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     removeRuntimeRecord?.();
@@ -10356,10 +10515,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       "Use herdr_spec action=status as the burn-down instead of counting items by hand; an item is done only when the verifier says so, never by judgment.",
     ],
     parameters: Type.Object(
-      { action: Type.Union([Type.Literal("status"), Type.Literal("verify")]) },
+      { action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance")]) },
       { additionalProperties: false },
     ),
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, _update, ctx) {
+      if (params.action === "advance") {
+        // Tests inject fake worktree/plan/dispatch ports through the context.
+        const result = await runSpecDriver(ctx, (ctx as { specDriverPorts?: Partial<SpecDriverPorts> }).specDriverPorts, signal);
+        const text =
+          "skipped" in result
+            ? `Spec driver skipped: ${result.skipped}.`
+            : [
+                result.actions.length ? `Started: ${result.actions.join("; ")}.` : "Nothing to start.",
+                ...result.rootAsks.map((ask) => `Needs you: ${ask.reason}`),
+                ...Object.entries(result.waits).map(([id, why]) => `${id} waits: ${why}`),
+              ].join("\n");
+        return { content: [{ type: "text", text }], details: result };
+      }
       const spec = await loadSpec(ctx.cwd);
       if (!spec)
         return { content: [{ type: "text", text: `No ${SPEC_PATH} in ${ctx.cwd}.` }], details: { configured: false } };

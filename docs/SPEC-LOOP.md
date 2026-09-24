@@ -179,6 +179,15 @@ These refine the design where it meets existing invariants:
 
   `herdr_spec action=status|verify` and `node packages/herdr-tools/spec.mjs status|verify [project]` print the same verdict; `verify` exits 0 only at M/M. A recorded `done` that the verifier rejects is shown as `verifying`. Nothing writes the state file yet; the stages that do come in PR 2 onward.
 
+- **PR 2 (built):** the state machine (`packages/herdr-tools/spec-driver.mjs`, pure) and its driver in the extension, run on every settled root turn and by `herdr_spec action=advance`.
+  - **Readiness:** an item is ready when its dependencies are integrating or later. It builds while fewer than `maxParallel` items are in flight, the root has no capacity gate waiting, and its `owns`/`sharedTouch` don't overlap an in-flight builder's `owns` (a conservative static-prefix glob test). Otherwise it waits with a named reason (dependency, capacity, ownership), shown in `herdr_spec status`.
+  - **Build:** the driver creates `spec/<id>` in a worktree from the local `<remote>/<branch>` ref under `~/.herdr/worktrees/<repo>/spec-<id>` (reused by rebuilds). It plans one lane with the build stage's profile and dispatches it under the standing policy, headless, so an out-of-policy dispatch waits instead of opening a dialog.
+  - **Review:** the build lane's receipt starts a review: a fresh read-only lane in the same worktree on the review profile. If `differentFrom` names a stage whose profile has the same provider and model, the item is blocked (human-gate) and the root is asked.
+  - **Verdict:** the review receipt's first line must be `VERDICT: PASS` or `VERDICT: FAIL`. PASS moves the item to `integrating` (PR 3). FAIL rebuilds with the findings until `maxBuildAttempts`, then the item fails and the root is asked. An unclear verdict, or a lane that ends without a receipt, is handled the same way.
+  - **Root asks** go into the root's digest as `spec-needs-root` alerts.
+  - **Grants:** the driver acts only when the acknowledged policy grants `dispatch` and the new `integrate` grant. `integrate` is the ARCHITECTURE invariant 4 exception for these local worktrees (and, in PR 3, integration merges). It is appended last, so existing policies keep their hash.
+  - **Not verified live:** that Herdr's `worktree list` registers a worktree created with `git worktree add`, which `herdr_plan` requires.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?
