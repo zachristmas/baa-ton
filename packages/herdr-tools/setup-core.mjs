@@ -279,7 +279,7 @@ export function sweepSkillContent() {
     "Root-only cleanup. Always preview before removing anything, and never run it unattended.",
     "",
     "1. Confirm this is a Herdr root session: `test \"${HERDR_ENV:-}\" = 1 && herdr status server`. If that fails, say so and stop.",
-    "2. Call `herdr_sweep` without `execute` (dry-run). Show the user the exact lane tabs and worktrees it found, not just a count.",
+    "2. Call `herdr_sweep` without `execute` (dry-run). Show the user the exact lane tabs, worktrees and leases it found, not just a count.",
     "3. If nothing was found, say so and stop.",
     "4. Otherwise ask whether to execute. On a TUI-capable root, call `herdr_sweep` with `execute=true` and tell the user to answer the native confirmation. On a headless root, pass `execute=true, confirm=true` only after the user approved this exact inventory in this conversation; rerun the dry-run first if the inventory may have changed.",
     "5. Report what the tool says it removed, not what was requested.",
