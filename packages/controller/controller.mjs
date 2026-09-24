@@ -16,6 +16,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import net from "node:net";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import {
   enqueueWakeHint,
@@ -35,6 +37,8 @@ const SOCKET_TIMEOUT_MS = 2_500;
 const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const MAX_DIGEST_WINDOW_SECONDS = 3_600;
+const MAX_ESCALATE_MINUTES = 1_440;
+const execFileAsync = promisify(execFile);
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
 const MESSAGE_DETAILS_MAX_LENGTH = 6_000;
 // Windows ACLs do not map to Node's POSIX mode bits. Privacy is provided by
@@ -348,8 +352,15 @@ export function validateOrchestrator(input, index) {
     value.program,
     `${label}.program`,
     ["id", "workspace_id"],
-    ["parent_manifest_path", "digest_window_seconds"],
+    ["parent_manifest_path", "digest_window_seconds", "directive_escalate_minutes"],
   );
+  if ("directive_escalate_minutes" in program)
+    assert(
+      Number.isSafeInteger(program.directive_escalate_minutes) &&
+        program.directive_escalate_minutes >= 1 &&
+        program.directive_escalate_minutes <= MAX_ESCALATE_MINUTES,
+      `${label}.program.directive_escalate_minutes must be an integer from 1 to ${MAX_ESCALATE_MINUTES}.`,
+    );
   if ("digest_window_seconds" in program)
     assert(
       Number.isSafeInteger(program.digest_window_seconds) &&
@@ -403,6 +414,9 @@ export function validateOrchestrator(input, index) {
         : {}),
       ...("digest_window_seconds" in program
         ? { digest_window_seconds: program.digest_window_seconds }
+        : {}),
+      ...("directive_escalate_minutes" in program
+        ? { directive_escalate_minutes: program.directive_escalate_minutes }
         : {}),
     },
     workflows,
@@ -1811,6 +1825,12 @@ export function digestText(items, open = []) {
       const { record } = item;
       return `${index + 1}. ${record.classification}: ${record.workflow_id}/${record.lane_id} (event ${record.identity.slice(0, 12)})`;
     }
+    if (item.kind === "directive") {
+      const { request: directive } = item;
+      return `${index + 1}. directive from ${directive.from} (${directive.id})${
+        (directive.sends ?? 0) > 1 ? " [re-sent: not yet acknowledged]" : ""
+      }: ${clipText(directive.text, DIGEST_DETAILS_MAX_LENGTH)}`;
+    }
     if (item.kind === "request") {
       const { request } = item;
       return `${index + 1}. request from ${request.workflowId}/${request.laneId} (${request.id}): ${request.summary}${request.note ? ` [${request.note}]` : ""}`;
@@ -1824,6 +1844,11 @@ export function digestText(items, open = []) {
   return [
     `[Baa-ton digest] ${items.length} update${items.length === 1 ? "" : "s"} since your last turn:`,
     ...lines,
+    ...(items.some((item) => item.kind === "directive")
+      ? [
+          "Acknowledge each directive with herdr_directive action=ack as soon as you accept it; an unacknowledged directive is re-sent once, then escalated to Zach.",
+        ]
+      : []),
     ...(open.length
       ? [
           `Open lane requests awaiting your answer (herdr_request action=answer): ${open
@@ -1916,6 +1941,170 @@ function interruptedDelivery(timestamp) {
   return { reason: "interrupted_root_delivery_requires_parent_review", timestamp };
 }
 
+const DEFAULT_DIRECTIVE_ESCALATE_MINUTES = 15;
+const DIRECTIVE_RESEND_WITHOUT_TURN_MS = 5 * 60_000;
+const DIRECTIVE_TEXT_MAX_LENGTH = 4_000;
+
+/** Show a local Herdr notification to the operator; never throws. */
+export async function herdrNotification({ title, body }) {
+  try {
+    await execFileAsync(
+      "herdr",
+      ["notification", "show", title, "--body", body, "--sound", "request"],
+      { timeout: 10_000 },
+    );
+    return { status: "sent" };
+  } catch (error) {
+    return { status: "failed", reason: clipText(String(error?.message ?? error), 300) };
+  }
+}
+
+function directiveEscalateMs(orchestrator) {
+  return (
+    (orchestrator.program.directive_escalate_minutes ?? DEFAULT_DIRECTIVE_ESCALATE_MINUTES) *
+    60_000
+  );
+}
+
+function rootSettledAfter(goal, since) {
+  const turn = goal?.supervisor?.rootTurn;
+  return turn?.state === "idle" && Date.parse(turn.updatedAt) > Date.parse(since);
+}
+
+function openDirectives(manifest, orchestrator) {
+  return (Array.isArray(manifest.directives) ? manifest.directives : []).filter(
+    (directive) =>
+      isRecord(directive) &&
+      directive.rootId === orchestrator.id &&
+      directive.status === "open",
+  );
+}
+
+/**
+ * Record a directive for one root (from Zach or a supervisor session). It is
+ * delivered in the root digest and stays open until the root acknowledges it
+ * with herdr_directive; the supervisor tick re-sends it once, then escalates.
+ */
+export async function postDirective({ manifestPath, rootId, from, text, timestamp = now() }) {
+  assertString(manifestPath, "manifestPath");
+  assert(isAbsolute(manifestPath), "manifestPath must be absolute.");
+  assertString(rootId, "rootId");
+  assertString(from, "from");
+  assert(
+    typeof text === "string" && text.trim() && text.length <= DIRECTIVE_TEXT_MAX_LENGTH,
+    `Directive text must be 1-${DIRECTIVE_TEXT_MAX_LENGTH} characters.`,
+  );
+  const release = await acquireManifestLock(manifestPath);
+  try {
+    const manifest = parseJson(
+      await readRegularFile(manifestPath, "Parent manifest"),
+      "Parent manifest",
+    );
+    manifest.directives = Array.isArray(manifest.directives) ? manifest.directives : [];
+    const directive = {
+      id: `directive-${randomUUID().slice(0, 8)}`,
+      rootId,
+      from,
+      text: text.trim(),
+      createdAt: timestamp,
+      status: "open",
+      sends: 0,
+      delivery: { status: "pending", attempts: 0, updatedAt: timestamp },
+    };
+    manifest.directives.push(directive);
+    await atomicWriteJson(manifestPath, manifest);
+    return directive;
+  } finally {
+    await release();
+  }
+}
+
+/** Queue open directives for the digest: new ones, and one re-send after the
+ * root finished a turn without acknowledging. Mutates the manifest. */
+function collectDirectiveItems({ orchestrator, manifest, goal, timestamp, items }) {
+  let changed = false;
+  for (const directive of openDirectives(manifest, orchestrator)) {
+    const delivery = directive.delivery ?? {
+      status: "pending",
+      attempts: 0,
+      updatedAt: directive.createdAt,
+    };
+    if (delivery.status === "sending") {
+      const interrupted = interruptedDelivery(timestamp);
+      directive.delivery = {
+        ...delivery,
+        status: "uncertain",
+        updatedAt: interrupted.timestamp,
+        reason: interrupted.reason,
+      };
+      changed = true;
+      continue;
+    }
+    if (
+      (delivery.status === "delivered" || delivery.status === "uncertain") &&
+      (directive.sends ?? 0) === 1
+    ) {
+      const sentAt = directive.sentAt ?? delivery.updatedAt;
+      const turned = goal?.supervisor?.rootTurn
+        ? rootSettledAfter(goal, sentAt)
+        : Date.parse(timestamp) - Date.parse(sentAt) > DIRECTIVE_RESEND_WITHOUT_TURN_MS;
+      if (turned) {
+        directive.delivery = {
+          status: "pending",
+          attempts: delivery.attempts ?? 1,
+          updatedAt: timestamp,
+          reason: "not_acknowledged_after_root_turn",
+        };
+        changed = true;
+      }
+    }
+    if (directive.delivery?.status === "pending")
+      items.push({ kind: "directive", request: directive });
+  }
+  return changed;
+}
+
+/**
+ * Escalate open directives the root has not acknowledged: after the one
+ * re-send was ignored, or after directive_escalate_minutes (default 15) in
+ * any state, including never delivered because the root stayed busy or had
+ * a dialog open. One local Herdr notification per directive.
+ */
+export async function escalateDirectives({
+  orchestrator,
+  manifestPath,
+  manifest,
+  goal,
+  notify = herdrNotification,
+  timestamp = now(),
+}) {
+  const limit = directiveEscalateMs(orchestrator);
+  const escalated = [];
+  for (const directive of openDirectives(manifest, orchestrator)) {
+    if (directive.escalatedAt) continue;
+    const delivery = directive.delivery ?? {};
+    const sentAt = directive.sentAt ?? delivery.updatedAt;
+    const resentAndIgnored =
+      (directive.sends ?? 0) >= 2 &&
+      (delivery.status === "delivered" || delivery.status === "uncertain") &&
+      (rootSettledAfter(goal, sentAt) || Date.parse(timestamp) - Date.parse(sentAt) > limit);
+    const overdue = Date.parse(timestamp) - Date.parse(directive.createdAt) > limit;
+    if (!resentAndIgnored && !overdue) continue;
+    const reason = resentAndIgnored
+      ? "re-sent once and still not acknowledged"
+      : `not acknowledged after ${Math.round(limit / 60_000)} min`;
+    const outcome = await notify({
+      title: "Baa-ton: directive not acknowledged",
+      body: clipText(`${orchestrator.id}: ${reason}. ${directive.from}: ${directive.text}`, 500),
+    });
+    directive.escalatedAt = timestamp;
+    directive.escalation = { ...outcome, reason };
+    escalated.push(directive.id);
+  }
+  if (escalated.length) await atomicWriteJson(manifestPath, manifest);
+  return escalated;
+}
+
 /** Pending root-bound items for one orchestrator's routes in this manifest. */
 function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timestamp }) {
   const routes = orchestrator.workflows.filter(
@@ -2004,6 +2193,7 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
       items.push({ kind: "request", request, lane });
     }
   }
+  if (collectDirectiveItems({ orchestrator, manifest, goal, timestamp, items })) changed = true;
   return { items, changed, open };
 }
 
@@ -2052,6 +2242,7 @@ export async function dispatchRootDigest({
   const urgent = items.some(
     (item) =>
       item.kind === "request" ||
+      item.kind === "directive" ||
       (item.kind === "event" &&
         URGENT_DIGEST_CLASSIFICATIONS.has(item.record.classification)),
   );
@@ -2085,6 +2276,8 @@ export async function dispatchRootDigest({
           wake: true,
         }),
       );
+    } else if (item.kind === "directive") {
+      inbox.push(undefined);
     } else if (item.kind === "request") {
       const { request, lane } = item;
       inbox.push(
@@ -2124,6 +2317,10 @@ export async function dispatchRootDigest({
     } else {
       const attempts = (Number.isSafeInteger(item.request.delivery.attempts) ? item.request.delivery.attempts : 0) + 1;
       item.request.delivery = { status: "sending", attempts, updatedAt: timestamp };
+      if (item.kind === "directive") {
+        item.request.sends = (item.request.sends ?? 0) + 1;
+        item.request.sentAt = timestamp;
+      }
       attemptsFor.push(attempts);
     }
   }
@@ -2521,6 +2718,7 @@ export async function runSupervisorTick({
   stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
   herdr,
+  notify = herdrNotification,
   timestamp = now(),
 } = {}) {
   requireStateDir(stateDir);
@@ -2618,6 +2816,16 @@ export async function runSupervisorTick({
             queueStore(manifest),
           );
       }
+      const escalatedDirectives = await escalateDirectives({
+        orchestrator,
+        manifestPath,
+        manifest,
+        goal,
+        notify,
+        timestamp,
+      });
+      if (escalatedDirectives.length)
+        pendingWakes.push({ manifestPath, kind: "directive-escalation", directiveIds: escalatedDirectives });
       // Event-driven delivery point for everything the root has not seen:
       // a digest deferred while the root worked goes out on the first tick
       // after its turn settles, independent of parent-goal status.

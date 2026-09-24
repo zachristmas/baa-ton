@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   ControllerError,
   JsonLineHerdrClient,
@@ -15,6 +16,7 @@ import {
   runSupervisorTick,
   routeChildMessage,
   validateConfig,
+  postDirective,
 } from "../controller.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
 import { readStore, storePath } from "../../herdr-tools/inbox/index.mjs";
@@ -3237,6 +3239,142 @@ test("open lane requests skip the collection window and every digest lists what 
       1,
       "an open request wakes the root once; later digests only list it",
     );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+async function directiveFixture() {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  const notices = [];
+  const notify = async (notice) => {
+    notices.push(notice);
+    return { status: "sent" };
+  };
+  const at = (seconds) => new Date(Date.parse("2026-09-14T01:00:00.000Z") + seconds * 1_000).toISOString();
+  const tick = (seconds, api) =>
+    runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, notify, timestamp: at(seconds) });
+  const settleRoot = (seconds) =>
+    patchSupervisor(fixture, { rootTurn: { ...rootTurn("idle"), runId: `run-${seconds}`, updatedAt: at(seconds) } });
+  const directive = async () =>
+    (await fixture.manifest()).directives[0];
+  return { fixture, rootId: config.orchestrators[0].id, notices, notify, at, tick, settleRoot, directive };
+}
+
+test("a directive stays open: delivered, re-sent once after an ignored turn, then escalated once", async () => {
+  const d = await directiveFixture();
+  const api = digestApi();
+  try {
+    const posted = await postDirective({
+      manifestPath: d.fixture.manifestPath,
+      rootId: d.rootId,
+      from: "zach",
+      text: "Run herdr_sweep for the finished cic lanes.",
+      timestamp: d.at(0),
+    });
+    await d.tick(1, api);
+    const digests = () => api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]"));
+    assert.equal(digests().length, 1);
+    assert.match(digests()[0].text, new RegExp(`directive from zach \\(${posted.id}\\): Run herdr_sweep for the finished cic lanes\\.`));
+    assert.match(digests()[0].text, /herdr_directive action=ack/);
+    assert.deepEqual([(await d.directive()).sends, (await d.directive()).delivery.status], [1, "delivered"]);
+
+    await d.tick(10, api);
+    assert.equal(digests().length, 1, "no re-send before the root has finished a turn");
+
+    await d.settleRoot(20);
+    await d.tick(30, api);
+    assert.equal(digests().length, 2, "re-sent once after a turn without an ack");
+    assert.match(digests()[1].text, /\[re-sent: not yet acknowledged\]/);
+    assert.equal((await d.directive()).sends, 2);
+    assert.equal(d.notices.length, 0);
+
+    await d.settleRoot(40);
+    const escalated = await d.tick(50, api);
+    assert.equal(digests().length, 2, "never a third send");
+    assert.equal(d.notices.length, 1);
+    assert.equal(d.notices[0].title, "Baa-ton: directive not acknowledged");
+    assert.match(d.notices[0].body, /re-sent once and still not acknowledged\. zach: Run herdr_sweep/);
+    assert.ok(escalated.pendingWakes.some((wake) => wake.kind === "directive-escalation" && wake.directiveIds[0] === posted.id));
+    assert.equal((await d.directive()).escalation.status, "sent");
+
+    await d.settleRoot(60);
+    await d.tick(70, api);
+    assert.equal(d.notices.length, 1, "escalated once");
+  } finally {
+    await d.fixture.cleanup();
+  }
+});
+
+test("an acknowledged directive is never re-sent or escalated", async () => {
+  const d = await directiveFixture();
+  const api = digestApi();
+  try {
+    await postDirective({ manifestPath: d.fixture.manifestPath, rootId: d.rootId, from: "supervisor", text: "Pause lane D13.", timestamp: d.at(0) });
+    await d.tick(1, api);
+    const manifest = await d.fixture.manifest();
+    manifest.directives[0].status = "acked";
+    manifest.directives[0].ackedAt = d.at(5);
+    await writeFile(d.fixture.manifestPath, JSON.stringify(manifest));
+    await d.settleRoot(20);
+    await d.tick(30, api);
+    await d.tick(60 * 60, api);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]")).length, 1);
+    assert.equal(d.notices.length, 0);
+  } finally {
+    await d.fixture.cleanup();
+  }
+});
+
+test("a directive the busy root never receives escalates after the configured minutes", async () => {
+  const d = await directiveFixture();
+  const api = digestApi();
+  try {
+    await patchSupervisor(d.fixture, { rootTurn: rootTurn("active") });
+    await postDirective({ manifestPath: d.fixture.manifestPath, rootId: d.rootId, from: "zach", text: "Sweep now.", timestamp: d.at(0) });
+    await d.tick(60, api);
+    assert.equal(api.prompts.length, 0, "a working root is never prompted");
+    assert.equal(d.notices.length, 0);
+    await d.tick(16 * 60, api);
+    assert.equal(api.prompts.length, 0);
+    assert.equal(d.notices.length, 1);
+    assert.match(d.notices[0].body, /not acknowledged after 15 min/);
+  } finally {
+    await d.fixture.cleanup();
+  }
+});
+
+test("directive_escalate_minutes is validated", () => {
+  const base = {
+    version: 2,
+    owner: "herdr-orchestrator",
+    orchestrators: [{ id: "o", root: ROOT, program: { id: "p", workspace_id: ROOT.workspace_id }, workflows: [] }],
+  };
+  const withMinutes = (value) => ({
+    ...base,
+    orchestrators: [{ ...base.orchestrators[0], program: { ...base.orchestrators[0].program, directive_escalate_minutes: value } }],
+  });
+  assert.equal(validateConfig(withMinutes(30)).orchestrators[0].program.directive_escalate_minutes, 30);
+  for (const value of [0, 1441, 2.5, "15"])
+    assert.throws(() => validateConfig(withMinutes(value)), /directive_escalate_minutes/);
+});
+
+test("the directive CLI posts and lists directives", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const { spawnSync } = await import("node:child_process");
+  const cli = fileURLToPath(new URL("../directive.mjs", import.meta.url));
+  try {
+    const posted = spawnSync(process.execPath, [cli, "post", "--manifest", fixture.manifestPath, "--root", "root-x", "--from", "supervisor", "--text", "Pause D13 until the port fix lands."], { encoding: "utf8" });
+    assert.equal(posted.status, 0, posted.stderr);
+    const record = JSON.parse(posted.stdout);
+    assert.equal(record.status, "open");
+    assert.equal(record.delivery.status, "pending");
+    const listed = spawnSync(process.execPath, [cli, "list", "--manifest", fixture.manifestPath], { encoding: "utf8" });
+    assert.match(listed.stdout, new RegExp(`${record.id} \\[open\\] sends=0 supervisor: Pause D13`));
+    const missing = spawnSync(process.execPath, [cli, "post", "--manifest", fixture.manifestPath, "--root", "root-x"], { encoding: "utf8" });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /--from is required/);
   } finally {
     await fixture.cleanup();
   }

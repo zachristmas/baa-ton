@@ -159,6 +159,11 @@ Updated 2026-09-23 with Zach's five additions (items 1-5 in his note), each from
 6. **Directives with ack (item 4)**: directives to the root are stored in the manifest and delivered as urgent digest items.
    - They stay open until the root runs `herdr_directive ack`.
    - If the root finishes a turn without acking, the directive is re-sent once. If it is still unacked, Zach gets a `herdr notification show`.
+   - **As built:**
+     - Directives are posted with `packages/controller/directive.mjs post` (or `postDirective`) into the parent manifest's `directives`, keyed by orchestrator id.
+     - A re-send happens after the first settled root turn whose timestamp is later than the send. Without a turn record, it happens after 5 minutes.
+     - Escalation comes after the ignored re-send, or `program.directive_escalate_minutes` (default 15) after posting, whichever is first. It covers a directive never delivered because the root stayed busy or blocked.
+     - It fires once per directive and is recorded in `escalation`. The notifier is injectable for tests.
 7. **Capacity gate + no-progress watchdog (items 1 and 3)**: two monitors on the existing supervisor tick.
    - **Capacity gate:** when the root's recorded capacity gate clears, "capacity available" goes into the digest. If capacity stays blocked for more than `program.capacity_escalate_minutes` (default 15), Zach gets a notification naming the top memory users.
    - **Watchdog:** if no lane has been `working` for `program.watchdog_minutes` (default 30) while the parent goal isn't terminal, Zach gets a notification and the root a nudge. Each alert fires once per episode.

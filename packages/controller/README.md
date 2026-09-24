@@ -48,7 +48,22 @@ Lane `done`, `blocked` and `goal-paused` events, child messages and open lane re
 - **After a short collection window.** Herdr reports `done` at the end of every child turn, usually beside that lane's child message. Non-urgent items wait until the oldest is `digest_window_seconds` old (default 60), so a burst becomes one wake. `blocked`, `goal-paused` and new lane requests skip the window. Every digest ends with the list of lane requests still awaiting an answer, so an unanswered request stays in front of the root without waking it again. Set it per project with `program.digest_window_seconds` (0–3600) in the controller config; `BAA_TON_DIGEST_WINDOW_SECONDS` is a machine-wide override.
 - **Once.** Items are marked `sending` and saved before the prompt; an interrupted send becomes `uncertain` and is never replayed. Deferrals are not counted as attempts.
 
-Hooks attempt delivery immediately; each supervisor tick (every 5 s) delivers whatever became due. There is no wall-clock stall timer: a lane that is `working` is left alone, and a stuck lane shows up as `blocked`.
+Hooks attempt delivery immediately; each supervisor tick (every 5 s) delivers whatever became due. There is no wall-clock stall timer for lanes: a lane that is `working` is left alone, and a stuck lane shows up as `blocked`.
+
+## Directives
+
+A directive is an instruction to the root from Zach or a supervisor session that must not be silently dropped (for example, one that lands while the root has a dialog open). Post one with:
+
+```sh
+node packages/controller/directive.mjs post --manifest <parent manifest> --root <orchestrator id> --from zach --text "Run herdr_sweep for the finished lanes."
+node packages/controller/directive.mjs list --manifest <parent manifest>
+```
+
+- **Storage:** directives live in the parent manifest's top-level `directives`.
+- **Delivery:** they go out as urgent digest items. The root acknowledges each one with `herdr_directive action=ack`.
+- **Re-send:** if the root finishes a turn after delivery without acknowledging, the directive is sent once more. A root without a turn record gets the re-send after 5 minutes.
+- **Escalation:** after the re-send is ignored, or `program.directive_escalate_minutes` (default 15, range 1-1440) after posting, whichever comes first, Zach gets one local Herdr notification (`herdr notification show ... --sound request`). This includes a directive never delivered because the root stayed busy.
+- **Scope:** this is the controller's first wall-clock threshold. The notification is local Herdr UI, not an external service.
 
 ## Validate
 
