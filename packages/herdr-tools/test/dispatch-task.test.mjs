@@ -89,6 +89,8 @@ async function fixture(options = {}) {
     source: "/source/index.ts",
     adapter: (kind) => registry.resolve(kind),
     busyRetryDelayMs: 1,
+    sessionPollMs: 1,
+    sessionWaitMs: options.sessionWaitMs ?? 2_000,
     update: async (_id, change) => {
       change(state);
       return structuredClone(state);
@@ -234,6 +236,22 @@ async function fixture(options = {}) {
       if (args[0] === "agent" && args[1] === "get") {
         const p = panes.get(args[2]);
         if (p.absent) throw new Error("agent_not_found");
+        // Herdr registers a started agent's session a little after the pane
+        // is ready: withhold agent_session for the first N reads.
+        if ((options.sessionLateGets ?? 0) > 0 && p.session) {
+          options.sessionLateGets -= 1;
+          return {
+            result: {
+              agent: {
+                pane_id: p.paneId,
+                workspace_id: "task-space",
+                agent: options.adapter?.kind ?? "pi",
+                interactive_ready: true,
+                agent_status: "idle",
+              },
+            },
+          };
+        }
         return {
           result: {
             agent: {
@@ -946,4 +964,49 @@ test("stalled assignment remains uncertain and cannot be automatically resubmitt
     assert.equal(f.calls.filter(c => c[1] === "prompt").length, 1);
     assert.deepEqual(f.state.ownership, topology);
   } finally { await f.close(); }
+});
+
+test("startup proof waits, bounded, for Herdr to register a started agent's session", async () => {
+  const f = await fixture({ sessionLateGets: 3 });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    assert.equal(f.calls.filter((c) => c[1] === "start").length, 2, "no agent is started twice");
+    assert.equal(f.options.sessionLateGets, 0, "the late reads were retried, not failed");
+    assert.ok(f.state.lanes.every((lane) => lane.nativeSession), "each lane records its session");
+  } finally {
+    await f.close();
+  }
+});
+
+test("a lane whose session registers after the wait is adopted in place on retry", async () => {
+  const f = await fixture({ sessionLateGets: Number.MAX_SAFE_INTEGER, sessionWaitMs: 20 });
+  try {
+    await assert.rejects(f.run(), /native session reference missing|session/);
+    assert.equal(f.state.status, "dispatch-failed");
+    assert.equal(f.state.retry.failedStage, "startup-proof");
+    assert.equal(f.calls.some((c) => c[1] === "prompt"), false, "no work is assigned without the session");
+    const panes = [...f.state.ownership.paneIds];
+    const starts = f.calls.filter((c) => c[1] === "start").length;
+    // Minutes later Herdr has registered the session; the retry proves the
+    // same pane instead of creating or starting another.
+    f.options.sessionLateGets = 0;
+    assert.equal((await f.run()).dispatched, true);
+    assert.deepEqual(f.state.ownership.paneIds.slice(0, panes.length), panes, "the failed lane keeps its pane");
+    assert.equal(f.calls.filter((c) => c[1] === "start").length - starts, 1, "only the not-yet-started lane starts");
+    assert.equal(f.calls.filter((c) => c[1] === "prompt").length, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a proof that fails with a session present is final, without waiting", async () => {
+  const f = await fixture({ unrelatedSession: true, sessionWaitMs: 60_000 });
+  try {
+    const started = Date.now();
+    await assert.rejects(f.run());
+    assert.ok(Date.now() - started < 5_000, "a mismatched session is not retried");
+    assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+  } finally {
+    await f.close();
+  }
 });
