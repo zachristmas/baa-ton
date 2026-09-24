@@ -17,3 +17,11 @@ export function routeChildMessage(options: {
   delivery: "pending" | "delivered" | "uncertain";
   request: { id: string; delivery: { status: string } };
 }>;
+
+export type CapacitySample = {
+  freeMemoryGb?: number;
+  swapUsedGb?: number;
+  load1PerCpu?: number;
+};
+
+export function sampleCapacity(): Promise<CapacitySample>;

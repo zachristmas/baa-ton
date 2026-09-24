@@ -148,6 +148,10 @@ isolation or clarity.
 - Acknowledge every directive that arrives in a digest with `herdr_directive action=ack`
   as soon as you accept it. An unacknowledged directive is re-sent once and then
   escalated to Zach.
+- Never park silently on machine capacity. Retire finished lanes first, then record the
+  gate with `herdr_capacity action=wait` (reason plus memory, swap or load
+  thresholds) and end the turn. The digest says when capacity is available, and Zach
+  is notified if it stays blocked.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —

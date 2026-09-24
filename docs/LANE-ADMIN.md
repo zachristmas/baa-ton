@@ -168,6 +168,11 @@ Updated 2026-09-23 with Zach's five additions (items 1-5 in his note), each from
    - **Capacity gate:** when the root's recorded capacity gate clears, "capacity available" goes into the digest. If capacity stays blocked for more than `program.capacity_escalate_minutes` (default 15), Zach gets a notification naming the top memory users.
    - **Watchdog:** if no lane has been `working` for `program.watchdog_minutes` (default 30) while the parent goal isn't terminal, Zach gets a notification and the root a nudge. Each alert fires once per episode.
    - These are the controller's first wall-clock thresholds, so the controller README text about "no stall timer" changes with this PR.
+   - **As built:**
+     - The root records the gate with `herdr_capacity` (wait, status or cancel) into `rootSupervision` in the parent manifest.
+     - The sampler reads `vm_stat` and `sysctl vm.swapusage` on macOS, or `/proc/meminfo` on Linux, plus `os.loadavg`.
+     - The watchdog counts a lane as working when its latest recorded event is `working`, and the root as working while its turn is `active`.
+     - Alerts are digest items with no ack, since they report state. Notifications fire once per blocked gate and once per idle episode.
 
 Each PR adds unit tests using fakes (a fake bind probe, a fake `ui.confirm`, the stub `herdr` for notifications) and keeps `npm test` green.
 
