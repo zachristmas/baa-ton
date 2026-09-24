@@ -3798,7 +3798,101 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     }
   }
 
-  type WorkflowWithRequests = Workflow & { laneRequests?: LaneRequest[] };
+  type WorkflowWithRequests = Workflow & { laneRequests?: LaneRequest[]; laneMessages?: LaneMessage[] };
+
+  /** Root-to-lane message (herdr_tell). */
+  type LaneMessage = {
+    id: string;
+    laneId: string;
+    from: "root";
+    text: string;
+    createdAt: string;
+    delivery: LaneDelivery;
+  };
+  type LaneDelivery = {
+    status: "delivered" | "pending" | "uncertain";
+    updatedAt: string;
+    attempts?: number;
+    reason?: string;
+    text?: string;
+  };
+
+  /** Type text into a lane only while it is idle. A busy or unreachable lane
+   * gets nothing typed and the delivery stays pending for the supervisor; a
+   * failed prompt is uncertain and never retyped. */
+  async function deliverToLane(
+    paneId: string | undefined,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<LaneDelivery> {
+    const stamp = now();
+    if (!paneId) return { status: "pending", updatedAt: stamp, reason: "the lane has no recorded pane", text };
+    let status: unknown;
+    try {
+      const agent = responseRecord(await runHerdr(["agent", "get", paneId], signal), "lane agent").agent;
+      status = isRecord(agent) ? agent.agent_status : undefined;
+    } catch (error) {
+      return { status: "pending", updatedAt: stamp, reason: `lane unavailable: ${clip((error as Error).message, 300)}`, text };
+    }
+    if (status === "working" || status === "blocked")
+      return { status: "pending", updatedAt: stamp, reason: `lane is ${status}`, text };
+    try {
+      await runHerdr(["agent", "prompt", paneId, text], signal);
+      return { status: "delivered", updatedAt: now(), attempts: 1 };
+    } catch (error) {
+      return { status: "uncertain", updatedAt: now(), attempts: 1, reason: clip((error as Error).message, 500) };
+    }
+  }
+
+  function laneMessageText(message: { id: string; text: string }) {
+    return `[Baa-ton root message] ${message.id}: ${message.text}\n(Reply with herdr_message if the root needs an answer.)`;
+  }
+
+  /** herdr_tell: the root sends a durable message to one of its live lanes. */
+  async function tellLane(
+    cwd: string,
+    params: { workflowId: string; laneId: string; text: string },
+    signal?: AbortSignal,
+  ) {
+    const scope = requireRootManifestExecutor(cwd);
+    const text = params.text.trim();
+    if (!text) throw new Error("text is required.");
+    let message: LaneMessage;
+    let paneId: string | undefined;
+    const release = await acquireManifestLock(cwd, 10_000);
+    try {
+      const manifest = await loadManifest(cwd);
+      const workflow = workflowFor(manifest, params.workflowId) as WorkflowWithRequests;
+      if (!workflowOwnedByRoot(workflow, scope, cwd))
+        throw new Error(`Workflow ${workflow.id} is not owned by this root.`);
+      const lane = workflow.lanes.find((item) => item.id === params.laneId);
+      if (!lane) throw new Error(`Workflow ${workflow.id} has no lane ${params.laneId}.`);
+      if (!lane.paneId) throw new Error(`Lane ${lane.id} has not been dispatched to a pane yet.`);
+      paneId = lane.paneId;
+      message = {
+        id: `lane-message-${randomUUID().slice(0, 8)}`,
+        laneId: lane.id,
+        from: "root",
+        text,
+        createdAt: now(),
+        delivery: { status: "pending", updatedAt: now(), reason: "not yet attempted" },
+      };
+      (workflow.laneMessages ??= []).push(message);
+      workflow.evidence.push({ at: message.createdAt, kind: "lane-message", text: `${message.id} to ${lane.id}: ${clip(text, 200)}` });
+      workflow.updatedAt = message.createdAt;
+      await saveManifest(cwd, manifest);
+    } finally {
+      await release();
+    }
+    const delivery = await deliverToLane(paneId, laneMessageText(message), signal);
+    await withManifestTransaction(cwd, (manifest) => {
+      const stored = (
+        manifest.workflows.find((item) => item.id === params.workflowId) as WorkflowWithRequests | undefined
+      )?.laneMessages?.find((item) => item.id === message.id);
+      if (stored) stored.delivery = delivery;
+    });
+    return { message: { ...message, delivery } };
+  }
 
   /** Answer a new request from the acknowledged policy, or leave it open
    * with the reason in `note`. */
@@ -4054,23 +4148,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } finally {
       await release();
     }
-    // Non-waiting delivery after the durable answer; never retyped on failure.
-    let delivery: NonNullable<LaneRequest["answerDelivery"]>;
-    try {
-      if (!paneId) throw new Error("the lane has no recorded pane");
-      await runHerdr(
-        [
-          "agent",
-          "prompt",
-          paneId,
-          `[Baa-ton request answer] ${answered.id}: ${answered.status}. ${answered.summary}${answered.note ? `. ${answered.note}` : ""}`,
-        ],
-        signal,
-      );
-      delivery = { status: "delivered", updatedAt: now() };
-    } catch (error) {
-      delivery = { status: "uncertain", updatedAt: now(), reason: clip((error as Error).message, 500) };
-    }
+    // Non-waiting delivery after the durable answer, only into an idle lane:
+    // a busy lane keeps it pending for the supervisor; never retyped on failure.
+    const delivery = await deliverToLane(
+      paneId,
+      `[Baa-ton request answer] ${answered.id}: ${answered.status}. ${answered.summary}${answered.note ? `. ${answered.note}` : ""}`,
+      signal,
+    );
     await withManifestTransaction(cwd, (manifest) => {
       const stored = (
         manifest.workflows.find((item) => item.id === answered.workflowId) as
@@ -10016,6 +10100,44 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 ? "\nOpen: the root will answer; do not repeat the request in chat."
                 : "");
       return { content: [{ type: "text", text }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_tell",
+    label: "Herdr Tell",
+    description:
+      "Send a durable message from the root to one of its dispatched lanes: an answer, a decision, a correction or a go-ahead. It is typed into the lane now if the lane is idle; while the lane is working or blocked it is queued and the supervisor delivers it when the lane goes idle. Delivery state is recorded in the workflow's laneMessages.",
+    promptSnippet: "Message one of your live lanes (answers, decisions, go-aheads).",
+    promptGuidelines: [
+      "Use herdr_tell to reach a lane you dispatched instead of refusing or asking the operator to type into its pane: answers to its questions, decisions, corrections and go-aheads. Do not use it to hand a lane new authority (push, merge, deploy, production); lane contracts still forbid those.",
+      "Answers to herdr_request records reach the lane on their own; use herdr_tell only for anything else.",
+    ],
+    parameters: Type.Object(
+      {
+        workflowId: Type.String({ minLength: 1 }),
+        laneId: Type.String({ minLength: 1 }),
+        text: Type.String({ minLength: 1, maxLength: 4000 }),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _update, ctx) {
+      const result = await tellLane(ctx.cwd, params, signal);
+      const delivery = result.message.delivery;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${result.message.id} to ${params.workflowId}/${params.laneId}: ${
+              delivery.status === "delivered"
+                ? "delivered"
+                : delivery.status === "pending"
+                  ? `queued (${delivery.reason}); the supervisor delivers it when the lane is idle`
+                  : `delivery uncertain (${delivery.reason}); it will not be retyped, check the lane before resending`
+            }.`,
+          },
+        ],
+        details: result,
+      };
     },
   });
   pi.registerTool({

@@ -102,6 +102,8 @@ test("lane requests: policy answers what it can, the root answers the rest and t
         prompts.push({ pane: args[2], text: args[3], wait: args.includes("--wait") });
         return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
       }
+      if (command === "herdr" && args[0] === "agent" && args[1] === "get")
+        return { code: 0, stdout: JSON.stringify({ result: { type: "agent_info", agent: { pane_id: args[2], agent_status: "idle" } } }), stderr: "" };
       throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
     },
   });

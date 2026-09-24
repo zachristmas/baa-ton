@@ -37,7 +37,9 @@ export type LaneRequest = {
     reason?: string;
   };
   /** Delivery of the root's answer back to the lane pane. */
-  answerDelivery?: { status: "delivered" | "uncertain"; updatedAt: string; reason?: string };
+  /** pending: the lane was busy or unreachable, nothing was typed; the
+   * supervisor delivers `text` once the lane is idle. */
+  answerDelivery?: { status: "delivered" | "pending" | "uncertain"; updatedAt: string; reason?: string; text?: string };
 };
 
 const TEXT_MAX = 2000;
