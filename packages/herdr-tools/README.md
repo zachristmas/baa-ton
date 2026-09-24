@@ -60,13 +60,16 @@ Herdr creates the lane. Baa-ton does not answer that prompt. Keep the pane and
 workflow intact while the user reviews it; do not launch a replacement agent.
 
 After the user resolves the prompt, retry `herdr_dispatch` for the **same**
-workflow. A controller-observed `blocked` or `unknown` workflow can resume startup only if its
+workflow. A controller-observed `blocked` workflow can resume startup only if its
 recorded failure was `agent-start` / `agent_not_ready`, no assignment or receipt
 exists, and each previously attempted agent is now natively ready with matching
 startup identity, session, exact profile and protocol-tool proof. Missing or
 mismatched proof and a still-blocked agent refuse recovery before changing the
 workflow. Ordinary blocked/unknown work and uncertain assignment submissions remain
-ineligible. The existing startup adoption path reuses the blocked agent; later,
+ineligible. An `unknown` workflow with a retryable failure also re-enters dispatch
+through the stalled-assignment recovery; the same readiness and proof checks apply
+to an `agent_not_ready` startup, and an uncertain assignment is still never
+resubmitted. The existing startup adoption path reuses the blocked agent; later,
 previously unstarted lanes may start normally after qualification.
 
 This path performs no approval keystrokes and does not infer permission from

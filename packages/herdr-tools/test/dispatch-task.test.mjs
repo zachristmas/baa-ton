@@ -811,12 +811,27 @@ for (const observedStatus of ["dispatch-failed", "blocked", "unknown"]) test(`st
       assert.deepEqual(f.state, before);
       f.options.unrelatedSession = false;
       blocked.promptAttemptedAt = new Date().toISOString();
-      await assert.rejects(f.run(), new RegExp(`cannot be dispatched from ${observedStatus}`));
+      const promptCalls = f.calls.filter((c) => c[1] === "prompt").length;
+      // An `unknown` retryable workflow enters dispatch through the stalled-
+      // assignment path (#30), which refuses the uncertain submission itself.
+      await assert.rejects(
+        f.run(),
+        observedStatus === "unknown"
+          ? /Assignment submission is uncertain; do not repeat terminal input/
+          : new RegExp(`cannot be dispatched from ${observedStatus}`),
+      );
+      assert.equal(f.calls.filter((c) => c[1] === "prompt").length, promptCalls, "no terminal input is repeated");
       delete blocked.promptAttemptedAt;
-      const previousError = f.state.retry.error;
-      f.state.retry.error = "unrelated failure";
-      await assert.rejects(f.run(), new RegExp(`cannot be dispatched from ${observedStatus}`));
-      f.state.retry.error = previousError;
+      f.state.status = observedStatus;
+      // A blocked workflow re-enters only for an agent_not_ready startup.
+      // (An `unknown` retryable workflow may retry any stage since #30; the
+      // startup proof below still guards it.)
+      if (observedStatus === "blocked") {
+        const previousError = f.state.retry.error;
+        f.state.retry.error = "unrelated failure";
+        await assert.rejects(f.run(), /cannot be dispatched from blocked/);
+        f.state.retry.error = previousError;
+      }
     }
     assert.equal((await f.run()).dispatched, true);
     // One blocked attempt plus one fresh start for the untouched lane.
