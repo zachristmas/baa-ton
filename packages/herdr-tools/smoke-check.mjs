@@ -389,7 +389,7 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 26, "extension registered its workflow tools");
+assert.equal(tools.size, 27, "extension registered its workflow tools");
 assert.ok(tools.has("herdr_recover_root"), "extension registers audited stale-root recovery");
 assert.ok(
   tools.has("herdr_bootstrap_root"),

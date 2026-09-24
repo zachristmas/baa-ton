@@ -41,7 +41,7 @@ const suites = {
     ["packages/herdr-tools/smoke-check.mjs"],
     ["--test", "packages/herdr-tools/test/*.test.mjs"],
   ],
-  controller: [["--test", "packages/controller/test/controller.test.mjs"]],
+  controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs"]],
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

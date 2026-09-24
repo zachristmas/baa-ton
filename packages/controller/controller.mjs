@@ -32,6 +32,15 @@ export {
   loadedCode,
   recordRuntime,
 } from "./code-version.mjs";
+import { describeIdleServices, idleLaneServices } from "./lane-services.mjs";
+export {
+  describeIdleServices,
+  idleLaneServices,
+  isHarnessCommand,
+  laneFinished,
+  paneServiceProcesses,
+  parseProcessIdentity,
+} from "./lane-services.mjs";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import {
@@ -2512,12 +2521,16 @@ export async function superviseRoot({
     ) {
       const users = await topUsers();
       const minutes = Math.round((Date.parse(timestamp) - Date.parse(gate.createdAt)) / 60_000);
+      // Name (never stop) stacks still held by finished lanes: retiring
+      // those lanes is usually the fastest way to clear the gate.
+      const idle = describeIdleServices(idleLaneServices(manifest.workflows));
       gate.escalatedAt = timestamp;
       gate.sample = current;
+      if (idle) queueRootAlert(entry, "capacity-idle-services", idle, timestamp);
       gate.escalation = await notify({
         title: "Baa-ton: capacity still blocked",
         body: clipText(
-          `${orchestrator.id} has waited ${minutes} min for "${gate.reason}" (${describeGate(gate)}). Now ${describeSample(current)}. Top memory: ${users.length ? users.join("; ") : "unavailable"}.`,
+          `${orchestrator.id} has waited ${minutes} min for "${gate.reason}" (${describeGate(gate)}). Now ${describeSample(current)}. Top memory: ${users.length ? users.join("; ") : "unavailable"}.${idle ? ` ${idle}` : ""}`,
           500,
         ),
       });

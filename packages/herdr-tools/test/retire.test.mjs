@@ -18,7 +18,7 @@ const policy = {
   },
 };
 
-async function setup({ acknowledged = true, stopCode = 0, laneStatus = "idle" } = {}) {
+async function setup({ acknowledged = true, stopCode = 0, laneStatus = "idle", handle } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-retire-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
@@ -114,6 +114,8 @@ async function setup({ acknowledged = true, stopCode = 0, laneStatus = "idle" } 
     },
     async exec(command, args, options = {}) {
       calls.push({ command, args, cwd: options.cwd });
+      const handled = await handle?.(command, args);
+      if (handled !== undefined) return handled;
       if (command === "herdr" && args[0] === "agent" && args[1] === "get")
         return {
           code: 0,
@@ -241,6 +243,125 @@ test("a lane still working is left alone", async () => {
     await f.settle();
     assert.equal((await f.manifest()).workflows[0].lanes[0].retirement, undefined);
     assert.equal(f.calls.some((call) => call.args[0] === "tab"), false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("registered services: a lane or the root registers panes and processes, and retire stops them", async () => {
+  const { spawn, execFileSync } = await import("node:child_process");
+  const byPid = spawn("sleep", ["300"], { stdio: "ignore" });
+  const inPane = spawn("sleep", ["301"], { stdio: "ignore" });
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const ps = (args) => {
+    try {
+      return { code: 0, stderr: "", stdout: execFileSync("ps", args, { encoding: "utf8" }) };
+    } catch {
+      return { code: 1, stderr: "", stdout: "" };
+    }
+  };
+  const f = await setup({
+    handle(command, args) {
+      if (command === "ps") return ps(args);
+      if (command === "herdr" && args[0] === "pane" && args[1] === "get")
+        return args[2] === "w-ret:p9"
+          ? { code: 0, stderr: "", stdout: JSON.stringify({ result: { pane: { pane_id: "w-ret:p9" } } }) }
+          : { code: 1, stderr: "pane_not_found", stdout: "" };
+      if (command === "herdr" && args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { process_info: { shell_pid: 99999, foreground_processes: [{ pid: 99999, name: "zsh" }, { pid: inPane.pid, name: "sleep" }] } },
+          }),
+        };
+      return undefined;
+    },
+  });
+  const service = (params) => f.tools.get("herdr_service").execute("service", params, undefined, undefined, f.ctx);
+  try {
+    const pane = await service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "web-dev", paneId: "w-ret:p9" });
+    assert.equal(pane.details.service.registeredBy, "root");
+    const proc = await service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "db", pid: byPid.pid });
+    assert.match(proc.details.service.command, /sleep 300/);
+    assert.ok(proc.details.service.start, "the start time pins the pid");
+
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "again", pid: byPid.pid }), /Already registered/);
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "self", pid: process.pid }), /cannot be registered/);
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "gone", pid: 999999 }), /No running process/);
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "agent", paneId: "w-ret:p3" }), /not available|lane's own agent pane/);
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "x", paneId: "w-ret:p9", pid: 5 }), /exactly one/);
+    await assert.rejects(service({ action: "register", workflowId: "herdr-ret00001", laneId: "lane-a", name: "bad name!", pid: byPid.pid }), /short service name/);
+
+    const listed = await service({ action: "list" });
+    assert.deepEqual(listed.details.services.map((item) => item.name), ["web-dev", "db"]);
+    assert.match(listed.content[0].text, /Services still held by finished lanes: web-dev \(herdr-ret00001\/lane-a, pane w-ret:p9\); db/);
+
+    const capacity = await f.tools.get("herdr_capacity").execute("capacity", { action: "status" }, undefined, undefined, f.ctx);
+    assert.match(capacity.content[0].text, /Services still held by finished lanes: web-dev/, "the capacity report names them");
+
+    const dry = await f.tools.get("herdr_retire").execute("retire", { workflowId: "herdr-ret00001" }, undefined, undefined, f.ctx);
+    assert.deepEqual(dry.details.candidates[0].services.map((item) => item.name), ["web-dev", "db"]);
+    assert.ok(alive(byPid.pid) && alive(inPane.pid), "a dry run stops nothing");
+
+    await f.tools.get("herdr_retire").execute("retire", { workflowId: "herdr-ret00001", execute: true }, undefined, undefined, f.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(alive(byPid.pid), false, "the registered process was stopped");
+    assert.equal(alive(inPane.pid), false, "the pane's foreground process was stopped");
+    const stored = await f.manifest();
+    assert.deepEqual(stored.workflows[0].laneServices.map((item) => item.state), ["stopped", "stopped"]);
+    assert.equal(stored.workflows[0].lanes[0].retirement.status, "retired");
+    assert.ok(stored.workflows[0].lanes[0].retirement.stops.some((stop) => /service db \(service-\w+\): SIGTERM pid/.test(stop.command)));
+  } finally {
+    byPid.kill();
+    inPane.kill();
+    await f.cleanup();
+  }
+});
+
+test("retire never signals a reused pid", async () => {
+  const f = await setup({ handle: (command, args) => (command === "ps" ? { code: 0, stderr: "", stdout: "Thu Sep 24 11:00:00 2026 sleep 300\n" } : undefined) });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows[0].laneServices = [{
+      id: "service-old", laneId: "lane-a", name: "db", kind: "process", pid: 424242, start: "Thu Sep 24 09:00:00 2026",
+      command: "postgres", registeredBy: "lane", registeredAt: "t", state: "active",
+    }];
+    await writeFile(join(f.parent, ".baa-ton", "herdr-orchestrator", "manifest.json"), JSON.stringify(manifest));
+    await f.tools.get("herdr_retire").execute("retire", { workflowId: "herdr-ret00001", execute: true }, undefined, undefined, f.ctx);
+    const stored = (await f.manifest()).workflows[0].laneServices[0];
+    assert.equal(stored.state, "stopped");
+    assert.match(stored.stopNote, /now belongs to another process; not signalled/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane registers its own services only", async () => {
+  const f = await setup({
+    handle: (command, args) =>
+      command === "herdr" && args[0] === "pane" && args[1] === "get"
+        ? { code: 0, stderr: "", stdout: JSON.stringify({ result: { pane: { pane_id: args[2] } } }) }
+        : undefined,
+  });
+  try {
+    process.env.HERDR_PANE_ID = "w-ret:p3";
+    const call = (params) => f.tools.get("herdr_service").execute("service", params, undefined, undefined, f.ctx);
+    const own = await call({ action: "register", name: "storybook", paneId: "w-ret:p8" });
+    assert.equal(own.details.service.laneId, "lane-b");
+    assert.equal(own.details.service.registeredBy, "lane");
+    await assert.rejects(call({ action: "register", laneId: "lane-a", name: "x", paneId: "w-ret:p7" }), /only for itself/);
+    const listed = await call({ action: "list" });
+    assert.deepEqual(listed.details.services.map((item) => item.laneId), ["lane-b"]);
+    const released = await call({ action: "release", serviceId: own.details.service.id });
+    assert.equal(released.details.service.state, "released");
   } finally {
     await f.cleanup();
   }

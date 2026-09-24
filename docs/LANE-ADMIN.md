@@ -184,3 +184,14 @@ Each PR adds unit tests using fakes (a fake bind probe, a fake `ui.confirm`, the
 2. **Policy location:** `.baa-ton/config.json`, with the hash acknowledgement stored in the manifest.
 3. **Dispatch-time leases:** writer lanes only.
 4. **Auto-grants:** recorded as evidence only. They don't wake the root or add a digest line.
+
+## Lane services (registered stacks)
+
+Services started through a granted runtime-launch template are stopped on retire by the template's `stop` command. A stack started any other way (by hand in a separate Herdr pane, or as a background process) is invisible to retire until it is registered:
+
+- `herdr_service action=register name=<short name>` with exactly one of `paneId` or `pid`. A lane registers for itself; the root registers for lanes it owns. Records live in `workflow.laneServices`.
+- A **process** is recorded with its start time and command (`ps -o lstart=,command=`). Retire sends SIGTERM only while the pid still has that start time, so a reused pid is never signalled.
+- A **pane** is stopped by sending SIGTERM to its foreground processes, read live from `herdr pane process-info`. The shell stays, and the pane is not closed.
+- Agents and Herdr/Baa-ton processes (and a lane's own agent pane) cannot be registered.
+- `release` unregisters without stopping.
+- Capacity reports (`herdr_capacity`, and the controller's escalation notice and digest alert) **name** services still held by finished, unretired lanes. That covers registered services and granted runtime templates. Naming never stops anything; retiring the lane does.

@@ -137,6 +137,7 @@ const LANE_PERMISSIONS = {
     // Leases are enforced by the tool itself (own lane only, policy-gated).
     "mcp__herdr-orchestrator__herdr_lease",
     "mcp__herdr-orchestrator__herdr_request",
+    "mcp__herdr-orchestrator__herdr_service",
   ],
   deny: [
     "Bash(git push:*)",
@@ -155,7 +156,7 @@ export const PERMISSION_ROUTE_WAIT_SECONDS = 600;
 
 /** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
 export const LANE_AUTO_MODE_ALLOW =
-  "This session is a Baa-ton child lane dispatched by the user's registered root. Calling its herdr-orchestrator MCP tools (herdr_complete, herdr_message, herdr_request, herdr_lease, herdr_permission_prompt) to report this lane's own progress, receipt, questions and resource requests to that parent root is the assigned contract and is expected; it does not bypass auto mode, grant new authority or reach external services.";
+  "This session is a Baa-ton child lane dispatched by the user's registered root. Calling its herdr-orchestrator MCP tools (herdr_complete, herdr_message, herdr_request, herdr_lease, herdr_service, herdr_permission_prompt) to report this lane's own progress, receipt, questions and resource requests to that parent root is the assigned contract and is expected; it does not bypass auto mode, grant new authority or reach external services.";
 
 function buildClaudeLaunchArguments(
   paths: ClaudeAdapterPaths,
