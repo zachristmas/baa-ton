@@ -131,6 +131,14 @@ import {
 } from "./live-identity.mjs";
 import { legacyStateStatus } from "./state-migration.mjs";
 import { classifyLocalValidation } from "./known-safe.mjs";
+import {
+  SPEC_PATH,
+  loadSpec,
+  loadSpecState,
+  specStatusTable,
+  targetRepo,
+  verifySpec,
+} from "./spec.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -10336,6 +10344,37 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ],
         details: result,
       };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_spec",
+    label: "Herdr Spec",
+    description:
+      `Read the project's spec (${SPEC_PATH}) and report progress. status prints one line (spec N/M done plus counts per stage) and a table of item, stage, lane, age and blocker; verify runs the deterministic verifier and lists the first failing check per item. An item is done only when the verifier passes: its evidence report exists with enough images and a recorded hash, its integrated commit is on the target branch, its tests were recorded green at that commit, and its preview specs passed on a release containing it. Read-only.`,
+    promptSnippet: "Show spec progress (N/M done) and each item's blocker.",
+    promptGuidelines: [
+      "Use herdr_spec action=status as the burn-down instead of counting items by hand; an item is done only when the verifier says so, never by judgment.",
+    ],
+    parameters: Type.Object(
+      { action: Type.Union([Type.Literal("status"), Type.Literal("verify")]) },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, _signal, _update, ctx) {
+      const spec = await loadSpec(ctx.cwd);
+      if (!spec)
+        return { content: [{ type: "text", text: `No ${SPEC_PATH} in ${ctx.cwd}.` }], details: { configured: false } };
+      const state = await loadSpecState(ctx.cwd);
+      const verification = await verifySpec(spec, state, { repo: targetRepo(spec, ctx.cwd) });
+      const text =
+        params.action === "status"
+          ? specStatusTable(spec, state, verification)
+          : [
+              `${verification.done}/${verification.total} done`,
+              ...verification.results
+                .filter((result) => !result.done)
+                .map((result) => `${result.id}: ${result.failing!.name}: ${result.failing!.detail}`),
+            ].join("\n");
+      return { content: [{ type: "text", text }], details: { configured: true, verification } };
     },
   });
   pi.registerTool({
