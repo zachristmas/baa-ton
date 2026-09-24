@@ -145,6 +145,9 @@ isolation or clarity.
   LSP and tsserver processes) and releases its leases. It never removes a worktree.
   Under an acknowledged policy that grants `retire`, lanes whose completion receipt
   reached the root are retired automatically when the root's turn settles.
+- Acknowledge every directive that arrives in a digest with `herdr_directive action=ack`
+  as soon as you accept it. An unacknowledged directive is re-sent once and then
+  escalated to Zach.
 - `herdr_sweep` is dry-run by default. Execute cleanup through native confirmation
   when available, or `confirm=true` on a headless root after showing the user the
   exact dry-run inventory and getting explicit approval in this conversation —

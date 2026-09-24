@@ -256,6 +256,23 @@ type ManifestWithGoalHistory = Manifest & {
   approvalPolicyAck?: ApprovalPolicyAck;
   /** Runtime lease ledger; active entries never share a port or name. */
   leases?: Lease[];
+  /** Directives to a root; open until the root acknowledges them. */
+  directives?: RootDirective[];
+};
+type RootDirective = {
+  id: string;
+  rootId: string;
+  from: string;
+  text: string;
+  createdAt: string;
+  status: "open" | "acked";
+  sends?: number;
+  sentAt?: string;
+  delivery?: { status: string; attempts?: number; updatedAt: string; reason?: string };
+  escalatedAt?: string;
+  escalation?: { status: string; reason?: string };
+  ackedAt?: string;
+  ackNote?: string;
 };
 type ParentGoalActionResult =
   | { goal: ParentGoal; goalHistoryCount: number }
@@ -790,6 +807,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       goalHistoryByRoot?: unknown;
       approvalPolicyAck?: ApprovalPolicyAck;
       leases?: Lease[];
+      directives?: RootDirective[];
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -826,6 +844,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
           ? { approvalPolicyAck: parsed.approvalPolicyAck }
           : {}),
         ...(Array.isArray(parsed.leases) ? { leases: parsed.leases } : {}),
+        ...(Array.isArray(parsed.directives) ? { directives: parsed.directives } : {}),
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
@@ -1799,8 +1818,18 @@ function validateControllerConfig(input: unknown): ControllerConfig {
       record.program,
       `controller config.orchestrators[${index}].program`,
       ["id", "workspace_id"],
-      ["parent_manifest_path", "digest_window_seconds"],
+      ["parent_manifest_path", "digest_window_seconds", "directive_escalate_minutes"],
     );
+    const directiveEscalateMinutes = program.directive_escalate_minutes;
+    if (
+      directiveEscalateMinutes !== undefined &&
+      (!Number.isSafeInteger(directiveEscalateMinutes) ||
+        (directiveEscalateMinutes as number) < 1 ||
+        (directiveEscalateMinutes as number) > 1_440)
+    )
+      throw new Error(
+        "controller program.directive_escalate_minutes must be an integer from 1 to 1440.",
+      );
     const digestWindowSeconds = program.digest_window_seconds;
     if (
       digestWindowSeconds !== undefined &&
@@ -1844,6 +1873,9 @@ function validateControllerConfig(input: unknown): ControllerConfig {
           : {}),
         ...(digestWindowSeconds !== undefined
           ? { digest_window_seconds: digestWindowSeconds as number }
+          : {}),
+        ...(directiveEscalateMinutes !== undefined
+          ? { directive_escalate_minutes: directiveEscalateMinutes as number }
           : {}),
       },
       workflows: record.workflows.map((workflow, workflowIndex) =>
@@ -9556,6 +9588,51 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 )
               : ["No finished lanes to retire."];
       return { content: [{ type: "text", text: lines.join("\n") }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_directive",
+    label: "Herdr Directive",
+    description:
+      "List or acknowledge directives sent to this root by Zach or a supervisor session. A directive stays open until acknowledged; the controller re-sends an unacknowledged one once and then notifies Zach.",
+    promptSnippet: "List or acknowledge directives to this root.",
+    promptGuidelines: [
+      "When a digest carries a directive, acknowledge it with herdr_directive action=ack id=<id> as soon as you accept it (add a short note), then act on it. Use action=list to see directives still open.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("list"), Type.Literal("ack")]),
+      id: Type.Optional(Type.String()),
+      note: Type.Optional(Type.String()),
+      includeAcked: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const scope = requireRootManifestExecutor(ctx.cwd);
+      const mine = (manifest: ManifestWithQueue) =>
+        (manifest.directives ?? []).filter((directive) => directive.rootId === scope.rootId);
+      const describe = (directive: RootDirective) =>
+        `${directive.id} [${directive.status}${directive.escalatedAt ? ", escalated" : ""}] ${directive.from}: ${directive.text}${directive.ackNote ? ` (ack: ${directive.ackNote})` : ""}`;
+      if (params.action === "list") {
+        const directives = mine(await loadManifest(ctx.cwd)).filter(
+          (directive) => params.includeAcked || directive.status === "open",
+        );
+        return {
+          content: [{ type: "text", text: directives.length ? directives.map(describe).join("\n") : "No open directives." }],
+          details: { directives },
+        };
+      }
+      if (!params.id) throw new Error("id is required to acknowledge a directive.");
+      const directive = await withManifestTransaction(ctx.cwd, (manifest) => {
+        const found = mine(manifest).find((item) => item.id === params.id);
+        if (!found) throw new Error(`Unknown directive ${params.id} for this root.`);
+        if (found.status === "open") {
+          found.status = "acked";
+          found.ackedAt = now();
+          const note = params.note?.trim();
+          if (note) found.ackNote = clip(note, 1000);
+        }
+        return { ...found };
+      });
+      return { content: [{ type: "text", text: `Acknowledged ${describe(directive)}` }], details: { directive } };
     },
   });
   pi.registerTool({

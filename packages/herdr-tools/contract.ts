@@ -201,6 +201,7 @@ export type ControllerOrchestrator = {
     parent_manifest_path?: string;
     /** Seconds to collect non-urgent updates before one root digest (default 60). */
     digest_window_seconds?: number;
+    directive_escalate_minutes?: number;
   };
   workflows: ControllerWorkflowMapping[];
 };
