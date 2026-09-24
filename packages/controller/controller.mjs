@@ -604,6 +604,58 @@ function configuredMappings(config) {
   );
 }
 
+const SUPERVISOR_DIAGNOSTICS_NAME = "supervisor-diagnostics.json";
+const MAX_SUPERVISOR_DIAGNOSTICS = 50;
+const DIAGNOSTIC_REFRESH_MS = 60_000;
+
+/**
+ * Record one skipped manifest in <stateDir>/supervisor-diagnostics.json so
+ * the skip is visible even when supervisor stderr is not captured. Entries
+ * are keyed by orchestrator, manifest, stage and error; a repeat refreshes
+ * `lastAt` at most once a minute. Never throws.
+ */
+async function recordManifestSkip(stateDir, { orchestrator, manifestPath, stage, error, timestamp }) {
+  const message = clipText(String(error?.message ?? error), 500);
+  const code = typeof error?.code === "string" ? error.code : undefined;
+  const skip = { manifestPath, status: "skipped", stage, error: message, ...(code ? { code } : {}) };
+  if (!stateDir) return skip;
+  try {
+    const path = join(stateDir, SUPERVISOR_DIAGNOSTICS_NAME);
+    let stored = { version: 1, skips: [] };
+    try {
+      const parsed = JSON.parse(await readFile(path, "utf8"));
+      if (isRecord(parsed) && Array.isArray(parsed.skips)) stored = parsed;
+    } catch {
+      // Missing or unreadable diagnostics start fresh.
+    }
+    const key = [orchestrator.id, manifestPath, stage, message].join("\n");
+    const existing = stored.skips.find((item) => item.key === key);
+    if (existing) {
+      if (Date.parse(timestamp) - Date.parse(existing.lastAt) < DIAGNOSTIC_REFRESH_MS) return skip;
+      existing.lastAt = timestamp;
+    } else {
+      stored.skips.push({
+        key,
+        orchestratorId: orchestrator.id,
+        manifestPath,
+        stage,
+        error: message,
+        ...(code ? { code } : {}),
+        firstAt: timestamp,
+        lastAt: timestamp,
+      });
+      if (stored.skips.length > MAX_SUPERVISOR_DIAGNOSTICS)
+        stored.skips.splice(0, stored.skips.length - MAX_SUPERVISOR_DIAGNOSTICS);
+    }
+    const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(stored, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, path);
+  } catch {
+    // Diagnostics are best effort; the skip is still in the tick result.
+  }
+  return skip;
+}
+
 function configuredParentManifests(config) {
   return config.orchestrators.flatMap((orchestrator) => {
     const paths = new Set(
@@ -2976,7 +3028,17 @@ export async function runSupervisorTick({
     const manifestKey = `${orchestrator.id}:${manifestPath}`;
     if (seenManifests.has(manifestKey)) continue;
     seenManifests.add(manifestKey);
-    const release = await acquireManifestLock(manifestPath);
+    // One unreadable, missing or invalid manifest (often a historical
+    // mapping) must not starve the valid ones after it. Skip it for this
+    // tick and leave a durable diagnostic; nothing is retried here, and any
+    // delivery already marked sending becomes uncertain on the next pass.
+    let release;
+    try {
+      release = await acquireManifestLock(manifestPath);
+    } catch (error) {
+      results.push(await recordManifestSkip(stateDir, { orchestrator, manifestPath, stage: "lock", error, timestamp }));
+      continue;
+    }
     try {
       const manifest = parseJson(
         await readRegularFile(manifestPath, "Parent manifest"),
@@ -3274,6 +3336,8 @@ export async function runSupervisorTick({
         { attempts: 1, reason: outcome.reason },
       );
       results.push({ manifestPath, status: outcome.status });
+    } catch (error) {
+      results.push(await recordManifestSkip(stateDir, { orchestrator, manifestPath, stage: "supervise", error, timestamp }));
     } finally {
       await release();
       // Publish both sides of the mapping; this is best effort, so a missing
@@ -3326,7 +3390,7 @@ async function updateWake(manifestPath, manifest, record, patch) {
   await atomicWriteJson(manifestPath, manifest);
 }
 
-async function recordRootActivity(config, event) {
+async function recordRootActivity(config, event, stateDir) {
   const timestamp = now();
   const results = [];
   const seenManifests = new Set();
@@ -3337,7 +3401,13 @@ async function recordRootActivity(config, event) {
     const manifestKey = `${orchestrator.id}:${manifestPath}`;
     if (seenManifests.has(manifestKey)) continue;
     seenManifests.add(manifestKey);
-    const release = await acquireManifestLock(manifestPath);
+    let release;
+    try {
+      release = await acquireManifestLock(manifestPath);
+    } catch (error) {
+      results.push(await recordManifestSkip(stateDir, { orchestrator, manifestPath, stage: "root-activity-lock", error, timestamp }));
+      continue;
+    }
     try {
       const manifest = parseJson(
         await readRegularFile(manifestPath, "Parent manifest"),
@@ -3368,6 +3438,8 @@ async function recordRootActivity(config, event) {
       goal.updatedAt = timestamp;
       await atomicWriteJson(manifestPath, manifest);
       results.push({ manifestPath, status: "recorded" });
+    } catch (error) {
+      results.push(await recordManifestSkip(stateDir, { orchestrator, manifestPath, stage: "root-activity", error, timestamp }));
     } finally {
       await release();
     }
@@ -3420,7 +3492,7 @@ export async function handleHook({
         herdr ?? new JsonLineHerdrClient(),
       );
       if (activation) return activation;
-      return recordRootActivity(config, event);
+      return recordRootActivity(config, event, stateDir);
     }
     return { accepted: true, ignored: true, reason: "unmapped_event" };
   }

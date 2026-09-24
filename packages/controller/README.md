@@ -39,6 +39,9 @@ Replace all placeholders with real opaque IDs and the absolute workflow manifest
 - Root unavailability leaves a durable pending event. Ambiguous delivery becomes uncertain and is not retried automatically.
 - The optional parent-goal supervisor sends one non-waiting recovery nudge per durable work transition, only after the mapped Pi root has fully settled. Delivered/uncertain wakes survive restarts without replay; terminal snapshots cannot release an active run. See the [supervisor wake protocol and rollout limits](../herdr-tools/GOAL-ADAPTER-PROTOCOL.md#supervisor-wake-protocol).
 - The controller never dispatches, resumes, closes, creates topology, mutates Git, or contacts external services.
+- One bad manifest cannot starve the others. A missing, unreadable, malformed or invalid manifest (often a historical mapping) is skipped for that tick, in both the supervisor tick and root-activity hooks.
+  - The skip shows in the tick result and in `<state dir>/supervisor-diagnostics.json`, with orchestrator, manifest, stage, error, `firstAt` and `lastAt`; repeats refresh one entry at most once a minute. This keeps it visible when supervisor stderr isn't captured.
+  - The skipped manifest is not rewritten. Nothing is retried within the tick, and a delivery already marked `sending` still becomes `uncertain` on the next pass, never replayed.
 
 ## Root digests
 

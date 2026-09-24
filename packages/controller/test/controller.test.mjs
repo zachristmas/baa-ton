@@ -2038,11 +2038,14 @@ test("malformed root-turn and acknowledgement fields fail strict manifest valida
     const api = recoveryApi();
     try {
       await patchSupervisor(fixture, patch);
-      await assert.rejects(
-        recoveryTick(fixture, api, 0),
-        /rootTurn|acknowledgedAt/,
-      );
+      const before = await readFile(fixture.manifestPath, "utf8");
+      // Fail closed for this manifest only: skipped with the reason, never
+      // prompted, never rewritten.
+      const result = await recoveryTick(fixture, api, 0);
+      assert.equal(result.results[0].status, "skipped");
+      assert.match(result.results[0].error, /rootTurn|acknowledgedAt/);
       assert.equal(api.prompts, 0);
+      assert.equal(await readFile(fixture.manifestPath, "utf8"), before);
     } finally {
       await fixture.cleanup();
     }
@@ -3543,4 +3546,91 @@ test("capacity_escalate_minutes and watchdog_minutes are validated and honoured"
   assert.equal(parsed.orchestrators[0].program.watchdog_minutes, 45);
   for (const extra of [{ watchdog_minutes: 0 }, { capacity_escalate_minutes: 1441 }, { watchdog_minutes: "30" }])
     assert.throws(() => validateConfig(program(extra)), /must be an integer from 1 to 1440/);
+});
+
+async function withHistoricalMapping(fixture, manifestPath) {
+  const configPath = join(fixture.stateDir, "config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.workflows.unshift({
+    workflow_id: "herdr-historical",
+    manifest_path: manifestPath,
+    pi_goal_pause_detection: false,
+    lanes: [{ ...CHILD, lane_id: "lane-historical", target: "historical-child", pane_id: "w-old:p9" }],
+  });
+  await writeFile(configPath, JSON.stringify(config, null, 2));
+}
+
+for (const [label, prepare, pattern] of [
+  ["a missing historical manifest directory", async () => {}, /ENOENT/],
+  [
+    "a malformed historical manifest",
+    async (path) => {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, "{ not json");
+    },
+    /Parent manifest/,
+  ],
+]) {
+  test(`${label} is skipped and logged while later manifests are still served`, async () => {
+    const fixture = await createFixture({
+      parentGoal: dueParentGoal(),
+      messageRequests: [pendingMessage("message-after-history", "Lane finished; receipt attached.", "2026-09-14T00:01:00.000Z")],
+    });
+    const historical = join(dirname(fixture.stateDir), "historical", "gone", "manifest.json");
+    await prepare(historical);
+    await withHistoricalMapping(fixture, historical);
+    const api = digestApi();
+    try {
+      const first = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:02:00.000Z" });
+      const skipped = first.results.find((result) => result.manifestPath === historical);
+      assert.equal(skipped.status, "skipped");
+      assert.match(skipped.error, pattern);
+      const digests = () => api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]"));
+      assert.equal(digests().length, 1, "the valid manifest after the bad one is still served");
+      assert.match(digests()[0].text, /message-after-history\): Lane finished; receipt attached\./);
+
+      const diagnostics = JSON.parse(await readFile(join(fixture.stateDir, "supervisor-diagnostics.json"), "utf8"));
+      assert.equal(diagnostics.skips.length, 1);
+      assert.equal(diagnostics.skips[0].manifestPath, historical);
+      assert.match(diagnostics.skips[0].error, pattern);
+      assert.equal(diagnostics.skips[0].firstAt, "2026-09-14T00:02:00.000Z");
+
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:02:05.000Z" });
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:04:00.000Z" });
+      assert.equal(digests().length, 1, "a delivered message is never replayed");
+      const later = JSON.parse(await readFile(join(fixture.stateDir, "supervisor-diagnostics.json"), "utf8"));
+      assert.equal(later.skips.length, 1, "repeats refresh one entry");
+      assert.equal(later.skips[0].lastAt, "2026-09-14T00:04:00.000Z");
+      const stored = await fixture.manifest();
+      assert.deepEqual(
+        stored.workflows[0].messageRequests.map((request) => [request.delivery.status, request.delivery.attempts]),
+        [["delivered", 1]],
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+}
+
+test("an interrupted send in a manifest is not replayed after a neighbouring manifest fails", async () => {
+  const fixture = await createFixture({
+    parentGoal: dueParentGoal(),
+    messageRequests: [
+      {
+        ...pendingMessage("message-interrupted", "Half-sent before a crash.", "2026-09-14T00:01:00.000Z"),
+        delivery: { status: "sending", attempts: 1, updatedAt: "2026-09-14T00:01:30.000Z" },
+      },
+    ],
+  });
+  const historical = join(dirname(fixture.stateDir), "historical", "gone", "manifest.json");
+  await withHistoricalMapping(fixture, historical);
+  const api = digestApi();
+  try {
+    await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, timestamp: "2026-09-14T00:02:00.000Z" });
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("message-interrupted")).length, 0);
+    const stored = await fixture.manifest();
+    assert.equal(stored.workflows[0].messageRequests[0].delivery.status, "uncertain");
+  } finally {
+    await fixture.cleanup();
+  }
 });
