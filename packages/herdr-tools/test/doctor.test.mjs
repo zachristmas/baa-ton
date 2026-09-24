@@ -70,6 +70,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
       "lane-bridge-liveness",
       "manifest-store",
       "native-herdr-connectivity",
+      "parent-goal-supervisor",
       "plugin-enablement-and-routing",
       "root-identity",
       "state-location",
@@ -81,6 +82,74 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
       (entry) => entry.id === "manifest-store",
     );
     assert.match(manifestCheck.detail, /Version 2 manifest/);
+    const after = await readFile(manifestPath, "utf8");
+    assert.equal(after, before, "doctor must never write the manifest");
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      value === undefined
+        ? delete process.env[key]
+        : (process.env[key] = value);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("herdr_doctor warns when a live parent goal has a stopped supervisor", async () => {
+  const { directory, cwd, configDir } = await fixture();
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(
+      (key) => [key, process.env[key]],
+    ),
+  );
+  try {
+    const manifestPath = join(cwd, ".baa-ton", "herdr-orchestrator", "manifest.json");
+    await mkdir(join(cwd, ".baa-ton", "herdr-orchestrator"), { recursive: true });
+    const manifest = {
+      version: 2,
+      workflows: [],
+      parentGoal: {
+        version: 1, id: "parent-goal-73132480", objective: "o", status: "active", nextAction: "n", signals: [],
+        supervisor: { version: 1, state: "stopped", intervalSeconds: 300, nudgeCount: 0, nextNudgeAt: null, createdAt: "t", updatedAt: "t" },
+        createdAt: "t", updatedAt: "t",
+      },
+    };
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const before = await readFile(manifestPath, "utf8");
+    Object.assign(process.env, {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "w1:p1",
+      HERDR_WORKSPACE_ID: "w1",
+      HERDR_PLUGIN_CONFIG_DIR: configDir,
+    });
+    const tools = new Map();
+    extension({
+      on() {},
+      registerTool(descriptor) {
+        tools.set(descriptor.name, descriptor);
+      },
+      registerCommand() {},
+      async exec(_command, args) {
+        if (args[0] === "plugin" && args[1] === "config-dir")
+          return { code: 0, stderr: "", stdout: configDir };
+        throw new Error(`unexpected herdr ${args.join(" ")}`);
+      },
+    });
+    const ctx = {
+      cwd,
+      hasUI: false,
+      mode: "json",
+      modelRegistry: {
+        find: () => ({ reasoning: true, thinkingLevelMap: {} }),
+        hasConfiguredAuth: () => true,
+        isUsingOAuth: () => true,
+      },
+    };
+    const report = await tools
+      .get("herdr_doctor")
+      .execute("doctor", {}, undefined, undefined, ctx);
+    const goalCheck = report.details.checks.find((entry) => entry.id === "parent-goal-supervisor");
+    assert.equal(goalCheck.status, "warn");
+    assert.match(goalCheck.detail, /parent-goal-73132480 is active but its supervisor is stopped, so the root gets no nudges\. Run herdr_goal action=start/);
+    assert.equal(report.details.ok, true, "a warning does not fail the doctor");
     const after = await readFile(manifestPath, "utf8");
     assert.equal(after, before, "doctor must never write the manifest");
   } finally {

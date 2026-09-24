@@ -3886,3 +3886,56 @@ test("a due nudge never lands mid-turn and goes out on the first tick after the 
     await fixture.cleanup();
   }
 });
+
+test("the watchdog alerts once when a live goal's supervisor has been stopped past the watchdog delay", async () => {
+  const stopped = (status) => ({
+    ...statusGoal(status),
+    supervisor: { ...statusGoal(status).supervisor, state: "stopped", nextNudgeAt: null, updatedAt: "2026-09-14T00:00:00.000Z" },
+  });
+  const live = await createFixture({ parentGoal: stopped("active") });
+  const done = await createFixture({ parentGoal: stopped("completed") });
+  const notices = [];
+  const api = recoveryApi();
+  const tick = (fixture, minutes) =>
+    runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      notify: async (notice) => {
+        notices.push(notice);
+        return { status: "sent" };
+      },
+      sample: async () => ({}),
+      topUsers: async () => [],
+      timestamp: new Date(Date.parse("2026-09-14T00:00:00.000Z") + minutes * 60_000).toISOString(),
+    });
+  const stoppedNotices = () => notices.filter((notice) => notice.title === "Baa-ton: supervisor stopped");
+  try {
+    await tick(live, 0);
+    await tick(live, 29);
+    assert.equal(stoppedNotices().length, 0, "a short deliberate stop stays quiet");
+    await tick(live, 31);
+    assert.equal(stoppedNotices().length, 1);
+    assert.match(stoppedNotices()[0].body, /supervisor for parent goal parent-bb029 \(active\) has been stopped for 31 min, so the root gets no nudges/);
+    assert.equal(api.prompts, 1, "the root gets the alert in its digest");
+    await tick(live, 45);
+    assert.equal(stoppedNotices().length, 1, "once per stop episode");
+    assert.equal((await live.manifest()).parentGoal.supervisor.state, "stopped", "the alert never restarts the supervisor itself");
+    // Restarting ends the episode; a later stop starts a new one.
+    const restarted = await live.manifest();
+    restarted.parentGoal.supervisor.state = "running";
+    await writeFile(live.manifestPath, JSON.stringify(restarted));
+    await tick(live, 50);
+    assert.equal((await live.manifest()).rootSupervision[0].supervisorStopped, undefined);
+    restarted.parentGoal.supervisor.state = "stopped";
+    await writeFile(live.manifestPath, JSON.stringify({ ...(await live.manifest()), parentGoal: restarted.parentGoal }));
+    await tick(live, 51);
+    await tick(live, 82);
+    assert.equal(stoppedNotices().length, 2, "a new stop episode alerts again");
+    await tick(done, 0);
+    await tick(done, 120);
+    assert.equal(stoppedNotices().length, 2, "a completed goal is not alerted");
+  } finally {
+    await live.cleanup();
+    await done.cleanup();
+  }
+});

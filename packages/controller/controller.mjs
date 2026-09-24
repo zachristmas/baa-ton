@@ -2506,6 +2506,43 @@ export async function superviseRoot({
       }
     }
   }
+  // A live goal whose supervisor is stopped gets no nudges at all (a reset
+  // once left the new goal stopped while every lane sat idle). The episode
+  // starts when a tick first sees it stopped; alert once after the watchdog
+  // delay, so a deliberate short stop stays quiet.
+  const stopped =
+    goal && !QUIET_PARENT_GOAL_STATUSES.has(goal.status) && goal.supervisor?.state === "stopped";
+  const existing = supervisionFor(manifest, orchestrator)?.supervisorStopped;
+  if (!stopped && existing) {
+    delete supervisionFor(manifest, orchestrator).supervisorStopped;
+    changed = true;
+  } else if (stopped) {
+    const target = supervisionFor(manifest, orchestrator, true);
+    if (!target.supervisorStopped || target.supervisorStopped.goalId !== goal.id) {
+      target.supervisorStopped = { goalId: goal.id, since: timestamp };
+      changed = true;
+    } else if (!target.supervisorStopped.alertedAt) {
+      const limit = (orchestrator.program.watchdog_minutes ?? DEFAULT_WATCHDOG_MINUTES) * 60_000;
+      const since = Date.parse(target.supervisorStopped.since);
+      if (Date.parse(timestamp) - since > limit) {
+        const minutes = Math.round((Date.parse(timestamp) - since) / 60_000);
+        const reason = `the supervisor for parent goal ${goal.id} (${goal.status}) has been stopped for ${minutes} min, so the root gets no nudges`;
+        queueRootAlert(
+          target,
+          "supervisor-stopped",
+          `${reason}. Run herdr_goal action=start, or record the goal as completed or paused.`,
+          timestamp,
+        );
+        target.supervisorStopped.alertedAt = timestamp;
+        target.supervisorStopped.notification = await notify({
+          title: "Baa-ton: supervisor stopped",
+          body: clipText(`${orchestrator.id}: ${reason}.`, 500),
+        });
+        outcome.watchdog = outcome.watchdog ?? "supervisor-stopped";
+        changed = true;
+      }
+    }
+  }
   if (changed) await atomicWriteJson(manifestPath, manifest);
   return outcome;
 }
