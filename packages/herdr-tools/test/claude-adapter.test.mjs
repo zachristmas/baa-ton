@@ -375,3 +375,26 @@ test("SessionStart helper merges lane identity and preserves bridge operations",
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a spec integration lane may merge locally; push, PR and every other deny stay", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-integrate-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/bridge/claude-startup-attest.mjs",
+      scratchDirectory: scratch,
+    });
+    const deny = async (context) => {
+      const args = adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json", ...context });
+      return JSON.parse(await readFile(args[args.indexOf("--settings") + 1], "utf8")).permissions.deny;
+    };
+    const normal = await deny({});
+    const integrate = await deny({ allowLocalMerge: true });
+    assert.ok(normal.includes("Bash(git merge:*)"));
+    assert.equal(integrate.includes("Bash(git merge:*)"), false);
+    assert.deepEqual(integrate, normal.filter((rule) => rule !== "Bash(git merge:*)"));
+    assert.ok(integrate.includes("Bash(git push:*)") && integrate.includes("Bash(gh pr create:*)"));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

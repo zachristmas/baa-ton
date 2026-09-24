@@ -75,7 +75,12 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   extension({ on() {}, registerCommand() {}, registerTool: (definition) => tools.set(definition.name, definition), async exec() { throw new Error("no herdr in this test"); } });
   const calls = { worktree: [], plan: [], dispatch: [] };
   let planned = 0;
+  const pushedShas = new Set();
   const ports = {
+    async ancestor(_repo, sha, ref) {
+      calls.ancestor = [...(calls.ancestor ?? []), ref];
+      return pushedShas.has(sha);
+    },
     async worktree(input) {
       calls.worktree.push(input);
     },
@@ -93,6 +98,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   const ctx = { cwd: parent, mode: "json", hasUI: false, ui: { confirm: async () => false, notify() {} }, specDriverPorts: ports };
   return {
     calls,
+    pushedShas,
+    stateDir,
     advance: () => tools.get("herdr_spec").execute("spec", { action: "advance" }, undefined, undefined, ctx),
     status: () => tools.get("herdr_spec").execute("spec", { action: "status" }, undefined, undefined, ctx),
     state: async () => JSON.parse(await readFile(join(stateDir, "spec-state.json"), "utf8")),
@@ -149,7 +156,7 @@ test("the driver builds ready items in their own worktree, then reviews them in 
 
     await f.laneReceipt("herdr-spec2", "VERDICT: PASS\nMatches the acceptance.");
     const third = await f.advance();
-    assert.match(third.content[0].text, /Started: build B -> herdr-spec3\./, "B starts once A is integrating");
+    assert.match(third.content[0].text, /Started: integrate A -> herdr-spec3; build B -> herdr-spec4\./, "A's merge and B's build start together");
     state = await f.state();
     assert.equal(state.items.A.state, "integrating");
   } finally {
@@ -185,4 +192,71 @@ test("without the dispatch and integrate grants the driver does nothing", async 
   } finally {
     await f.cleanup();
   }
+});
+
+test("integration: one merge lane on spec-integration, then a push prompt, then verification once pushed", async () => {
+  const f = await fixture();
+  const sha = "c".repeat(40);
+  try {
+    await f.advance();
+    await f.laneReceipt("herdr-spec1", "Committed.");
+    await f.advance();
+    await f.laneReceipt("herdr-spec2", "VERDICT: PASS");
+    await f.advance();
+    const merge = f.calls.plan.find((call) => call.specStage === "integrate");
+    assert.equal(merge.taskProfile, "balanced");
+    assert.equal(merge.readOnly, false);
+    assert.match(merge.worktree, /spec-integration$/);
+    assert.match(merge.laneObjective, /git merge --no-ff spec\/A/);
+    const integration = f.calls.worktree.find((call) => call.branch === "spec-integration");
+    assert.equal(integration.base, "refs/remotes/origin/feature/release");
+    assert.match(integration.path, /spec-integration$/);
+
+    // A migration slot reserved by A's build lane is released once A is integrated.
+    const withLease = await f.manifest();
+    withLease.leases = [
+      { id: "lease-m1", resource: "migration", label: "default", kind: "sequence", number: 56, digits: 4, workflowId: "herdr-spec1", laneId: "lane-1", state: "active", grantedBy: "lane-policy", grantedAt: "t" },
+      { id: "lease-m2", resource: "migration", label: "default", kind: "sequence", number: 57, digits: 4, workflowId: "herdr-other", laneId: "lane-1", state: "active", grantedBy: "lane-policy", grantedAt: "t" },
+    ];
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(withLease));
+    await f.laneReceipt("herdr-spec3", `INTEGRATED: ${sha}\nSUITE: pass`);
+    await f.laneReceipt("herdr-spec4", "B committed.");
+    await f.advance();
+    let state = await f.state();
+    assert.equal(state.items.A.state, "awaiting-push");
+    assert.deepEqual((await f.manifest()).leases.map((lease) => [lease.id, lease.state]), [["lease-m1", "released"], ["lease-m2", "active"]]);
+    assert.deepEqual(state.items.A.tests.map((run) => [run.command, run.sha, run.result]), [["npm test", sha, "pass"]]);
+    // The integration queue has drained, so this round (A) is offered for a
+    // push; B, still in review, joins the next round.
+    const alerts = (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-push-ready");
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0].text, /1 integrated spec item\(s\) ready to push: A \(spec-integration at cccccccccccc\)\. Ask the user/);
+    assert.match(alerts[0].text, new RegExp(`push origin ${sha}:refs/heads/feature/release`));
+    await f.advance();
+    assert.equal(
+      (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-push-ready").length,
+      1,
+      "the same round is offered once",
+    );
+
+    f.pushedShas.add(sha);
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.items.A.state, "verifying");
+    assert.equal(state.items.A.integratedSha, sha);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("only a spec integration lane's contract allows local merges", async () => {
+  const { laneContract } = await jiti.import("../index.ts");
+  const workflow = { id: "herdr-c1", agentKind: "claude", lanes: [] };
+  const lane = { id: "lane-1", objective: "x", readOnly: false, agentKind: "claude", status: "planned" };
+  const normal = laneContract(workflow, lane);
+  const integrate = laneContract(workflow, { ...lane, specStage: "integrate" });
+  assert.match(normal, /Never push, merge, deploy, create a PR/);
+  assert.match(integrate, /you may merge spec\/\* branches and commit on this worktree's integration branch \(local only\)\. Never push, deploy, create a PR/);
+  assert.doesNotMatch(integrate, /Never push, merge/);
+  assert.match(laneContract(workflow, { ...lane, specStage: "build" }), /Never push, merge/);
 });

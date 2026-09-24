@@ -20,8 +20,8 @@ export type SpecItem = {
 };
 export type Spec = {
   version: 1;
-  target: { repo: string; remote: string; branch: string; preview?: { url: string; releaseCheck?: string } };
-  defaults: { maxParallel: number; maxBuildAttempts: number };
+  target: { repo: string; remote: string; branch: string; suite: string[]; preview?: { url: string; releaseCheck?: string } };
+  defaults: { maxParallel: number; maxBuildAttempts: number; pushGate: "round" | "item" };
   stages: Record<string, { profile: string; differentFrom?: string }>;
   items: SpecItem[];
 };
@@ -55,3 +55,4 @@ export function verifySpec(
 export function itemStage(state: SpecState, id: string, verified?: ItemVerification): string;
 export function specSummaryLine(spec: Spec, state: SpecState, verification: SpecVerification): string;
 export function specStatusTable(spec: Spec, state: SpecState, verification: SpecVerification, now?: number): string;
+export function gitAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean>;

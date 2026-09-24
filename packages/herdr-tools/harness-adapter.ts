@@ -147,6 +147,9 @@ export type LaunchContext = {
    * harness's baseline. Adapters that scope their MCP config (e.g. Claude's
    * --strict-mcp-config) must merge these in; others may ignore the field. */
   extraMcpServers?: Record<string, unknown>;
+  /** A spec integration lane: lift the harness's own ban on local merges
+   * (push, PR and every other deny stay). */
+  allowLocalMerge?: boolean;
 };
 
 export type RequiredAdapterCapability =

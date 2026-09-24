@@ -226,6 +226,9 @@ function buildClaudeLaunchArguments(
     },
     permissions: {
       ...LANE_PERMISSIONS,
+      deny: context?.allowLocalMerge
+        ? LANE_PERMISSIONS.deny.filter((rule) => rule !== "Bash(git merge:*)")
+        : LANE_PERMISSIONS.deny,
       // A headless lane has nobody to answer a permission prompt. A granted
       // extra server's tools must be pre-allowed the same way the two fixed
       // herdr-orchestrator tools below already are, or every call hangs.
