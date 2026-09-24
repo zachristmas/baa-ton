@@ -33,6 +33,8 @@ export const ITEM_STATES = [
   "done",
   "blocked",
   "failed",
+  // Out of scope for now (acceptance says deferred, no owned files): not counted in M.
+  "deferred",
 ];
 const BLOCK_REASONS = ["decision", "dependency", "capacity", "human-gate"];
 const ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
@@ -101,9 +103,16 @@ export function validateSpec(input) {
     };
   }
   const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside" };
+  // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb"], "spec.defaults");
+    for (const key of ["minFreeMemoryGb", "maxSwapUsedGb"])
+      if (input.defaults[key] !== undefined) {
+        if (typeof input.defaults[key] !== "number" || !(input.defaults[key] >= 0) || input.defaults[key] > 4096)
+          throw new Error(`spec.defaults.${key} must be a number of GB.`);
+        defaults[key] = input.defaults[key];
+      }
     if (input.defaults.finalReport !== undefined) {
       if (!["alongside", "replace"].includes(input.defaults.finalReport))
         throw new Error('spec.defaults.finalReport must be "alongside" (keep the build lane\'s report and add a .final one) or "replace".');
@@ -137,7 +146,7 @@ export function validateSpec(input) {
   const items = input.items.map((item, index) => {
     const label = `spec.items[${index}]`;
     if (!isRecord(item)) throw new Error(`${label} must be an object.`);
-    onlyKeys(item, ["id", "title", "dependsOn", "owns", "sharedTouch", "migrations", "decisions", "acceptance"], label);
+    onlyKeys(item, ["id", "title", "dependsOn", "owns", "sharedTouch", "migrations", "decisions", "acceptance", "adopt"], label);
     if (typeof item.id !== "string" || !ITEM_ID.test(item.id)) throw new Error(`${label}.id must be a short identifier.`);
     if (ids.has(item.id)) throw new Error(`${label}.id ${item.id} is duplicated.`);
     ids.add(item.id);
@@ -159,7 +168,40 @@ export function validateSpec(input) {
         minImages: positiveInteger(evidence.minImages, `${label}.acceptance.evidence.minImages`, { min: 0 }) ?? 0,
       };
     }
+    let adopt;
+    if (item.adopt !== undefined) {
+      // Existing work in a live run (see spec-adopt.mjs). Paths are absolute:
+      // lanes kept worktrees and reports outside the target repository.
+      if (!isRecord(item.adopt)) throw new Error(`${label}.adopt must be an object.`);
+      onlyKeys(item.adopt, ["worktree", "branch", "report", "workflow", "review", "accepted"], `${label}.adopt`);
+      adopt = {};
+      for (const key of ["worktree", "report"])
+        if (item.adopt[key] !== undefined) {
+          text(item.adopt[key], `${label}.adopt.${key}`, { max: 1000 });
+          if (!isAbsolute(item.adopt[key]) || item.adopt[key].split(/[\\/]/).includes(".."))
+            throw new Error(`${label}.adopt.${key} must be an absolute path.`);
+          adopt[key] = item.adopt[key];
+        }
+      if (item.adopt.branch !== undefined) {
+        text(item.adopt.branch, `${label}.adopt.branch`, { max: 200 });
+        if (!/^[\w./-]+$/.test(item.adopt.branch) || item.adopt.branch.includes("..") || ["main", "master", "HEAD"].includes(item.adopt.branch))
+          throw new Error(`${label}.adopt.branch must be a feature branch name.`);
+        adopt.branch = item.adopt.branch;
+      }
+      for (const key of ["workflow", "review"])
+        if (item.adopt[key] !== undefined) {
+          if (typeof item.adopt[key] !== "string" || !/^[\w.-]{1,80}$/.test(item.adopt[key]))
+            throw new Error(`${label}.adopt.${key} must be a workflow id.`);
+          adopt[key] = item.adopt[key];
+        }
+      if (item.adopt.accepted !== undefined) {
+        if (typeof item.adopt.accepted !== "boolean") throw new Error(`${label}.adopt.accepted must be true or false.`);
+        adopt.accepted = item.adopt.accepted;
+      }
+      if (adopt.worktree && !adopt.branch) throw new Error(`${label}.adopt.worktree needs adopt.branch.`);
+    }
     return {
+      ...(adopt ? { adopt } : {}),
       id: item.id,
       title: text(item.title, `${label}.title`, { max: 300 }),
       dependsOn: strings(item.dependsOn, `${label}.dependsOn`) ?? [],
@@ -356,9 +398,11 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
 /** Verify every item; the loop's exit condition and the burn-down. */
 export async function verifySpec(spec, state, options = {}) {
   const results = [];
-  for (const item of spec.items) results.push(await verifyItem(spec, state, item, options));
-  const done = results.filter((result) => result.done).length;
-  return { done, total: results.length, results };
+  for (const item of spec.items)
+    if (state.items?.[item.id]?.state === "deferred") results.push({ id: item.id, done: false, deferred: true, checks: [] });
+    else results.push(await verifyItem(spec, state, item, options));
+  const counted = results.filter((result) => !result.deferred);
+  return { done: counted.filter((result) => result.done).length, total: counted.length, deferred: results.length - counted.length, results };
 }
 
 export function finalReportPath(spec, report) {
@@ -406,7 +450,11 @@ export function specSummaryLine(spec, state, verification) {
     const key = stage === "blocked" ? `blocked(${state.items?.[item.id]?.blockedReason})` : stage;
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  const order = [...ITEM_STATES.filter((stage) => stage !== "blocked" && stage !== "done"), ...BLOCK_REASONS.map((reason) => `blocked(${reason})`)];
+  const order = [
+    ...ITEM_STATES.filter((stage) => stage !== "blocked" && stage !== "done" && stage !== "deferred"),
+    ...BLOCK_REASONS.map((reason) => `blocked(${reason})`),
+    "deferred",
+  ];
   const parts = order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`);
   return [`spec ${verification.done}/${verification.total} done`, ...parts].join(" · ");
 }
@@ -445,14 +493,22 @@ export function specStatusTable(spec, state, verification, now = Date.now()) {
   return [specSummaryLine(spec, state, verification), "", format(header), ...rows.map(format)].join("\n");
 }
 
-/** CLI: `node spec.mjs verify|status [project dir]`; exit 0 only when every item is done (verify). */
+/** CLI: `node spec.mjs verify|status|adopt [project dir] [--dry-run] [--force]`; verify exits 0 only when every item is done. */
 async function main(argv) {
-  const [command = "status", directory = process.cwd()] = argv;
-  if (!["verify", "status"].includes(command)) {
-    process.stderr.write("usage: node spec.mjs verify|status [project dir]\n");
+  const [command = "status", ...rest] = argv;
+  const directory = rest.find((arg) => !arg.startsWith("--")) ?? process.cwd();
+  if (!["verify", "status", "adopt"].includes(command)) {
+    process.stderr.write("usage: node spec.mjs verify|status|adopt [project dir] [--dry-run] [--force]\n");
     return 2;
   }
   const cwd = resolve(directory);
+  if (command === "adopt") {
+    // Loaded lazily: spec-adopt imports this module.
+    const { adoptSpec, adoptionTable } = await import("./spec-adopt.mjs");
+    const result = await adoptSpec({ cwd, dryRun: rest.includes("--dry-run"), force: rest.includes("--force") });
+    process.stdout.write(`${adoptionTable(result.rows)}\n${result.written ? `Wrote ${SPEC_STATE_PATH}.` : "Dry run: nothing written."}\n`);
+    return 0;
+  }
   const spec = await loadSpec(cwd);
   if (!spec) {
     process.stderr.write(`No ${SPEC_PATH} in ${cwd}.\n`);

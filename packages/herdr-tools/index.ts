@@ -147,6 +147,7 @@ import {
   verifySpec,
 } from "./spec.mjs";
 import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
+import { adoptSpec, adoptionTable, itemOwnedChanges } from "./spec-adopt.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -4548,6 +4549,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
     plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
+    /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
+    status?(worktree: string): Promise<string>;
+    /** Live memory and swap sample (the controller's sampleCapacity). */
+    sample?(): Promise<{ freeMemoryGb?: number; swapUsedGb?: number }>;
     /** Directory holding the spec worktrees (default ~/.herdr/worktrees/<repo>). */
     worktreeRoot?: string;
     /** GET the preview's release check and return the response body. */
@@ -4558,6 +4563,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   };
 
   let specDriverRunning = false;
+  /** How long the driver starts no new lanes after a shell failed to start. */
+  const SPEC_SHELL_BACKOFF_MS = 10 * 60_000;
 
   /**
    * The spec loop's driver (docs/SPEC-LOOP.md section 4). Runs on every
@@ -4634,11 +4641,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               released.set(item.id, releaseSha);
           }
       }
+      // Memory-aware dispatch: a waiting capacity gate, the spec's own live
+      // floor, or a backoff after a shell failed to start all hold new lanes.
+      let capacityWaiting: boolean | string = supervision?.capacityGate?.status === "waiting";
+      const backoff = (state as { dispatchBackoff?: { until: string; reason: string } }).dispatchBackoff;
+      if (!capacityWaiting && backoff && Date.parse(backoff.until) > Date.parse(use.now()))
+        capacityWaiting = `backing off until ${backoff.until} after: ${backoff.reason}`;
+      if (!capacityWaiting && (spec.defaults.minFreeMemoryGb !== undefined || spec.defaults.maxSwapUsedGb !== undefined)) {
+        const current = await (ports?.sample ?? sampleCapacity)().catch(() => undefined);
+        if (current) {
+          if (spec.defaults.minFreeMemoryGb !== undefined && (current.freeMemoryGb ?? Infinity) < spec.defaults.minFreeMemoryGb)
+            capacityWaiting = `free memory ${current.freeMemoryGb} GB is below ${spec.defaults.minFreeMemoryGb} GB`;
+          else if (spec.defaults.maxSwapUsedGb !== undefined && (current.swapUsedGb ?? 0) > spec.defaults.maxSwapUsedGb)
+            capacityWaiting = `swap used ${current.swapUsedGb} GB is above ${spec.defaults.maxSwapUsedGb} GB`;
+        }
+      }
       const step = advanceSpec({
         spec,
         state,
         lane: laneView,
-        capacityWaiting: supervision?.capacityGate?.status === "waiting",
+        capacityWaiting,
         pushed,
         released,
         now: use.now(),
@@ -4647,10 +4669,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const integrationWorktree = join(worktreeRoot, "spec-integration");
       const next = step.state;
       const done: string[] = [];
+      if (backoff && !(typeof capacityWaiting === "string" && capacityWaiting.startsWith("backing off")))
+        delete (next as { dispatchBackoff?: unknown }).dispatchBackoff;
+      let shellTimeout = false;
       for (const action of step.actions) {
         const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
         const record = next.items[item.id];
-        const branch = `spec/${item.id}`;
+        // After a shell failed to start, start nothing else this pass; the
+        // items keep their state and are retried after the backoff.
+        if (shellTimeout && action.kind !== "decide") continue;
+        // An adopted item keeps its own branch and worktree.
+        const branch = record.branch ?? `spec/${item.id}`;
         const worktree =
           action.kind === "integrate" || action.kind === "verify"
             ? integrationWorktree
@@ -4671,7 +4700,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           } else if (action.kind === "integrate") {
             profile = spec.stages.integrate?.profile ?? "balanced";
             await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
-            objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch });
+            // Adopted work may be uncommitted: list exactly the item-owned
+            // paths (never secrets) for the integration lane to commit first.
+            let commitFirst;
+            if (record.worktree) {
+              const porcelain = await (ports?.status ?? (async (path: string) => (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], { timeout: 30_000 })).stdout))(record.worktree).catch(() => "");
+              const changes = itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns);
+              if (changes.paths.length || changes.secrets.length) commitFirst = { worktree: record.worktree, ...changes };
+            }
+            objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch, commitFirst });
           } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
             await use.worktree({ repo, path: worktree, branch, base: `refs/remotes/${spec.target.remote}/${spec.target.branch}` }, signal);
@@ -4712,6 +4749,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           done.push(`${action.kind} ${item.id} -> ${workflow.id}`);
         } catch (error) {
           record.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
+          if (/shell did not become ready/i.test((error as Error).message)) {
+            shellTimeout = true;
+            (next as { dispatchBackoff?: unknown }).dispatchBackoff = {
+              until: new Date(Date.parse(use.now()) + SPEC_SHELL_BACKOFF_MS).toISOString(),
+              reason: clip((error as Error).message, 200),
+            };
+          }
           if (!record.lane?.workflowId || record.lane.workflowId === undefined) delete record.lane;
           done.push(`${action.kind} ${item.id} failed: ${clip((error as Error).message, 120)}`);
         }
@@ -10629,13 +10673,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ],
     parameters: Type.Object(
       {
-        action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance"), Type.Literal("answer")]),
+        action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance"), Type.Literal("answer"), Type.Literal("adopt")]),
+        dryRun: Type.Optional(Type.Boolean()),
+        force: Type.Optional(Type.Boolean()),
         itemId: Type.Optional(Type.String()),
         text: Type.Optional(Type.String({ maxLength: 8000 })),
       },
       { additionalProperties: false },
     ),
     async execute(_id, params, signal, _update, ctx) {
+      if (params.action === "adopt") {
+        requireRootManifestExecutor(ctx.cwd);
+        const result = await adoptSpec({ cwd: ctx.cwd, dryRun: params.dryRun ?? false, force: params.force ?? false });
+        return {
+          content: [{ type: "text", text: `${adoptionTable(result.rows)}\n${result.written ? `Wrote ${SPEC_STATE_PATH}.` : "Dry run: nothing written."}` }],
+          details: result,
+        };
+      }
       if (params.action === "answer") {
         requireRootManifestExecutor(ctx.cwd);
         if (!params.itemId || !params.text?.trim()) throw new Error("itemId and text are required to record answers.");
