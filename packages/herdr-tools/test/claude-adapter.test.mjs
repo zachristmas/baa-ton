@@ -118,8 +118,12 @@ test("launchArguments emits exact model/effort and generated settings/mcp config
       settings.permissions.deny.some((rule) => /^Bash\(git merge/.test(rule)),
     );
     const permissionHook = settings.hooks.PermissionRequest[0];
-    assert.equal(permissionHook.matcher, "Bash");
-    assert.match(permissionHook.hooks[0].command, /known-safe-hook\.mjs" --log ".*known-safe-approvals\.jsonl"$/);
+    assert.equal(permissionHook.matcher, "*", "every prompt is classified or routed");
+    assert.match(
+      permissionHook.hooks[0].command,
+      /known-safe-hook\.mjs" --log ".*known-safe-approvals\.jsonl" --bridge "\/bridge\/mcp-server\.mjs" --intent ".+" --wait-seconds 600$/,
+    );
+    assert.equal(permissionHook.hooks[0].timeout, 660, "the hook outlives its own wait");
     assert.ok(existsSync(permissionHook.hooks[0].command.match(/^node "([^"]+)"/)[1]), "the hook script ships next to the adapter");
     assert.equal(settings.autoMode.allow[0], "$defaults", "built-in classifier rules are kept");
     assert.match(settings.autoMode.allow[1], /herdr_complete, herdr_message/);

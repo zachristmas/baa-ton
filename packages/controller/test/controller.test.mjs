@@ -20,6 +20,7 @@ import {
   postDirective,
   runSupervisorLauncher,
   SUPERVISOR_RESTART_EXIT_CODE,
+  nudgeDecision,
 } from "../controller.mjs";
 import { codeChangeWatcher, codeFingerprint, codeStamp, listRuntime, loadedCode, recordRuntime } from "../code-version.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
@@ -4068,4 +4069,25 @@ test("the nudge flags a planned workflow from an earlier root session and names 
   } finally {
     await fixture.cleanup();
   }
+});
+
+test("a permission request wakes the root even while Herdr reports the lane working", () => {
+  const orchestrator = { id: "o-1", root: { pane_id: "w-root:p1", workspace_id: "w-root" }, workflows: [] };
+  const request = (id, kind, summary) => ({ id, laneId: "lane-1", kind, status: "open", summary });
+  const manifest = {
+    workflows: [{
+      id: "herdr-perm",
+      status: "running",
+      taskBinding: { workspaceId: "w-root", rootPaneId: "w-root:p1" },
+      eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "working" } }] },
+      laneRequests: [
+        request("request-perm", "permission", "permission: Bash docker compose up -d db"),
+        request("request-lease", "lease", "lease app"),
+      ],
+    }],
+  };
+  const decision = nudgeDecision({ goal: { status: "active" }, manifest, orchestrator, manifestPath: "/m.json" });
+  const text = JSON.stringify(decision);
+  assert.match(text, /lane herdr-perm\/lane-1 \(working\) waits on permission request-perm: permission: Bash docker compose up -d db/);
+  assert.doesNotMatch(text, /request-lease/, "other requests from a working lane still wait for the lane to stop");
 });

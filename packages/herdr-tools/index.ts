@@ -9853,7 +9853,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_request",
     label: "Herdr Request",
     description:
-      "Formal lane requests. A lane opens lease, runtime-launch or approval requests (the bridge opens permission requests); requests that match the acknowledged approvalPolicy are answered immediately, the rest reach the root digest and stay open until the root answers. The root lists open requests and answers them.",
+      "Formal lane requests. A lane opens lease, runtime-launch or approval requests (a Claude lane's permission hook opens permission requests); requests that match the acknowledged approvalPolicy are answered immediately, the rest reach the root digest and stay open until the root answers. The root lists open requests and answers them.",
     promptSnippet: "Open, check, list or answer formal lane requests.",
     promptGuidelines: [
       "A lane uses herdr_request action=open kind=lease|runtime-launch|approval instead of asking in chat; runtime-launch needs the exact command. Check an open request with action=status. The root uses action=list and action=answer decision=grant|deny for every open request it owes an answer.",
