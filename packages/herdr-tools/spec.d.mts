@@ -21,7 +21,7 @@ export type SpecItem = {
 export type Spec = {
   version: 1;
   target: { repo: string; remote: string; branch: string; suite: string[]; preview?: { url: string; releaseCheck?: string } };
-  defaults: { maxParallel: number; maxBuildAttempts: number; pushGate: "round" | "item" };
+  defaults: { maxParallel: number; maxBuildAttempts: number; pushGate: "round" | "item"; finalReport: "alongside" | "replace" };
   stages: Record<string, { profile: string; differentFrom?: string }>;
   items: SpecItem[];
 };
@@ -56,3 +56,7 @@ export function itemStage(state: SpecState, id: string, verified?: ItemVerificat
 export function specSummaryLine(spec: Spec, state: SpecState, verification: SpecVerification): string;
 export function specStatusTable(spec: Spec, state: SpecState, verification: SpecVerification, now?: number): string;
 export function gitAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean>;
+/** A report's path for the final evidence (the .final sibling unless replace). */
+export function finalReportPath(spec: Spec, report: string): string;
+/** The deployed SHA from a release-check response body (JSON or text). */
+export function releaseShaFrom(body: string): string | undefined;

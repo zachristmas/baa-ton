@@ -100,10 +100,15 @@ export function validateSpec(input) {
         : {}),
     };
   }
-  const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round" };
+  const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside" };
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport"], "spec.defaults");
+    if (input.defaults.finalReport !== undefined) {
+      if (!["alongside", "replace"].includes(input.defaults.finalReport))
+        throw new Error('spec.defaults.finalReport must be "alongside" (keep the build lane\'s report and add a .final one) or "replace".');
+      defaults.finalReport = input.defaults.finalReport;
+    }
     if (input.defaults.pushGate !== undefined) {
       if (!["round", "item"].includes(input.defaults.pushGate))
         throw new Error('spec.defaults.pushGate must be "round" (one push prompt per integration round) or "item".');
@@ -288,8 +293,11 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
   const evidence = item.acceptance.evidence;
   if (evidence) {
     let buffer;
+    // The verify stage records where it wrote the final report; before that
+    // the report is looked up in the target repository.
+    const reportPath = typeof record.evidence?.path === "string" ? record.evidence.path : join(repo, evidence.report);
     try {
-      buffer = await readFile(join(repo, evidence.report));
+      buffer = await readFile(reportPath);
     } catch {
       buffer = undefined;
     }
@@ -351,6 +359,33 @@ export async function verifySpec(spec, state, options = {}) {
   for (const item of spec.items) results.push(await verifyItem(spec, state, item, options));
   const done = results.filter((result) => result.done).length;
   return { done, total: results.length, results };
+}
+
+export function finalReportPath(spec, report) {
+  if (spec.defaults.finalReport === "replace") return report;
+  const dot = report.lastIndexOf(".");
+  return dot > report.lastIndexOf("/") ? `${report.slice(0, dot)}.final${report.slice(dot)}` : `${report}.final`;
+}
+
+/** The deployed commit from a release check: a JSON field (sha, commit,
+ * gitSha, revision, version, and nested under build/git/release) or the
+ * first full or abbreviated SHA in a text body. */
+export function releaseShaFrom(body) {
+  const hex = /^[0-9a-f]{7,40}$/i;
+  try {
+    const value = JSON.parse(body);
+    const queue = [value];
+    while (queue.length) {
+      const current = queue.shift();
+      if (!isRecord(current)) continue;
+      for (const key of ["sha", "commit", "commitSha", "gitSha", "git_sha", "revision", "version"])
+        if (typeof current[key] === "string" && hex.test(current[key].trim())) return current[key].trim().toLowerCase();
+      for (const key of ["build", "git", "release", "deployment", "data"]) if (isRecord(current[key])) queue.push(current[key]);
+    }
+    return undefined;
+  } catch {
+    return /\b([0-9a-f]{40}|[0-9a-f]{7,12})\b/i.exec(String(body))?.[1]?.toLowerCase();
+  }
 }
 
 /** Item stage for display: done only when the verifier says so. */

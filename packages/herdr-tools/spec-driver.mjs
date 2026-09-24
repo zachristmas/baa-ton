@@ -66,6 +66,17 @@ export function decideResult(summary) {
   };
 }
 
+/** Parse a verify lane's receipt: PREVIEW: <spec> pass|fail and REPORT: <path> lines. */
+export function verifyResult(summary) {
+  const lines = String(summary ?? "").split("\n");
+  const previews = lines
+    .map((line) => /^\s*PREVIEW\s*:\s*(\S+)\s+(pass|fail)\b/i.exec(line))
+    .filter(Boolean)
+    .map((match) => ({ spec: match[1], result: match[2].toLowerCase() }));
+  const report = lines.map((line) => /^\s*REPORT\s*:\s*(\S+)\s*$/i.exec(line)?.[1]).find(Boolean);
+  return { previews, ...(report ? { report } : {}) };
+}
+
 /** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
 export function integrationResult(summary) {
   const text = String(summary ?? "");
@@ -81,10 +92,11 @@ export function integrationResult(summary) {
  * @param {(ref: {workflowId: string, laneId: string}) => {status?: string, receipt?: {summary: string}} | undefined} input.lane
  * @param {boolean} [input.capacityWaiting] the root has a capacity gate waiting
  * @param {Set<string>} [input.pushed] integration SHAs the target branch already contains
+ * @param {Map<string, string>} [input.released] item id -> preview release SHA that contains its commit
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
  */
-export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), now }) {
+export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), released = new Map(), now }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
   next.items ??= {};
   const actions = [];
@@ -103,6 +115,28 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {
     const current = record(item.id);
+    if (current.state === "verifying") {
+      const view = current.lane ? lane(current.lane) : undefined;
+      if (!view) continue;
+      if (view.receipt) {
+        const result = verifyResult(view.receipt.summary);
+        const runs = result.previews.map((run) => ({ ...run, sha: current.integratedSha, releaseSha: current.releaseSha, at: now }));
+        const failed = runs.filter((run) => run.result !== "pass");
+        const missing = item.acceptance.preview.filter((path) => !runs.some((run) => run.spec === path));
+        current.preview = [...(Array.isArray(current.preview) ? current.preview : []), ...runs];
+        current.verifyLane = current.lane;
+        delete current.lane;
+        if (result.report) current.finalReport = result.report;
+        if (failed.length || missing.length) {
+          move(item.id, "blocked", {
+            blockedReason: "human-gate",
+            note: failed.length ? `preview failed: ${failed.map((run) => run.spec).join(", ")}` : `preview not run: ${missing.join(", ")}`,
+          });
+          rootAsks.push({ itemId: item.id, reason: `${item.id}: verification on the preview ${failed.length ? "failed" : "is incomplete"} after the push; decide whether to fix forward` });
+        } else current.verified = now;
+      } else if (LANE_ENDED.has(view.status)) delete current.lane;
+      continue;
+    }
     if (current.state === "deciding") {
       const view = current.lane ? lane(current.lane) : undefined;
       if (!view) continue;
@@ -224,6 +258,28 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
     }
   }
 
+  // 1d2. Verification: once the preview reports a release containing the
+  // item's commit, a verify lane runs its preview specs and writes the final
+  // report. Items with nothing to verify on the preview skip the lane.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    if (current?.state !== "verifying" || current.lane || current.verified) continue;
+    const needsLane = item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
+    if (!needsLane) {
+      current.verified = now;
+      continue;
+    }
+    if (item.acceptance.preview.length && spec.target.preview) {
+      const releaseSha = released.get(item.id);
+      if (!releaseSha) {
+        waits[item.id] = "preview: the release check does not report a deploy containing this commit yet";
+        continue;
+      }
+      current.releaseSha = releaseSha;
+    }
+    actions.push({ kind: "verify", itemId: item.id, attempt: 1 });
+  }
+
   // 1e. The decide stage (when configured) runs before an item can build,
   // and its leftover questions go to the user in one batched round.
   const decideStage = Boolean(spec.stages.decide);
@@ -269,7 +325,12 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
 
   // 3. Dispatch ready items within the slots, capacity and ownership rules.
   const byId = new Map(spec.items.map((item) => [item.id, item]));
-  const inFlight = () => spec.items.filter((item) => ACTIVE_STATES.has(next.items[item.id]?.state));
+  // A verifying item waiting for a deploy holds no slot.
+  const inFlight = () =>
+    spec.items.filter((item) => {
+      const current = next.items[item.id];
+      return ACTIVE_STATES.has(current?.state) && (current.state !== "verifying" || Boolean(current.lane));
+    });
   // A review reuses its item's slot; only new builds need one.
   let slots = spec.defaults.maxParallel - inFlight().length;
   for (const item of spec.items) {
@@ -326,6 +387,22 @@ export function decideObjective(spec, item) {
     item.owns.length ? `Proposed ownership: ${item.owns.join(", ")}.` : "",
     "Answer every design question the decisions, notes and scope rules already settle. List only what a person still has to decide.",
     "Finish with herdr_complete. In the summary, put each open question on its own line starting QUESTION:, the files the build will own on a line OWNS: glob, glob (if different from the proposal), and MIGRATIONS: <n> if the item needs migrations. No QUESTION: lines means it is ready to build.",
+  ].filter(Boolean).join("\n");
+}
+
+/** The verify lane's objective: preview specs against the deployed release, then the final report. */
+export function verifyObjective(spec, item, { releaseSha, reportPath }) {
+  return [
+    `Verify spec item ${item.id}: ${item.title}, now pushed to ${spec.target.remote}/${spec.target.branch}${releaseSha ? ` and deployed (release ${releaseSha})` : ""}.`,
+    item.acceptance.preview.length && spec.target.preview
+      ? `Run these browser specs against the preview at ${spec.target.preview.url}: ${item.acceptance.preview.join(", ")}.`
+      : "",
+    `Acceptance: ${item.acceptance.text}`,
+    item.acceptance.evidence
+      ? `Write the final evidence report at ${reportPath} in this worktree, with at least ${item.acceptance.evidence.minImages} screenshots from the preview run.`
+      : "",
+    "Do not change code or Git state; this stage only verifies.",
+    "Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, and REPORT: <path of the report you wrote>.",
   ].filter(Boolean).join("\n");
 }
 

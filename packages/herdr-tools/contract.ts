@@ -337,7 +337,7 @@ export type LaneInput =
       dependsOn?: string[];
       /** Set only by the spec loop's driver (not the herdr_plan schema):
        * the stage this lane runs, which selects its stage-specific rule. */
-      specStage?: "decide" | "build" | "review" | "integrate";
+      specStage?: "decide" | "build" | "review" | "integrate" | "verify";
     };
 
 export type GoalStatus =
@@ -442,7 +442,7 @@ export type Lane = {
   objective: string;
   readOnly: boolean;
   /** The spec-loop stage this lane runs (see LaneInput.specStage). */
-  specStage?: "decide" | "build" | "review" | "integrate";
+  specStage?: "decide" | "build" | "review" | "integrate" | "verify";
   agentKind: AgentKind;
   status: string;
   agentName?: string;

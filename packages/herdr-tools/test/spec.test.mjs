@@ -9,6 +9,8 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   docxImageCount,
+  finalReportPath,
+  releaseShaFrom,
   specStatusTable,
   specSummaryLine,
   validateSpec,
@@ -62,7 +64,7 @@ test("a spec validates strictly", () => {
     item("I08"),
     item("I10", { dependsOn: ["I08"], owns: ["src/a/**"], migrations: 1, acceptance: { tests: ["npm test"], evidence: { report: "artifacts/i10.docx", minImages: 2 } } }),
   ]));
-  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round" });
+  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside" });
   assert.equal(spec.items[1].acceptance.evidence.minImages, 2);
   assert.deepEqual(spec.items[0].acceptance.tests, []);
   for (const [bad, pattern] of [
@@ -208,4 +210,19 @@ test("the CLI and herdr_spec report the same verdict", async () => {
   } finally {
     await rm(r.directory, { recursive: true, force: true });
   }
+});
+
+test("release checks report the deployed SHA as JSON or text; final reports sit alongside by default", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  assert.equal(releaseShaFrom(JSON.stringify({ status: "ok", version: sha })), sha);
+  assert.equal(releaseShaFrom(JSON.stringify({ build: { git: { commit: "ABCDEF1" } } })), "abcdef1");
+  assert.equal(releaseShaFrom(JSON.stringify({ status: "ok", version: "1.4.2" })), undefined, "a semver is not a SHA");
+  assert.equal(releaseShaFrom(`deployed ${sha} at 10:00`), sha);
+  assert.equal(releaseShaFrom("<html>no build info</html>"), undefined);
+  const alongside = validateSpec(baseSpec([item("A")]));
+  const replace = validateSpec({ ...baseSpec([item("A")]), defaults: { finalReport: "replace" } });
+  assert.equal(finalReportPath(alongside, "artifacts/a/evidence.docx"), "artifacts/a/evidence.final.docx");
+  assert.equal(finalReportPath(alongside, "artifacts/report"), "artifacts/report.final");
+  assert.equal(finalReportPath(replace, "artifacts/a/evidence.docx"), "artifacts/a/evidence.docx");
+  assert.throws(() => validateSpec({ ...baseSpec([item("A")]), defaults: { finalReport: "both" } }), /finalReport/);
 });

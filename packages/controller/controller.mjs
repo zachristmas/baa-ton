@@ -2055,7 +2055,44 @@ function clipText(text, max) {
  * whole batch in a single turn instead of one turn per event, and each line
  * names the durable record it came from.
  */
-export function digestText(items, open = []) {
+const SPEC_LINE_STATES = ["pending", "deciding", "ready", "building", "reviewing", "integrating", "awaiting-push", "verifying", "failed"];
+
+/**
+ * The spec loop's burn-down line for the root digest, from spec.json and
+ * spec-state.json next to the manifest (docs/SPEC-LOOP.md section 9). The
+ * driver moves an item to done only through the verifier, so the recorded
+ * states are enough here; no git access. Undefined without a spec.
+ */
+export async function specDigestLine(manifestPath) {
+  try {
+    const spec = JSON.parse(await readFile(join(dirname(dirname(manifestPath)), "spec.json"), "utf8"));
+    const items = Array.isArray(spec?.items) ? spec.items : [];
+    if (!items.length) return undefined;
+    let state = {};
+    try {
+      state = JSON.parse(await readFile(join(dirname(manifestPath), "spec-state.json"), "utf8"))?.items ?? {};
+    } catch {
+      state = {};
+    }
+    const counts = new Map();
+    let done = 0;
+    for (const item of items) {
+      const record = isRecord(state[item?.id]) ? state[item.id] : {};
+      const stage = typeof record.state === "string" ? record.state : "pending";
+      if (stage === "done") done += 1;
+      else {
+        const key = stage === "blocked" ? `blocked(${record.blockedReason ?? "?"})` : stage;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    const order = [...SPEC_LINE_STATES, ...[...counts.keys()].filter((key) => key.startsWith("blocked(")).sort()];
+    return [`spec ${done}/${items.length} done`, ...order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`)].join(" · ");
+  } catch {
+    return undefined;
+  }
+}
+
+export function digestText(items, open = [], specLine) {
   const lines = items.map((item, index) => {
     if (item.kind === "event") {
       const { record } = item;
@@ -2080,6 +2117,7 @@ export function digestText(items, open = []) {
   });
   return [
     `[Baa-ton digest] ${items.length} update${items.length === 1 ? "" : "s"} since your last turn:`,
+    ...(specLine ? [specLine] : []),
     ...lines,
     ...(items.some((item) => item.kind === "directive")
       ? [
@@ -2842,7 +2880,7 @@ export async function dispatchRootDigest({
         attempts: attemptsFor[index],
       });
 
-  const outcome = await deliverRootPrompt(root, herdr, digestText(items, open));
+  const outcome = await deliverRootPrompt(root, herdr, digestText(items, open, await specDigestLine(manifestPath)));
   const finishedAt = now();
   for (const [index, item] of items.entries()) {
     if (item.kind === "event")

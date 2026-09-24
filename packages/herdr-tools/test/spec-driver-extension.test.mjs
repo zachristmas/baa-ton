@@ -12,7 +12,7 @@ const { validateApprovalPolicy, approvalPolicyHash } = await jiti.import("../app
 
 const launch = (provider, model) => ({ provider, model, thinking: "high", auth: "subscription" });
 
-async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b", decide = false } = {}) {
+async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b", decide = false, specDocument, seed } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-spec-driver-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
@@ -41,7 +41,7 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   }
   await writeFile(
     join(parent, ".baa-ton", "spec.json"),
-    JSON.stringify({
+    JSON.stringify(specDocument ?? {
       version: 1,
       target: { repo: ".", remote: "origin", branch: "feature/release" },
       stages: { ...(decide ? { decide: { profile: "planning" } } : {}), build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
@@ -51,6 +51,7 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
       ],
     }),
   );
+  if (seed) await writeFile(join(stateDir, "spec-state.json"), JSON.stringify(seed));
   await writeFile(
     manifestPath,
     JSON.stringify({
@@ -76,7 +77,13 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   const calls = { worktree: [], plan: [], dispatch: [] };
   let planned = 0;
   const pushedShas = new Set();
+  const release = { body: "{}" };
   const ports = {
+    worktreeRoot: join(directory, "worktrees"),
+    async fetchRelease(url) {
+      calls.release = [...(calls.release ?? []), url];
+      return release.body;
+    },
     async ancestor(_repo, sha, ref) {
       calls.ancestor = [...(calls.ancestor ?? []), ref];
       return pushedShas.has(sha);
@@ -99,6 +106,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   return {
     calls,
     pushedShas,
+    release,
+    worktreeRoot: join(directory, "worktrees"),
     stateDir,
     tools,
     ctx,
@@ -244,8 +253,8 @@ test("integration: one merge lane on spec-integration, then a push prompt, then 
     f.pushedShas.add(sha);
     await f.advance();
     state = await f.state();
-    assert.equal(state.items.A.state, "verifying");
     assert.equal(state.items.A.integratedSha, sha);
+    assert.equal(state.items.A.state, "done", "nothing to check on the preview: the verifier passes it once pushed");
   } finally {
     await f.cleanup();
   }
@@ -285,6 +294,82 @@ test("decide lanes read the project; answers recorded by the root unblock the bu
     await f.advance();
     const build = f.calls.plan.find((call) => call.specStage === "build");
     assert.match(build.laneObjective, /answers to its open questions:\nAfter tax\./);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+/** A minimal stored zip with the given entry names (a .docx for the report check). */
+function docx(images) {
+  const names = ["word/document.xml", ...Array.from({ length: images }, (_, index) => `word/media/image${index + 1}.png`)];
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const name of names) {
+    const bytes = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(bytes.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(bytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, bytes);
+    centrals.push(central, bytes);
+    offset += 30 + bytes.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(names.length, 8);
+  end.writeUInt16LE(names.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+test("verification: waits for the deploy, runs the preview specs, records the final report, and the verifier marks done", async () => {
+  const sha = "d".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release", preview: { url: "https://preview.example.test", releaseCheck: "https://preview.example.test/api/version" } },
+      items: [{
+        id: "A",
+        title: "Shipping discount",
+        acceptance: { text: "Discount applies to shipping only.", tests: ["npm test"], preview: ["e2e/a.spec.ts"], evidence: { report: "artifacts/a.docx", minImages: 2 } },
+      }],
+    },
+    seed: {
+      version: 1,
+      items: { A: { state: "verifying", integratedSha: sha, tests: [{ command: "npm test", sha, result: "pass" }] } },
+    },
+  });
+  try {
+    f.release.body = JSON.stringify({ version: "e".repeat(40) });
+    let result = await f.advance();
+    assert.match(result.content[0].text, /A waits: preview: the release check does not report a deploy containing this commit yet/);
+    assert.deepEqual(f.calls.release, ["https://preview.example.test/api/version"]);
+
+    f.release.body = JSON.stringify({ version: sha });
+    result = await f.advance();
+    assert.match(result.content[0].text, /Started: verify A -> herdr-spec1\./);
+    const verify = f.calls.plan[0];
+    assert.equal(verify.specStage, "verify");
+    assert.equal(verify.taskProfile, "quick");
+    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-integration"));
+    assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
+
+    await mkdir(join(f.worktreeRoot, "spec-integration", "artifacts"), { recursive: true });
+    await writeFile(join(f.worktreeRoot, "spec-integration", "artifacts", "a.final.docx"), docx(2));
+    f.pushedShas.add(sha);
+    await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
+    result = await f.advance();
+    assert.match(result.content[0].text, /done A/);
+    const state = await f.state();
+    assert.equal(state.items.A.state, "done");
+    assert.equal(state.items.A.evidence.images, 2);
+    assert.equal(state.items.A.evidence.path, join(f.worktreeRoot, "spec-integration", "artifacts", "a.final.docx"));
   } finally {
     await f.cleanup();
   }

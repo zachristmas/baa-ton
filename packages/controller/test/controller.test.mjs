@@ -22,6 +22,8 @@ import {
   SUPERVISOR_RESTART_EXIT_CODE,
   nudgeDecision,
   deliverLaneQueue,
+  digestText,
+  specDigestLine,
 } from "../controller.mjs";
 import { codeChangeWatcher, codeFingerprint, codeStamp, listRuntime, loadedCode, recordRuntime } from "../code-version.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
@@ -4177,5 +4179,37 @@ test("capacity escalation names services still held by finished lanes, without s
     assert.equal(services[0].state, "active", "naming never stops a service");
   } finally {
     await s.fixture.cleanup();
+  }
+});
+
+test("every root digest starts with the spec burn-down line when a spec exists", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-spec-line-"));
+  try {
+    const stateDir = join(directory, ".baa-ton", "herdr-orchestrator");
+    await mkdir(stateDir, { recursive: true });
+    const manifestPath = join(stateDir, "manifest.json");
+    assert.equal(await specDigestLine(manifestPath), undefined, "no spec, no line");
+    await writeFile(join(directory, ".baa-ton", "spec.json"), JSON.stringify({ items: ["A", "B", "C", "D", "E", "F"].map((id) => ({ id })) }));
+    assert.equal(await specDigestLine(manifestPath), "spec 0/6 done · 6 pending", "a spec without state is all pending");
+    await writeFile(
+      join(stateDir, "spec-state.json"),
+      JSON.stringify({
+        version: 1,
+        items: {
+          A: { state: "done" },
+          B: { state: "building" },
+          C: { state: "building" },
+          D: { state: "awaiting-push" },
+          E: { state: "blocked", blockedReason: "decision" },
+        },
+      }),
+    );
+    const line = await specDigestLine(manifestPath);
+    assert.equal(line, "spec 1/6 done · 1 pending · 2 building · 1 awaiting-push · 1 blocked(decision)");
+    const text = digestText([{ kind: "alert", request: { kind: "spec-push-ready", text: "push round" } }], [], line);
+    assert.deepEqual(text.split("\n").slice(0, 3), ["[Baa-ton digest] 1 update since your last turn:", line, "1. spec-push-ready: push round"]);
+    assert.doesNotMatch(digestText([{ kind: "alert", request: { kind: "x", text: "y" } }]), /spec \d/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
