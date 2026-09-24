@@ -277,6 +277,8 @@ type CapacityGate = {
 };
 type RootSupervision = {
   rootId: string;
+  /** 2: the goal's nudge interval was chosen under the repeating-nudge policy. */
+  nudgeIntervalPolicy?: 2;
   capacityGate?: CapacityGate;
   alerts?: unknown[];
   watchdog?: Record<string, unknown>;
@@ -835,7 +837,8 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
     if (
       (parsed.version === 1 || parsed.version === 2) &&
       Array.isArray(parsed.workflows)
-    )
+    ) {
+      stripSupervisorIntervalPolicy(parsed);
       return {
         version: 2,
         workflows: (parsed.workflows as Workflow[]).map((workflow) =>
@@ -870,6 +873,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         ...(Array.isArray(parsed.directives) ? { directives: parsed.directives } : {}),
         ...(Array.isArray(parsed.rootSupervision) ? { rootSupervision: parsed.rootSupervision } : {}),
       };
+    }
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -884,6 +888,37 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
     }
     throw new Error(`Cannot read Herdr manifest: ${(error as Error).message}`);
   }
+}
+
+/** Drop the #28 `supervisor.intervalPolicy` key from every goal copy: bridges
+ * loaded from earlier releases reject unknown supervisor keys. The marker
+ * lives in rootSupervision instead (see hasNudgeIntervalPolicy). */
+function stripSupervisorIntervalPolicy(manifest: Record<string, unknown>): void {
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) return value.forEach(visit);
+    if (!isRecord(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "supervisor" && isRecord(child)) delete child.intervalPolicy;
+      visit(child);
+    }
+  };
+  for (const key of ["parentGoal", "parentGoals", "goalHistory", "goalHistoryByRoot"]) visit(manifest[key]);
+}
+
+function hasNudgeIntervalPolicy(manifest: ManifestWithQueue, rootId: string): boolean {
+  return Boolean(
+    manifest.rootSupervision?.some((entry) => entry.rootId === rootId && entry.nudgeIntervalPolicy === 2),
+  );
+}
+
+function markNudgeIntervalPolicy(manifest: ManifestWithQueue, rootId: string): void {
+  const entries = (manifest.rootSupervision ??= []);
+  let entry = entries.find((item) => item.rootId === rootId);
+  if (!entry) {
+    entry = { rootId, alerts: [] };
+    entries.push(entry);
+  }
+  entry.nudgeIntervalPolicy = 2;
 }
 
 async function saveManifest(cwd: string, manifest: Manifest): Promise<void> {
@@ -1256,7 +1291,6 @@ async function parentGoal(
           version: 1,
           state: "stopped",
           intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
-          intervalPolicy: 2,
           nudgeCount: 0,
           nextNudgeAt: null,
           rootActivity: { status: "unknown", observedAt: timestamp },
@@ -1284,6 +1318,7 @@ async function parentGoal(
       syncLegacyProjection(initialized);
       if (rootTurn && initialized.supervisor)
         initialized.supervisor.rootTurn = rootTurn;
+      markNudgeIntervalPolicy(manifest, scope.rootId);
       await saveManifest(cwd, manifest);
       return {
         goal: initialized,
@@ -1298,7 +1333,6 @@ async function parentGoal(
         version: 1,
         state: "stopped",
         intervalSeconds: parentGoalNudgeInterval(undefined),
-        intervalPolicy: 2,
         nudgeCount: 0,
         nextNudgeAt: null,
         rootActivity: { status: "unknown", observedAt: timestamp },
@@ -1336,11 +1370,11 @@ async function parentGoal(
       control.state = "running";
       control.intervalSeconds = parentGoalNudgeInterval(
         nudgeIntervalSeconds ??
-          (control.intervalPolicy === 2
+          (hasNudgeIntervalPolicy(manifest, scope.rootId)
             ? control.intervalSeconds
             : Math.min(control.intervalSeconds, DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS)),
       );
-      control.intervalPolicy = 2;
+      markNudgeIntervalPolicy(manifest, scope.rootId);
       if (previousSupervisorState !== "running") {
         control.nextNudgeAt = new Date(
           Date.parse(timestamp) + control.intervalSeconds * 1000,

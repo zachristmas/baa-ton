@@ -609,13 +609,44 @@ const NUDGE_INTERVAL_POLICY = 2;
 const QUIET_PARENT_GOAL_STATUSES = new Set(["completed", "paused"]);
 
 /**
- * One-time upgrade for goals written before the repeating nudge: an interval
- * above the 300 s default is lowered to it. Goals the extension wrote under
- * the new policy (intervalPolicy 2) keep whatever interval was chosen.
+ * Remove the short-lived `supervisor.intervalPolicy` key (#28) from every
+ * goal copy in the manifest. Bridges loaded from releases before #28 validate
+ * parent goals with a strict key allowlist and reject it, which broke
+ * herdr_message and herdr_complete for lanes dispatched before an upgrade.
+ * Returns whether any copy carried the new policy (2), so the marker can move
+ * to rootSupervision.
  */
-function upgradeNudgeInterval(supervisor, timestamp) {
-  if (supervisor.intervalPolicy === NUDGE_INTERVAL_POLICY) return false;
-  supervisor.intervalPolicy = NUDGE_INTERVAL_POLICY;
+export function stripSupervisorIntervalPolicy(manifest) {
+  let found = false;
+  let changed = false;
+  const visit = (value) => {
+    if (Array.isArray(value)) return value.forEach(visit);
+    if (!isRecord(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "supervisor" && isRecord(child) && "intervalPolicy" in child) {
+        if (child.intervalPolicy === NUDGE_INTERVAL_POLICY) found = true;
+        delete child.intervalPolicy;
+        changed = true;
+      }
+      visit(child);
+    }
+  };
+  for (const key of ["parentGoal", "parentGoals", "goalHistory", "goalHistoryByRoot"]) visit(manifest[key]);
+  return { changed, found };
+}
+
+/**
+ * One-time upgrade for goals written before the repeating nudge: an interval
+ * above the 300 s default is lowered to it. The marker lives in this root's
+ * rootSupervision entry (`nudgeIntervalPolicy: 2`), never in the strictly
+ * validated supervisor, so goals the extension marked keep their chosen
+ * interval. Pre-#28 extensions drop unknown top-level keys when they save,
+ * so a lost marker at worst re-caps an interval chosen above 300 s.
+ */
+function upgradeNudgeInterval(manifest, orchestrator, supervisor, timestamp) {
+  const entry = supervisionFor(manifest, orchestrator);
+  if (entry?.nudgeIntervalPolicy === NUDGE_INTERVAL_POLICY) return false;
+  supervisionFor(manifest, orchestrator, true).nudgeIntervalPolicy = NUDGE_INTERVAL_POLICY;
   if (supervisor.intervalSeconds > DEFAULT_NUDGE_INTERVAL_SECONDS) {
     supervisor.intervalSeconds = DEFAULT_NUDGE_INTERVAL_SECONDS;
     const capped = nextNudgeAt(timestamp, DEFAULT_NUDGE_INTERVAL_SECONDS);
@@ -3160,6 +3191,13 @@ export async function runSupervisorTick({
       );
       const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
       const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
+      // Forward compatibility: keep parent goals readable by older bridges.
+      const policy = stripSupervisorIntervalPolicy(manifest);
+      if (policy.changed) {
+        if (policy.found)
+          supervisionFor(manifest, orchestrator, true).nudgeIntervalPolicy = NUDGE_INTERVAL_POLICY;
+        await atomicWriteJson(manifestPath, manifest);
+      }
       // Queue continuation uses this existing event-driven tick as its retry
       // point. A landed predecessor can wake only a clear ordered head.
       for (const [workflowIndex, stored] of matchedWorkflows.entries()) {
@@ -3291,7 +3329,7 @@ export async function runSupervisorTick({
         goal.updatedAt = timestamp;
         await atomicWriteJson(manifestPath, manifest);
       };
-      if (upgradeNudgeInterval(supervisor, timestamp)) await persist();
+      if (upgradeNudgeInterval(manifest, orchestrator, supervisor, timestamp)) await persist();
       if (supervisor.state !== "running") {
         results.push({ manifestPath, status: "not-running" });
         continue;

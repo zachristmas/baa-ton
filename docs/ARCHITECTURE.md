@@ -25,6 +25,9 @@ The workflow tools run through the local MCP bridge. The controller installs wit
 4. **Event-driven control.** Treat lifecycle signals as observations. Never turn them into autonomous Git, PR, deployment, production, or external actions.
 5. **Bounded reads and foreground tests.** No polling loops, detached jobs, or hidden background test workers.
 6. **Fail closed.** Reject malformed mappings, identity drift, ambiguous targets, and unsafe local file permissions before mutation.
+7. **Forward-compatible manifests.** Lanes dispatched before an upgrade keep running MCP bridges loaded from the older release, and they share the manifest with the upgraded root and controller. Two rules follow:
+   - **Strict objects:** never add a field inside an object an earlier release validates strictly. That includes parent goals and their `supervisor`, `lastDelivery`, `rootTurn` and `rootActivity`. The oldest supported release's validator is vendored in `packages/controller/test/fixtures/`, and `controller.test.mjs` plus the smoke check run manifests written by current code through it after every write. #28's `supervisor.intervalPolicy` broke `herdr_message`/`herdr_complete` for pre-upgrade lanes; the follow-up moved that marker to `rootSupervision` and strips the key from existing goals.
+   - **New top-level fields:** before #28, `loadManifest` kept only the top-level keys it knew. A pre-upgrade lane's `herdr_complete` therefore rewrites the manifest without `approvalPolicyAck`, `leases`, `directives` or `rootSupervision`. New state must tolerate that loss, or live inside an object older writers already carry through unchanged.
 
 ## Validation
 
