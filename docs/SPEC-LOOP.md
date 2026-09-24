@@ -169,6 +169,16 @@ These refine the design where it meets existing invariants:
 3. **Item state lives in a side file** (`.baa-ton/herdr-orchestrator/spec-state.json`, written under the manifest lock), not a new top-level manifest key. Pre-upgrade manifest writers drop top-level keys they don't know (ARCHITECTURE invariant 7).
 4. **New verifier inputs.** Test results at the integrated SHA need a durable record (written by the build and integrate stages), and `minImages` needs .docx parsing (the zip's `word/media` entries), with no new dependencies.
 
+## Build status
+
+- **PR 1 (built):** `packages/herdr-tools/spec.mjs` validates `.baa-ton/spec.json` strictly (unknown keys, duplicate ids, unknown or cyclic dependencies, paths outside the repo and bad stage references are rejected). It reads item state from `.baa-ton/herdr-orchestrator/spec-state.json` and verifies each item in order:
+  1. the evidence report: it exists, has `minImages` images (counted from the .docx `word/media/` entries without a zip dependency, or image references in Markdown/HTML), and its SHA-256 matches `evidence.sha256`;
+  2. `integratedSha` is an ancestor of `refs/remotes/<remote>/<branch>` (no fetch; the verifier reads the local ref);
+  3. each acceptance test has a `pass` recorded at `integratedSha`;
+  4. each preview spec has a `pass` recorded on a `releaseSha` that contains `integratedSha`.
+
+  `herdr_spec action=status|verify` and `node packages/herdr-tools/spec.mjs status|verify [project]` print the same verdict; `verify` exits 0 only at M/M. A recorded `done` that the verifier rejects is shown as `verifying`. Nothing writes the state file yet; the stages that do come in PR 2 onward.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?
