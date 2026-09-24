@@ -83,6 +83,7 @@ Both run on the supervisor tick for each root and live in the parent manifest's 
 - **No-progress watchdog.** It fires when the parent goal is not terminal, no mapped lane's latest event is `working`, the root turn is not active, and nothing has changed for `program.watchdog_minutes` (default 30).
   - Zach gets one notification, and the root gets a digest nudge with the reason.
   - It fires once per idle episode. New lane or root activity starts a new episode.
+  - It also alerts once when a goal that is neither completed nor paused has had its supervisor `stopped` for `watchdog_minutes`, since that root gets no nudges at all. The episode is tracked as `rootSupervision[].supervisorStopped` and ends when the supervisor runs again.
 - **Config:** both thresholds are integers from 1 to 1440. The sampler, top-memory probe and notifier are injectable for tests.
 
 ## Validate

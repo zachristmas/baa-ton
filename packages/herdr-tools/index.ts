@@ -1334,6 +1334,25 @@ async function parentGoal(
       if (!objective?.trim())
         throw new Error("objective is required to initialize a parent goal.");
       const timestamp = now();
+      // A new goal (including the one after a reset) is supervised from the
+      // start: the #28 goal loop must not depend on a separate start call.
+      // It keeps the previous goal's interval, and stays paused only when
+      // that goal was explicitly paused.
+      const previous = [...history].reverse().find((item) =>
+        isRecord((item as { supervisor?: unknown }).supervisor),
+      ) as { supervisor?: ParentGoal["supervisor"] } | undefined;
+      const previousControl = previous?.supervisor;
+      const carriedPause =
+        previousControl?.state === "paused" && previousControl.pauseReason?.trim()
+          ? previousControl.pauseReason.trim()
+          : undefined;
+      const previousInterval =
+        previousControl && Number.isSafeInteger(previousControl.intervalSeconds)
+          ? hasNudgeIntervalPolicy(manifest, scope.rootId)
+            ? previousControl.intervalSeconds
+            : Math.min(previousControl.intervalSeconds, DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS)
+          : undefined;
+      const intervalSeconds = parentGoalNudgeInterval(nudgeIntervalSeconds ?? previousInterval);
       const initialized: ParentGoal = {
         version: 1,
         id: `parent-goal-${randomUUID().slice(0, 12)}`,
@@ -1345,10 +1364,13 @@ async function parentGoal(
         signals: [],
         supervisor: {
           version: 1,
-          state: "stopped",
-          intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
+          state: carriedPause ? "paused" : "running",
+          intervalSeconds,
+          ...(carriedPause ? { pauseReason: carriedPause } : {}),
           nudgeCount: 0,
-          nextNudgeAt: null,
+          nextNudgeAt: carriedPause
+            ? null
+            : new Date(Date.parse(timestamp) + intervalSeconds * 1000).toISOString(),
           rootActivity: { status: "unknown", observedAt: timestamp },
           createdAt: timestamp,
           updatedAt: timestamp,
@@ -8531,6 +8553,25 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       return {
         status: "ok",
         detail: `Version 2 manifest at ${manifestPath(cwd)}: ${manifest.workflows.length} workflow(s), parent goal ${goal ? "present" : "absent"}.`,
+      };
+    });
+
+    await check("parent-goal-supervisor", async () => {
+      const manifest = await loadManifest(cwd);
+      const scope = currentRootScope(cwd);
+      const goal = scope ? rootGoalFor(manifest, cwd, scope).goal : manifest.parentGoal;
+      if (!goal) return { status: "ok", detail: "No parent goal is registered." };
+      const state = goal.supervisor?.state ?? "not configured";
+      if (goal.status !== "completed" && goal.status !== "paused" && state === "stopped")
+        return {
+          status: "warn",
+          detail: `Parent goal ${goal.id} is ${goal.status} but its supervisor is ${state}, so the root gets no nudges. Run herdr_goal action=start, or record the goal as completed or paused.`,
+        };
+      return {
+        status: "ok",
+        detail: `Parent goal ${goal.id} is ${goal.status}; supervisor ${state}${
+          goal.supervisor?.nextNudgeAt ? `, next nudge ${goal.supervisor.nextNudgeAt}` : ""
+        }.`,
       };
     });
 

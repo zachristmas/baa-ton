@@ -772,7 +772,12 @@ try {
       undefined,
       ctx,
     );
-  assert.equal(initializedGoal.details.goal.supervisor.state, "stopped");
+  assert.equal(
+    initializedGoal.details.goal.supervisor.state,
+    "running",
+    "a new goal is supervised from the start, without a separate start call",
+  );
+  assert.ok(initializedGoal.details.goal.supervisor.nextNudgeAt, "and it is scheduled");
   assert.equal(initializedGoal.details.goal.supervisor.intervalSeconds, 300, "default nudge interval");
   assert.equal("intervalPolicy" in initializedGoal.details.goal.supervisor, false, "older bridges reject unknown supervisor keys");
   assert.deepEqual(calls.at(-1), [
