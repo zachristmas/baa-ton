@@ -211,9 +211,12 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
       }
     } else if (view && LANE_ENDED.has(view.status))
       failAttempt(`${current.state === "building" ? "build" : "review"} lane ended (${view.status}) without a receipt`);
-    // A stage whose dispatch never produced a lane is retried.
-    else if (!current.lane)
-      actions.push({ kind: current.state === "building" ? "build" : "review", itemId: item.id, attempt: attempts, ...(current.findings ? { findings: current.findings } : {}) });
+    // A stage whose dispatch never produced a lane is retried, under the
+    // same capacity hold as a new build.
+    else if (!current.lane) {
+      if (capacityWaiting) waits[item.id] = `capacity: ${typeof capacityWaiting === "string" ? capacityWaiting : "the root is waiting on a capacity gate"}`;
+      else actions.push({ kind: current.state === "building" ? "build" : "review", itemId: item.id, attempt: attempts, ...(current.findings ? { findings: current.findings } : {}) });
+    }
   }
 
   // 1b. Pushed integrations move on to verification.
@@ -337,7 +340,7 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
     const current = record(item.id);
     if (current.state !== "ready") continue;
     if (capacityWaiting) {
-      waits[item.id] = "capacity: the root is waiting on a capacity gate";
+      waits[item.id] = `capacity: ${typeof capacityWaiting === "string" ? capacityWaiting : "the root is waiting on a capacity gate"}`;
       continue;
     }
     if (slots <= 0) {
@@ -407,9 +410,15 @@ export function verifyObjective(spec, item, { releaseSha, reportPath }) {
 }
 
 /** The integration lane's objective: merge locally, renumber, run the suite, never push. */
-export function integrateObjective(spec, item, { integrationBranch, itemBranch }) {
+export function integrateObjective(spec, item, { integrationBranch, itemBranch, commitFirst }) {
   return [
     `Integrate spec item ${item.id}: ${item.title}.`,
+    commitFirst?.paths.length
+      ? `First commit the item's uncommitted work in ${commitFirst.worktree} on ${itemBranch}, staging exactly these paths and nothing else (never git add -A or .): git -C ${commitFirst.worktree} add -- ${commitFirst.paths.map((path) => JSON.stringify(path)).join(" ")} && git -C ${commitFirst.worktree} commit -m "${item.id}: commit adopted work before integration"`
+      : "",
+    commitFirst?.secrets.length
+      ? `Leave these uncommitted; they look like secrets and must never be staged: ${commitFirst.secrets.join(", ")}.`
+      : "",
     `This worktree is on ${integrationBranch}: the target tip plus the items already integrated. Merge ${itemBranch} into it (git merge --no-ff ${itemBranch}) and resolve any conflicts.`,
     item.migrations
       ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference.`

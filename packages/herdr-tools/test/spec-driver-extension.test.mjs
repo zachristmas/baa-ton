@@ -107,6 +107,7 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     calls,
     pushedShas,
     release,
+    ports,
     worktreeRoot: join(directory, "worktrees"),
     stateDir,
     tools,
@@ -370,6 +371,111 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     assert.equal(state.items.A.state, "done");
     assert.equal(state.items.A.evidence.images, 2);
     assert.equal(state.items.A.evidence.path, join(f.worktreeRoot, "spec-integration", "artifacts", "a.final.docx"));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("adopted work: an attached legacy lane is never dispatched twice, and its receipt reviews the adopted branch", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      stages: { build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
+      items: [{ id: "LIVE", title: "Live item", owns: ["src/live/**"], adopt: { worktree: "/work/wt-live", branch: "demo/live", workflow: "herdr-legacy" }, acceptance: { text: "l" } }],
+    },
+    seed: {
+      version: 1,
+      items: { LIVE: { state: "building", attempts: 1, worktree: "/work/wt-live", branch: "demo/live", lane: { workflowId: "herdr-legacy", laneId: "lane-1" }, adopted: { workflow: "herdr-legacy" } } },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-legacy", status: "running", lanes: [{ id: "lane-1", status: "working" }], evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    await f.advance();
+    await f.advance();
+    assert.equal(f.calls.plan.length, 0, "the live legacy lane keeps the item; nothing is dispatched");
+
+    const withReceipt = await f.manifest();
+    withReceipt.workflows[0].lanes[0] = { id: "lane-1", status: "completion-reported", completionReceipt: { id: "r", summary: "Done on demo/live.", delivery: "delivered" } };
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(withReceipt));
+    await f.advance();
+    assert.equal(f.calls.plan.length, 1);
+    assert.equal(f.calls.plan[0].specStage, "review");
+    assert.equal(f.calls.plan[0].worktree, "/work/wt-live", "the review reads the adopted worktree");
+    assert.match(f.calls.plan[0].laneObjective, /git diff origin\/feature\/release\.\.\.demo\/live/);
+    assert.equal(f.calls.worktree.length, 0, "no spec/<id> worktree is created for adopted work");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("integrating adopted work: the lane commits exactly the item-owned paths first, never secrets", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "ACC", title: "Accepted", owns: ["src/acc/**"], acceptance: { text: "a" } }],
+    },
+    seed: { version: 1, items: { ACC: { state: "integrating", attempts: 1, worktree: "/work/wt-acc", branch: "demo/acc" } } },
+  });
+  try {
+    f.ports.status = async (worktree) => {
+      assert.equal(worktree, "/work/wt-acc");
+      return [" M src/acc/rules.ts", "?? src/acc/new.test.ts", "?? src/acc/.env.local", "?? src/acc/stack.lane-secrets.json", " M src/other/unrelated.ts"].join("\n");
+    };
+    await f.advance();
+    const merge = f.calls.plan[0];
+    assert.equal(merge.specStage, "integrate");
+    assert.match(merge.laneObjective, /git merge --no-ff demo\/acc/, "integrates from the adopted branch");
+    assert.match(merge.laneObjective, /git -C \/work\/wt-acc add -- "src\/acc\/rules\.ts" "src\/acc\/new\.test\.ts" && git -C \/work\/wt-acc commit/);
+    assert.match(merge.laneObjective, /never git add -A/);
+    assert.match(merge.laneObjective, /Leave these uncommitted; they look like secrets and must never be staged: src\/acc\/\.env\.local, src\/acc\/stack\.lane-secrets\.json\./);
+    assert.doesNotMatch(merge.laneObjective.split("Leave these")[0], /\.env|lane-secrets|unrelated/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("memory-aware dispatch: a live memory floor holds builds, and a shell start timeout backs off", async () => {
+  const document = {
+    version: 1,
+    target: { repo: ".", remote: "origin", branch: "feature/release" },
+    defaults: { minFreeMemoryGb: 4 },
+    items: [{ id: "A", title: "A", owns: ["src/a/**"], acceptance: { text: "a" } }, { id: "B", title: "B", owns: ["src/b/**"], acceptance: { text: "b" } }],
+  };
+  const f = await fixture({ specDocument: document });
+  try {
+    f.ports.sample = async () => ({ freeMemoryGb: 1.5, swapUsedGb: 20 });
+    let result = await f.advance();
+    assert.match(result.content[0].text, /A waits: capacity: free memory 1\.5 GB is below 4 GB/);
+    assert.equal(f.calls.plan.length, 0);
+
+    f.ports.sample = async () => ({ freeMemoryGb: 9, swapUsedGb: 2 });
+    f.ports.dispatch = async (workflowId) => {
+      f.calls.dispatch.push(workflowId);
+      throw new Error("Pane w-spec:p9 shell did not become ready for agent start; inspect it before retrying.");
+    };
+    result = await f.advance();
+    assert.equal(f.calls.dispatch.length, 1, "after a shell start timeout nothing else starts this pass");
+    let state = await f.state();
+    assert.equal(state.dispatchBackoff.until, "2026-09-24T12:10:00.000Z");
+    assert.match(state.dispatchBackoff.reason, /shell did not become ready/);
+
+    result = await f.advance();
+    assert.equal(f.calls.dispatch.length, 1, "still backing off");
+    assert.match(result.content[0].text, /waits: capacity: backing off until 2026-09-24T12:10:00\.000Z/);
+
+    f.ports.now = () => "2026-09-24T12:11:00.000Z";
+    f.ports.dispatch = async (workflowId) => {
+      f.calls.dispatch.push(workflowId);
+      return { dispatched: true };
+    };
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.dispatchBackoff, undefined, "the backoff clears once it has passed");
+    assert.ok(f.calls.dispatch.length > 1);
   } finally {
     await f.cleanup();
   }

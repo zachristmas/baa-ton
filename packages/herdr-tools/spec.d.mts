@@ -4,6 +4,7 @@ export const STAGES: string[];
 export const ITEM_STATES: string[];
 
 export type SpecItem = {
+  adopt?: { worktree?: string; branch?: string; report?: string; workflow?: string; review?: string; accepted?: boolean };
   id: string;
   title: string;
   dependsOn: string[];
@@ -21,10 +22,18 @@ export type SpecItem = {
 export type Spec = {
   version: 1;
   target: { repo: string; remote: string; branch: string; suite: string[]; preview?: { url: string; releaseCheck?: string } };
-  defaults: { maxParallel: number; maxBuildAttempts: number; pushGate: "round" | "item"; finalReport: "alongside" | "replace" };
+  defaults: {
+    maxParallel: number;
+    maxBuildAttempts: number;
+    pushGate: "round" | "item";
+    finalReport: "alongside" | "replace";
+    minFreeMemoryGb?: number;
+    maxSwapUsedGb?: number;
+  };
   stages: Record<string, { profile: string; differentFrom?: string }>;
   items: SpecItem[];
 };
+export type SpecAdopt = { worktree?: string; branch?: string; report?: string; workflow?: string; review?: string; accepted?: boolean };
 export type SpecState = { version: 1; items: Record<string, any> };
 export type ItemVerification = {
   id: string;
@@ -32,7 +41,7 @@ export type ItemVerification = {
   checks: Array<{ name: string; ok: boolean; detail: string }>;
   failing?: { name: string; ok: boolean; detail: string };
 };
-export type SpecVerification = { done: number; total: number; results: ItemVerification[] };
+export type SpecVerification = { done: number; total: number; deferred?: number; results: Array<ItemVerification & { deferred?: boolean }> };
 
 export function validateSpec(input: unknown): Spec;
 export function validateSpecState(input: unknown): SpecState;

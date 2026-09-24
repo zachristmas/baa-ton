@@ -4213,3 +4213,16 @@ test("every root digest starts with the spec burn-down line when a spec exists",
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("the digest line leaves deferred spec items out of M", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-spec-deferred-"));
+  try {
+    const stateDir = join(directory, ".baa-ton", "herdr-orchestrator");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(directory, ".baa-ton", "spec.json"), JSON.stringify({ items: [{ id: "A" }, { id: "B" }, { id: "C" }] }));
+    await writeFile(join(stateDir, "spec-state.json"), JSON.stringify({ version: 1, items: { A: { state: "done" }, C: { state: "deferred" } } }));
+    assert.equal(await specDigestLine(join(stateDir, "manifest.json")), "spec 1/2 done · 1 pending · 1 deferred");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

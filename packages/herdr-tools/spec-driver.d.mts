@@ -8,7 +8,8 @@ export function advanceSpec(input: {
   spec: Spec;
   state: SpecState | undefined;
   lane: (ref: { workflowId: string; laneId: string }) => { status?: string; receipt?: { summary: string } } | undefined;
-  capacityWaiting?: boolean;
+  /** true, or the reason dispatch must wait for capacity. */
+  capacityWaiting?: boolean | string;
   pushed?: Set<string>;
   released?: Map<string, string>;
   now: string;
@@ -27,6 +28,10 @@ export function decideObjective(spec: Spec, item: SpecItem): string;
 export function decideResult(summary: unknown): { questions: string[]; owns?: string[]; migrations?: number };
 export function reviewObjective(spec: Spec, item: SpecItem, options: { branch: string; buildSummary?: string }): string;
 export function integrationResult(summary: unknown): { sha?: string; suite?: "pass" | "fail" };
-export function integrateObjective(spec: Spec, item: SpecItem, options: { integrationBranch: string; itemBranch: string }): string;
+export function integrateObjective(
+  spec: Spec,
+  item: SpecItem,
+  options: { integrationBranch: string; itemBranch: string; commitFirst?: { worktree: string; paths: string[]; secrets: string[] } },
+): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; report?: string };
 export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;

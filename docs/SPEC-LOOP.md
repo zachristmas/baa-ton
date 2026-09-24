@@ -214,6 +214,23 @@ These refine the design where it meets existing invariants:
   - **Digest line:** every root digest now starts with the burn-down line (`spec N/M done · 2 building · 1 awaiting-push · 1 blocked(decision)`), computed by the controller from `spec.json` and `spec-state.json`.
   - **Not verified live:** the release-check formats beyond these parsers; a real preview run.
 
+## Adopting a live run
+
+A run that started before the spec loop already has work: worktrees and branches, local commits, evidence reports, reviews, and legacy workflows still running. On an empty `spec-state.json` the driver would rebuild every item and double-dispatch live ones. So a live run is adopted first:
+
+1. Per item, `adopt` in spec.json names what exists: `{ "worktree": "<abs>", "branch": "<name>", "report": "<abs>", "workflow": "<id>", "review": "<id>", "accepted": true }`. All fields are optional. Paths are absolute, because lanes kept worktrees and reports outside the target repo.
+2. Run `herdr_spec action=adopt dryRun=true` (or `node packages/herdr-tools/spec.mjs adopt <project> --dry-run`). It prints each item's proposed state, the reason and any warnings (a missing workflow or report, too few images, a FAIL verdict). Then run it without the dry run to write the first `spec-state.json` under the manifest lock. Adopt refuses to replace a state that already tracks items unless `force` is set.
+3. **Starting states,** first match wins:
+   - `deferred`: the acceptance says deferred and the item owns no files. It's excluded from M.
+   - `integrating`: `accepted: true`, or a receipt starting `VERDICT: PASS` on the adopted or review workflow.
+   - `building`: the adopted workflow still has a live lane. The item is attached to that lane, so nothing is dispatched twice, and the lane's receipt advances it like a driver-built lane.
+   - `reviewing`: a build receipt exists, or the evidence report exists. The driver starts a review lane, honoring `differentFrom`.
+   - `pending`: otherwise.
+4. The report's path, SHA-256 and image count are recorded at adopt time. The verifier reads a recorded path, even outside the repo.
+5. **Adopted branches and worktrees** replace `spec/<id>` for build, review and integration. Before merging an adopted branch, the driver lists the item-owned uncommitted paths in its worktree (all changes when `owns` is empty). It never lists anything matching `*secret*`, `.env*` or `*.lane-secrets.json`, tracked or not. The integration lane commits exactly those paths first and leaves any listed secrets uncommitted.
+
+Memory-aware dispatch: besides a waiting capacity gate, the driver samples free memory and swap before dispatching when `defaults.minFreeMemoryGb` or `defaults.maxSwapUsedGb` is set. After a dispatch fails with "shell did not become ready", it starts nothing else that pass and backs off for 10 minutes. Retries of an undispatched stage honor the same hold.
+
 ## Open questions for Zach
 
 - Is one push prompt per integration round right, or one per item?

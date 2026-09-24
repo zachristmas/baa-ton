@@ -2076,17 +2076,24 @@ export async function specDigestLine(manifestPath) {
     }
     const counts = new Map();
     let done = 0;
+    let deferred = 0;
     for (const item of items) {
       const record = isRecord(state[item?.id]) ? state[item.id] : {};
       const stage = typeof record.state === "string" ? record.state : "pending";
       if (stage === "done") done += 1;
+      else if (stage === "deferred") deferred += 1;
       else {
         const key = stage === "blocked" ? `blocked(${record.blockedReason ?? "?"})` : stage;
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     }
     const order = [...SPEC_LINE_STATES, ...[...counts.keys()].filter((key) => key.startsWith("blocked(")).sort()];
-    return [`spec ${done}/${items.length} done`, ...order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`)].join(" · ");
+    // Deferred items are out of scope for now and not counted in M.
+    return [
+      `spec ${done}/${items.length - deferred} done`,
+      ...order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`),
+      ...(deferred ? [`${deferred} deferred`] : []),
+    ].join(" · ");
   } catch {
     return undefined;
   }
