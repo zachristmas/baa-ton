@@ -34,6 +34,8 @@ Open your agent (Claude Code, Codex, Pi or OpenCode) in a Herdr pane inside the 
 | `baa-ton-configure` | Picks a harness and model for each job type. |
 | `baa-ton-update` | Updates Baa-ton and keeps your settings. |
 
+If the root's old Herdr workspace is gone, move its workflows to a new root with the audited `herdr_recover_root` preview instead of resetting anything. See [stale-root recovery](packages/herdr-tools/README.md#recover-a-stale-project-root).
+
 ## Pick a model per job
 
 The root asks for a job type (`planning`, `quick`, `balanced`, `implementation`, `sustained`, `review`, `deep-review`). `.baa-ton/config.json` decides who does it:
