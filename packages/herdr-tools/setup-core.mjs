@@ -6,9 +6,9 @@
  * persisted for the user, while dispatch still performs live qualification.
  */
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const toolsDirectory = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +22,7 @@ const START_SKILL_START = "<!-- baa-ton:start-skill:start -->";
 const START_SKILL_END = "<!-- baa-ton:start-skill:end -->";
 const LEGACY_SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
 const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
-const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall"];
+const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall", "baa-ton-sweep"];
 
 const START_SKILL_DIRECTORIES = {
   pi: [".pi", "skills"],
@@ -87,17 +87,27 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function managedReferenceBlock(baaPath) {
+// Instruction files load in every session, so the reference must stay
+// conditional: BAA.md governs only explicitly selected orchestration sessions.
+export function managedReferenceBlock(baaReference) {
   return [
     BAA_REFERENCE_START,
-    `Read and follow the Baa-ton operating contract at \`${baaPath}\` before planning, delegating, or acting as a root.`,
+    `In an explicitly selected Herdr orchestration session, read and follow the Baa-ton operating contract at \`${baaReference}\` before planning, delegating, or acting as a root. Otherwise ignore it.`,
     BAA_REFERENCE_END,
   ].join("\n");
 }
 
+// Tracked instruction files are shared across machines, so reference BAA.md
+// relative to the instruction file; fall back to absolute across drives.
+export function portableBaaReference(instructionPath, baaPath) {
+  const reference = relative(dirname(resolve(instructionPath)), resolve(baaPath));
+  if (!reference || isAbsolute(reference)) return baaPath;
+  return reference.split("\\").join("/");
+}
+
 export function updateManagedReference(path, baaPath) {
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const block = managedReferenceBlock(baaPath);
+  const block = managedReferenceBlock(portableBaaReference(path, baaPath));
   const pattern = new RegExp(`${escapeRegExp(BAA_REFERENCE_START)}[\\s\\S]*?${escapeRegExp(BAA_REFERENCE_END)}\\n?`);
   const next = pattern.test(existing)
     ? existing.replace(pattern, `${block}\n`)
@@ -132,7 +142,19 @@ export function uninstallSkillPath(projectRoot, harnessId) {
   return projectSkillPath(projectRoot, harnessId, "baa-ton-uninstall");
 }
 
+export function sweepSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-sweep");
+}
+
+// `harness` may list several harnesses when their skill directories resolve to
+// one file (for example `.codex` symlinked to `.claude`).
 export function startSkillContent({ harness, baaPath, projectRoot }) {
+  const harnesses = [harness].flat();
+  const sessionName = harnesses.join(" or ");
+  const harnessArgument = harnesses.length === 1 ? harnesses[0] : "<harness>";
+  const harnessChoice = harnesses.length === 1
+    ? ""
+    : ` Use the harness you are running in: ${harnesses.map((id) => `\`${id}\``).join(" or ")}.`;
   const rootSetupPath = join(checkoutDirectory, "packages", "herdr-tools", "root-setup.mjs");
   const setupPath = join(checkoutDirectory, "packages", "herdr-tools", "setup.mjs");
   return [
@@ -144,10 +166,10 @@ export function startSkillContent({ harness, baaPath, projectRoot }) {
     "",
     "# Start Baa-ton",
     "",
-    `Use this skill when Baa-ton is installed but the current ${harness} session does not have its root tools connected, or when Baa-ton needs to be repaired. The target project is \`${projectRoot}\`.`,
+    `Use this skill when Baa-ton is installed but the current ${sessionName} session does not have its root tools connected, or when Baa-ton needs to be repaired. The target project is \`${projectRoot}\`.`,
     "",
     `1. Read \`${baaPath}\` and confirm this is the intended Herdr pane.`,
-    `2. Run: \`node "${rootSetupPath}" --harness ${harness}\`.`,
+    `2. Run: \`node "${rootSetupPath}" --harness ${harnessArgument}\`.${harnessChoice}`,
     "3. Follow the helper's one-time integration instruction and restart this harness in the same pane if it requests a restart.",
     "4. Call `herdr_bootstrap_root` with no arguments first. If it succeeds or reports `alreadyRegistered`, skip to step 5.",
     "5. If it fails with an existing-state error naming a different pane/workspace, that is not this pane's problem to fix: call it again with `add=true` to register a concurrent root without touching any other root or manifest state. Only consider `reset=true` if the user explicitly asks to retire every other root; it wipes the shared parent manifest for this cwd, including other roots' workflows.",
@@ -229,16 +251,38 @@ export function updateSkillContent({ projectRoot }) {
     `Use this skill only when the user asks to update Baa-ton. The project is \`${projectRoot}\`.`,
     "",
     "1. Preserve the project's `BAA.md`, `.baa-ton/config.json`, instruction files, and user-authored skills.",
-    `2. Update the checkout with \`git -C "${checkoutDirectory}" pull --ff-only\`. If the checkout has local changes or the fast-forward fails, stop and report it.`,
+    `2. Run \`git -C "${checkoutDirectory}" status --short\`. If the checkout has local changes, show them and ask the user whether to commit them to a branch first; never stash, reset, or discard them. Then update with \`git -C "${checkoutDirectory}" pull --ff-only\`; if the fast-forward fails, stop and report it.`,
     // npm's --prefix only changes where node_modules/package-lock end up; it
     // does not redirect which package.json npm reads dependencies from --
     // that still comes from the shell's cwd, so `npm --prefix "<dir>"
     // install` run from an unrelated directory fails looking for a
     // package.json that isn't there. cd into the checkout first instead.
     `3. Install dependency changes: \`cd "${checkoutDirectory}" && npm install --no-audit --no-fund\`.`,
-    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`.`,
+    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`. This rewrites only the managed \`baa-ton:start\` blocks and skills that carry Baa-ton markers; a hand-authored skill of the same name is left alone.`,
     "5. Report the new checkout commit and any preserved or changed project configuration. Restart the harness only if its integration requires it.",
     "6. Do not reset active Herdr roots, retire resources, initialize goals, plan work, or dispatch lanes as part of an update.",
+    START_SKILL_END,
+    "",
+  ].join("\n");
+}
+
+export function sweepSkillContent() {
+  return [
+    "---",
+    "name: baa-ton-sweep",
+    "description: Preview or run Baa-ton's Herdr cleanup sweep for terminal lane tabs and orphaned Git worktrees left by dispatched agents. Use when the user asks to clean up child sessions or check for leftover lanes/worktrees, and after a root goal reaches a terminal state.",
+    "---",
+    START_SKILL_START,
+    "",
+    "# Baa-ton sweep",
+    "",
+    "Root-only cleanup. Always preview before removing anything, and never run it unattended.",
+    "",
+    "1. Confirm this is a Herdr root session: `test \"${HERDR_ENV:-}\" = 1 && herdr status server`. If that fails, say so and stop.",
+    "2. Call `herdr_sweep` without `execute` (dry-run). Show the user the exact lane tabs, worktrees and leases it found, not just a count.",
+    "3. If nothing was found, say so and stop.",
+    "4. Otherwise ask whether to execute. On a TUI-capable root, call `herdr_sweep` with `execute=true` and tell the user to answer the native confirmation. On a headless root, pass `execute=true, confirm=true` only after the user approved this exact inventory in this conversation; rerun the dry-run first if the inventory may have changed.",
+    "5. Report what the tool says it removed, not what was requested.",
     START_SKILL_END,
     "",
   ].join("\n");
@@ -266,17 +310,39 @@ function removeLegacySetupSkill(projectRoot, harness) {
   return true;
 }
 
+// Resolve symlinks on the longest existing prefix so harness directories that
+// alias one another (e.g. `.codex` -> `.claude`) map to the same skill file.
+function resolveThroughSymlinks(path) {
+  const suffix = [];
+  let current = resolve(path);
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return resolve(path);
+    suffix.unshift(basename(current));
+    current = parent;
+  }
+  return join(realpathSync(current), ...suffix);
+}
+
 export function installProjectSkills({ projectRoot, selected, baaPath }) {
   for (const harness of Object.keys(START_SKILL_DIRECTORIES)) removeLegacySetupSkill(projectRoot, harness);
   const content = {
-    "baa-ton-start": (harness) => startSkillContent({ harness, baaPath, projectRoot }),
+    "baa-ton-start": (harnesses) => startSkillContent({ harness: harnesses, baaPath, projectRoot }),
     "baa-ton-configure": () => configureSkillContent({ baaPath, projectRoot }),
     "baa-ton-update": () => updateSkillContent({ projectRoot }),
     "baa-ton-uninstall": () => uninstallSkillContent(),
+    "baa-ton-sweep": () => sweepSkillContent(),
   };
-  return selected.flatMap((harness) => PROJECT_SKILLS.map((skillName) => installStartSkill(
+  const groups = new Map();
+  for (const harness of selected) {
+    const key = resolveThroughSymlinks(join(projectRoot, ...START_SKILL_DIRECTORIES[harness]));
+    const group = groups.get(key) ?? { harness, harnesses: [] };
+    group.harnesses.push(harness);
+    groups.set(key, group);
+  }
+  return [...groups.values()].flatMap(({ harness, harnesses }) => PROJECT_SKILLS.map((skillName) => installStartSkill(
     projectSkillPath(projectRoot, harness, skillName),
-    content[skillName](harness),
+    content[skillName](harnesses.length === 1 ? harnesses[0] : harnesses),
   )));
 }
 
@@ -284,6 +350,16 @@ export function ensureProjectBaa(projectRoot, installedBaaPath) {
   const projectBaaPath = join(projectRoot, "BAA.md");
   if (!existsSync(projectBaaPath)) copyFileSync(installedBaaPath, projectBaaPath);
   return resolve(projectBaaPath);
+}
+
+// A CLAUDE.md that imports AGENTS.md already receives AGENTS.md's block;
+// writing both would load the reference twice.
+function importsAgentsFile(path) {
+  try {
+    return /^@(\.\/)?AGENTS\.md\s*$/m.test(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
 }
 
 export function instructionCandidates(projectRoot, selected) {
@@ -295,7 +371,12 @@ export function instructionCandidates(projectRoot, selected) {
     const globalPath = join(homedir(), harness.instructionFile);
     if (existsSync(globalPath)) candidates.push(globalPath);
   }
-  return [...new Set(candidates)];
+  const unique = [...new Set(candidates)];
+  return unique.filter((path) => !(
+    basename(path) === "CLAUDE.md" &&
+    unique.includes(join(dirname(path), "AGENTS.md")) &&
+    importsAgentsFile(path)
+  ));
 }
 
 export function buildSetupConfig({ projectRoot, baaPath, detected, selected, instructionFiles, defaults, skills = [] }) {
