@@ -114,7 +114,7 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
 The policy file is plain JSON in the repo, and a lane could edit it by accident. To guard against that, the root acknowledges it:
 
 - **Hash:** the policy hash is SHA-256 over the validated, canonicalized policy. Reformatting the file keeps the acknowledgement, but any change to what it grants needs a new one.
-- **Stored acknowledgement:** the manifest records `approvalPolicyAck { hash, grants, ackedAt, rootPaneId }`. `loadManifest` carries it through, and the smoke check guards against later writes dropping it.
+- **Stored acknowledgement:** `approvalPolicyAck { hash, grants, ackedAt, rootPaneId }` is kept in the manifest and in `approval-policy-ack.json` beside it; the newer copy wins on load. The side file exists because pre-#21 writers and stale in-memory saves rewrote the manifest without the ack. A bootstrap `reset=true` removes it.
 - **Acknowledging on a TUI root:** the first routine operation after the policy appears or changes shows one dialog. It lists the grants and says what always asks, then "Record this policy and dispatch X?". Declining falls back to the ordinary one-off dialog.
 - **Acknowledging on a headless root:** there is never an implicit acknowledgement. `herdr_policy action=ack confirm=true` is allowed only after the user approves the exact policy shown by `herdr_policy action=show`. Until then, headless dispatch keeps the existing `confirm=true` one-off path.
 - **Evidence:** each standing decision adds workflow evidence: `authorization-policy-granted`, `approval-policy-not-applied` (with the reason) or `approval-policy-acknowledged`. Standing grants don't wake the root.
