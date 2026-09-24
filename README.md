@@ -63,6 +63,12 @@ Invoke `baa-ton-configure` in the project to edit `.baa-ton/config.json`, where 
 
 Invoke `baa-ton-update` in the project to update the shared Baa-ton checkout, install dependency changes, and refresh the project integrations. Your project contract, configuration, instructions, and user-authored skills are preserved.
 
+What an update does and doesn't change:
+- **Profiles:** setup keeps every task profile that already names an `agentKind` or `launchProfile`, fills only missing ones, and prints which it kept and filled.
+- **Optional sections:** it lists `.baa-ton/config.json` sections you haven't configured (`runtime` leases, `approvalPolicy`) and never enables them for you.
+- **Supervisor:** the controller supervisor restarts itself when its code on disk changes and stays stable for two checks. Herdr runs plugin startup hooks only when its server starts, so a supervisor started before this version must be restarted once.
+- **Version skew:** roots and lanes keep the code they loaded. `herdr_doctor` reports `runtime-version-skew` (installed commit versus what the root, each lane's MCP bridge and the supervisor loaded) and `controller-plugin-install` (the controller plugin linked from a different checkout than the one being updated). Reload what it lists before starting new work: a root in the same session (`pi --session <path>`), and a lane through `/mcp` reconnect or `herdr_resume`.
+
 Older installs kept orchestrator state in `.pi/herdr-orchestrator`. Setup copies it to `.baa-ton/herdr-orchestrator`, rewrites the absolute paths and route ids in it and in the controller's `config.json` and `inbox.json`, and leaves the old directory in place as an archive with a `MIGRATED-TO-BAA-TON.json` marker. Update at a quiet point: an old Baa-ton still running against `.pi` after the copy is reported by `herdr_doctor`. To migrate by hand, run `node packages/herdr-tools/state-migration.mjs --project-root <project> --controller-config-dir "$(herdr plugin config-dir herdr-orchestrator-controller)"`; `--status` only reports.
 
 ## Re-run project setup

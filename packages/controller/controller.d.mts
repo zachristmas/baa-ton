@@ -25,3 +25,28 @@ export type CapacitySample = {
 };
 
 export function sampleCapacity(): Promise<CapacitySample>;
+
+export type LoadedCode = {
+  checkout: string;
+  fingerprint: string;
+  commit?: string;
+  stamp: string;
+};
+export type RuntimeRecord = {
+  role: string;
+  pid: number;
+  startedAt: string;
+  checkout?: string;
+  fingerprint?: string;
+  commit?: string;
+  paneId?: string;
+  workspaceId?: string;
+  sessionPath?: string;
+  agentKind?: string;
+};
+export const checkoutRoot: string;
+export function loadedCode(root?: string): LoadedCode;
+export function codeFingerprint(root?: string): string;
+export function gitCommit(root?: string): string | undefined;
+export function recordRuntime(configDir: string | undefined, record: Record<string, unknown>): () => void;
+export function listRuntime(configDir: string | undefined): RuntimeRecord[];

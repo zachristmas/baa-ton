@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
+import { existsSync } from "node:fs";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -17,7 +18,10 @@ import {
   routeChildMessage,
   validateConfig,
   postDirective,
+  runSupervisorLauncher,
+  SUPERVISOR_RESTART_EXIT_CODE,
 } from "../controller.mjs";
+import { codeChangeWatcher, codeFingerprint, codeStamp, listRuntime, loadedCode, recordRuntime } from "../code-version.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
 import { validateParentGoal as validateParentGoal974a77d } from "./fixtures/controller-974a77d-goal-validation.mjs";
 import { readStore, storePath } from "../../herdr-tools/inbox/index.mjs";
@@ -3937,5 +3941,96 @@ test("the watchdog alerts once when a live goal's supervisor has been stopped pa
   } finally {
     await live.cleanup();
     await done.cleanup();
+  }
+});
+
+async function fakeCheckout() {
+  const root = await mkdtemp(join(tmpdir(), "baa-checkout-"));
+  await mkdir(join(root, "packages", "controller"), { recursive: true });
+  await mkdir(join(root, "packages", "herdr-tools", "inbox"), { recursive: true });
+  await writeFile(join(root, "packages", "controller", "controller.mjs"), "export const v = 1;\n");
+  await writeFile(join(root, "packages", "herdr-tools", "index.ts"), "export const v = 1;\n");
+  return root;
+}
+
+test("code fingerprints change with content and a change is reported only once stable", async () => {
+  const root = await fakeCheckout();
+  try {
+    const loaded = loadedCode(root);
+    assert.match(loaded.fingerprint, /^[0-9a-f]{12}$/);
+    const changed = codeChangeWatcher(loaded, root);
+    assert.equal(changed(), undefined, "unchanged code");
+    await writeFile(join(root, "packages", "controller", "controller.mjs"), "export const v = 2;\n");
+    assert.notEqual(codeFingerprint(root), loaded.fingerprint);
+    assert.equal(changed(), undefined, "the first sighting of new code waits (a pull may be mid-write)");
+    assert.equal(changed(), codeFingerprint(root), "stable new code is reported");
+    await writeFile(join(root, "packages", "controller", "controller.mjs"), "export const v = 1;\n");
+    const back = codeChangeWatcher(loaded, root);
+    assert.equal(back(), undefined, "reverting to the loaded code is not a change");
+    assert.equal(codeStamp(root).includes("packages/controller/controller.mjs"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the supervisor releases its lease, drops its runtime record and asks for a restart when its code changes", async () => {
+  const fixture = await createFixture({});
+  let reported = 0;
+  const restarts = [];
+  const loop = await runSupervisorLoop({
+    intervalMs: 3_600_000,
+    stateDir: fixture.stateDir,
+    configDir: fixture.stateDir,
+    herdr: { async request() { return { result: {} }; } },
+    loaded: { checkout: "/checkout", fingerprint: "aaaaaaaaaaaa", commit: "0".repeat(40), stamp: "s" },
+    codeChanged: () => (++reported >= 2 ? "bbbbbbbbbbbb" : undefined),
+    onCodeChange: (fingerprint) => restarts.push(fingerprint),
+  });
+  try {
+    assert.equal(loop.started, true);
+    const records = listRuntime(fixture.stateDir);
+    assert.deepEqual(records.map((record) => [record.role, record.fingerprint, record.pid]), [["supervisor", "aaaaaaaaaaaa", process.pid]]);
+    await loop.tick();
+    assert.deepEqual(restarts, [], "no restart while the code is unchanged");
+    await loop.tick();
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    assert.deepEqual(restarts, ["bbbbbbbbbbbb"]);
+    assert.equal(existsSync(join(fixture.stateDir, "supervisor.lock")), false, "the lease is released before the restart");
+    assert.deepEqual(listRuntime(fixture.stateDir), [], "the runtime record is removed");
+  } finally {
+    await loop.stop();
+    await fixture.cleanup();
+  }
+});
+
+test("the supervisor launcher restarts on the restart exit code, stops on any other, and guards against loops", async () => {
+  const exits = [SUPERVISOR_RESTART_EXIT_CODE, SUPERVISOR_RESTART_EXIT_CODE, 0];
+  let runs = 0;
+  assert.equal(await runSupervisorLauncher({ restartDelayMs: 0, spawnRunner: async () => { runs += 1; return exits.shift(); } }), 0);
+  assert.equal(runs, 3, "two code-change restarts, then a normal exit");
+  let clock = 0;
+  let loops = 0;
+  const code = await runSupervisorLauncher({
+    restartDelayMs: 0,
+    maxRestarts: 3,
+    windowMs: 60_000,
+    clock: () => (clock += 1_000),
+    spawnRunner: async () => { loops += 1; return SUPERVISOR_RESTART_EXIT_CODE; },
+  });
+  assert.equal(code, SUPERVISOR_RESTART_EXIT_CODE);
+  assert.equal(loops, 4, "more than three restarts in a minute stops the launcher");
+});
+
+test("runtime records list only live processes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "baa-runtime-"));
+  try {
+    const remove = recordRuntime(dir, { role: "bridge", fingerprint: "cccccccccccc", paneId: "w1:p2" });
+    await mkdir(join(dir, "runtime"), { recursive: true });
+    await writeFile(join(dir, "runtime", "bridge-99999999.json"), JSON.stringify({ role: "bridge", pid: 99999999 }));
+    assert.deepEqual(listRuntime(dir).map((record) => record.paneId), ["w1:p2"]);
+    remove();
+    assert.deepEqual(listRuntime(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

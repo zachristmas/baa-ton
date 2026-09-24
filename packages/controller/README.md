@@ -57,6 +57,15 @@ Lane `done`, `blocked` and `goal-paused` events, child messages and open lane re
 
 Hooks attempt delivery immediately; each supervisor tick (every 5 s) delivers whatever became due. There is no wall-clock stall timer for lanes: a lane that is `working` is left alone, and a stuck lane shows up as `blocked`.
 
+## Updates and version reporting
+
+- **Restart on update:** Herdr runs plugin `[[startup]]` hooks only when its server starts, so `node controller.mjs supervisor` is a small launcher.
+  - It runs the supervisor loop as a child (`supervisor-run`).
+  - The loop checks its code on disk after each tick (sizes and times first, then a content fingerprint). When new code has stayed stable for two checks, it finishes the tick, releases its lease, and exits with code 75. The launcher starts it again from the new files.
+  - Any other exit ends the launcher, as a crash did before. More than 5 code-change restarts in 10 minutes stops it.
+  - A supervisor started before this version has no launcher and must be restarted once.
+- **Version records:** the supervisor, each Pi root's extension and each lane's MCP bridge write `<config dir>/runtime/<role>-<pid>.json` with the checkout, commit and fingerprint they loaded. `herdr_doctor`'s `runtime-version-skew` check compares these with the checkout on disk. Tests never write them (`BAA_TON_NO_RUNTIME_RECORDS=1` in the hermetic runner).
+
 ## Directives
 
 A directive is an instruction to the root from Zach or a supervisor session that must not be silently dropped (for example, one that lands while the root has a dialog open). Post one with:

@@ -23,7 +23,8 @@ test("hermetic environment drops agent-session identity and keeps the rest", () 
     OPENCODE_CONFIG: "/tmp/opencode.json",
     CLAUDE_CONFIG_DIR: "/home/tester/.claude",
   });
-  assert.deepEqual(Object.keys(env).sort(), ["CLAUDE_CONFIG_DIR", "HOME", "PATH"]);
+  assert.deepEqual(Object.keys(env).sort(), ["BAA_TON_NO_RUNTIME_RECORDS", "CLAUDE_CONFIG_DIR", "HOME", "PATH"]);
+  assert.equal(env.BAA_TON_NO_RUNTIME_RECORDS, "1", "tests never write runtime records into the real Herdr config dir");
   assert.equal(env.PATH, [stubs, "/usr/bin"].join(delimiter));
 });
 

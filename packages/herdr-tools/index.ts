@@ -154,7 +154,18 @@ async function importRouteChildMessage() {
   );
 }
 
-const { routeChildMessage, sampleCapacity } = await importRouteChildMessage();
+const {
+  routeChildMessage,
+  sampleCapacity,
+  loadedCode,
+  recordRuntime,
+  listRuntime,
+  codeFingerprint,
+  gitCommit,
+} = await importRouteChildMessage();
+// What this process loaded, captured once: herdr_doctor compares it (and the
+// other running pieces' records) with the checkout on disk.
+const LOADED_CODE = loadedCode();
 
 const MANIFEST_DIR = ".baa-ton/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
@@ -8556,6 +8567,108 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
     });
 
+    await check("runtime-version-skew", async () => {
+      const short = (commit?: string) => (commit ? commit.slice(0, 7) : "unknown commit");
+      const installed = new Map<string, { fingerprint: string; commit?: string }>();
+      const installedFor = (checkout: string) => {
+        if (!installed.has(checkout))
+          installed.set(checkout, { fingerprint: codeFingerprint(checkout), commit: gitCommit(checkout) });
+        return installed.get(checkout)!;
+      };
+      const runtimeDir = configPath ? dirname(configPath) : dirname(rootConfigPath());
+      const pieces: Array<Record<string, unknown>> = [
+        {
+          role: "extension",
+          pid: process.pid,
+          checkout: LOADED_CODE.checkout,
+          fingerprint: LOADED_CODE.fingerprint,
+          commit: LOADED_CODE.commit,
+          paneId: process.env[HERDR_PANE_ID_ENV],
+          self: true,
+        },
+        ...listRuntime(runtimeDir).filter((record) => record.pid !== process.pid),
+      ];
+      const lines: string[] = [];
+      let stale = 0;
+      const reload = (piece: Record<string, unknown>) =>
+        piece.role === "supervisor"
+          ? "it restarts itself within two ticks; if it does not, restart the Herdr server at a quiet point"
+          : piece.role === "extension"
+            ? `exit and restart this root in the same session${piece.sessionPath ? ` (pi --session ${piece.sessionPath})` : ""}`
+            : "reconnect its MCP server in the same session (Claude: /mcp, reconnect herdr-orchestrator) or herdr_resume the lane";
+      for (const piece of pieces) {
+        const checkout = String(piece.checkout ?? LOADED_CODE.checkout);
+        const disk = installedFor(checkout);
+        const label = `${piece.role}${piece.self ? " (this process)" : ""} pid ${piece.pid}${piece.paneId ? ` pane ${piece.paneId}` : ""}`;
+        if (piece.fingerprint === disk.fingerprint) lines.push(`${label}: current (${short(disk.commit)})`);
+        else {
+          stale += 1;
+          lines.push(
+            `${label}: loaded ${short(piece.commit as string | undefined)} (${piece.fingerprint}), installed ${short(disk.commit)} (${disk.fingerprint}) in ${checkout}; ${reload(piece)}`,
+          );
+        }
+      }
+      // Pieces started before version reporting existed leave no record.
+      const recorded = new Set(pieces.map((piece) => piece.paneId).filter(Boolean));
+      const manifest = await loadManifest(cwd).catch(() => undefined);
+      const finished = new Set(
+        (manifest?.workflows ?? []).flatMap((workflow) =>
+          workflow.lanes
+            .filter((lane) => lane.completionReceipt || lane.retirement || lane.sessionLog?.status === "retired")
+            .map((lane) => lane.paneId),
+        ),
+      );
+      let unknown = 0;
+      for (const orchestrator of controllerConfig?.orchestrators ?? []) {
+        if (!pieces.some((piece) => piece.role === "supervisor") && orchestrator === controllerConfig?.orchestrators[0]) {
+          unknown += 1;
+          lines.push("supervisor: no version record (started before version reporting); restart it once, then it restarts itself on later updates");
+        }
+        for (const workflow of orchestrator.workflows)
+          for (const lane of workflow.lanes)
+            if (!recorded.has(lane.pane_id) && !finished.has(lane.pane_id)) {
+              unknown += 1;
+              lines.push(`lane ${workflow.workflow_id}/${lane.lane_id} pane ${lane.pane_id}: no version record (started before version reporting or not running); reload it to be safe`);
+            }
+      }
+      return {
+        status: stale || unknown ? "warn" : "ok",
+        detail: `${stale ? `${stale} running piece(s) on old code. ` : ""}${unknown ? `${unknown} piece(s) of unknown version. ` : ""}${lines.join("; ")}`,
+      };
+    });
+
+    await check("controller-plugin-install", async () => {
+      let raw: unknown;
+      try {
+        raw = await runHerdr(["plugin", "list", "--plugin", "herdr-orchestrator-controller", "--json"], signal);
+      } catch (error) {
+        return { status: "warn", detail: `Could not list Herdr plugins: ${clip((error as Error).message, 300)}` };
+      }
+      const found: string[] = [];
+      const visit = (value: unknown): void => {
+        if (Array.isArray(value)) return value.forEach(visit);
+        if (!isRecord(value)) return;
+        if (value.id === "herdr-orchestrator-controller" || value.name === "herdr-orchestrator-controller")
+          for (const key of ["manifest_path", "manifestPath", "root", "path"])
+            if (typeof value[key] === "string") found.push(value[key] as string);
+        Object.values(value).forEach(visit);
+      };
+      visit(raw);
+      if (!found.length)
+        return { status: "warn", detail: "The controller plugin is not listed (or its path is not reported); updates cannot be checked against it." };
+      const pluginPath = found[0];
+      const pluginRoot = /\.toml$/.test(pluginPath) ? dirname(pluginPath) : pluginPath;
+      const expected = join(LOADED_CODE.checkout, "packages", "controller");
+      const same = await Promise.all([realpath(pluginRoot).catch(() => resolve(pluginRoot)), realpath(expected).catch(() => expected)])
+        .then(([a, b]) => a === b);
+      return same
+        ? { status: "ok", detail: `Controller plugin linked from this checkout (${pluginRoot}).` }
+        : {
+            status: "warn",
+            detail: `Split install: the controller plugin runs from ${pluginRoot}, but this extension runs from ${LOADED_CODE.checkout}. Updating one checkout does not update the other. Relink the controller from ${expected} (herdr plugin unlink herdr-orchestrator-controller, then herdr plugin link ${expected}) at a quiet point, or update both checkouts.`,
+          };
+    });
+
     await check("parent-goal-supervisor", async () => {
       const manifest = await loadManifest(cwd);
       const scope = currentRootScope(cwd);
@@ -8896,10 +9009,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await autoRetireFinishedLanes(ctx);
   });
   pi.on("session_shutdown", async (_event, ctx) => {
+    removeRuntimeRecord?.();
+    removeRuntimeRecord = undefined;
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "unknown");
   });
+  let removeRuntimeRecord: (() => void) | undefined;
   pi.on("session_start", async (_event, ctx) => {
+    if (process.env.HERDR_ENV === "1" && process.env.BAA_TON_NO_RUNTIME_RECORDS !== "1" && !removeRuntimeRecord)
+      removeRuntimeRecord = recordRuntime(dirname(rootConfigPath()), {
+        role: "extension",
+        checkout: LOADED_CODE.checkout,
+        fingerprint: LOADED_CODE.fingerprint,
+        commit: LOADED_CODE.commit,
+        paneId: process.env[HERDR_PANE_ID_ENV],
+        workspaceId: process.env.HERDR_WORKSPACE_ID,
+        sessionPath: ctx.sessionManager?.getSessionFile?.(),
+        agentKind: "pi",
+      });
     rootRunId = randomUUID();
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "unknown");

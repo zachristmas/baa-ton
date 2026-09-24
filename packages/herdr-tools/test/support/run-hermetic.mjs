@@ -29,6 +29,10 @@ export function hermeticEnvironment(env = process.env) {
     if (!SESSION_VARIABLE.test(key)) isolated[key] = value;
   }
   isolated[pathKey] = [stubs, env[pathKey]].filter(Boolean).join(delimiter);
+  // Running pieces record their loaded code in the controller config dir,
+  // which falls back to the user's real Herdr directory. Tests of the
+  // recorder pass an explicit directory instead.
+  isolated.BAA_TON_NO_RUNTIME_RECORDS = "1";
   return isolated;
 }
 
