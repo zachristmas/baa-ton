@@ -1,0 +1,176 @@
+# Baa-ton spec loop: run until the spec is met
+
+Status: design, 2026-09-24. Author: Ink, for Zach. Builder: lane-admin.
+
+Examples below are illustrative. They describe a multi-day run against a real project, with its identifiers removed.
+
+## Goal
+
+Run Baa-ton and Herdr in a loop until a written spec is met, asking the user only for real decisions and pushes. The first spec is a readiness checklist of about 30 items for a pull request. An item is done when its code is merged into the target pull request's branch and an evidence report proves it.
+
+## What a multi-day run showed
+
+1. **The goal forbade its own finish line.** The parent goal said "no commit, push, merge, or deploy", and every lane contract says never push, merge or create a PR. After three days, about 20 worktrees and 17 local evidence reports existed, and the target branch tip was still the commit every lane started from. No item had been integrated.
+2. **"Done" was the LLM's opinion.** The spec was prose in a markdown table. Each turn the root re-read it and decided what was done, so it re-argued, re-asked and parked. The burn-down had to be counted by hand.
+3. **The loop driver was an LLM that stops.** In one afternoon the root:
+   - parked on stale records;
+   - chose on its own to dispatch one lane at a time while most of the machine's memory sat free;
+   - asked a person three times for one lane's frozen install, dependency build and unit tests;
+   - set itself to `waiting-for-event` with nothing pending.
+   Supervisor nudges help, but the root still decides whether to act.
+4. **Decisions arrived mid-build, one at a time.** One item stopped four times in a day: for its migration slot, a file overlap, a policy question and test admission.
+5. **Conflicts between items were found late.** A migration chain with one misordered number, shared source files, and a build cache shared across worktrees all surfaced mid-lane.
+6. **Lanes graded their own work.** The `review` profile exists, but no stage used it.
+7. **Resources and cost were unmanaged.**
+   - Service stacks outlived their lanes (several GB idle) and tripped the capacity gate.
+   - Every lane ran a frontier model at high effort in one long session; contexts reached hundreds of thousands of tokens.
+   - There was no cost-per-item figure, so a subscription's usage was spent without finishing.
+
+## Design
+
+### 1. Spec file: the single source of truth
+
+`.baa-ton/spec.json` (validated by a schema, strict). Names, paths and commands in this example are illustrative:
+
+```jsonc
+{
+  "version": 1,
+  "target": {
+    "repo": "~/src/example-app",
+    "remote": "origin",
+    "branch": "feature/example-release",
+    "preview": { "url": "https://preview.example.test", "releaseCheck": "https://preview.example.test/api/version" }
+  },
+  "defaults": { "maxParallel": 4, "maxBuildAttempts": 3 },
+  "stages": {
+    "decide":    { "profile": "planning" },
+    "build":     { "profile": "implementation" },
+    "review":    { "profile": "review", "differentFrom": "build" },
+    "integrate": { "profile": "balanced" },
+    "verify":    { "profile": "quick" }
+  },
+  "items": [{
+    "id": "I10",
+    "title": "Example feature: a discount that applies to shipping only",
+    "dependsOn": ["I08"],
+    "owns": ["services/orders/src/features/shipping-discount/**", "apps/admin/src/features/shipping-discount/**"],
+    "sharedTouch": ["services/orders/src/features/checkout/**"],
+    "migrations": 1,
+    "decisions": ["board:I10", "board:Q2"],
+    "acceptance": {
+      "text": "Checkout reduces shipping only, never below zero; ...",
+      "tests": ["npm test --workspace services/orders"],
+      "preview": ["tests/e2e/i10-shipping-discount.spec.ts"],
+      "evidence": { "report": "artifacts/i10/evidence.docx", "minImages": 4 }
+    }
+  }]
+}
+```
+
+- **Import once.** A one-time `herdr_spec import` step (LLM-assisted, reviewed by the user) turns the project's workboard into this file. After that the spec is canonical; the board keeps its prose and decisions, and links each row by item id.
+- **Decisions are data.** `decisions` points at the board rows a lane must read, so lanes stop re-asking what is already decided.
+
+### 2. Item state machine
+
+`pending → deciding → ready → building → reviewing → integrating → verifying → done`
+
+There is also `blocked{reason: decision | dependency | capacity | human-gate}` and `failed{attempts}`. Transitions are recorded durably with their evidence (receipt ids, commit SHAs, report hashes), the same way workflows record events today. Only the loop driver moves an item; a lane's receipt is an input to that, not a verdict.
+
+### 3. Verifier: a deterministic exit test (no LLM)
+
+`herdr_spec verify` (also a CLI) checks each item and prints `N/M done` plus the first failing check for each item:
+
+1. The evidence report exists, has at least `minImages` inline images, and its hash matches the recorded one.
+2. The item's integrated commit is an ancestor of `target.remote/target.branch`.
+3. Its `tests` were recorded green at the integrated target SHA.
+4. Its `preview` specs passed against the preview once the release check reports that SHA or a later one.
+
+This is both the loop's exit condition and the burn-down: the loop stops when it reports M/M. No stage sets `done` directly; only the verifier does.
+
+### 4. Loop driver: code drives the loop, and the root advises
+
+Each supervisor tick computes ready actions deterministically:
+
+- A **ready** item has all `dependsOn` items at `integrating` or later. Its `owns` must not overlap any in-flight builder's `owns`, and its `sharedTouch` must not overlap one either.
+- It is dispatched to its stage's profile when `maxParallel` and the live capacity gate allow.
+- When a lane files its receipt, the driver advances the state and dispatches the next stage, with a fresh lane per stage (small context, no very long sessions).
+- The root LLM is prompted only for judgment:
+  - the decide stage's leftover questions;
+  - a review rejection that needs triage;
+  - an item that hits `maxBuildAttempts`.
+- The root cannot choose to serialize, and it cannot park the loop. "Waiting" is a computed state with a named reason, shown in `herdr_spec status`.
+
+### 5. Stages
+
+| Stage | Who | Does | Output |
+| --- | --- | --- | --- |
+| decide | planning profile, read-only | Reads the item, the linked decisions, meeting notes and scope rules. Answers what those settle and lists the rest. The leftovers from all items are batched into one question round for the user. | Decision record, confirmed `owns`, migration count |
+| build | implementation profile, own worktree **from the current target tip** | Implements the change with leases and the local-validation grant (install, build, codegen, tests, lane DB and services, browser tests). Commits on `spec/<id>`. | Commit SHA, local evidence report, receipt |
+| review | review profile on a **different model or harness** than the builder | Read-only review of the diff against acceptance and evidence. Pass or fail with findings. | Verdict; a fail sends the item back to build with the findings |
+| integrate | one serial integration queue | Merges `spec/<id>` onto the integration branch (target tip plus already-integrated items) in dependency order. Renumbers migrations from the sequence lease, runs the full suite, commits. | Integration SHA, suite result |
+| push (human gate) | the user | One batched prompt: "Push N integrated items (list) to the target branch?" | Push to `target.branch` |
+| verify | quick profile | Waits for the preview release check to report the pushed SHA, runs the item's `preview` specs against the preview, and writes the final evidence report at that SHA. | Final report; the verifier marks the item done |
+
+### 6. Ownership and ordering
+
+- **Overlapping writers.** The driver refuses to run two builders whose `owns` overlap. `sharedTouch` edits are held until the owner item has been integrated.
+- **Migration numbers.** Numbers become a new lease kind, `sequence`, which reserves a slot at build time. The integrator assigns the final number in integration order, so re-chaining migrations happens mechanically, not by message.
+- **Shared build caches.** Builds always bypass or isolate caches that are shared across worktrees (for example a per-worktree cache directory).
+
+### 7. Policy
+
+Add grants to `approvalPolicy`:
+
+- **`local-validation`:** install `--frozen-lockfile`, builds, codegen, typecheck, lint, tests, and DB, services and browser tests inside the lane's leases.
+- **`integrate`:** local commits and merges into the integration branch.
+
+Push to the target, deploy, production, shared DBs, and package or lockfile edits stay human-gated. The push gate is batched per integration round.
+
+### 8. Resources and cost
+
+- **Service lifecycle.** Services started for a lane are registered to it and stopped at the end of its stage and on retire. The capacity digest names idle stacks owned by finished lanes.
+- **Right-sized models.** Per-stage profiles let small builds run on cheap models while review stays on a frontier model.
+- **Cost report.** Record turns and token usage per lane from the harness transcript, and roll them up per item in `herdr_spec status`, so cost per item is visible.
+
+### 9. Visibility
+
+`herdr_spec status` prints one table: item, stage, lane or pane, age, and blocker (with its reason). Every root digest starts with the verifier line, e.g. `spec 11/29 done · 4 building · 2 reviewing · 1 awaiting push · 3 blocked(decision)`.
+
+## Human touchpoints
+
+Two, both batched:
+
+1. decision rounds from the decide stage;
+2. push rounds to the target branch.
+
+Everything else runs under policy.
+
+## Build plan (one PR each; unit tests with fakes, `npm test` green)
+
+1. **Spec schema, verifier and `herdr_spec status`.** Read-only and useful right away as the real burn-down.
+2. **State machine and dispatch** for the build and review stages, including the `differentFrom` review rule and a fresh lane per stage.
+3. **Integration queue**, `sequence` leases for migration numbers, the `integrate` grant and the batched push gate.
+4. **Decide stage** and batched decision rounds.
+5. **Preview verification** (release-check wait, preview browser-test run, final evidence report).
+6. The **`local-validation` grant** and **service lifecycle** already queued with lane-admin fold into PRs 2-3.
+
+## Moving a running project onto it
+
+1. Import the spec items. Items with a local evidence report and no review become `reviewing`; the rest follow their board status.
+2. Start the integration queue on reviewed items first, so the target branch starts to move. Re-base builds onto the target tip at integration time.
+3. Replace any "no commit, push, merge, or deploy" wording in the parent goal with the policy above; lane contracts get the stage-specific rule.
+
+## Implementation notes (lane-admin, against the current code)
+
+These refine the design where it meets existing invariants:
+
+1. **The loop driver runs in the root's extension, not the controller.** The controller never dispatches: it has no harness adapters, no root identity proof and no Pi context. The deterministic driver runs on every settled root turn (the same mechanism auto-retire uses), and the controller computes ready actions and wakes the root when there are any. It is still code, not the LLM, that decides and dispatches.
+2. **Automatic local Git actions are an explicit grant.** The integrate stage's merges and commits, and worktree creation from the target tip, are exceptions to ARCHITECTURE invariant 4. The `integrate` grant is that exception, and the invariant text is amended to say so. Push, deploy and production stay excluded.
+3. **Item state lives in a side file** (`.baa-ton/herdr-orchestrator/spec-state.json`, written under the manifest lock), not a new top-level manifest key. Pre-upgrade manifest writers drop top-level keys they don't know (ARCHITECTURE invariant 7).
+4. **New verifier inputs.** Test results at the integrated SHA need a durable record (written by the build and integrate stages), and `minImages` needs .docx parsing (the zip's `word/media` entries), with no new dependencies.
+
+## Open questions for Zach
+
+- Is one push prompt per integration round right, or one per item?
+- Does every push to the target branch redeploy the preview, and which endpoint reports the deployed SHA?
+- Should the verify stage's final report replace the lane's local report, or sit alongside it?
