@@ -771,6 +771,8 @@ try {
       ctx,
     );
   assert.equal(initializedGoal.details.goal.supervisor.state, "stopped");
+  assert.equal(initializedGoal.details.goal.supervisor.intervalSeconds, 300, "default nudge interval");
+  assert.equal(initializedGoal.details.goal.supervisor.intervalPolicy, 2);
   assert.deepEqual(calls.at(-1), [
     "pane",
     "report-metadata",
@@ -878,19 +880,26 @@ try {
   rootIdle = true;
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
   assert.equal((await tick(5)).results[0].status, "delivered");
-  assert.equal((await persistedGoal()).supervisor.nextNudgeAt, null);
+  assert.equal(
+    (await persistedGoal()).supervisor.nextNudgeAt,
+    new Date(tickBase + 6 * 5000).toISOString(),
+    "a delivered nudge schedules the next one a full interval later",
+  );
   rootIdle = false;
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
   assert.ok((await persistedGoal()).supervisor.lastDelivery.acknowledgedAt);
-  for (let step = 6; step < 10; step += 1) await tick(step);
+  for (let step = 6; step < 10; step += 1)
+    assert.equal((await tick(step)).results[0].status, "root-turn-not-idle");
+  assert.equal(supervisorPrompts, 1, "a due nudge never lands mid-turn");
   rootIdle = true;
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
-  await tick(10);
+  assert.equal((await tick(10)).results[0].status, "delivered");
   assert.equal(
     supervisorPrompts,
-    1,
-    "acknowledging and settling a delivered wake do not re-arm it",
+    2,
+    "while work waits (a planned, undispatched workflow) the nudge repeats once the root settles",
   );
+  const scheduleBeforeNoop = (await persistedGoal()).supervisor.nextNudgeAt;
   await tools
     .get("herdr_goal")
     .execute(
@@ -909,13 +918,14 @@ try {
       undefined,
       headlessRootCtx,
     );
-  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
-  await tick(11);
   assert.equal(
-    supervisorPrompts,
-    1,
-    "idempotent state/start calls cannot reset the wake latch",
+    (await persistedGoal()).supervisor.nextNudgeAt,
+    scheduleBeforeNoop,
+    "idempotent state/start calls do not reschedule the nudge",
   );
+  await eventHandlers.get("agent_settled")({}, headlessRootCtx);
+  assert.equal((await tick(11)).results[0].status, "delivered");
+  assert.equal(supervisorPrompts, 3);
   await eventHandlers.get("session_shutdown")(
     { reason: "reload" },
     headlessRootCtx,
@@ -930,8 +940,8 @@ try {
     "unknown",
     "reload cannot manufacture a settled run",
   );
-  await tick(12);
-  assert.equal(supervisorPrompts, 1, "reload preserves delivered dedupe");
+  assert.equal((await tick(12)).results[0].status, "root-turn-not-idle");
+  assert.equal(supervisorPrompts, 3, "a reload never counts as a settled turn");
   rootIdle = false;
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
   await tools
@@ -943,7 +953,11 @@ try {
       undefined,
       headlessRootCtx,
     );
-  assert.equal((await tick(13)).results[0].status, "not-active");
+  assert.equal(
+    (await tick(13)).results[0].status,
+    "root-turn-not-idle",
+    "waiting-for-event with actionable work is still supervised, but never mid-turn",
+  );
   await tools.get("herdr_goal").execute(
     "goal-next",
     {
@@ -959,11 +973,7 @@ try {
   rootIdle = true;
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
   assert.equal((await tick(15)).results[0].status, "delivered");
-  assert.equal(
-    supervisorPrompts,
-    2,
-    "a real durable work transition authorizes one later wake",
-  );
+  assert.equal(supervisorPrompts, 4);
   const rootBeforeChild = await persistedGoal();
   process.env.HERDR_PANE_ID = "w-child:p1";
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
@@ -991,10 +1001,10 @@ try {
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
   for (let step = 16; step < 21; step += 1)
-    assert.equal((await tick(step)).results[0].status, "not-active");
+    assert.equal((await tick(step)).results[0].status, "not-running");
   assert.equal(
     supervisorPrompts,
-    2,
+    4,
     "pause disarms all future nudges despite lifecycle activity",
   );
   assert.equal((await persistedGoal()).supervisor.nextNudgeAt, null);
@@ -1052,6 +1062,21 @@ try {
     );
   assert.equal((await persistedGoal()).supervisor.lastDelivery, undefined);
   assert.ok((await persistedGoal()).supervisor.nextNudgeAt);
+  await tools
+    .get("herdr_goal")
+    .execute(
+      "blocked-keeps-supervision",
+      { action: "set-state", status: "blocked", nextAction: "Blocked on D19 ports." },
+      undefined,
+      undefined,
+      headlessRootCtx,
+    );
+  assert.equal(
+    (await persistedGoal()).supervisor.state,
+    "running",
+    "blocked no longer parks the root out of supervision",
+  );
+  assert.ok((await persistedGoal()).supervisor.nextNudgeAt, "a blocked goal stays scheduled");
   await tools
     .get("herdr_goal")
     .execute(

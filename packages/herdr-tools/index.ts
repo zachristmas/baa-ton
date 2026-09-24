@@ -1120,8 +1120,10 @@ function nonTerminalWorkflowIds(
     .map((workflow) => workflow.id);
 }
 
+const DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 300;
+
 function parentGoalNudgeInterval(value: number | undefined): number {
-  const interval = value ?? MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS;
+  const interval = value ?? DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS;
   if (
     !Number.isSafeInteger(interval) ||
     interval < MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS ||
@@ -1254,6 +1256,7 @@ async function parentGoal(
           version: 1,
           state: "stopped",
           intervalSeconds: parentGoalNudgeInterval(nudgeIntervalSeconds),
+          intervalPolicy: 2,
           nudgeCount: 0,
           nextNudgeAt: null,
           rootActivity: { status: "unknown", observedAt: timestamp },
@@ -1295,6 +1298,7 @@ async function parentGoal(
         version: 1,
         state: "stopped",
         intervalSeconds: parentGoalNudgeInterval(undefined),
+        intervalPolicy: 2,
         nudgeCount: 0,
         nextNudgeAt: null,
         rootActivity: { status: "unknown", observedAt: timestamp },
@@ -1317,20 +1321,26 @@ async function parentGoal(
       goal.status = status as ParentGoalStatus;
       if (objective?.trim()) goal.objective = objective.trim();
       if (nextAction?.trim()) goal.nextAction = nextAction.trim();
-      if (status === "completed" || status === "blocked") {
+      // Only completion ends supervision. A blocked goal keeps being nudged
+      // while actionable work exists, so the root cannot park out of it.
+      if (status === "completed") {
         const control = supervisor();
         control.state = "stopped";
         control.nextNudgeAt = null;
         control.updatedAt = timestamp;
       }
     } else if (action === "start") {
-      if (goal.status === "completed" || goal.status === "blocked")
-        throw new Error("A completed or blocked parent goal cannot be started.");
+      if (goal.status === "completed")
+        throw new Error("A completed parent goal cannot be started.");
       const control = supervisor();
       control.state = "running";
       control.intervalSeconds = parentGoalNudgeInterval(
-        nudgeIntervalSeconds ?? control.intervalSeconds,
+        nudgeIntervalSeconds ??
+          (control.intervalPolicy === 2
+            ? control.intervalSeconds
+            : Math.min(control.intervalSeconds, DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS)),
       );
+      control.intervalPolicy = 2;
       if (previousSupervisorState !== "running") {
         control.nextNudgeAt = new Date(
           Date.parse(timestamp) + control.intervalSeconds * 1000,
@@ -1367,7 +1377,7 @@ async function parentGoal(
       ) {
         delete control.lastDelivery;
         control.nextNudgeAt =
-          goal.status === "active" && control.state === "running"
+          goal.status !== "completed" && goal.status !== "paused" && control.state === "running"
             ? new Date(
                 Date.parse(timestamp) + control.intervalSeconds * 1000,
               ).toISOString()

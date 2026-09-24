@@ -37,7 +37,11 @@ Replace all placeholders with real opaque IDs and the absolute workflow manifest
 - Event identity is `{ pane_id, workspace_id }`; target names are verified only through live `agent.get` results.
 - Every accepted event is atomically appended under `workflow.eventController.events`; duplicate events do not wake the root twice.
 - Root unavailability leaves a durable pending event. Ambiguous delivery becomes uncertain and is not retried automatically.
-- The optional parent-goal supervisor sends one non-waiting recovery nudge per durable work transition, only after the mapped Pi root has fully settled. Delivered/uncertain wakes survive restarts without replay; terminal snapshots cannot release an active run. See the [supervisor wake protocol and rollout limits](../herdr-tools/GOAL-ADAPTER-PROTOCOL.md#supervisor-wake-protocol).
+- The optional parent-goal supervisor nudges the mapped Pi root, non-waiting, once per interval (default 300 s) while actionable work waits: open lane requests, lease asks, unread or uncertain child messages, planned but undispatched workflows, pending queue items or open directives.
+  - Each nudge names those items.
+  - It stays quiet for completed and paused goals, and for `action-required` while a question or approval for Zach is open.
+  - It only prompts a fully settled root that Herdr does not report as working or blocked.
+  - An interrupted send becomes uncertain and is never replayed; the next nudge comes a full interval later. See the [supervisor wake protocol and rollout limits](../herdr-tools/GOAL-ADAPTER-PROTOCOL.md#supervisor-wake-protocol).
 - The controller never dispatches, resumes, closes, creates topology, mutates Git, or contacts external services.
 - One bad manifest cannot starve the others. A missing, unreadable, malformed or invalid manifest (often a historical mapping) is skipped for that tick, in both the supervisor tick and root-activity hooks.
   - The skip shows in the tick result and in `<state dir>/supervisor-diagnostics.json`, with orchestrator, manifest, stage, error, `firstAt` and `lastAt`; repeats refresh one entry at most once a minute. This keeps it visible when supervisor stderr isn't captured.
