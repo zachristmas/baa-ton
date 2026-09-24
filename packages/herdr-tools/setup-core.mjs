@@ -258,9 +258,15 @@ export function updateSkillContent({ projectRoot }) {
     // install` run from an unrelated directory fails looking for a
     // package.json that isn't there. cd into the checkout first instead.
     `3. Install dependency changes: \`cd "${checkoutDirectory}" && npm install --no-audit --no-fund\`.`,
-    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`. This rewrites only the managed \`baa-ton:start\` blocks and skills that carry Baa-ton markers; a hand-authored skill of the same name is left alone.`,
-    "5. Report the new checkout commit and any preserved or changed project configuration. Restart the harness only if its integration requires it.",
-    "6. Do not reset active Herdr roots, retire resources, initialize goals, plan work, or dispatch lanes as part of an update.",
+    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`. This rewrites only the managed \`baa-ton:start\` blocks and skills that carry Baa-ton markers; a hand-authored skill of the same name is left alone. It keeps every task profile that already names an agentKind or launchProfile, fills only missing profiles, and prints which it kept and which it filled. It also migrates old \`.pi/herdr-orchestrator\` state.`,
+    "5. Find what is still running old code: from the root, call `herdr_doctor` and read `runtime-version-skew` and `controller-plugin-install`. Then tell the user exactly what to reload, one line per piece:",
+    "   - Controller supervisor: from this version on it restarts itself within two ticks of its code changing. If the doctor says it has no version record, it predates self-restart: ask the user to restart it once at a quiet point (restarting the Herdr server does it). Never stop the Herdr server yourself.",
+    "   - Root on old code: exit and restart the root in the same session (Pi: `pi --session <session path>`, which the doctor prints).",
+    "   - Lane on old code, or with no version record: reconnect its MCP server in the same session (Claude: `/mcp`, then reconnect herdr-orchestrator) or `herdr_resume` it. Lanes left on old code can reject or erase newer manifest fields (docs/ARCHITECTURE.md, forward-compatible manifests), so do this before new work.",
+    "   - Split install (the controller plugin is linked from another checkout): tell the user which two checkouts differ; relink only with their approval.",
+    "6. If setup listed optional `.baa-ton/config.json` sections that are not configured (`runtime` leases, `approvalPolicy`), explain what each enables and offer to add it with the user's values. Never add them without explicit approval.",
+    "7. Report the new checkout commit, the profile choices kept or filled, and the reload list from step 5.",
+    "8. Do not reset active Herdr roots, retire resources, initialize goals, plan work, or dispatch lanes as part of an update.",
     START_SKILL_END,
     "",
   ].join("\n");
@@ -416,3 +422,41 @@ export function buildSetupConfig({ projectRoot, baaPath, detected, selected, ins
 }
 
 export { checkoutDirectory, toolsDirectory, defaultsPath, BAA_CONFIG_DIRECTORY, BAA_CONFIG_NAME };
+
+/**
+ * Apply detected default launch profiles without overwriting a project's own
+ * choices: a profile that already names an agentKind or launchProfile is
+ * kept exactly, and only missing profiles are filled. Returns what happened
+ * so setup can report it.
+ */
+export function mergeDetectedProfiles(config, computed) {
+  config.profiles ??= {};
+  const filled = [];
+  const preserved = [];
+  for (const [name, resolved] of Object.entries(computed)) {
+    const current = config.profiles[name];
+    if (current && (current.launchProfile !== undefined || current.agentKind !== undefined)) {
+      preserved.push(name);
+      continue;
+    }
+    config.profiles[name] = { ...current, agentKind: resolved.agentKind, launchProfile: resolved.launchProfile };
+    filled.push(name);
+  }
+  return { filled, preserved };
+}
+
+/** Optional config sections a project has not added yet, with what they do. */
+export function missingOptionalConfigSections(config) {
+  const sections = [];
+  if (!config?.runtime)
+    sections.push({
+      key: "runtime",
+      summary: "runtime.leases: collision-free ports and database names for lanes (herdr_lease); see docs/LANE-ADMIN.md",
+    });
+  if (!config?.approvalPolicy)
+    sections.push({
+      key: "approvalPolicy",
+      summary: "approvalPolicy: routine local dispatch, retry, resume, retire and lane leases without a dialog, acknowledged once with herdr_policy; see docs/LANE-ADMIN.md",
+    });
+  return sections;
+}

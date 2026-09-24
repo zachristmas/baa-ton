@@ -17,7 +17,21 @@ import {
 } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import {
+  codeChangeWatcher,
+  loadedCode,
+  recordRuntime,
+} from "./code-version.mjs";
+export {
+  checkoutRoot,
+  codeFingerprint,
+  gitCommit,
+  listRuntime,
+  loadedCode,
+  recordRuntime,
+} from "./code-version.mjs";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import {
@@ -3928,11 +3942,19 @@ async function acquireSupervisorLease(leaseDirectory) {
   }
 }
 
+/** Exit code the supervisor runner uses to ask its launcher for a restart. */
+export const SUPERVISOR_RESTART_EXIT_CODE = 75;
+
 export async function runSupervisorLoop({
   intervalMs = 5_000,
   stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
   herdr,
+  // Called (after the lease is released) once the code on disk has changed
+  // and stayed stable; the runner exits so its launcher loads the new code.
+  onCodeChange,
+  codeChanged,
+  loaded,
 } = {}) {
   assert(
     Number.isSafeInteger(intervalMs) && intervalMs >= 5_000,
@@ -3947,6 +3969,16 @@ export async function runSupervisorLoop({
       reason: "supervisor_already_running",
       stop: async () => {},
     };
+  const code = onCodeChange ? (loaded ?? loadedCode()) : undefined;
+  const changed = onCodeChange ? (codeChanged ?? codeChangeWatcher(code)) : undefined;
+  const removeRuntime = code
+    ? recordRuntime(resolvedConfigDir, {
+        role: "supervisor",
+        checkout: code.checkout,
+        fingerprint: code.fingerprint,
+        commit: code.commit,
+      })
+    : () => {};
   let stopping = false;
   let ticking = false;
   let timer;
@@ -3960,6 +3992,21 @@ export async function runSupervisorLoop({
     // overlap a late socket delivery with a new scheduler.
     await inFlightTick;
     await releaseLease();
+    removeRuntime();
+  };
+  const checkCode = () => {
+    if (stopping || !changed) return;
+    let fingerprint;
+    try {
+      fingerprint = changed();
+    } catch {
+      return;
+    }
+    if (!fingerprint) return;
+    process.stderr.write(
+      `herdr-orchestrator-controller supervisor: code changed on disk (${code?.fingerprint ?? "?"} -> ${fingerprint}); restarting.\n`,
+    );
+    void stop().then(() => onCodeChange(fingerprint));
   };
   process.once("SIGINT", () => void stop());
   process.once("SIGTERM", () => void stop());
@@ -3984,13 +4031,65 @@ export async function runSupervisorLoop({
     inFlightTick = current;
     return current.finally(() => {
       if (inFlightTick === current) inFlightTick = undefined;
+      checkCode();
     });
   };
   // Herdr restarts restore panes and agents asynchronously. Do not make an
   // immediate startup nudge race that restoration; the first normal interval
   // is the server-settle window, then later ticks retain the same cadence.
   timer = setInterval(() => void tick(), intervalMs);
-  return { started: true, stop };
+  return { started: true, stop, tick };
+}
+
+/**
+ * The Herdr [[startup]] entry point. Herdr runs startup hooks only when its
+ * server starts, so after an update the old supervisor would keep running
+ * from memory. The launcher runs the supervisor as a child and starts it again
+ * when it exits with SUPERVISOR_RESTART_EXIT_CODE (its code changed on disk).
+ * Any other exit ends the launcher, as a crash did before. A runaway guard
+ * stops after more than `maxRestarts` restarts within `windowMs`.
+ */
+export async function runSupervisorLauncher({
+  spawnRunner = spawnSupervisorRunner,
+  restartDelayMs = 1_000,
+  maxRestarts = 5,
+  windowMs = 10 * 60_000,
+  clock = () => Date.now(),
+} = {}) {
+  const restarts = [];
+  while (true) {
+    const exitCode = await spawnRunner();
+    if (exitCode !== SUPERVISOR_RESTART_EXIT_CODE) return exitCode;
+    const at = clock();
+    restarts.push(at);
+    while (restarts.length && at - restarts[0] > windowMs) restarts.shift();
+    if (restarts.length > maxRestarts) {
+      process.stderr.write(
+        `herdr-orchestrator-controller supervisor: ${restarts.length} code-change restarts in ${Math.round(windowMs / 60_000)} min; stopping.\n`,
+      );
+      return exitCode;
+    }
+    if (restartDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, restartDelayMs));
+  }
+}
+
+function spawnSupervisorRunner() {
+  return new Promise((resolveExit) => {
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "supervisor-run"], {
+      stdio: "inherit",
+      env: process.env,
+      cwd: process.cwd(),
+    });
+    const forward = (signal) => child.kill(signal);
+    process.on("SIGTERM", forward);
+    process.on("SIGINT", forward);
+    child.on("exit", (exitCode, signal) => {
+      process.off("SIGTERM", forward);
+      process.off("SIGINT", forward);
+      resolveExit(exitCode ?? (signal ? 1 : 0));
+    });
+    child.on("error", () => resolveExit(1));
+  });
 }
 
 export function hookResponse(result) {
@@ -4020,20 +4119,28 @@ async function main() {
     return;
   }
   if (command === "supervisor") {
-    await runSupervisorLoop();
+    process.exitCode = await runSupervisorLauncher();
+    return;
+  }
+  if (command === "supervisor-run") {
+    await runSupervisorLoop({
+      onCodeChange: () => process.exit(SUPERVISOR_RESTART_EXIT_CODE),
+    });
     return;
   }
   throw new ControllerError(
-    "Usage: node controller.mjs <hook|supervisor-once|supervisor>.",
+    "Usage: node controller.mjs <hook|supervisor-once|supervisor|supervisor-run>.",
     "usage",
   );
 }
 
 let launchedDirectly = false;
 try {
+  // Compare real paths: a plugin root reached through a symlink (for
+  // example macOS /var -> /private/var) must still run main().
   launchedDirectly =
     Boolean(process.argv[1]) &&
-    resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+    realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
 } catch {
   launchedDirectly = false;
 }

@@ -192,6 +192,27 @@ async function refreshCurrentHerdrIdentity() {
   return identity;
 }
 
+// Record which code this bridge loaded so herdr_doctor can report version
+// skew (a lane keeps its bridge for its whole session, across updates).
+if (process.env.HERDR_ENV === "1" && process.env.BAA_TON_NO_RUNTIME_RECORDS !== "1") {
+  try {
+    const { loadedCode, recordRuntime } = await import(
+      pathToFileURL(join(root, "..", "controller", "code-version.mjs")).href
+    );
+    const code = loadedCode();
+    recordRuntime(configDirectory(), {
+      role: "bridge",
+      checkout: code.checkout,
+      fingerprint: code.fingerprint,
+      commit: code.commit,
+      paneId: process.env.HERDR_PANE_ID,
+      workspaceId: process.env.HERDR_WORKSPACE_ID,
+    });
+  } catch {
+    // Version reporting is best effort and never blocks the bridge.
+  }
+}
+
 const permissionToolName =
   "mcp__herdr-orchestrator__herdr_permission_prompt";
 

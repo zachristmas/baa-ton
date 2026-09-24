@@ -66,6 +66,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
     assert.deepEqual(checkIds, [
       "adapter-registry-capability-matrix",
       "codex-sandbox-git-metadata-writability",
+      "controller-plugin-install",
       "extension-source",
       "lane-bridge-liveness",
       "manifest-store",
@@ -73,6 +74,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
       "parent-goal-supervisor",
       "plugin-enablement-and-routing",
       "root-identity",
+      "runtime-version-skew",
       "state-location",
     ]);
     assert.equal(report.details.ok, true);

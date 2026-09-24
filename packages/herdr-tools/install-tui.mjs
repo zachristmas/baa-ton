@@ -40,6 +40,8 @@ import {
   writeJsonAtomic,
   readJson,
   checkoutDirectory,
+  mergeDetectedProfiles,
+  missingOptionalConfigSections,
 } from "./setup-core.mjs";
 import { readClaudeDefaults, readCodexDefaults, readPiDefaults, readOpencodeDefaults } from "./harness-detect.mjs";
 import { liveHerdrConfigDirectory } from "./live-herdr.mjs";
@@ -225,7 +227,8 @@ async function runNonInteractive(options) {
     const selected = config.selectedHarnesses ?? [];
     const detectionResults = await detectSelectedHarnesses(selected, projectRoot);
     const computed = defaultLaunchProfiles(selected, detectionResults, defaults.profiles);
-    const { configPath: writtenPath } = performConfigOnlyWriteDirect({ projectRoot, resolvedProfiles: computed, existingConfig: config });
+    const { configPath: writtenPath, profileChanges } = performConfigOnlyWriteDirect({ projectRoot, resolvedProfiles: computed, existingConfig: config, preserveExisting: true });
+    reportProfileChanges(profileChanges);
     if (!options.quiet) {
       console.log(`Baa-ton profile defaults refreshed at ${writtenPath}`);
       reportUnconfigured(defaults, computed);
@@ -253,9 +256,12 @@ async function runNonInteractive(options) {
     defaults,
     skills: skills.map((skill) => skill.path),
   });
-  for (const [name, resolved] of Object.entries(computed))
-    config.profiles[name] = { ...config.profiles[name], agentKind: resolved.agentKind, launchProfile: resolved.launchProfile };
+  // Unattended setup (also the update path) never replaces a project's own
+  // profile choices; it only fills profiles that have none.
+  const profileChanges = mergeDetectedProfiles(config, computed);
   writeJsonAtomic(configPath, config);
+  reportProfileChanges(profileChanges);
+  reportOptionalSections(config);
 
   if (options.quiet) {
     console.log(`Project ready at ${projectRoot}. Configure worker profiles and model choices in ${configPath}.`);
@@ -273,11 +279,15 @@ async function runNonInteractive(options) {
     }
     console.log("\nTask profiles:");
     for (const [name, profile] of Object.entries(defaults.profiles)) {
-      const resolved = computed[name];
-      const suffix = resolved ? ` -> ${resolved.agentKind}/${resolved.launchProfile.model} (${resolved.launchProfile.thinking})` : " -> unconfigured";
+      // Report what is configured now: a kept choice or a filled default.
+      const resolved = config.profiles?.[name]?.launchProfile ? config.profiles[name] : computed[name];
+      const suffix = resolved?.launchProfile ? ` -> ${resolved.agentKind ?? "?"}/${resolved.launchProfile.model} (${resolved.launchProfile.thinking})` : " -> unconfigured";
       console.log(`  ${name}: ${profile.description}${suffix}`);
     }
-    reportUnconfigured(defaults, computed);
+    reportUnconfigured(
+      defaults,
+      Object.fromEntries(Object.entries(config.profiles ?? {}).filter(([, value]) => value?.launchProfile)),
+    );
     console.log(`Run from the target Herdr pane for root setup: node ${join(checkoutDirectory, "packages/herdr-tools/root-setup.mjs")} --harness <name>`);
   }
   await migrateLegacyState(projectRoot, options);
@@ -287,13 +297,30 @@ async function runNonInteractive(options) {
   console.log(`\n${bannerText()}`);
 }
 
-function performConfigOnlyWriteDirect({ projectRoot, resolvedProfiles, existingConfig }) {
+function performConfigOnlyWriteDirect({ projectRoot, resolvedProfiles, existingConfig, preserveExisting = false }) {
   const configPath = join(projectRoot, ".baa-ton", "config.json");
   const config = { ...existingConfig, profiles: { ...existingConfig.profiles } };
-  for (const [name, resolved] of Object.entries(resolvedProfiles))
-    config.profiles[name] = { ...config.profiles[name], agentKind: resolved.agentKind, launchProfile: resolved.launchProfile };
+  let profileChanges;
+  if (preserveExisting) profileChanges = mergeDetectedProfiles(config, resolvedProfiles);
+  else
+    // Interactive edits: these are the user's explicit picks.
+    for (const [name, resolved] of Object.entries(resolvedProfiles))
+      config.profiles[name] = { ...config.profiles[name], agentKind: resolved.agentKind, launchProfile: resolved.launchProfile };
   writeJsonAtomic(configPath, config);
-  return { configPath, config };
+  return { configPath, config, profileChanges };
+}
+
+function reportProfileChanges(changes) {
+  if (!changes) return;
+  if (changes.preserved.length) console.log(`Kept existing profile choices: ${changes.preserved.join(", ")}`);
+  if (changes.filled.length) console.log(`Filled missing profiles from detected defaults: ${changes.filled.join(", ")}`);
+}
+
+function reportOptionalSections(config) {
+  const missing = missingOptionalConfigSections(config);
+  if (!missing.length) return;
+  console.log("Optional .baa-ton/config.json sections not configured (nothing is enabled automatically):");
+  for (const section of missing) console.log(`  ${section.summary}`);
 }
 
 function reportUnconfigured(defaults, computed) {
