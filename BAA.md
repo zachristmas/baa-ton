@@ -131,6 +131,12 @@ isolation or clarity.
   Push, merge, deploy, production, close and sweep always ask. On a headless root,
   acknowledge only after the user has approved the exact policy shown by
   `herdr_policy action=show`.
+- Under an acknowledged policy that grants `local-validation`, do not ask the user
+  before a lane runs a frozen install (`--frozen-lockfile`, `npm ci`), a build,
+  codegen, typecheck, lint or tests, including headed browser tests, in its own
+  worktree and leased ports. The lane's permission prompts for these are answered by
+  policy. Still ask for package or lockfile edits, shared databases or services, push,
+  merge, deploy and production.
 - Ports, port blocks and service/database names come from `runtime.leases` in
   `.baa-ton/config.json` through `herdr_lease`, never from chat negotiation. Writer
   lanes receive the configured `dispatchLeases` at dispatch; a lane may request more

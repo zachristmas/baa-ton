@@ -95,8 +95,9 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
 }
 ```
 
-- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch`.
+- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch | local-validation`.
   - `retire` covers closing a finished lane's session and stopping its leased services. It never removes a worktree.
+  - `local-validation` answers a lane's own permission and runtime-launch requests for routine checks in its worktree: frozen installs (`npm ci`, `pnpm|yarn|bun install --frozen-lockfile`, `yarn install --immutable`), and build, codegen, typecheck, lint and test scripts (through npm, pnpm, yarn, bun, workspace filters or turbo) or tools (`tsc`, `eslint`, `prettier --check`, `vitest`, `jest`, `playwright test` including `--headed`, `node --test`). The classifier is `classifyLocalValidation` in `packages/herdr-tools/known-safe.mjs`. It is outside the grant when a script name mentions deploy, publish, release, prod, push, migrate, seed, reset, drop, add, remove, update or upgrade; when an install has package arguments or rewrites the lockfile; when an environment assignment (other than CI, NODE_ENV=test or development, colour and debug flags) or a `PORT=` outside the lane's leases could point a command at a shared service; and when a `cd` or redirect leaves the worktree. Database and service stacks stay with `runtime-launch` templates, whose placeholders bind them to the lane's leases. The grant is last in the list, so adding it re-hashes only the policies that add it.
   - Push, merge, deploy, production, close, sweep, reparent and external messages are rejected by name.
   - Any invalid field makes the whole policy count as absent (fail closed).
 - The task-profile and clean-worktree rules are fixed, not configurable.
@@ -108,6 +109,7 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
   - **dispatch/retry:** every lane resolves to a named `taskProfile` (its own or the workflow's). No lane has an ad-hoc `launchProfile` or extra `mcpServers`. The worktree, if any, is clean.
   - **resume:** a clean worktree.
   - **runtime-launch:** the command matches a template token for token, and every `{lease.*}` placeholder resolves to one of this lane's active leases (PR 4).
+  - **local-validation:** the command classifies as local validation for the lane's worktree and leased ports. This is checked first, so a policy without `runtime-launch` can still grant it.
 
 ### Recording it once, safely
 
