@@ -14,8 +14,14 @@ export const STANDING_GRANTS = [
   "retire",
   "lease",
   "runtime-launch",
-  // Last, so adding it never reorders (and re-hashes) an existing policy.
+  // Appended in order, so adding a grant never reorders (and re-hashes) an
+  // existing policy.
   "local-validation",
+  // The one exception to "no autonomous Git actions" (ARCHITECTURE invariant
+  // 4): the spec loop's local worktrees from the target tip and, from the
+  // integration stage, local commits and merges on the integration branch.
+  // Never push, deploy or production.
+  "integrate",
 ] as const;
 export type StandingGrant = (typeof STANDING_GRANTS)[number];
 export type StandingOperation = "dispatch" | "retry" | "resume";
@@ -230,6 +236,10 @@ export function approvalPolicySummary(policy: ApprovalPolicy, hash: string): str
   for (const command of policy.runtimeLaunch?.commands ?? [])
     lines.push(
       `Runtime ${command.name}: ${command.start}${command.stop ? ` (stop: ${command.stop})` : ""}`,
+    );
+  if (policy.grants.includes("integrate"))
+    lines.push(
+      "Integrate: the spec loop creates spec/<item> worktrees from the target tip and makes local commits and merges on its integration branch. Never pushes.",
     );
   if (policy.grants.includes("local-validation"))
     lines.push(

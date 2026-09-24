@@ -387,7 +387,11 @@ export function specStatusTable(spec, state, verification, now = Date.now()) {
         ? ""
         : stage === "blocked"
           ? `${record.blockedReason}${record.note ? `: ${record.note}` : ""}`
-          : verified?.failing
+          : record.note
+            ? record.note
+            : record.wait && (stage === "pending" || stage === "ready")
+              ? `waits: ${record.wait}`
+              : verified?.failing
             ? `${verified.failing.name}: ${verified.failing.detail}`
             : "";
     return [item.id, stage, record.lane ? `${record.lane.workflowId}/${record.lane.laneId}` : "-", age(record.since, now), blocker];

@@ -95,7 +95,8 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
 }
 ```
 
-- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch | local-validation`.
+- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch | local-validation | integrate`.
+  - `integrate` lets the spec loop's driver create `spec/<item>` worktrees from the target tip and, from its integration stage, make local commits and merges on the integration branch. It never pushes (see docs/SPEC-LOOP.md).
   - `retire` covers closing a finished lane's session and stopping its leased services. It never removes a worktree.
   - `local-validation` answers a lane's own permission and runtime-launch requests for routine checks in its worktree: frozen installs (`npm ci`, `pnpm|yarn|bun install --frozen-lockfile`, `yarn install --immutable`), and build, codegen, typecheck, lint and test scripts (through npm, pnpm, yarn, bun, workspace filters or turbo) or tools (`tsc`, `eslint`, `prettier --check`, `vitest`, `jest`, `playwright test` including `--headed`, `node --test`). The classifier is `classifyLocalValidation` in `packages/herdr-tools/known-safe.mjs`. It is outside the grant when a script name mentions deploy, publish, release, prod, push, migrate, seed, reset, drop, add, remove, update or upgrade; when an install has package arguments or rewrites the lockfile; when an environment assignment (other than CI, NODE_ENV=test or development, colour and debug flags) or a `PORT=` outside the lane's leases could point a command at a shared service; and when a `cd` or redirect leaves the worktree. Database and service stacks stay with `runtime-launch` templates, whose placeholders bind them to the lane's leases. The grant is last in the list, so adding it re-hashes only the policies that add it.
   - Push, merge, deploy, production, close, sweep, reparent and external messages are rejected by name.
