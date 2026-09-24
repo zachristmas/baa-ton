@@ -1102,6 +1102,7 @@ const TERMINAL_LANE_STATUSES = new Set([
   "operator-closed",
   "completion-reported",
   "completed",
+  "superseded",
 ]);
 
 type LaneRetirementRecord = {
@@ -1158,11 +1159,13 @@ const TERMINAL_WORKFLOW_STATUSES = new Set([
   "completed",
   "closed",
   "operator-closed",
+  "superseded",
 ]);
 const TERMINAL_WORKFLOW_OUTCOMES = new Set([
   "completed",
   "closed",
   "operator-closed",
+  "superseded",
 ]);
 
 function workflowOwnedByRoot(
@@ -4266,6 +4269,55 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ),
       });
     return { candidates, results };
+  }
+
+  /** Whether a workflow was planned by a root session other than the one the
+   * manifest records as current for this root. */
+  function plannedByEarlierRootSession(manifest: ManifestWithQueue, workflow: Workflow, rootId: string): boolean {
+    const bound = workflow.taskBinding?.rootSessionPath;
+    const current =
+      manifest.rootSessionLogs?.find((entry) => entry.rootId === rootId) ?? manifest.sessionLog;
+    if (!bound || !current?.sessionRef) return false;
+    const ref = current.sessionRef;
+    const known = [
+      ref.sessionId,
+      isRecord(ref.metadata) ? ref.metadata.sessionPath : undefined,
+      isRecord(ref.nativeHandle) ? ref.nativeHandle.value : undefined,
+    ].filter((value): value is string => typeof value === "string");
+    return known.length > 0 && !known.includes(bound);
+  }
+
+  async function supersedeWorkflow(cwd: string, workflowId: string, reason: string) {
+    const scope = requireRootManifestExecutor(cwd);
+    const why = reason?.trim();
+    if (!why) throw new Error("reason is required to supersede a workflow.");
+    return withManifestTransaction(cwd, (manifest) => {
+      const workflow = workflowFor(manifest, workflowId);
+      if (!workflowOwnedByRoot(workflow, scope, cwd))
+        throw new Error(`Workflow ${workflowId} is not owned by this root.`);
+      const launched =
+        Boolean(workflow.dispatchedAt) ||
+        (workflow.ownership?.tabIds?.length ?? 0) > 0 ||
+        (workflow.ownership?.paneIds?.length ?? 0) > 0 ||
+        workflow.lanes.some((lane) => lane.paneId || lane.agentStartAttemptedAt || lane.promptAttemptedAt);
+      if (!["planned", "dispatch-failed"].includes(workflow.status) || launched)
+        throw new Error(
+          `Workflow ${workflowId} is ${workflow.status}${launched ? " and has launched resources" : ""}; herdr_supersede only retires workflows that never started a lane. Use herdr_close instead.`,
+        );
+      const staleRootSession = plannedByEarlierRootSession(manifest, workflow, scope.rootId);
+      const stamp = now();
+      workflow.status = "superseded";
+      (workflow as { outcome: string }).outcome = "superseded";
+      for (const lane of workflow.lanes) lane.status = "superseded";
+      const released = releaseWorkflowLeases(manifest, workflow, "workflow superseded");
+      workflow.evidence.push({
+        at: stamp,
+        kind: "workflow-superseded",
+        text: `${why}${staleRootSession ? " (planned by an earlier root session)" : ""}`,
+      });
+      workflow.updatedAt = stamp;
+      return { workflow: { ...workflow }, staleRootSession, releasedLeases: released.length };
+    });
   }
 
   async function leaseTool(
@@ -10013,6 +10065,34 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           },
         ],
         details: { gate, sample: current },
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_supersede",
+    label: "Herdr Supersede",
+    description:
+      "Retire a planned workflow that was never dispatched, typically one planned by an earlier root session. It touches no Herdr resources (none were created), marks the workflow and its lanes superseded (terminal), releases any leases and records the reason. herdr_close cannot do this because the lanes never ran.",
+    promptSnippet: "Retire an undispatched planned workflow (e.g. from an earlier root session).",
+    promptGuidelines: [
+      "Use herdr_supersede with a reason for planned workflows you will not dispatch, especially ones the supervisor flags as planned by an earlier root session; re-plan the work with herdr_plan if it is still needed.",
+    ],
+    parameters: Type.Object({
+      workflowId: Type.String(),
+      reason: Type.String({ minLength: 1 }),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const result = await supersedeWorkflow(ctx.cwd, params.workflowId, params.reason);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Superseded ${result.workflow.id}${result.staleRootSession ? " (planned by an earlier root session)" : ""}: ${params.reason.trim()}${
+              result.releasedLeases ? `; released ${result.releasedLeases} lease(s)` : ""
+            }.`,
+          },
+        ],
+        details: result,
       };
     },
   });

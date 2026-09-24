@@ -4034,3 +4034,38 @@ test("runtime records list only live processes", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("the nudge flags a planned workflow from an earlier root session and names herdr_supersede", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("active"), laneRequests: [] });
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  const manifest = await fixture.manifest();
+  const binding = (path) => ({ workspaceId: ROOT.workspace_id, rootPaneId: ROOT.pane_id, rootSessionPath: path });
+  manifest.workflows.push(
+    { id: "herdr-stale", status: "planned", taskBinding: binding("/sessions/old.jsonl"), lanes: [] },
+    { id: "herdr-fresh", status: "planned", taskBinding: binding("/sessions/new.jsonl"), lanes: [] },
+    { id: "herdr-gone", status: "superseded", taskBinding: binding("/sessions/old.jsonl"), lanes: [] },
+  );
+  manifest.rootSessionLogs = [{
+    rootId: config.orchestrators[0].id,
+    kind: "root",
+    status: "working",
+    startedAt: "t",
+    sessionRef: { provider: "pi", sessionId: "s-new", metadata: { sessionPath: "/sessions/new.jsonl" } },
+  }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const texts = [];
+  const api = recoveryApi();
+  try {
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: { async request(method, params) { if (method === "agent.prompt") texts.push(params.text); return api.request(method, params); } },
+      timestamp: "2026-09-14T00:00:00.000Z",
+    });
+    const nudge = texts.find((text) => text.startsWith("[Baa-ton supervisor]"));
+    assert.match(nudge, /workflow herdr-stale was planned by an earlier root session and cannot be dispatched as is; retire it with herdr_supersede/);
+    assert.match(nudge, /workflow herdr-fresh is planned but not dispatched/);
+    assert.doesNotMatch(nudge, /herdr-gone/, "superseded workflows are not work");
+  } finally {
+    await fixture.cleanup();
+  }
+});

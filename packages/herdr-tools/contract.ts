@@ -550,6 +550,7 @@ export type Workflow = {
     | "completed"
     | "closed"
     | "operator-closed"
+    | "superseded"
     | "unknown";
   status: string;
   lanes: Lane[];
