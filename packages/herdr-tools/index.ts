@@ -154,7 +154,7 @@ async function importRouteChildMessage() {
   );
 }
 
-const { routeChildMessage } = await importRouteChildMessage();
+const { routeChildMessage, sampleCapacity } = await importRouteChildMessage();
 
 const MANIFEST_DIR = ".baa-ton/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
@@ -258,6 +258,28 @@ type ManifestWithGoalHistory = Manifest & {
   leases?: Lease[];
   /** Directives to a root; open until the root acknowledges them. */
   directives?: RootDirective[];
+  /** Controller-owned per-root capacity gate, alerts and watchdog state. */
+  rootSupervision?: RootSupervision[];
+};
+type CapacityGate = {
+  id: string;
+  status: "waiting" | "cleared" | "cancelled";
+  reason: string;
+  minFreeMemoryGb?: number;
+  maxSwapUsedGb?: number;
+  maxLoadPerCpu?: number;
+  createdAt: string;
+  clearedAt?: string;
+  cancelledAt?: string;
+  escalatedAt?: string;
+  sample?: Record<string, number>;
+  escalation?: { status: string; reason?: string };
+};
+type RootSupervision = {
+  rootId: string;
+  capacityGate?: CapacityGate;
+  alerts?: unknown[];
+  watchdog?: Record<string, unknown>;
 };
 type RootDirective = {
   id: string;
@@ -808,6 +830,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       approvalPolicyAck?: ApprovalPolicyAck;
       leases?: Lease[];
       directives?: RootDirective[];
+      rootSupervision?: RootSupervision[];
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -845,6 +868,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
           : {}),
         ...(Array.isArray(parsed.leases) ? { leases: parsed.leases } : {}),
         ...(Array.isArray(parsed.directives) ? { directives: parsed.directives } : {}),
+        ...(Array.isArray(parsed.rootSupervision) ? { rootSupervision: parsed.rootSupervision } : {}),
       };
     return { version: 2, workflows: [] };
   } catch (error: unknown) {
@@ -1818,18 +1842,23 @@ function validateControllerConfig(input: unknown): ControllerConfig {
       record.program,
       `controller config.orchestrators[${index}].program`,
       ["id", "workspace_id"],
-      ["parent_manifest_path", "digest_window_seconds", "directive_escalate_minutes"],
+      [
+        "parent_manifest_path",
+        "digest_window_seconds",
+        "directive_escalate_minutes",
+        "capacity_escalate_minutes",
+        "watchdog_minutes",
+      ],
     );
-    const directiveEscalateMinutes = program.directive_escalate_minutes;
-    if (
-      directiveEscalateMinutes !== undefined &&
-      (!Number.isSafeInteger(directiveEscalateMinutes) ||
-        (directiveEscalateMinutes as number) < 1 ||
-        (directiveEscalateMinutes as number) > 1_440)
-    )
-      throw new Error(
-        "controller program.directive_escalate_minutes must be an integer from 1 to 1440.",
-      );
+    const minuteKeys = ["directive_escalate_minutes", "capacity_escalate_minutes", "watchdog_minutes"] as const;
+    for (const key of minuteKeys) {
+      const value = program[key];
+      if (
+        value !== undefined &&
+        (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 1_440)
+      )
+        throw new Error(`controller program.${key} must be an integer from 1 to 1440.`);
+    }
     const digestWindowSeconds = program.digest_window_seconds;
     if (
       digestWindowSeconds !== undefined &&
@@ -1874,9 +1903,11 @@ function validateControllerConfig(input: unknown): ControllerConfig {
         ...(digestWindowSeconds !== undefined
           ? { digest_window_seconds: digestWindowSeconds as number }
           : {}),
-        ...(directiveEscalateMinutes !== undefined
-          ? { directive_escalate_minutes: directiveEscalateMinutes as number }
-          : {}),
+        ...Object.fromEntries(
+          minuteKeys
+            .filter((key) => program[key] !== undefined)
+            .map((key) => [key, program[key] as number]),
+        ),
       },
       workflows: record.workflows.map((workflow, workflowIndex) =>
         validateControllerWorkflow(
@@ -9633,6 +9664,83 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         return { ...found };
       });
       return { content: [{ type: "text", text: `Acknowledged ${describe(directive)}` }], details: { directive } };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_capacity",
+    label: "Herdr Capacity",
+    description:
+      "Record, inspect or cancel this root's capacity gate. Instead of parking on 'not enough RAM', record the thresholds you are waiting for: the controller samples memory, swap and load on each supervisor tick, puts 'capacity available' in your digest when the gate clears, and notifies Zach with the top memory users if it stays blocked.",
+    promptSnippet: "Wait for memory/swap/load capacity without stalling silently.",
+    promptGuidelines: [
+      "When work must wait for machine capacity, call herdr_capacity action=wait with reason and at least one of minFreeMemoryGb, maxSwapUsedGb, maxLoadPerCpu, then end the turn; a digest tells you when it clears. Retire finished lanes (herdr_retire) first to free memory.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("wait"), Type.Literal("status"), Type.Literal("cancel")]),
+      reason: Type.Optional(Type.String()),
+      minFreeMemoryGb: Type.Optional(Type.Number({ minimum: 0 })),
+      maxSwapUsedGb: Type.Optional(Type.Number({ minimum: 0 })),
+      maxLoadPerCpu: Type.Optional(Type.Number({ minimum: 0 })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const scope = requireRootManifestExecutor(ctx.cwd);
+      const current = await sampleCapacity();
+      const describe = (gate?: CapacityGate) =>
+        gate
+          ? `${gate.id} [${gate.status}] ${gate.reason}: ${[
+              gate.minFreeMemoryGb !== undefined ? `free >= ${gate.minFreeMemoryGb} GB` : "",
+              gate.maxSwapUsedGb !== undefined ? `swap <= ${gate.maxSwapUsedGb} GB` : "",
+              gate.maxLoadPerCpu !== undefined ? `load <= ${gate.maxLoadPerCpu}/CPU` : "",
+            ].filter(Boolean).join(", ")}`
+          : "No capacity gate.";
+      const now_ = `Now: ${JSON.stringify(current)}`;
+      if (params.action === "status") {
+        const gate = (await loadManifest(ctx.cwd)).rootSupervision?.find((item) => item.rootId === scope.rootId)?.capacityGate;
+        return { content: [{ type: "text", text: `${describe(gate)}\n${now_}` }], details: { gate, sample: current } };
+      }
+      const gate = await withManifestTransaction(ctx.cwd, (manifest) => {
+        const entries = (manifest.rootSupervision ??= []);
+        let entry = entries.find((item) => item.rootId === scope.rootId);
+        if (!entry) {
+          entry = { rootId: scope.rootId, alerts: [] };
+          entries.push(entry);
+        }
+        if (params.action === "cancel") {
+          if (entry.capacityGate?.status === "waiting") {
+            entry.capacityGate.status = "cancelled";
+            entry.capacityGate.cancelledAt = now();
+          }
+          return entry.capacityGate;
+        }
+        if (!params.reason?.trim()) throw new Error("reason is required to wait for capacity.");
+        if (
+          params.minFreeMemoryGb === undefined &&
+          params.maxSwapUsedGb === undefined &&
+          params.maxLoadPerCpu === undefined
+        )
+          throw new Error("Give at least one of minFreeMemoryGb, maxSwapUsedGb or maxLoadPerCpu.");
+        entry.capacityGate = {
+          id: `capacity-${randomUUID().slice(0, 8)}`,
+          status: "waiting",
+          reason: clip(params.reason.trim(), 500),
+          ...(params.minFreeMemoryGb !== undefined ? { minFreeMemoryGb: params.minFreeMemoryGb } : {}),
+          ...(params.maxSwapUsedGb !== undefined ? { maxSwapUsedGb: params.maxSwapUsedGb } : {}),
+          ...(params.maxLoadPerCpu !== undefined ? { maxLoadPerCpu: params.maxLoadPerCpu } : {}),
+          createdAt: now(),
+        };
+        return entry.capacityGate;
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${describe(gate)}\n${now_}${
+              params.action === "wait" ? "\nEnd the turn; a digest reports 'capacity available' when the gate clears." : ""
+            }`,
+          },
+        ],
+        details: { gate, sample: current },
+      };
     },
   });
   pi.registerTool({

@@ -3249,7 +3249,8 @@ async function directiveFixture() {
   const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
   const notices = [];
   const notify = async (notice) => {
-    notices.push(notice);
+    // The no-progress watchdog also runs on these ticks; count directive notices only.
+    if (notice.title.includes("directive")) notices.push(notice);
     return { status: "sent" };
   };
   const at = (seconds) => new Date(Date.parse("2026-09-14T01:00:00.000Z") + seconds * 1_000).toISOString();
@@ -3274,7 +3275,7 @@ test("a directive stays open: delivered, re-sent once after an ignored turn, the
       timestamp: d.at(0),
     });
     await d.tick(1, api);
-    const digests = () => api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]"));
+    const digests = () => api.prompts.filter((prompt) => prompt.text.includes("directive from"));
     assert.equal(digests().length, 1);
     assert.match(digests()[0].text, new RegExp(`directive from zach \\(${posted.id}\\): Run herdr_sweep for the finished cic lanes\\.`));
     assert.match(digests()[0].text, /herdr_directive action=ack/);
@@ -3320,7 +3321,7 @@ test("an acknowledged directive is never re-sent or escalated", async () => {
     await d.settleRoot(20);
     await d.tick(30, api);
     await d.tick(60 * 60, api);
-    assert.equal(api.prompts.filter((prompt) => prompt.text.startsWith("[Baa-ton digest]")).length, 1);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("directive from")).length, 1);
     assert.equal(d.notices.length, 0);
   } finally {
     await d.fixture.cleanup();
@@ -3378,4 +3379,168 @@ test("the directive CLI posts and lists directives", async () => {
   } finally {
     await fixture.cleanup();
   }
+});
+
+async function supervisionFixture({ gate, events = [], rootTurnState = "idle", rootTurnAt = "2026-09-14T01:00:00.000Z" } = {}) {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const config = validateConfig(JSON.parse(await readFile(join(fixture.stateDir, "config.json"), "utf8")));
+  const rootId = config.orchestrators[0].id;
+  const manifest = await fixture.manifest();
+  manifest.parentGoal.supervisor.rootTurn = { ...rootTurn(rootTurnState), updatedAt: rootTurnAt };
+  manifest.workflows[0].eventController = { version: 1, events };
+  if (gate) manifest.rootSupervision = [{ rootId, alerts: [], capacityGate: gate }];
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const notices = [];
+  let current = { freeMemoryGb: 2, swapUsedGb: 24, load1PerCpu: 0.9 };
+  const at = (minutes) => new Date(Date.parse("2026-09-14T01:00:00.000Z") + minutes * 60_000).toISOString();
+  const tick = (minutes, api) =>
+    runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      notify: async (notice) => {
+        notices.push(notice);
+        return { status: "sent" };
+      },
+      sample: async () => current,
+      topUsers: async () => ["claude (101) 2.1 GB", "tsserver (202) 1.4 GB"],
+      timestamp: at(minutes),
+    });
+  return {
+    fixture,
+    rootId,
+    notices,
+    at,
+    tick,
+    setSample(next) {
+      current = next;
+    },
+    async supervision() {
+      return (await fixture.manifest()).rootSupervision?.[0];
+    },
+  };
+}
+
+const capacityGate = {
+  id: "capacity-1",
+  status: "waiting",
+  reason: "dispatch D19 needs 8 GB",
+  minFreeMemoryGb: 8,
+  maxSwapUsedGb: 20,
+  createdAt: "2026-09-14T01:00:00.000Z",
+};
+const workingEvent = (receivedAt, status = "working") => ({
+  identity: `event-${receivedAt}-${status}`,
+  received_at: receivedAt,
+  workflow_id: "herdr-bb029",
+  lane_id: CHILD.lane_id,
+  pane_id: CHILD.pane_id,
+  classification: "unclassified",
+  source: { agent_status: status },
+  wake: { status: "not-required", attempts: 0, updated_at: receivedAt },
+});
+
+test("a capacity gate that clears puts 'capacity available' in the root digest", async () => {
+  const s = await supervisionFixture({ gate: capacityGate, events: [workingEvent("2026-09-14T01:00:00.000Z")] });
+  const api = digestApi();
+  try {
+    await s.tick(1, api);
+    assert.equal((await s.supervision()).capacityGate.status, "waiting");
+    s.setSample({ freeMemoryGb: 11.5, swapUsedGb: 6, load1PerCpu: 0.3 });
+    await s.tick(2, api);
+    const gate = (await s.supervision()).capacityGate;
+    assert.equal(gate.status, "cleared");
+    const digest = api.prompts.find((prompt) => prompt.text.includes("capacity-available"));
+    assert.ok(digest, "the root is told capacity recovered");
+    assert.match(digest.text, /capacity available for "dispatch D19 needs 8 GB": free 11\.5 GB, swap 6 GB, load 0\.3\/CPU \(gate: free >= 8 GB, swap <= 20 GB\)/);
+    assert.equal(s.notices.length, 0);
+  } finally {
+    await s.fixture.cleanup();
+  }
+});
+
+test("a capacity gate blocked past 15 minutes notifies Zach once with the top memory users", async () => {
+  const s = await supervisionFixture({ gate: capacityGate, events: [workingEvent("2026-09-14T01:00:00.000Z")] });
+  const api = digestApi();
+  try {
+    await s.tick(14, api);
+    assert.equal(s.notices.filter((notice) => notice.title.includes("capacity")).length, 0);
+    await s.tick(16, api);
+    const capacity = s.notices.filter((notice) => notice.title.includes("capacity"));
+    assert.equal(capacity.length, 1);
+    assert.equal(capacity[0].title, "Baa-ton: capacity still blocked");
+    assert.match(capacity[0].body, /waited 16 min for "dispatch D19 needs 8 GB"/);
+    assert.match(capacity[0].body, /Top memory: claude \(101\) 2\.1 GB; tsserver \(202\) 1\.4 GB/);
+    await s.tick(20, api);
+    assert.equal(s.notices.filter((notice) => notice.title.includes("capacity")).length, 1, "once per gate");
+    assert.equal((await s.supervision()).capacityGate.status, "waiting", "still waiting until it clears");
+  } finally {
+    await s.fixture.cleanup();
+  }
+});
+
+test("the watchdog alerts once per idle episode when no lane has worked for 30 minutes", async () => {
+  const s = await supervisionFixture({
+    events: [workingEvent("2026-09-14T00:50:00.000Z"), workingEvent("2026-09-14T01:00:00.000Z", "idle")],
+  });
+  const api = digestApi();
+  try {
+    await s.tick(29, api);
+    assert.equal(s.notices.length, 0);
+    await s.tick(31, api);
+    assert.equal(s.notices.length, 1);
+    assert.equal(s.notices[0].title, "Baa-ton: no progress");
+    assert.match(s.notices[0].body, /no lane has been working for 31 min while parent goal parent-recovery is active/);
+    const nudge = api.prompts.find((prompt) => prompt.text.includes("no-progress"));
+    assert.ok(nudge, "the root is nudged with the reason");
+    assert.match(nudge.text, /Plan or dispatch the next step, or record a truthful goal state/);
+    await s.tick(45, api);
+    assert.equal(s.notices.length, 1, "one alert per episode");
+
+    // New activity starts a new episode.
+    const manifest = await s.fixture.manifest();
+    manifest.workflows[0].eventController.events.push(
+      workingEvent(s.at(50)),
+      workingEvent(s.at(55), "done"),
+    );
+    await writeFile(s.fixture.manifestPath, JSON.stringify(manifest));
+    await s.tick(60, api);
+    assert.equal(s.notices.length, 1, "working recently");
+    await s.tick(90, api);
+    assert.equal(s.notices.length, 2, "a new idle episode alerts again");
+  } finally {
+    await s.fixture.cleanup();
+  }
+});
+
+test("the watchdog stays quiet while a lane or the root is working, or the goal is terminal", async () => {
+  const working = await supervisionFixture({ events: [workingEvent("2026-09-14T00:00:00.000Z")] });
+  const busyRoot = await supervisionFixture({ rootTurnState: "active" });
+  const api = digestApi();
+  try {
+    await working.tick(120, api);
+    await busyRoot.tick(120, api);
+    assert.equal(working.notices.length + busyRoot.notices.length, 0);
+    const manifest = await working.fixture.manifest();
+    manifest.workflows[0].eventController.events.push(workingEvent("2026-09-14T00:10:00.000Z", "idle"));
+    manifest.parentGoal.status = "completed";
+    await writeFile(working.fixture.manifestPath, JSON.stringify(manifest));
+    await working.tick(180, api);
+    assert.equal(working.notices.length, 0, "a completed goal is not a stall");
+  } finally {
+    await working.fixture.cleanup();
+    await busyRoot.fixture.cleanup();
+  }
+});
+
+test("capacity_escalate_minutes and watchdog_minutes are validated and honoured", () => {
+  const program = (extra) => ({
+    version: 2,
+    owner: "herdr-orchestrator",
+    orchestrators: [{ id: "o", root: ROOT, program: { id: "p", workspace_id: ROOT.workspace_id, ...extra }, workflows: [] }],
+  });
+  const parsed = validateConfig(program({ capacity_escalate_minutes: 5, watchdog_minutes: 45 }));
+  assert.equal(parsed.orchestrators[0].program.capacity_escalate_minutes, 5);
+  assert.equal(parsed.orchestrators[0].program.watchdog_minutes, 45);
+  for (const extra of [{ watchdog_minutes: 0 }, { capacity_escalate_minutes: 1441 }, { watchdog_minutes: "30" }])
+    assert.throws(() => validateConfig(program(extra)), /must be an integer from 1 to 1440/);
 });

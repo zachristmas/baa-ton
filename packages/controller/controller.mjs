@@ -16,6 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
@@ -352,15 +353,20 @@ export function validateOrchestrator(input, index) {
     value.program,
     `${label}.program`,
     ["id", "workspace_id"],
-    ["parent_manifest_path", "digest_window_seconds", "directive_escalate_minutes"],
+    [
+      "parent_manifest_path",
+      "digest_window_seconds",
+      "directive_escalate_minutes",
+      "capacity_escalate_minutes",
+      "watchdog_minutes",
+    ],
   );
-  if ("directive_escalate_minutes" in program)
-    assert(
-      Number.isSafeInteger(program.directive_escalate_minutes) &&
-        program.directive_escalate_minutes >= 1 &&
-        program.directive_escalate_minutes <= MAX_ESCALATE_MINUTES,
-      `${label}.program.directive_escalate_minutes must be an integer from 1 to ${MAX_ESCALATE_MINUTES}.`,
-    );
+  for (const key of ["directive_escalate_minutes", "capacity_escalate_minutes", "watchdog_minutes"])
+    if (key in program)
+      assert(
+        Number.isSafeInteger(program[key]) && program[key] >= 1 && program[key] <= MAX_ESCALATE_MINUTES,
+        `${label}.program.${key} must be an integer from 1 to ${MAX_ESCALATE_MINUTES}.`,
+      );
   if ("digest_window_seconds" in program)
     assert(
       Number.isSafeInteger(program.digest_window_seconds) &&
@@ -415,9 +421,11 @@ export function validateOrchestrator(input, index) {
       ...("digest_window_seconds" in program
         ? { digest_window_seconds: program.digest_window_seconds }
         : {}),
-      ...("directive_escalate_minutes" in program
-        ? { directive_escalate_minutes: program.directive_escalate_minutes }
-        : {}),
+      ...Object.fromEntries(
+        ["directive_escalate_minutes", "capacity_escalate_minutes", "watchdog_minutes"]
+          .filter((key) => key in program)
+          .map((key) => [key, program[key]]),
+      ),
     },
     workflows,
   };
@@ -1825,6 +1833,7 @@ export function digestText(items, open = []) {
       const { record } = item;
       return `${index + 1}. ${record.classification}: ${record.workflow_id}/${record.lane_id} (event ${record.identity.slice(0, 12)})`;
     }
+    if (item.kind === "alert") return `${index + 1}. ${item.request.kind}: ${item.request.text}`;
     if (item.kind === "directive") {
       const { request: directive } = item;
       return `${index + 1}. directive from ${directive.from} (${directive.id})${
@@ -2105,6 +2114,237 @@ export async function escalateDirectives({
   return escalated;
 }
 
+const DEFAULT_CAPACITY_ESCALATE_MINUTES = 15;
+const DEFAULT_WATCHDOG_MINUTES = 30;
+const GIB = 1024 ** 3;
+
+function roundTo(value, digits = 1) {
+  return value === undefined ? undefined : Math.round(value * 10 ** digits) / 10 ** digits;
+}
+
+/**
+ * One local capacity sample: available memory (macOS: free + inactive +
+ * speculative + purgeable pages; Linux: MemAvailable), swap in use, and the
+ * one-minute load per CPU. Fields the platform cannot report are omitted.
+ */
+export async function sampleCapacity() {
+  const cpus = Math.max(1, os.cpus().length);
+  const sample = {
+    freeMemoryGb: roundTo(os.freemem() / GIB),
+    load1PerCpu: roundTo(os.loadavg()[0] / cpus, 2),
+  };
+  try {
+    if (process.platform === "darwin") {
+      const { stdout } = await execFileAsync("vm_stat", [], { timeout: 5_000 });
+      const pageSize = Number(/page size of (\d+) bytes/.exec(stdout)?.[1] ?? 4096);
+      const pages = (label) => Number(new RegExp(`${label}:\\s+(\\d+)`).exec(stdout)?.[1] ?? 0);
+      sample.freeMemoryGb = roundTo(
+        (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable")) *
+          pageSize /
+          GIB,
+      );
+      const swap = await execFileAsync("sysctl", ["-n", "vm.swapusage"], { timeout: 5_000 });
+      const used = /used = ([\d.]+)([MG])/.exec(swap.stdout);
+      if (used) sample.swapUsedGb = roundTo(Number(used[1]) / (used[2] === "G" ? 1 : 1024));
+    } else if (process.platform === "linux") {
+      const meminfo = await readFile("/proc/meminfo", "utf8");
+      const kb = (label) => Number(new RegExp(`^${label}:\\s+(\\d+) kB`, "m").exec(meminfo)?.[1]);
+      if (Number.isFinite(kb("MemAvailable"))) sample.freeMemoryGb = roundTo((kb("MemAvailable") * 1024) / GIB);
+      if (Number.isFinite(kb("SwapTotal")) && Number.isFinite(kb("SwapFree")))
+        sample.swapUsedGb = roundTo(((kb("SwapTotal") - kb("SwapFree")) * 1024) / GIB);
+    }
+  } catch {
+    // Keep the portable os.* figures when the platform probe is unavailable.
+  }
+  return sample;
+}
+
+/** The processes holding the most resident memory, largest first. */
+export async function topMemoryUsers(limit = 5) {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axo", "rss=,pid=,comm="], {
+      timeout: 5_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return stdout
+      .split("\n")
+      .map((line) => /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line))
+      .filter(Boolean)
+      .map(([, rss, pid, command]) => ({ rssGb: Number(rss) / (1024 * 1024), pid: Number(pid), command: basename(command.trim()) }))
+      .sort((a, b) => b.rssGb - a.rssGb)
+      .slice(0, limit)
+      .map((item) => `${item.command} (${item.pid}) ${roundTo(item.rssGb)} GB`);
+  } catch {
+    return [];
+  }
+}
+
+function supervisionFor(manifest, orchestrator, create = false) {
+  const entries = Array.isArray(manifest.rootSupervision) ? manifest.rootSupervision : [];
+  let entry = entries.find((item) => isRecord(item) && item.rootId === orchestrator.id);
+  if (!entry && create) {
+    entry = { rootId: orchestrator.id, alerts: [] };
+    manifest.rootSupervision = [...entries, entry];
+  }
+  if (entry && !Array.isArray(entry.alerts)) entry.alerts = [];
+  return entry;
+}
+
+function queueRootAlert(entry, kind, text, timestamp) {
+  const alert = {
+    id: `alert-${randomUUID().slice(0, 8)}`,
+    kind,
+    text,
+    createdAt: timestamp,
+    delivery: { status: "pending", attempts: 0, updatedAt: timestamp },
+  };
+  entry.alerts.push(alert);
+  // Keep the record bounded; delivered alerts are history only.
+  if (entry.alerts.length > 50) entry.alerts.splice(0, entry.alerts.length - 50);
+  return alert;
+}
+
+function describeSample(sample) {
+  return [
+    sample.freeMemoryGb !== undefined ? `free ${sample.freeMemoryGb} GB` : undefined,
+    sample.swapUsedGb !== undefined ? `swap ${sample.swapUsedGb} GB` : undefined,
+    sample.load1PerCpu !== undefined ? `load ${sample.load1PerCpu}/CPU` : undefined,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+function describeGate(gate) {
+  return [
+    gate.minFreeMemoryGb !== undefined ? `free >= ${gate.minFreeMemoryGb} GB` : undefined,
+    gate.maxSwapUsedGb !== undefined ? `swap <= ${gate.maxSwapUsedGb} GB` : undefined,
+    gate.maxLoadPerCpu !== undefined ? `load <= ${gate.maxLoadPerCpu}/CPU` : undefined,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+export function capacityGateSatisfied(gate, sample) {
+  const checks = [];
+  if (gate.minFreeMemoryGb !== undefined) checks.push(sample.freeMemoryGb !== undefined && sample.freeMemoryGb >= gate.minFreeMemoryGb);
+  if (gate.maxSwapUsedGb !== undefined) checks.push(sample.swapUsedGb !== undefined && sample.swapUsedGb <= gate.maxSwapUsedGb);
+  if (gate.maxLoadPerCpu !== undefined) checks.push(sample.load1PerCpu !== undefined && sample.load1PerCpu <= gate.maxLoadPerCpu);
+  return checks.length > 0 && checks.every(Boolean);
+}
+
+/** When lanes or the root last showed progress, or undefined while one is
+ * working right now. */
+function lastProgressAt(manifest, orchestrator, manifestPath, goal) {
+  if (goal?.supervisor?.rootTurn?.state === "active") return undefined;
+  const routes = orchestrator.workflows.filter(
+    (route) => resolve(route.manifest_path) === resolve(manifestPath),
+  );
+  let latest = Date.parse(goal?.supervisor?.rootTurn?.updatedAt ?? goal?.updatedAt ?? goal?.createdAt ?? 0) || 0;
+  for (const route of routes) {
+    const stored = manifest.workflows?.find((item) => isRecord(item) && item.id === route.workflow_id);
+    const events = Array.isArray(stored?.eventController?.events) ? stored.eventController.events : [];
+    for (const lane of route.lanes) {
+      const laneEvents = events.filter((event) => event.lane_id === lane.lane_id);
+      const last = laneEvents.at(-1);
+      if (last?.source?.agent_status === "working") return undefined;
+      for (const event of laneEvents) latest = Math.max(latest, Date.parse(event.received_at ?? event.at ?? 0) || 0);
+    }
+  }
+  return latest;
+}
+
+/**
+ * Capacity gate and no-progress watchdog for one root, on the supervisor
+ * tick. Queues root alerts (delivered in the digest) and sends at most one
+ * Herdr notification per blocked gate and per idle episode.
+ */
+export async function superviseRoot({
+  orchestrator,
+  manifestPath,
+  manifest,
+  goal,
+  notify = herdrNotification,
+  sample = sampleCapacity,
+  topUsers = topMemoryUsers,
+  timestamp = now(),
+}) {
+  let changed = false;
+  const outcome = { capacity: undefined, watchdog: undefined };
+  const entry = supervisionFor(manifest, orchestrator);
+  const gate = entry?.capacityGate;
+  if (gate?.status === "waiting") {
+    const current = await sample();
+    if (capacityGateSatisfied(gate, current)) {
+      gate.status = "cleared";
+      gate.clearedAt = timestamp;
+      gate.sample = current;
+      queueRootAlert(
+        entry,
+        "capacity-available",
+        `capacity available for "${gate.reason}": ${describeSample(current)} (gate: ${describeGate(gate)}). Resume the work you parked on capacity.`,
+        timestamp,
+      );
+      outcome.capacity = "cleared";
+      changed = true;
+    } else if (
+      !gate.escalatedAt &&
+      Date.parse(timestamp) - Date.parse(gate.createdAt) >
+        (orchestrator.program.capacity_escalate_minutes ?? DEFAULT_CAPACITY_ESCALATE_MINUTES) * 60_000
+    ) {
+      const users = await topUsers();
+      const minutes = Math.round((Date.parse(timestamp) - Date.parse(gate.createdAt)) / 60_000);
+      gate.escalatedAt = timestamp;
+      gate.sample = current;
+      gate.escalation = await notify({
+        title: "Baa-ton: capacity still blocked",
+        body: clipText(
+          `${orchestrator.id} has waited ${minutes} min for "${gate.reason}" (${describeGate(gate)}). Now ${describeSample(current)}. Top memory: ${users.length ? users.join("; ") : "unavailable"}.`,
+          500,
+        ),
+      });
+      outcome.capacity = "escalated";
+      changed = true;
+    }
+  }
+  if (goal && !TERMINAL_PARENT_GOAL_STATES.has(goal.status)) {
+    const since = lastProgressAt(manifest, orchestrator, manifestPath, goal);
+    const limit = (orchestrator.program.watchdog_minutes ?? DEFAULT_WATCHDOG_MINUTES) * 60_000;
+    if (since !== undefined && Date.parse(timestamp) - since > limit) {
+      const target = entry ?? supervisionFor(manifest, orchestrator, true);
+      const idleSince = new Date(since).toISOString();
+      if (target.watchdog?.idleSince !== idleSince) {
+        const minutes = Math.round((Date.parse(timestamp) - since) / 60_000);
+        const reason = `no lane has been working for ${minutes} min while parent goal ${goal.id} is ${goal.status}${goal.nextAction ? ` (next: ${clipText(goal.nextAction, 200)})` : ""}`;
+        queueRootAlert(target, "no-progress", `${reason}. Plan or dispatch the next step, or record a truthful goal state.`, timestamp);
+        target.watchdog = {
+          idleSince,
+          alertedAt: timestamp,
+          notification: await notify({ title: "Baa-ton: no progress", body: clipText(`${orchestrator.id}: ${reason}.`, 500) }),
+        };
+        outcome.watchdog = "alerted";
+        changed = true;
+      }
+    }
+  }
+  if (changed) await atomicWriteJson(manifestPath, manifest);
+  return outcome;
+}
+
+function collectAlertItems({ orchestrator, manifest, timestamp, items }) {
+  const entry = supervisionFor(manifest, orchestrator);
+  let changed = false;
+  for (const alert of entry?.alerts ?? []) {
+    if (alert.delivery?.status === "sending") {
+      const interrupted = interruptedDelivery(timestamp);
+      alert.delivery = { ...alert.delivery, status: "uncertain", updatedAt: interrupted.timestamp, reason: interrupted.reason };
+      changed = true;
+      continue;
+    }
+    if (alert.delivery?.status === "pending") items.push({ kind: "alert", request: alert });
+  }
+  return changed;
+}
+
 /** Pending root-bound items for one orchestrator's routes in this manifest. */
 function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timestamp }) {
   const routes = orchestrator.workflows.filter(
@@ -2194,6 +2434,7 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
     }
   }
   if (collectDirectiveItems({ orchestrator, manifest, goal, timestamp, items })) changed = true;
+  if (collectAlertItems({ orchestrator, manifest, timestamp, items })) changed = true;
   return { items, changed, open };
 }
 
@@ -2243,6 +2484,7 @@ export async function dispatchRootDigest({
     (item) =>
       item.kind === "request" ||
       item.kind === "directive" ||
+      item.kind === "alert" ||
       (item.kind === "event" &&
         URGENT_DIGEST_CLASSIFICATIONS.has(item.record.classification)),
   );
@@ -2276,7 +2518,7 @@ export async function dispatchRootDigest({
           wake: true,
         }),
       );
-    } else if (item.kind === "directive") {
+    } else if (item.kind === "directive" || item.kind === "alert") {
       inbox.push(undefined);
     } else if (item.kind === "request") {
       const { request, lane } = item;
@@ -2719,6 +2961,8 @@ export async function runSupervisorTick({
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
   herdr,
   notify = herdrNotification,
+  sample = sampleCapacity,
+  topUsers = topMemoryUsers,
   timestamp = now(),
 } = {}) {
   requireStateDir(stateDir);
@@ -2826,6 +3070,18 @@ export async function runSupervisorTick({
       });
       if (escalatedDirectives.length)
         pendingWakes.push({ manifestPath, kind: "directive-escalation", directiveIds: escalatedDirectives });
+      const supervision = await superviseRoot({
+        orchestrator,
+        manifestPath,
+        manifest,
+        goal,
+        notify,
+        sample,
+        topUsers,
+        timestamp,
+      });
+      if (supervision.capacity || supervision.watchdog)
+        pendingWakes.push({ manifestPath, kind: "supervision", ...supervision });
       // Event-driven delivery point for everything the root has not seen:
       // a digest deferred while the root worked goes out on the first tick
       // after its turn settles, independent of parent-goal status.

@@ -65,6 +65,19 @@ node packages/controller/directive.mjs list --manifest <parent manifest>
 - **Escalation:** after the re-send is ignored, or `program.directive_escalate_minutes` (default 15, range 1-1440) after posting, whichever comes first, Zach gets one local Herdr notification (`herdr notification show ... --sound request`). This includes a directive never delivered because the root stayed busy.
 - **Scope:** this is the controller's first wall-clock threshold. The notification is local Herdr UI, not an external service.
 
+## Capacity gate and no-progress watchdog
+
+Both run on the supervisor tick for each root and live in the parent manifest's `rootSupervision` entry for that root.
+
+- **Capacity gate.** The root records what it is waiting for with `herdr_capacity action=wait`, giving a reason and at least one of `minFreeMemoryGb`, `maxSwapUsedGb` or `maxLoadPerCpu`.
+  - While the gate is waiting, each tick samples available memory (macOS: free, inactive, speculative and purgeable pages; Linux: `MemAvailable`), swap in use and the one-minute load per CPU.
+  - When every given threshold holds, the gate clears and "capacity available" goes into the root digest.
+  - If it is still blocked after `program.capacity_escalate_minutes` (default 15), Zach gets one Herdr notification naming the top memory users.
+- **No-progress watchdog.** It fires when the parent goal is not terminal, no mapped lane's latest event is `working`, the root turn is not active, and nothing has changed for `program.watchdog_minutes` (default 30).
+  - Zach gets one notification, and the root gets a digest nudge with the reason.
+  - It fires once per idle episode. New lane or root activity starts a new episode.
+- **Config:** both thresholds are integers from 1 to 1440. The sampler, top-memory probe and notifier are injectable for tests.
+
 ## Validate
 
 ```sh
