@@ -246,6 +246,13 @@ Fixes from the first dry run on a live run:
 - **Stalled lanes:** a lane Herdr reports `done` with no receipt is asked once, through `herdr_tell`, for its receipt in its stage's format. If nothing comes within 30 minutes, the item goes to the root. A lane whose session is `gone` is retried in the same worktree; a gone build lane counts as an attempt only when its worktree has no uncommitted changes.
 - **Resolved by decision:** `adopt.resolved: "<reason>"` records an item settled by a decision with no code (the user resolved it, or it was verified absent) as `resolved`. The verifier counts it as done by decision (`spec 3/30 done (1 by decision)`). Adopting logs it in `spec-state.json` `decisions` and alerts the root and the user, and `herdr_spec action=reopen itemId=<id>` overturns it (also logged).
 
+Reviewing adopted work: adopted worktrees are dirty by design, because their work is uncommitted.
+
+- **Commit before review:** before an adopted item's review, the driver commits that item's own changes on its branch as one commit, `spec <id>: adopt work as built`. It's a local commit under the `integrate` grant, with the same rules as integration: `owns` plus `sharedTouch`, explicit paths only (`git add -- <paths>` and `git commit -- <paths>`), never secrets. The reviewer then reads the branch diff against the target tip.
+- **Shared worktrees:** in a worktree shared by several items, each item commits its own paths when its review starts, in spec order. The first item claims a shared file; other items' changes are left for their own commits.
+- **Holds:** changes no item owns, or a failed commit (a hook, for example), hold the item for the root with the file list or the error.
+- **Dirty worktrees:** read-only lanes (review, decide) may be planned into a dirty worktree, because they never write. Writer lanes and resume still require a clean one.
+
 Memory-aware dispatch: besides a waiting capacity gate, the driver samples free memory and swap before dispatching when `defaults.minFreeMemoryGb` or `defaults.maxSwapUsedGb` is set. After a dispatch fails with "shell did not become ready", it starts nothing else that pass and backs off for 10 minutes. Retries of an undispatched stage honor the same hold.
 
 ## Open questions for Zach

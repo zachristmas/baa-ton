@@ -3614,9 +3614,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     return { ...persisted, ...routed, delivery: routed.delivery };
   }
 
+  /** The worktree root; clean unless `allowDirty` (read-only lanes only:
+   * a lane that never writes cannot mix its edits with existing changes). */
   async function assertCleanLocalWorktree(
     cwd: string,
     signal?: AbortSignal,
+    options: { allowDirty?: boolean } = {},
   ): Promise<string> {
     const root = (await pi.exec(
       "git",
@@ -3632,6 +3635,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "worktreeCwd must name the Git worktree root, not a subdirectory.",
       );
+    if (options.allowDirty) return checkoutPath;
     const result = (await pi.exec(
       "git",
       ["-C", checkoutPath, "status", "--porcelain", "--untracked-files=all"],
@@ -3665,7 +3669,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ...(workflow.worktree
           ? {
               cleanWorktree: async () => {
-                await assertCleanLocalWorktree(workflow.worktree!, signal);
+                await assertCleanLocalWorktree(workflow.worktree!, signal, {
+                  allowDirty: workflow.lanes.length > 0 && workflow.lanes.every((lane) => lane.readOnly),
+                });
               },
             }
           : {}),
@@ -4554,6 +4560,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
+    /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
+    commit?(input: { worktree: string; paths: string[]; message: string }): Promise<string>;
     /** Send a root-to-lane message (herdr_tell). */
     tell?(input: { workflowId: string; laneId: string; text: string }): Promise<{ message: { delivery: { status: string } } }>;
     /** Live memory and swap sample (the controller's sampleCapacity). */
@@ -4693,6 +4701,55 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const done: string[] = [];
       if (backoff && !(typeof capacityWaiting === "string" && capacityWaiting.startsWith("backing off")))
         delete (next as { dispatchBackoff?: unknown }).dispatchBackoff;
+      /**
+       * Commit an adopted item's own uncommitted changes (owns plus
+       * sharedTouch, explicit paths, never secrets) as one commit. Changes
+       * owned by other items sharing the worktree stay for their own
+       * commits; anything else holds the item for the root. Returns true
+       * when the item is held.
+       */
+      const commitAdoptedWork = async (item: (typeof spec.items)[number], record: Record<string, any>, branch: string) => {
+        const worktree = record.worktree as string;
+        const porcelain = await statusOf(worktree).catch(() => "");
+        if (!porcelain.trim()) return false;
+        const owns = (id: string, fallback: string[]) => (next.items[id]?.decided?.owns as string[] | undefined) ?? fallback;
+        const changes = itemOwnedChanges(porcelain, owns(item.id, item.owns), item.sharedTouch);
+        const siblings = spec.items.filter((other) => other.id !== item.id && next.items[other.id]?.worktree === worktree);
+        const siblingPaths = new Set(siblings.flatMap((other) => itemOwnedChanges(porcelain, owns(other.id, other.owns), other.sharedTouch).paths));
+        const outside = changes.outside.filter((path) => !siblingPaths.has(path));
+        const hold = (note: string, reason: string) => {
+          Object.assign(record, { state: "blocked", blockedReason: "human-gate", note, since: use.now() });
+          record.history = [...(record.history ?? []), { at: use.now(), from: "reviewing", to: "blocked", note }];
+          step.rootAsks.push({ itemId: item.id, reason });
+          done.push(`review ${item.id} held: ${note}`);
+          return true;
+        };
+        if (outside.length) {
+          const files = outside.slice(0, 20).join(", ") + (outside.length > 20 ? `, and ${outside.length - 20} more` : "");
+          return hold(
+            `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
+            `${item.id}: ${worktree} has uncommitted changes that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to reviewing.`,
+          );
+        }
+        if (!changes.paths.length) return false;
+        const message = `spec ${item.id}: adopt work as built`;
+        try {
+          const sha = await (ports?.commit ??
+            (async (input: { worktree: string; paths: string[]; message: string }) => {
+              await execFile("git", ["-C", input.worktree, "add", "--", ...input.paths], { timeout: 60_000 });
+              await execFile("git", ["-C", input.worktree, "commit", "-m", input.message, "--", ...input.paths], { timeout: 120_000 });
+              return (await execFile("git", ["-C", input.worktree, "rev-parse", "HEAD"], { timeout: 30_000 })).stdout.trim();
+            }))({ worktree, paths: changes.paths, message });
+          record.adoptCommit = { sha, paths: changes.paths, at: use.now() };
+          done.push(`committed ${changes.paths.length} adopted path(s) for ${item.id} on ${branch}`);
+          return false;
+        } catch (error) {
+          return hold(
+            `committing the adopted work failed: ${clip((error as Error).message, 300)}`,
+            `${item.id}: committing its adopted work in ${worktree} failed (${clip((error as Error).message, 200)}); commit it by hand and set the item back to reviewing.`,
+          );
+        }
+      };
       let shellTimeout = false;
       for (const action of step.actions) {
         const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
@@ -4776,6 +4833,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 step.rootAsks.push({ itemId: item.id, reason: `${item.id}: the review profile must differ from ${against}` });
                 continue;
               }
+            }
+            // Adopted work is often uncommitted: commit this item's own
+            // changes on its branch first, so the reviewer reads a real diff
+            // (a local commit under the integrate grant).
+            if (record.adopted && record.worktree) {
+              const held = await commitAdoptedWork(item, record, branch);
+              if (held) continue;
             }
             objective = reviewObjective(spec, item, { branch, buildSummary: record.buildSummary });
           }
@@ -6523,8 +6587,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     cwd: string,
     expectedWorkspaceId?: string,
     signal?: AbortSignal,
+    options: { allowDirty?: boolean } = {},
   ): Promise<WorktreeBinding> {
-    const checkoutPath = await assertCleanLocalWorktree(cwd, signal);
+    const checkoutPath = await assertCleanLocalWorktree(cwd, signal, options);
     const worktreeList = responseRecord(
       await runHerdr(["worktree", "list", "--cwd", checkoutPath], signal),
       "worktree list",
@@ -6876,8 +6941,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "A worktree workflow may use multiple lanes only when every lane declares readOnly: true.",
       );
+    // Read-only lanes (review, decide) may use a dirty worktree; writers need it clean.
     const worktreeBinding = target.worktree
-      ? await inspectWorktreeForWorkspace(target.worktree)
+      ? await inspectWorktreeForWorkspace(target.worktree, undefined, undefined, {
+          allowDirty: lanes.length > 0 && lanes.every((lane) => lane.readOnly),
+        })
       : undefined;
     requireRootGoalExecutor();
     const root = await currentPaneRoot();

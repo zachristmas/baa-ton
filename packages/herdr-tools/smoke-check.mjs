@@ -1183,6 +1183,23 @@ try {
     policyAck.details.ack.hash,
     "later manifest writes keep the policy acknowledgement",
   );
+  // Read-only lanes (spec review, decide) never write, so they may plan into
+  // a dirty worktree; a writer still needs it clean (checked above).
+  worktreeClean = false;
+  const readOnlyPlan = await tools.get("herdr_plan").execute(
+    "dirty-read-only",
+    { objective: "review dirty work", worktreeCwd: dirtyWorktreeCwd, lanes: [{ objective: "review it", readOnly: true }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(readOnlyPlan.content[0].text, /^Planned /, "read-only lanes may use a dirty worktree");
+  await assert.rejects(
+    tools.get("herdr_plan").execute("dirty-writer", { objective: "write dirty", worktreeCwd: dirtyWorktreeCwd, lanes: [{ objective: "write it" }] }, undefined, undefined, ctx),
+    /worktreeCwd must be clean/,
+    "a writer lane still needs a clean worktree",
+  );
+  worktreeClean = true;
 } finally {
   if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
   else process.env.HERDR_ENV = previousHerdrEnv;
