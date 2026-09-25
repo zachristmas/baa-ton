@@ -472,6 +472,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch}. Local only: never push, and never touch any other branch.`,
+    "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
     "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then what you changed and the suite output for a failure.",
   ].filter(Boolean).join("\n");
 }
