@@ -1200,6 +1200,23 @@ try {
     "a writer lane still needs a clean worktree",
   );
   worktreeClean = true;
+  // A worktree Herdr already has open in another workspace: the lanes join
+  // that workspace as new tabs instead of the plan failing.
+  const previousOpen = openWorktreeWorkspaceId;
+  openWorktreeWorkspaceId = "w-held-elsewhere";
+  const elsewhere = await tools.get("herdr_plan").execute(
+    "open-elsewhere",
+    { objective: "review held worktree", worktreeCwd: dirtyWorktreeCwd, lanes: [{ objective: "review it", readOnly: true }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const elsewhereId = /^Planned (\S+) /.exec(elsewhere.content[0].text)?.[1];
+  const planned = JSON.parse(await readFile(manifestPath, "utf8")).workflows.find((item) => item.id === elsewhereId);
+  assert.equal(planned.laneWorkspaceId, "w-held-elsewhere", "the lanes' workspace is recorded");
+  assert.equal(planned.taskBinding.workspaceId, rootWorkspaceId, "the task binding stays with the root");
+  assert.ok(planned.evidence.some((entry) => entry.kind === "worktree-open-elsewhere"));
+  openWorktreeWorkspaceId = previousOpen;
 } finally {
   if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
   else process.env.HERDR_ENV = previousHerdrEnv;

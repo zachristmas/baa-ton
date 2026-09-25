@@ -441,6 +441,8 @@ export type Lane = {
   id: string;
   objective: string;
   readOnly: boolean;
+  /** The Herdr workspace holding this lane's tab. */
+  workspaceId?: string;
   /** The spec-loop stage this lane runs (see LaneInput.specStage). */
   specStage?: "decide" | "build" | "review" | "integrate" | "verify";
   agentKind: AgentKind;
@@ -573,6 +575,10 @@ export type Workflow = {
   cwd: string;
   worktree: string | null;
   worktreeBinding?: WorktreeBinding;
+  /** Where the lanes' tabs live when that differs from the task workspace:
+   * a worktree already open in another Herdr workspace (Herdr opens a
+   * worktree in one workspace only), so lanes join it as new tabs. */
+  laneWorkspaceId?: string;
   evidence: LedgerEventRecord[];
   ownership: {
     createdBy: "herdr-orchestrator";
