@@ -23,3 +23,9 @@ export function classifyLocalValidation(
   command: string,
   options?: { cwd?: string; leasedPorts?: number[] },
 ): { matched: true; classes: string[] } | { matched: false; reason: string };
+
+export function laneConfinedVerdict(
+  toolName: string,
+  toolInput: Record<string, unknown> | undefined,
+  options?: { cwd?: string },
+): { allow: boolean; reason: string };

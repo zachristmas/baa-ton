@@ -20,9 +20,10 @@
  * Usage: node known-safe-hook.mjs [--log <file>] [--options <json>]
  *          [--bridge <mcp-server.mjs> --intent <startup intent>] [--wait-seconds <n>] [--poll-ms <n>]
  */
+import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { classifyCommand } from "./known-safe.mjs";
+import { classifyCommand, laneConfinedVerdict } from "./known-safe.mjs";
 import { bridgeClient, DEFAULT_WAIT_MS, routePermission } from "./permission-route.mjs";
 
 export function decide(input, options = {}) {
@@ -35,6 +36,56 @@ export function decide(input, options = {}) {
 }
 
 const INTERACTIVE_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+/**
+ * Facts the classifier needs about the session's own worktree, read with
+ * git only for git and gh commands: its current branch (the one it may push
+ * and open PRs for), its origin repository, whether tracked files are clean,
+ * and the state of any branch a `checkout -B` would reset.
+ */
+export function worktreeFacts(cwd, command, git = (args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] })) {
+  if (!cwd || !/(^|[\s;&|(])(git|gh)\s/.test(String(command))) return {};
+  const facts = {};
+  const quiet = (args) => {
+    try {
+      return git(args).trim();
+    } catch {
+      return undefined;
+    }
+  };
+  const branch = quiet(["branch", "--show-current"]);
+  if (branch && !["main", "master"].includes(branch)) facts.ownBranch = branch;
+  const url = quiet(["remote", "get-url", "origin"]);
+  const repo = url && /[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(url)?.[1];
+  if (repo) facts.mergeRepo = repo;
+  const status = quiet(["status", "--porcelain", "--untracked-files=no"]);
+  if (status !== undefined) facts.worktreeClean = status === "";
+  const states = {};
+  for (const match of String(command).matchAll(/checkout (?:-q )?-B (\S+) origin\/main/g)) {
+    const name = match[1];
+    if (quiet(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`]) === undefined) states[name] = "missing";
+    else {
+      try {
+        git(["merge-base", "--is-ancestor", `refs/heads/${name}`, "origin/main"]);
+        states[name] = "merged";
+      } catch {
+        states[name] = "unmerged";
+      }
+    }
+  }
+  if (Object.keys(states).length) facts.branchStates = states;
+  return facts;
+}
+
+/** The unattended default once nobody answered: allow inside the lane, deny outside. */
+export function policyDefault(input, waitedSeconds) {
+  const verdict = laneConfinedVerdict(input.tool_name, isRecord(input.tool_input) ? input.tool_input : {}, { cwd: input.cwd });
+  if (verdict.allow) return { behavior: "allow" };
+  return {
+    behavior: "deny",
+    message: `Denied by the unattended policy (no answer within ${waitedSeconds} s): ${verdict.reason}. Stay inside your worktree and scratch, or ask the root with herdr_request and continue with other work meanwhile.`,
+  };
+}
 
 function argument(name) {
   const index = process.argv.lastIndexOf(name);
@@ -65,6 +116,8 @@ async function main() {
     return;
   }
   if (input?.hook_event_name && input.hook_event_name !== "PermissionRequest") return;
+  // Explicit options win over what the worktree says.
+  if (input?.tool_name === "Bash") options = { ...worktreeFacts(input.cwd, input.tool_input?.command), ...options };
   const known = decide(input, options);
   if (known?.output) {
     audit({ sessionId: input.session_id, decision: "allow", rules: known.result.rules, command: input.tool_input.command });
@@ -77,28 +130,44 @@ async function main() {
   // Tools that need the person's own answer are never routed.
   if (INTERACTIVE_TOOLS.has(input.tool_name)) return;
   const seconds = Number(argument("--wait-seconds"));
-  const client = bridgeClient({
+  const waitedSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_WAIT_MS / 1000;
+  // A lane never sits on a pane prompt: with no answer (or no route), the
+  // unattended policy decides.
+  const fallBack = (reason) => {
+    const decision = policyDefault(input, waitedSeconds);
+    audit({ sessionId: input.session_id, decision: `policy-${decision.behavior}`, reason, tool: input.tool_name, ...(input.tool_name === "Bash" ? { command: input.tool_input?.command } : {}) });
+    process.stdout.write(JSON.stringify(output(decision)));
+  };
+  let client;
+  try {
+    client = bridgeClient({
     bridge,
     env: { ...process.env, HERDR_ENV: "1", BAA_STARTUP_INTENT: intent, BAA_TON_NO_RUNTIME_RECORDS: "1" },
-  });
+    });
+  } catch (error) {
+    return fallBack(`no route to the root: ${error?.message ?? error}`);
+  }
   try {
     const routed = await routePermission({
       call: client.call,
       toolName: input.tool_name,
       input: isRecord(input.tool_input) ? input.tool_input : {},
-      waitMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : DEFAULT_WAIT_MS,
+      waitMs: waitedSeconds * 1000,
       ...(Number(argument("--poll-ms")) > 0 ? { pollMs: Number(argument("--poll-ms")) } : {}),
     });
+    if (!routed.decision) return fallBack(routed.reason ?? "no answer");
     audit({
       sessionId: input.session_id,
-      decision: routed.decision?.behavior ?? "prompt",
+      decision: routed.decision.behavior,
       requestId: routed.request?.id,
       answeredBy: routed.request?.answeredBy,
       ...(routed.reason ? { reason: routed.reason } : {}),
       tool: input.tool_name,
       ...(input.tool_name === "Bash" ? { command: input.tool_input?.command } : {}),
     });
-    if (routed.decision) process.stdout.write(JSON.stringify(output(routed.decision)));
+    process.stdout.write(JSON.stringify(output(routed.decision)));
+  } catch (error) {
+    return fallBack(`routing failed: ${error?.message ?? error}`);
   } finally {
     client.close();
   }

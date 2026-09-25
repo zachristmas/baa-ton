@@ -126,8 +126,13 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
     assert.equal(decision.behavior, "deny");
     assert.match(decision.message, /request-9: not on a shared database/);
 
+    // No answer: the unattended policy decides instead of leaving a pane prompt.
     const timedOut = run("Bash", { command: "docker compose up -d db" }, "open", ["--wait-seconds", "0"]);
-    assert.equal(timedOut.stdout, "", "no answer: the normal prompt shows");
+    const denied2 = JSON.parse(timedOut.stdout).hookSpecificOutput.decision;
+    assert.equal(denied2.behavior, "deny");
+    assert.match(denied2.message, /unattended policy \(no answer within 0 s\): `docker` reaches outside the lane[\s\S]*herdr_request/);
+    const confined = run("Bash", { command: `pnpm --filter web build > ${directory}/build.log` }, "open", ["--wait-seconds", "0"]);
+    assert.deepEqual(JSON.parse(confined.stdout).hookSpecificOutput.decision, { behavior: "allow" }, "a command inside the lane's worktree is allowed");
 
     const question = run("AskUserQuestion", { questions: [] }, "granted");
     assert.equal(question.stdout, "", "interactive tools are never routed");
@@ -135,7 +140,7 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
     const audit = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.deepEqual(
       audit.map((entry) => [entry.decision, entry.requestId, entry.tool]),
-      [["allow", "request-9", "Bash"], ["deny", "request-9", "mcp__other__tool"], ["prompt", "request-9", "Bash"]],
+      [["allow", "request-9", "Bash"], ["deny", "request-9", "mcp__other__tool"], ["policy-deny", undefined, "Bash"], ["policy-allow", undefined, "Bash"]],
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

@@ -165,7 +165,7 @@ export const KNOWN_SAFE_HOOK = fileURLToPath(new URL("./known-safe-hook.mjs", im
 /** Audit log of the hook's decisions, next to the manifest. */
 export const KNOWN_SAFE_LOG = "known-safe-approvals.jsonl";
 /** How long a routed prompt waits for the root before the normal prompt shows. */
-export const PERMISSION_ROUTE_WAIT_SECONDS = 600;
+export const PERMISSION_ROUTE_WAIT_SECONDS = 300;
 
 /** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
 export const LANE_AUTO_MODE_ALLOW =

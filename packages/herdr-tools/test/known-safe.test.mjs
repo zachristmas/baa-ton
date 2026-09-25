@@ -92,7 +92,7 @@ test("git branch operations on a feature branch", () => {
   allowed("git fetch -q origin && git checkout -q -b feature/new-thing origin/main", {}, "git-create-branch");
   allowed("git checkout -q --detach origin/main", {}, "git-detach-origin-main");
   deferred("git checkout -q -b main origin/main", {}, /branch name main/);
-  deferred("git checkout -B feature/x origin/main", {}, /force/);
+  deferred("git checkout -B feature/x origin/main", {}, /needs a clean worktree/);
   deferred("git reset --hard origin/main", {}, /hard reset/);
   deferred("git checkout -f feature/x", {}, /force/);
 });
@@ -233,5 +233,134 @@ test("local validation excludes package edits, shared services, releases and esc
     const result = classifyLocalValidation(command, options);
     assert.equal(result.matched, false, command);
     assert.match(result.reason, reason, command);
+  }
+});
+
+const WT = "/work/lane";
+
+test("rm of files the same command created with >, touch or cp", () => {
+  allowed("git log -1 > out.txt && wc -l out.txt; rm -f out.txt", {}, "rm-created-file");
+  allowed("touch marker.txt && ls; rm marker.txt", {}, "rm-created-file");
+  allowed("cp src/a.ts a.bak && diff a.bak src/a.ts; rm -f a.bak", {}, "rm-created-file");
+  deferred("git log -1 >> log.txt; rm -f log.txt", {}, /not a known-safe/, "an append does not create the file");
+  deferred("touch ../outside.txt; rm -f ../outside.txt", {}, /\.\./);
+  deferred("cp a.ts /etc/a.ts; rm -f /etc/a.ts", {}, /not a known-safe/);
+  deferred("rm -f other.txt", {}, /not a known-safe target/);
+});
+
+test("rm through variables set once to a session scratchpad or a subfolder", () => {
+  allowed(`S=${SCRATCH}; echo x > $S/note.txt; rm -f $S/note.txt`, {}, "rm-under-scratchpad-variable");
+  allowed(`R=${SCRATCH}/run-1 && mkdir -p $R && rm -rf "$R"`, {}, "rm-scratchpad-subfolder-variable");
+  deferred(`S=${SCRATCH}; S=/Users/dev; rm -f $S/note.txt`, {}, /not a known-safe target/, "reassigned");
+  deferred(`R=${SCRATCH}/../x; rm -rf "$R"`, {}, /not a known-safe target|\.\./);
+  deferred(`R=${SCRATCH}; rm -rf "$R"`, {}, /not a known-safe target/, "the scratchpad root itself is never removed whole");
+});
+
+test("one named file directly in /tmp, and rmdir", () => {
+  allowed("rm -f /tmp/probe.json", {}, "rm-tmp-file");
+  allowed("rm -f /private/tmp/probe.json", {}, "rm-tmp-file");
+  deferred("rm -f /tmp/*.json", {}, /not a known-safe target/);
+  deferred("rm -f /tmp/dir/file", {}, /not a known-safe target/);
+  deferred("rm -rf /tmp/probe", {}, /not a known-safe target/);
+  allowed("rmdir build/empty", {}, "rmdir-empty");
+  allowed("rmdir -p a/b/c", {}, "rmdir-empty");
+  deferred("rmdir ../x", {}, /\.\./);
+});
+
+test("resetting the lane's own branch at origin/main needs a clean worktree and a missing or merged branch", () => {
+  const clean = { worktreeClean: true, branchStates: { "ink/x": "merged", "ink/new": "missing", "ink/work": "unmerged" } };
+  allowed("git checkout -q -B ink/x origin/main", clean, "git-reset-own-branch");
+  allowed("git checkout -q -B ink/new origin/main", clean, "git-reset-own-branch");
+  deferred("git checkout -q -B ink/work origin/main", clean, /commits not on origin\/main/);
+  deferred("git checkout -q -B ink/x origin/main", { ...clean, worktreeClean: false }, /clean worktree/);
+  deferred("git checkout -q -B main origin/main", clean, /branch name main/);
+});
+
+test("discarding file changes only after saving them to a scratch patch, or for generated artifacts", () => {
+  allowed(`git diff -- src/a.ts > ${SCRATCH}/a.patch && git checkout -- src/a.ts`, { cwd: WT }, "git-discard-after-patch");
+  allowed(`git diff > ${SCRATCH}/all.patch; git checkout -- src/a.ts src/b.ts`, { cwd: WT }, "git-discard-after-patch");
+  deferred(`git diff -- src/a.ts > ${SCRATCH}/a.patch && git checkout -- src/b.ts`, { cwd: WT }, /patch of them saved/);
+  deferred("git checkout -- src/a.ts", { cwd: WT }, /patch of them saved/);
+  deferred(`git diff > ${SCRATCH}/all.patch; git checkout -- .`, { cwd: WT }, /covers the whole tree/);
+  deferred("git diff > /tmp/x.patch; git checkout -- src/a.ts", { cwd: WT }, /redirect|patch of them saved/);
+  allowed("git checkout -- apps/api/openapi-spec.json", { cwd: WT }, "git-revert-generated-artifact");
+  allowed("git restore packages/client/src/api.generated.ts", { cwd: WT }, "git-revert-generated-artifact");
+  deferred("git checkout -- apps/api/openapi-spec.json src/real.ts", { cwd: WT }, /patch of them saved/);
+});
+
+test("the lane-admin PR flow: token export, own-branch push, and PRs by branch name", () => {
+  const flow = { allowOwnBranchPush: true, allowMergeByBranch: true, ownBranch: "ink/fix", mergeRepo: "owner/repo" };
+  allowed("export GH_TOKEN=$(gh auth token --user owner); git push -q -u origin ink/fix 2>&1 | grep -v remote", flow, "git-push-own-branch");
+  allowed('gh pr create -R owner/repo --head ink/fix --base main --title "Fix the thing" --body-file - <<\'EOF\'\nBody; with && characters.\nEOF', flow, "gh-pr-create-own-branch");
+  allowed("gh pr merge ink/fix -R owner/repo --merge && gh pr view ink/fix -R owner/repo --json state,mergeCommit", flow, "gh-merge-by-branch");
+  deferred("git push -q -u origin ink/other", flow, /push target ink\/other/);
+  deferred('gh pr create -R owner/repo --head ink/other --base main --title "x" --body-file -', flow, /own branch/);
+  deferred('gh pr create -R other/repo --head ink/fix --base main --title "x" --body-file -', flow, /own branch/);
+  deferred("gh pr view 73 -R owner/repo", flow, /never a number/);
+  deferred("gh pr merge ink/other -R owner/repo --merge", flow, /branch name ink\/other/);
+  deferred('gh pr create -R owner/repo --head ink/fix --base main --title "x" --body-file -', { ...flow, allowMergeByBranch: false }, /not enabled/);
+});
+
+test("the unattended default allows only what stays inside the lane", async () => {
+  const { laneConfinedVerdict } = await import("../known-safe.mjs");
+  const verdict = (tool, input) => laneConfinedVerdict(tool, input, { cwd: WT });
+  for (const command of ["pnpm --filter web test", `node scripts/gen.mjs ${WT}/out.json > /tmp/gen.log`, `cat ${SCRATCH}/notes.md`, "/usr/bin/env node a.js"])
+    assert.equal(verdict("Bash", { command }).allow, true, command);
+  for (const [command, reason] of [
+    ["curl -s https://example.test", /`curl` reaches outside/],
+    ["git push origin feature/x", /`git push` reaches outside/],
+    ["npm publish", /npm publish/],
+    ["cat /etc/hosts", /\/etc\/hosts is outside/],
+    ["cp a.txt ~/a.txt", /home directory/],
+    ["cat ../sibling/secret.txt", /\.\. path/],
+    ["cp build/x /usr/local/bin/x", /system path \/usr\/local\/bin\/x/],
+    ["sudo make install", /`sudo`/],
+  ])
+    assert.match(verdict("Bash", { command }).reason, reason, command);
+  assert.equal(verdict("Edit", { file_path: `${WT}/src/a.ts` }).allow, true);
+  assert.equal(verdict("Write", { file_path: "/elsewhere/a.ts" }).allow, false);
+  assert.equal(verdict("WebFetch", { url: "https://example.test" }).allow, false);
+});
+
+test("the hook reads its own worktree's branch, repository and cleanliness for the PR flow", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtemp, rm: remove, writeFile: write } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { worktreeFacts, policyDefault } = await import("../known-safe-hook.mjs");
+  const repo = await mkdtemp(join(tmpdir(), "baa-facts-"));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" };
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { env, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    git("init", "-q", "-b", "main");
+    await write(join(repo, "a.txt"), "a");
+    git("add", "a.txt");
+    git("commit", "-q", "-m", "a");
+    git("remote", "add", "origin", "git@github.com:owner/repo.git");
+    git("update-ref", "refs/remotes/origin/main", "HEAD");
+    git("branch", "ink/merged");
+    git("checkout", "-q", "-b", "ink/work");
+    await write(join(repo, "b.txt"), "b");
+    git("add", "b.txt");
+    git("commit", "-q", "-m", "b");
+    const facts = worktreeFacts(repo, "git checkout -q -B ink/merged origin/main; git checkout -q -B ink/work origin/main; git checkout -q -B ink/new origin/main", (args) => git(...args));
+    assert.deepEqual(facts, {
+      ownBranch: "ink/work",
+      mergeRepo: "owner/repo",
+      worktreeClean: true,
+      branchStates: { "ink/merged": "merged", "ink/work": "unmerged", "ink/new": "missing" },
+    });
+    await write(join(repo, "a.txt"), "changed");
+    assert.equal(worktreeFacts(repo, "git status", (args) => git(...args)).worktreeClean, false);
+    assert.deepEqual(worktreeFacts(repo, "ls -la", (args) => git(...args)), {}, "no git or gh: nothing is read");
+    // With those facts the lane-admin flow self-approves, and nothing else does.
+    const options = { ...facts, allowOwnBranchPush: true, allowMergeByBranch: true };
+    allowed("git push -q -u origin ink/work", options, "git-push-own-branch");
+    deferred("git push -q -u origin ink/merged", options, /push target/);
+    allowed("gh pr merge ink/work -R owner/repo --merge", options, "gh-merge-by-branch");
+    deferred("gh pr merge ink/work -R someone/else --merge", options, /repository someone\/else/);
+    assert.equal(policyDefault({ tool_name: "Bash", tool_input: { command: "curl x" }, cwd: repo }, 300).behavior, "deny");
+  } finally {
+    await remove(repo, { recursive: true, force: true });
   }
 });

@@ -224,6 +224,15 @@ A root can stay in one LLM turn for many minutes, so the driver doesn't wait for
 
 Passes never overlap: a trigger during a pass leaves exactly one follow-up pass. A pass that throws backs the timer off, doubling up to 5 minutes. `maxParallel`, the capacity gate, the live memory floor and the shell-timeout backoff all apply inside every pass. Each pass that started something, needed the root, or changed its skip reason is appended to `.baa-ton/herdr-orchestrator/spec-driver.log`. The driver opens no dialog and uses no LLM, so a pass mid-turn is safe.
 
+## Unattended operation
+
+The loop runs with nobody watching panes. Every path by which a lane or the root could wait on a person, and what resolves it:
+
+| Waiting on | Resolved by |
+| --- | --- |
+| A lane's permission prompt for a known-safe command: temp-file removal, `rmdir`, own-branch create or reset, a discard after a scratch patch, a generated-artifact revert, the lane-admin PR flow | The lane's PermissionRequest hook approves it at once (`known-safe.mjs`). |
+| Any other lane permission prompt | Routed to the root as a lane request. A grant or deny reaches the waiting hook. With no answer within 300 s (or no route), the unattended policy decides: allow when the command stays inside the lane's worktree, scratch and `/tmp` with no network, credentials, publishing or system commands; otherwise deny, with a reason the lane can act on. The prompt never falls back to the pane. |
+
 ## Adopting a live run
 
 A run that started before the spec loop already has work: worktrees and branches, local commits, evidence reports, reviews, and legacy workflows still running. On an empty `spec-state.json` the driver would rebuild every item and double-dispatch live ones. So a live run is adopted first:
