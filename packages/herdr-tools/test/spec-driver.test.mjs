@@ -202,7 +202,7 @@ test("per-item push gate, suite failures rebuild, unclear receipts go to the roo
   assert.deepEqual(step.actions.filter((action) => action.itemId === "B"), [{ kind: "integrate", itemId: "B", attempt: 1 }], "a lost integration lane is simply retried");
   assert.equal(step.state.items.B.attempts, 1, "not counted as a build attempt");
   const objective = integrateObjective(s, s.items[1], { integrationBranch: "spec-integration", itemBranch: "spec/B" });
-  assert.match(objective, /git merge --no-ff spec\/B/);
+  assert.match(objective, /git merge --no-ff -m "spec\(B\): integrate" spec\/B/);
   assert.match(objective, /never push/);
   assert.match(objective, /INTEGRATED: <full 40-character SHA/);
 });

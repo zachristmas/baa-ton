@@ -252,6 +252,10 @@ Reviewing adopted work: adopted worktrees are dirty by design, because their wor
 - **Shared worktrees:** in a worktree shared by several items, each item commits its own paths when its review starts, in spec order. The first item claims a shared file; other items' changes are left for their own commits.
 - **Holds:** changes no item owns, or a failed commit (a hook, for example), hold the item for the root with the file list or the error.
 - **Dirty worktrees:** read-only lanes (review, decide) may be planned into a dirty worktree, because they never write. Writer lanes and resume still require a clean one.
+- **Commit headers:** every commit the driver or an integration lane makes uses a conventional header of at most 72 characters: `spec(<id>): adopt work as built`, `spec(<id>): integrate`, `spec(<id>): commit work before integration`. Commitlint's config-conventional accepts these.
+- **What blocks:** only modified or staged tracked files outside `owns`/`sharedTouch` block an adopted item. Untracked files outside the list (lane harness scripts, artifact folders) stay in place, uncommitted, and are listed in the item's history. Secrets are never staged.
+- **Hooks:** the repository's hooks run. The driver stages the explicit paths, checks that nothing else is staged, and commits without a pathspec, so lint-staged can rewrite and re-stage files. If a hook fails, the last ~40 lines of its output (not the command line) go into the item's reason.
+- **Retry after a deploy:** holds a code change may fix (a failed adopt commit, or blocking changes at review or integration) are stamped with the loaded code's fingerprint. They retry once, back to the stage they were in, on the first pass after new code loads. Holds recorded before stamping existed are recognized by their note.
 
 Memory-aware dispatch: besides a waiting capacity gate, the driver samples free memory and swap before dispatching when `defaults.minFreeMemoryGb` or `defaults.maxSwapUsedGb` is set. After a dispatch fails with "shell did not become ready", it starts nothing else that pass and backs off for 10 minutes. Retries of an undispatched stage honor the same hold.
 

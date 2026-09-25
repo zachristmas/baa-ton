@@ -148,7 +148,7 @@ import {
   verifySpec,
 } from "./spec.mjs";
 import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
-import { adoptSpec, adoptionTable, itemOwnedChanges } from "./spec-adopt.mjs";
+import { adoptSpec, adoptionTable, failureOutput, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
@@ -4560,6 +4560,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
+    /** The loaded code's fingerprint (holds retry once it changes). */
+    codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
     commit?(input: { worktree: string; paths: string[]; message: string }): Promise<string>;
     /** Send a root-to-lane message (herdr_tell). */
@@ -4576,6 +4578,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   };
 
   let specDriverRunning = false;
+  /** Holds a code change may fix; they retry once after a deploy. */
+  const SPEC_DEPLOY_RETRY_CAUSES = new Set(["adopt-commit", "tracked-outside", "integrate-outside"]);
+
+  /**
+   * Stage exactly `paths` and commit them with the repository's hooks
+   * running (lint-staged may rewrite staged files). Committing without a
+   * pathspec keeps lint-staged working, so first make sure nothing else is
+   * staged. Returns the new commit's SHA.
+   */
+  async function commitExactPaths(input: { worktree: string; paths: string[]; message: string }): Promise<string> {
+    const git = (args: string[], timeout = 60_000) => execFile("git", ["-C", input.worktree, ...args], { timeout, maxBuffer: 8 * 1024 * 1024 });
+    await git(["add", "--", ...input.paths]);
+    const staged = (await git(["diff", "--cached", "--name-only"])).stdout.split("\n").filter(Boolean);
+    const extra = staged.filter((path) => !input.paths.includes(path));
+    if (extra.length) throw Object.assign(new Error("other files are staged"), { stderr: `Other files are already staged; not committing them: ${extra.join(", ")}` });
+    await git(["commit", "-m", input.message], 300_000);
+    return (await git(["rev-parse", "HEAD"])).stdout.trim();
+  }
   /** How long the driver starts no new lanes after a shell failed to start. */
   const SPEC_SHELL_BACKOFF_MS = 10 * 60_000;
 
@@ -4676,6 +4696,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             capacityWaiting = `swap used ${current.swapUsedGb} GB is above ${spec.defaults.maxSwapUsedGb} GB`;
         }
       }
+      const codeVersion = ports?.codeVersion ?? LOADED_CODE.fingerprint;
+      // Items held for a cause a deploy may fix (commit rules, hooks, the
+      // untracked-files rule) retry once on the first pass under new code.
+      // Holds recorded before causes were stamped are recognized by note.
+      for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, Record<string, any>]>) {
+        if (record.state !== "blocked" || record.blockedReason !== "human-gate") continue;
+        const retryable =
+          SPEC_DEPLOY_RETRY_CAUSES.has(record.blockedCause) ||
+          (!record.blockedCause && /^(committing the adopted work failed|uncommitted changes outside the item's owns)/.test(record.note ?? ""));
+        if (!retryable || record.blockedByCode === codeVersion) continue;
+        const resume = [...(record.history ?? [])].reverse().find((entry: { to?: string; from?: string }) => entry.to === "blocked")?.from;
+        if (resume !== "reviewing" && resume !== "integrating") continue;
+        record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: resume, note: "retried after a deploy" }];
+        Object.assign(record, { state: resume, since: use.now() });
+        for (const key of ["blockedReason", "blockedCause", "blockedByCode", "note", "lane"]) delete record[key];
+        void id;
+      }
       // Worktrees with uncommitted changes, for lanes whose pane is gone: their
       // retry in the same worktree does not count as a build attempt.
       const statusOf =
@@ -4716,37 +4753,44 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const changes = itemOwnedChanges(porcelain, owns(item.id, item.owns), item.sharedTouch);
         const siblings = spec.items.filter((other) => other.id !== item.id && next.items[other.id]?.worktree === worktree);
         const siblingPaths = new Set(siblings.flatMap((other) => itemOwnedChanges(porcelain, owns(other.id, other.owns), other.sharedTouch).paths));
+        // Only modified tracked files block; untracked files beyond the list
+        // (lane harness scripts, artifact folders) stay in place, uncommitted.
         const outside = changes.outside.filter((path) => !siblingPaths.has(path));
-        const hold = (note: string, reason: string) => {
-          Object.assign(record, { state: "blocked", blockedReason: "human-gate", note, since: use.now() });
+        const untracked = changes.untracked.filter((path) => !siblingPaths.has(path));
+        const hold = (note: string, reason: string, cause: string) => {
+          Object.assign(record, { state: "blocked", blockedReason: "human-gate", blockedCause: cause, blockedByCode: codeVersion, note, since: use.now() });
           record.history = [...(record.history ?? []), { at: use.now(), from: "reviewing", to: "blocked", note }];
           step.rootAsks.push({ itemId: item.id, reason });
-          done.push(`review ${item.id} held: ${note}`);
+          done.push(`review ${item.id} held: ${note.split("\n")[0]}`);
           return true;
         };
         if (outside.length) {
           const files = outside.slice(0, 20).join(", ") + (outside.length > 20 ? `, and ${outside.length - 20} more` : "");
           return hold(
             `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
-            `${item.id}: ${worktree} has uncommitted changes that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to reviewing.`,
+            `${item.id}: ${worktree} has modified tracked files that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to reviewing.`,
+            "tracked-outside",
           );
         }
+        if (untracked.length)
+          record.history = [
+            ...(record.history ?? []),
+            { at: use.now(), from: "reviewing", to: "reviewing", note: `left untracked, uncommitted: ${untracked.slice(0, 20).join(", ")}${untracked.length > 20 ? `, and ${untracked.length - 20} more` : ""}` },
+          ];
         if (!changes.paths.length) return false;
-        const message = `spec ${item.id}: adopt work as built`;
+        const message = specCommitMessage(item.id, "adopt work as built");
         try {
-          const sha = await (ports?.commit ??
-            (async (input: { worktree: string; paths: string[]; message: string }) => {
-              await execFile("git", ["-C", input.worktree, "add", "--", ...input.paths], { timeout: 60_000 });
-              await execFile("git", ["-C", input.worktree, "commit", "-m", input.message, "--", ...input.paths], { timeout: 120_000 });
-              return (await execFile("git", ["-C", input.worktree, "rev-parse", "HEAD"], { timeout: 30_000 })).stdout.trim();
-            }))({ worktree, paths: changes.paths, message });
+          const sha = await (ports?.commit ?? commitExactPaths)({ worktree, paths: changes.paths, message });
           record.adoptCommit = { sha, paths: changes.paths, at: use.now() };
           done.push(`committed ${changes.paths.length} adopted path(s) for ${item.id} on ${branch}`);
           return false;
         } catch (error) {
+          // The hook's own output (commitlint, lint-staged, eslint), not the command line.
+          const output = failureOutput(error);
           return hold(
-            `committing the adopted work failed: ${clip((error as Error).message, 300)}`,
-            `${item.id}: committing its adopted work in ${worktree} failed (${clip((error as Error).message, 200)}); commit it by hand and set the item back to reviewing.`,
+            `committing the adopted work failed:\n${output}`,
+            `${item.id}: committing its adopted work in ${worktree} failed. Hook output:\n${output}\nFix the cause and it retries after the next deploy, or commit it by hand and set the item back to reviewing.`,
+            "adopt-commit",
           );
         }
       };
@@ -4803,18 +4847,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 Object.assign(record, {
                   state: "blocked",
                   blockedReason: "human-gate",
+                  blockedCause: "integrate-outside",
+                  blockedByCode: codeVersion,
                   note: `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
                   since: use.now(),
                 });
                 record.history = [...(record.history ?? []), { at: use.now(), from: "integrating", to: "blocked", note: "uncommitted changes outside its files" }];
                 step.rootAsks.push({
                   itemId: item.id,
-                  reason: `${item.id}: ${record.worktree} has uncommitted changes outside the item's owns and sharedTouch (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to integrating.`,
+                  reason: `${item.id}: ${record.worktree} has modified tracked files outside the item's owns and sharedTouch (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to integrating.`,
                 });
                 done.push(`integrate ${item.id} held: uncommitted changes outside its files`);
                 continue;
               }
-              if (changes.paths.length || changes.secrets.length) commitFirst = { worktree: record.worktree, paths: changes.paths, secrets: changes.secrets };
+              if (changes.untracked.length)
+                record.history = [
+                  ...(record.history ?? []),
+                  { at: use.now(), from: "integrating", to: "integrating", note: `left untracked, uncommitted: ${changes.untracked.slice(0, 20).join(", ")}${changes.untracked.length > 20 ? `, and ${changes.untracked.length - 20} more` : ""}` },
+                ];
+              if (changes.paths.length || changes.secrets.length || changes.untracked.length)
+                commitFirst = { worktree: record.worktree, paths: changes.paths, secrets: changes.secrets, untracked: changes.untracked };
             }
             objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch, commitFirst });
           } else if (action.kind === "build") {

@@ -243,7 +243,7 @@ test("integration: one merge lane on spec-integration, then a push prompt, then 
     assert.equal(merge.taskProfile, "balanced");
     assert.equal(merge.readOnly, false);
     assert.match(merge.worktree, /spec-integration$/);
-    assert.match(merge.laneObjective, /git merge --no-ff spec\/A/);
+    assert.match(merge.laneObjective, /git merge --no-ff -m "spec\(A\): integrate" spec\/A/);
     const integration = f.calls.worktree.find((call) => call.branch === "spec-integration");
     assert.equal(integration.base, "refs/remotes/origin/feature/release");
     assert.match(integration.path, /spec-integration$/);
@@ -452,7 +452,7 @@ test("integrating adopted work: the lane commits exactly the item-owned paths fi
     await f.advance();
     const merge = f.calls.plan[0];
     assert.equal(merge.specStage, "integrate");
-    assert.match(merge.laneObjective, /git merge --no-ff demo\/acc/, "integrates from the adopted branch");
+    assert.match(merge.laneObjective, /git merge --no-ff -m "spec\(ACC\): integrate" demo\/acc/, "integrates from the adopted branch");
     assert.match(
       merge.laneObjective,
       /git -C \/work\/wt-acc add -- "src\/acc\/rules\.ts" "src\/acc\/new\.test\.ts" "db\/migrations\/meta\/_journal\.json" && git -C \/work\/wt-acc commit/,
@@ -529,20 +529,20 @@ test("an adopted branch with uncommitted changes outside its files, or with no o
   });
   try {
     f.ports.status = async (worktree) =>
-      worktree === "/work/wt-mix" ? " M src/mix/a.ts\n?? artifacts/run/screenshot.png\n M src/other.ts" : "?? artifacts/run/trace.zip";
+      worktree === "/work/wt-mix" ? " M src/mix/a.ts\n?? artifacts/run/screenshot.png\n M src/other.ts" : " M lib/shared.ts\n?? artifacts/run/trace.zip";
     const first = await f.advance();
     assert.match(first.content[0].text, /integrate MIX held: uncommitted changes outside its files/);
     let state = await f.state();
     assert.equal(state.items.MIX.state, "blocked");
-    assert.match(state.items.MIX.note, /artifacts\/run\/screenshot\.png, src\/other\.ts/);
+    assert.match(state.items.MIX.note, /outside the item's owns and sharedTouch: src\/other\.ts$/, "only the tracked change blocks; the untracked artifact does not");
     // With MIX held, NONE is next in the queue on the following pass.
     await f.advance();
     state = await f.state();
     assert.equal(state.items.NONE.state, "blocked", "no owns: commit nothing and ask the root");
     assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0, "nothing was merged");
     const asks = (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-needs-root").map((alert) => alert.text);
-    assert.ok(asks.some((text) => /MIX: \/work\/wt-mix has uncommitted changes outside/.test(text)));
-    assert.ok(asks.some((text) => /NONE: \/work\/wt-none has uncommitted changes outside[\s\S]*artifacts\/run\/trace\.zip/.test(text)));
+    assert.ok(asks.some((text) => /MIX: \/work\/wt-mix has modified tracked files outside/.test(text)));
+    assert.ok(asks.some((text) => /NONE: \/work\/wt-none has modified tracked files outside[\s\S]*lib\/shared\.ts/.test(text)));
   } finally {
     await f.cleanup();
   }
@@ -777,8 +777,8 @@ test("before an adopted review, each item's own changes are committed on its bra
     };
     await f.advance();
     assert.deepEqual(commits, [
-      { worktree: shared, paths: ["src/a/one.ts", "src/a/two.ts", "db/journal.json"], message: "spec A: adopt work as built" },
-      { worktree: shared, paths: ["src/b/three.ts"], message: "spec B: adopt work as built" },
+      { worktree: shared, paths: ["src/a/one.ts", "src/a/two.ts", "db/journal.json"], message: "spec(A): adopt work as built" },
+      { worktree: shared, paths: ["src/b/three.ts"], message: "spec(B): adopt work as built" },
     ], "A first (it claims the shared journal), then B; the secret stays uncommitted");
     const reviews = f.calls.plan.filter((call) => call.specStage === "review");
     assert.deepEqual(reviews.map((call) => [call.worktree, call.readOnly]), [[shared, true], [shared, true]]);
@@ -809,20 +809,110 @@ test("an adopted review is held when the worktree has changes no item owns, or t
     },
   });
   try {
-    f.ports.status = async (worktree) => (worktree === "/work/wt-a" ? " M src/a/x.ts\n?? artifacts/run/log.txt" : " M src/c/y.ts");
+    f.ports.status = async (worktree) => (worktree === "/work/wt-a" ? " M src/a/x.ts\n M lib/stray.ts\n?? artifacts/run/log.txt" : " M src/c/y.ts");
     const commits = [];
+    const hookLines = Array.from({ length: 50 }, (_, index) => `lint line ${index + 1}`);
     f.ports.commit = async (input) => {
       commits.push(input);
-      throw new Error("pre-commit hook failed");
+      throw Object.assign(new Error(`Command failed: git -C /work/wt-c commit -m ${input.message}`), {
+        stderr: `${hookLines.join("\n")}\n⧗   input: spec(C): adopt work as built\n✖   subject may not be empty [subject-empty]\nhusky - commit-msg script failed (code 1)\n`,
+      });
     };
     const result = await f.advance();
-    assert.match(result.content[0].text, /review A held: uncommitted changes outside the item's owns and sharedTouch: artifacts\/run\/log\.txt/);
-    assert.match(result.content[0].text, /review C held: committing the adopted work failed: pre-commit hook failed/);
+    assert.match(result.content[0].text, /review A held: uncommitted changes outside the item's owns and sharedTouch: lib\/stray\.ts/);
+    assert.match(result.content[0].text, /review C held: committing the adopted work failed:/);
+    const noteC = (await f.state()).items.C.note;
+    assert.match(noteC, /husky - commit-msg script failed \(code 1\)/, "the hook's own output reaches the root");
+    assert.doesNotMatch(noteC, /Command failed: git/, "not the command line");
+    assert.doesNotMatch(noteC, /lint line 1\n/, "only the last ~40 lines");
+    assert.match(noteC, /lint line 50/);
     assert.deepEqual(commits.map((input) => input.worktree), ["/work/wt-c"], "nothing is committed for A");
     const state = await f.state();
     assert.deepEqual([state.items.A.state, state.items.C.state], ["blocked", "blocked"]);
     assert.equal(f.calls.plan.length, 0, "no review lane for a held item");
   } finally {
     await f.cleanup();
+  }
+});
+
+test("holds a deploy may fix retry once on the first pass under new code", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: ["OLD", "LEGACY", "SAME", "OTHER"].map((id) => ({ id, title: id, owns: [`src/${id.toLowerCase()}/**`], acceptance: { text: id } })),
+    },
+    seed: {
+      version: 1,
+      items: {
+        OLD: { state: "blocked", blockedReason: "human-gate", blockedCause: "adopt-commit", blockedByCode: "code-old", note: "committing the adopted work failed:\nhook", history: [{ at: "t", from: "reviewing", to: "blocked" }] },
+        LEGACY: { state: "blocked", blockedReason: "human-gate", note: "uncommitted changes outside the item's owns and sharedTouch: x", history: [{ at: "t", from: "integrating", to: "blocked" }] },
+        SAME: { state: "blocked", blockedReason: "human-gate", blockedCause: "adopt-commit", blockedByCode: "code-new", note: "committing the adopted work failed:\nhook", history: [{ at: "t", from: "reviewing", to: "blocked" }] },
+        OTHER: { state: "blocked", blockedReason: "human-gate", note: "review receipt has no VERDICT: PASS or VERDICT: FAIL line", history: [{ at: "t", from: "reviewing", to: "blocked" }] },
+      },
+    },
+  });
+  try {
+    f.ports.codeVersion = "code-new";
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.items.OLD.state, "reviewing", "held under older code: retried");
+    assert.equal(state.items.LEGACY.state, "integrating", "an unstamped hold from before this change is retried too");
+    assert.equal(state.items.SAME.state, "blocked", "held under the current code: stays for the root");
+    assert.equal(state.items.OTHER.state, "blocked", "other human-gate causes are never retried automatically");
+    assert.equal(state.items.OLD.history.at(-1).note, "retried after a deploy");
+    assert.equal(state.items.OLD.blockedCause, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("the real commit path: conventional header, hooks run and may rewrite staged files, untracked files stay", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { chmod, mkdtemp: mkd, readFile: read } = await import("node:fs/promises");
+  const { tmpdir: tmp } = await import("node:os");
+  const repo = await mkd(join(tmp(), "baa-adopt-commit-"));
+  const savedEnv = Object.fromEntries(["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"].map((key) => [key, process.env[key]]));
+  Object.assign(process.env, { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" });
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      stages: { build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
+      items: [{ id: "D05", title: "Adopted", owns: ["src/**"], acceptance: { text: "d" } }],
+    },
+    seed: { version: 1, items: { D05: { state: "reviewing", attempts: 1, worktree: repo, branch: "demo/d05", adopted: { worktree: repo, branch: "demo/d05" } } } },
+  });
+  try {
+    git("init", "-q", "-b", "demo/d05");
+    await mkdir(join(repo, "src"), { recursive: true });
+    await writeFile(join(repo, "src", "a.ts"), "export const a = 1;\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "chore: base");
+    // commitlint-style commit-msg hook (type(scope): subject, no spaces in the type),
+    // and a lint-staged-style pre-commit that rewrites and re-adds staged files.
+    const hooks = join(repo, ".git", "hooks");
+    await writeFile(join(hooks, "commit-msg"), '#!/bin/sh\nhead -1 "$1" | grep -Eq "^[a-z]+(\\([A-Za-z0-9._-]+\\))?: .+" || { echo "subject must be conventional" >&2; exit 1; }\n');
+    await writeFile(join(hooks, "pre-commit"), "#!/bin/sh\nfor f in $(git diff --cached --name-only); do printf '// formatted\\n' >> \"$f\"; git add \"$f\"; done\n");
+    await chmod(join(hooks, "commit-msg"), 0o755);
+    await chmod(join(hooks, "pre-commit"), 0o755);
+    await writeFile(join(repo, "src", "a.ts"), "export const a = 2;\n");
+    await writeFile(join(repo, "harness.sh"), "echo lane-only\n");
+
+    const result = await f.advance();
+    assert.match(result.content[0].text, /committed 1 adopted path\(s\) for D05 on demo\/d05/);
+    assert.equal(git("log", "-1", "--format=%s"), "spec(D05): adopt work as built");
+    assert.match(await read(join(repo, "src", "a.ts"), "utf8"), /\/\/ formatted/, "the pre-commit hook's rewrite is in the commit");
+    assert.equal(git("status", "--porcelain"), "?? harness.sh", "the untracked lane script stays, uncommitted");
+    const state = await f.state();
+    assert.match(state.items.D05.history.map((entry) => entry.note ?? "").join("\n"), /left untracked, uncommitted: harness\.sh/);
+    assert.equal(f.calls.plan.at(-1).specStage, "review");
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv))
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    await f.cleanup();
+    await rm(repo, { recursive: true, force: true });
   }
 });
