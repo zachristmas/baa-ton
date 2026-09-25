@@ -3,17 +3,17 @@ import { test } from "node:test";
 import { baselineResult, compareToBaseline, knownFailures, suiteFailures } from "../spec-baseline.mjs";
 
 test("failures are read per package and task from receipts and common runner outputs", () => {
-  assert.deepEqual(suiteFailures("SUITE: fail\nFAILED: @gsd/ticket-service lint\nFAILED: @gsd/web test\nFAILED: @gsd/web test"), [
-    { package: "@gsd/ticket-service", task: "lint" },
-    { package: "@gsd/web", task: "test" },
+  assert.deepEqual(suiteFailures("SUITE: fail\nFAILED: @acme/ticket-service lint\nFAILED: @acme/web test\nFAILED: @acme/web test"), [
+    { package: "@acme/ticket-service", task: "lint" },
+    { package: "@acme/web", task: "test" },
   ]);
   const turbo = [
-    "\x1b[31m@gsd/ticket-service#lint: command (/r/apps/ticket) /bin/pnpm run lint exited (1)\x1b[0m",
+    "\x1b[31m@acme/ticket-service#lint: command (/r/apps/ticket) /bin/pnpm run lint exited (1)\x1b[0m",
     " Tasks:    40 successful, 42 total",
-    "Failed:    @gsd/ticket-service#lint, @gsd/api-clients#typecheck",
+    "Failed:    @acme/ticket-service#lint, @acme/api-clients#typecheck",
   ].join("\n");
-  assert.deepEqual(suiteFailures(turbo).map((failure) => `${failure.package} ${failure.task}`), ["@gsd/ticket-service lint", "@gsd/api-clients typecheck"]);
-  assert.deepEqual(suiteFailures(" ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @gsd/web@1.0.0 test: `vitest run`"), [{ package: "@gsd/web", task: "test" }]);
+  assert.deepEqual(suiteFailures(turbo).map((failure) => `${failure.package} ${failure.task}`), ["@acme/ticket-service lint", "@acme/api-clients typecheck"]);
+  assert.deepEqual(suiteFailures(" ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @acme/web@1.0.0 test: `vitest run`"), [{ package: "@acme/web", task: "test" }]);
   assert.deepEqual(suiteFailures("✖  nx run ticket-service:lint\n\nFailed tasks:\n\n- ticket-service:lint\n- web:test"), [
     { package: "ticket-service", task: "lint" },
     { package: "web", task: "test" },
@@ -22,12 +22,12 @@ test("failures are read per package and task from receipts and common runner out
 });
 
 test("an integration passes only when every failure is already failing at the baseline", () => {
-  const known = [{ package: "@gsd/ticket-service", task: "lint" }];
-  assert.equal(compareToBaseline([{ package: "@GSD/ticket-service", task: "LINT" }], known).pass, true, "case-insensitive");
-  const mixed = compareToBaseline([{ package: "@gsd/ticket-service", task: "lint" }, { package: "@gsd/web", task: "test" }], known);
+  const known = [{ package: "@acme/ticket-service", task: "lint" }];
+  assert.equal(compareToBaseline([{ package: "@ACME/ticket-service", task: "LINT" }], known).pass, true, "case-insensitive");
+  const mixed = compareToBaseline([{ package: "@acme/ticket-service", task: "lint" }, { package: "@acme/web", task: "test" }], known);
   assert.equal(mixed.pass, false);
-  assert.deepEqual(mixed.fresh, [{ package: "@gsd/web", task: "test" }]);
-  assert.equal(compareToBaseline([{ package: "@gsd/ticket-service", task: "test" }], known).pass, false, "same package, other task");
+  assert.deepEqual(mixed.fresh, [{ package: "@acme/web", task: "test" }]);
+  assert.equal(compareToBaseline([{ package: "@acme/ticket-service", task: "test" }], known).pass, false, "same package, other task");
   assert.equal(compareToBaseline([], known).pass, false, "no parsed failures: nothing to compare");
 });
 

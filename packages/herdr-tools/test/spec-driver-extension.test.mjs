@@ -1309,33 +1309,33 @@ test("the integration gate is baseline-relative: failures the target tip already
     const d03 = state.items.D03.lane;
     // Turborepo output pasted into both receipts: the same three lint errors.
     const turbo = [
-      "@gsd/ticket-service#lint: command (/repo/apps/services/ticket) /usr/bin/pnpm run lint exited (1)",
+      "@acme/ticket-service#lint: command (/repo/apps/services/ticket) /usr/bin/pnpm run lint exited (1)",
       " Tasks:    41 successful, 42 total",
-      "Failed:    @gsd/ticket-service#lint",
+      "Failed:    @acme/ticket-service#lint",
     ].join("\n");
     await receive(f, baselineLane, `BASELINE: ${target}\nSUITE: fail\n${turbo}`, "baseline");
-    await receive(f, d03, `INTEGRATED: ${merged}\nSUITE: fail\nFAILED: @gsd/ticket-service lint`);
+    await receive(f, d03, `INTEGRATED: ${merged}\nSUITE: fail\nFAILED: @acme/ticket-service lint`);
     await f.advance();
     state = await f.state();
-    assert.deepEqual(state.baselines[target].failures, [{ package: "@gsd/ticket-service", task: "lint" }]);
+    assert.deepEqual(state.baselines[target].failures, [{ package: "@acme/ticket-service", task: "lint" }]);
     assert.equal(state.baselineRun, undefined);
     assert.equal(state.items.D03.state, "awaiting-push", "its only failure is the target's own");
-    assert.deepEqual(state.items.D03.integration.baselineFailures, [{ package: "@gsd/ticket-service", task: "lint" }]);
+    assert.deepEqual(state.items.D03.integration.baselineFailures, [{ package: "@acme/ticket-service", task: "lint" }]);
     assert.deepEqual(state.items.D03.tests, [], "no acceptance tests of its own");
     // D04's integration names the known failures, then fails a new task too.
     const d04Plan = f.calls.plan.filter((call) => call.specStage === "integrate").at(-1);
-    assert.match(d04Plan.laneObjective, /already fails these suite tasks at 222222222222 \(its baseline\): @gsd\/ticket-service lint/);
+    assert.match(d04Plan.laneObjective, /already fails these suite tasks at 222222222222 \(its baseline\): @acme\/ticket-service lint/);
     state = await f.state();
     const d04 = state.items.D04.lane;
-    await receive(f, d04, `INTEGRATED: ${"b".repeat(40)}\nSUITE: fail\nFAILED: @gsd/ticket-service lint\nFAILED: @gsd/payment-service test`);
+    await receive(f, d04, `INTEGRATED: ${"b".repeat(40)}\nSUITE: fail\nFAILED: @acme/ticket-service lint\nFAILED: @acme/payment-service test`);
     const result = await f.advance();
     state = await f.state();
     assert.ok(["ready", "building"].includes(state.items.D04.state), "a new failure is a real one: back to its builder");
     assert.equal(state.items.D04.integration, undefined);
-    assert.match(state.items.D04.findings, /tasks the target does not already fail: @gsd\/payment-service test/);
+    assert.match(state.items.D04.findings, /tasks the target does not already fail: @acme\/payment-service test/);
     assert.match(result.content[0].text, /push/i);
     const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
-    assert.ok(alerts.some((alert) => alert.kind === "spec-push-ready" && /known baseline failures, not from these items\): @gsd\/ticket-service lint/.test(alert.text)), "the push ask lists them");
+    assert.ok(alerts.some((alert) => alert.kind === "spec-push-ready" && /known baseline failures, not from these items\): @acme\/ticket-service lint/.test(alert.text)), "the push ask lists them");
   } finally {
     await f.cleanup();
   }
@@ -1353,7 +1353,7 @@ test("with defaults.fixBaseline one lane fixes the baseline first; integrations 
     seed: {
       version: 1,
       items: { D12: { state: "integrating", attempts: 1 } },
-      baselines: { [target]: { suite: "fail", failures: [{ package: "@gsd/ticket-service", task: "lint" }, { package: "@gsd/web", task: "test" }], at: "t" } },
+      baselines: { [target]: { suite: "fail", failures: [{ package: "@acme/ticket-service", task: "lint" }, { package: "@acme/web", task: "test" }], at: "t" } },
     },
   });
   try {
@@ -1362,19 +1362,19 @@ test("with defaults.fixBaseline one lane fixes the baseline first; integrations 
     const fix = f.calls.plan.find((call) => call.objective.startsWith("spec fix-baseline"));
     assert.ok(fix, "one fix-baseline lane");
     assert.equal(fix.specStage, "integrate", "it holds the integration worktree");
-    assert.match(fix.laneObjective, /already fails: @gsd\/ticket-service lint, @gsd\/web test/);
+    assert.match(fix.laneObjective, /already fails: @acme\/ticket-service lint, @acme\/web test/);
     assert.equal(f.calls.plan.filter((call) => call.objective.startsWith("spec D12 integrate")).length, 0, "no integration while it runs");
     assert.match(first.content[0].text, /fixing the target's baseline failures first/);
     let state = await f.state();
     const lane = state.baselineRun.lane;
     // pnpm output: the lint error is fixed, one test failure remains.
-    await receive(f, lane, `INTEGRATED: ${"c".repeat(40)}\nSUITE: fail\n ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @gsd/web@1.0.0 test: \`vitest run\``);
+    await receive(f, lane, `INTEGRATED: ${"c".repeat(40)}\nSUITE: fail\n ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @acme/web@1.0.0 test: \`vitest run\``);
     await f.advance();
     state = await f.state();
-    assert.deepEqual(state.baselines[target].fix.remaining, [{ package: "@gsd/web", task: "test" }]);
+    assert.deepEqual(state.baselines[target].fix.remaining, [{ package: "@acme/web", task: "test" }]);
     const integrate = f.calls.plan.find((call) => call.objective.startsWith("spec D12 integrate"));
     assert.ok(integrate, "then the item integrates");
-    assert.match(integrate.laneObjective, /its baseline\): @gsd\/web test\./);
+    assert.match(integrate.laneObjective, /its baseline\): @acme\/web test\./);
     assert.doesNotMatch(integrate.laneObjective, /ticket-service/, "the fixed failure is no longer known");
   } finally {
     await f.cleanup();
