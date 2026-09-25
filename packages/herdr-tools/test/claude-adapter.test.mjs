@@ -418,3 +418,17 @@ test("every lane, the integration lane included, is denied positional stash drop
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("lanes are denied detaching jobs with disown, nohup or setsid", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-detach-"));
+  try {
+    const adapter = claudeLaunchAdapter({ bridge: "/bridge/mcp-server.mjs", attestHelper: "/bridge/claude-startup-attest.mjs", scratchDirectory: scratch });
+    for (const context of [{}, { allowLocalMerge: true }]) {
+      const args = adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json", ...context });
+      const { permissions } = JSON.parse(await readFile(args[args.indexOf("--settings") + 1], "utf8"));
+      for (const rule of ["Bash(disown:*)", "Bash(nohup:*)", "Bash(setsid:*)"]) assert.ok(permissions.deny.includes(rule), `${rule} (${JSON.stringify(context)})`);
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

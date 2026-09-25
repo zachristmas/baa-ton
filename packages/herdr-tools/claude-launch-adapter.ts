@@ -150,6 +150,12 @@ const LANE_PERMISSIONS = {
     "Bash(git stash drop:*)",
     "Bash(git stash clear:*)",
     "Bash(git stash pop:*)",
+    // Detached jobs are invisible to Herdr and Baa-ton. A long command runs
+    // synchronously with a long timeout, or in the harness's own tracked
+    // background mode (the Bash tool's run_in_background).
+    "Bash(disown:*)",
+    "Bash(nohup:*)",
+    "Bash(setsid:*)",
     "Bash(herdr workspace close:*)",
   ],
 };
