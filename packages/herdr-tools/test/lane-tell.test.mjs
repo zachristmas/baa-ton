@@ -72,6 +72,8 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
   const f = await fixture();
   const prompts = [];
   const status = { "w-tell:p2": "idle", "w-tell:p3": "working" };
+  // What Herdr reports running in each pane (undefined: the fixture default).
+  const agentKind = {};
   const tools = new Map();
   Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w-tell", HERDR_PLUGIN_CONFIG_DIR: f.configDir, HERDR_PANE_ID: f.rootPane });
   extension({
@@ -80,7 +82,7 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
     registerTool: (definition) => tools.set(definition.name, definition),
     async exec(command, args) {
       if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-        return { code: 0, stdout: JSON.stringify({ result: { type: "agent_info", agent: { pane_id: args[2], agent_status: status[args[2]] } } }), stderr: "" };
+        return { code: 0, stdout: JSON.stringify({ result: { type: "agent_info", agent: { agent: agentKind[args[2]] ?? "pi", pane_id: args[2], agent_status: status[args[2]] } } }), stderr: "" };
       if (command === "herdr" && args[0] === "agent" && args[1] === "prompt") {
         prompts.push({ pane: args[2], text: args[3] });
         return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
@@ -124,6 +126,19 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
     assert.equal(answered.details.request.answerDelivery.status, "pending");
     assert.match(answered.details.request.answerDelivery.text, /^\[Baa-ton request answer\] request-q1: granted\. approval: May I reset my lane database\?\. Yes, your own database only\.$/);
     assert.equal(prompts.length, 1, "the answer waits for the lane to go idle");
+
+    // The lane's agent exited and its pane holds a shell, or a different
+    // agent now runs there: nothing is typed, the message stays pending.
+    const typedBefore = prompts.length;
+    agentKind["w-tell:p2"] = "";
+    const shell = await tell({ workflowId: "herdr-tell0001", laneId: "lane-idle", text: "Are you there?" });
+    assert.equal(shell.details.message.delivery.status, "pending");
+    assert.match(shell.details.message.delivery.reason, /lane agent not ready: no_agent_in_pane/);
+    agentKind["w-tell:p2"] = "claude";
+    const other = await tell({ workflowId: "herdr-tell0001", laneId: "lane-idle", text: "Still there?" });
+    assert.match(other.details.message.delivery.reason, /agent_kind_mismatch/);
+    assert.equal(prompts.length, typedBefore, "nothing typed into a shell or the wrong agent");
+    delete agentKind["w-tell:p2"];
 
     await assert.rejects(tell({ workflowId: "herdr-tell0001", laneId: "lane-planned", text: "x" }), /has not been dispatched/);
     await assert.rejects(tell({ workflowId: "herdr-tell0001", laneId: "lane-nope", text: "x" }), /has no lane lane-nope/);

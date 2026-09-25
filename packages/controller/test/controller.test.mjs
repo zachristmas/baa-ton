@@ -4101,7 +4101,7 @@ test("the supervisor delivers queued root messages and held answers once a lane 
   const failures = {};
   const herdr = {
     async request(method, params) {
-      if (method === "agent.get") return { type: "agent_info", agent: { pane_id: params.target, agent_status: status[params.target] } };
+      if (method === "agent.get") return { type: "agent_info", agent: { agent: "claude", pane_id: params.target, agent_status: status[params.target] } };
       if (method === "agent.prompt") {
         if (failures[params.target]) throw failures[params.target];
         prompts.push(params);
@@ -4226,5 +4226,103 @@ test("the digest line leaves deferred spec items out of M", async () => {
     assert.equal(await specDigestLine(join(stateDir, "manifest.json")), "spec 2/2 done (1 by decision) · 1 deferred");
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+
+test("nothing is typed into a pane whose agent is gone or not ready: the send stays pending", async () => {
+  const { liveAgentReady } = await import("../controller.mjs");
+  const agent = (fields) => ({ type: "agent_info", agent: { agent: "claude", pane_id: "w:p2", workspace_id: "w", agent_status: "idle", interactive_ready: true, ...fields } });
+  assert.equal(liveAgentReady(agent({}), { pane_id: "w:p2", agent_kind: "claude" }).ok, true);
+  for (const [result, reason] of [
+    [{ type: "agent_info", agent: null }, "no_agent_in_pane"],
+    [agent({ agent: "" }), "no_agent_in_pane"],
+    [agent({ pane_id: "w:p9" }), "agent_pane_mismatch"],
+    [agent({ agent: "pi" }), "agent_kind_mismatch"],
+    [agent({ interactive_ready: false }), "agent_not_interactive_ready"],
+    [agent({ launch_pending: true }), "agent_not_interactive_ready"],
+    [agent({ agent_status: "unknown" }), "agent_status_unknown"],
+  ])
+    assert.deepEqual(liveAgentReady(result, { pane_id: "w:p2", agent_kind: "claude" }), { ok: false, reason });
+
+  // The agent is live when the pass starts and gone by the time of the send.
+  let gets = 0;
+  const prompts = [];
+  const herdr = {
+    async request(method, params) {
+      if (method === "agent.get") {
+        gets += 1;
+        if (gets > 1) throw Object.assign(new HerdrApiErrorLike("agent_not_found"), {});
+        return agent({ pane_id: params.target });
+      }
+      if (method === "agent.prompt") prompts.push(params);
+      return {};
+    },
+  };
+  function HerdrApiErrorLike(code) {
+    const error = new Error(code);
+    error.code = code;
+    return error;
+  }
+  const workflow = {
+    id: "w1",
+    agentKind: "claude",
+    lanes: [{ id: "lane-1", paneId: "w:p2", agentKind: "claude" }],
+    laneMessages: [
+      { id: "m-1", laneId: "lane-1", text: "one", delivery: { status: "pending", updatedAt: "t", text: "[Baa-ton root message] m-1: one" } },
+    ],
+  };
+  // First check passes (gets=1) and the message is delivered; the second message
+  // arrives after the agent exited and must not be typed.
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t1" }), true);
+  assert.equal(prompts.length, 1);
+  workflow.laneMessages.push({ id: "m-2", laneId: "lane-1", text: "two", delivery: { status: "pending", updatedAt: "t", text: "[Baa-ton root message] m-2: two" } });
+  assert.equal(await deliverLaneQueue({ workflow, herdr, timestamp: "t2" }), false);
+  assert.equal(prompts.length, 1, "nothing typed once the agent is gone");
+  assert.equal(workflow.laneMessages[1].delivery.status, "pending");
+  // A shell (agent get says no agent) is treated the same way.
+  const shellPane = { async request(method) { if (method === "agent.get") return { type: "agent_info", agent: { pane_id: "w:p2" } }; prompts.push("typed"); return {}; } };
+  assert.equal(await deliverLaneQueue({ workflow, herdr: shellPane, timestamp: "t3" }), false);
+  assert.equal(prompts.length, 1);
+});
+
+test("a root digest is not typed when the root agent exits between the readiness check and the send", async () => {
+  const s = await supervisionFixture({ gate: capacityGate, events: [workingEvent("2026-09-14T01:00:00.000Z")] });
+  const base = digestApi();
+  let gets = 0;
+  let exited = false;
+  const api = {
+    prompts: base.prompts,
+    async request(method, params) {
+      if (method === "agent.get") {
+        gets += 1;
+        // The pane's agent is gone once the digest is about to be sent: Herdr
+        // then reports the pane without an agent (a raw shell).
+        if (exited) return { type: "agent_info", agent: { pane_id: ROOT.pane_id, workspace_id: ROOT.workspace_id } };
+      }
+      return base.request(method, params);
+    },
+  };
+  try {
+    await s.tick(1, api);
+    s.setSample({ freeMemoryGb: 11.5, swapUsedGb: 6, load1PerCpu: 0.3 });
+    // Let the readiness check pass, then make the agent exit before the send.
+    const original = api.request;
+    let checks = 0;
+    api.request = async (method, params) => {
+      if (method === "agent.get" && ++checks >= 2) exited = true;
+      return original(method, params);
+    };
+    await s.tick(2, api);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("capacity-available")).length, 0, "nothing is typed into the shell");
+    const alert = (await s.supervision()).alerts.find((item) => item.kind === "capacity-available");
+    assert.notEqual(alert.delivery.status, "delivered", "the digest item stays undelivered for a later pass");
+    // The root is back: the digest goes out.
+    exited = false;
+    api.request = original;
+    await s.tick(5, api);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("capacity-available")).length, 1);
+  } finally {
+    await s.fixture.cleanup();
   }
 });

@@ -186,6 +186,7 @@ const {
   describeIdleServices,
   idleLaneServices,
   isHarnessCommand,
+  liveAgentReady,
   paneServiceProcesses,
   parseProcessIdentity,
 } = await importRouteChildMessage();
@@ -4045,13 +4046,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     paneId: string | undefined,
     text: string,
     signal?: AbortSignal,
+    expectedKind?: string,
   ): Promise<LaneDelivery> {
     const stamp = now();
     if (!paneId) return { status: "pending", updatedAt: stamp, reason: "the lane has no recorded pane", text };
+    // Right before typing: the lane's own agent must be live and ready in the
+    // pane. A pane whose agent exited holds a raw shell; never type there.
     let status: unknown;
     try {
-      const agent = responseRecord(await runHerdr(["agent", "get", paneId], signal), "lane agent").agent;
-      status = isRecord(agent) ? agent.agent_status : undefined;
+      const ready = liveAgentReady(await runHerdr(["agent", "get", paneId], signal), {
+        pane_id: paneId,
+        ...(expectedKind ? { agent_kind: expectedKind } : {}),
+      });
+      if (!ready.ok) return { status: "pending", updatedAt: stamp, reason: `lane agent not ready: ${ready.reason}`, text };
+      status = ready.agent.agent_status;
     } catch (error) {
       return { status: "pending", updatedAt: stamp, reason: `lane unavailable: ${clip((error as Error).message, 300)}`, text };
     }
@@ -4080,6 +4088,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (!text) throw new Error("text is required.");
     let message: LaneMessage;
     let paneId: string | undefined;
+    let laneKind: string | undefined;
     const release = await acquireManifestLock(cwd, 10_000);
     try {
       const manifest = await loadManifest(cwd);
@@ -4090,6 +4099,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (!lane) throw new Error(`Workflow ${workflow.id} has no lane ${params.laneId}.`);
       if (!lane.paneId) throw new Error(`Lane ${lane.id} has not been dispatched to a pane yet.`);
       paneId = lane.paneId;
+      laneKind = laneAgentKind(workflow, lane);
       message = {
         id: `lane-message-${randomUUID().slice(0, 8)}`,
         laneId: lane.id,
@@ -4105,7 +4115,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } finally {
       await release();
     }
-    const delivery = await deliverToLane(paneId, laneMessageText(message), signal);
+    const delivery = await deliverToLane(paneId, laneMessageText(message), signal, laneKind);
     await withManifestTransaction(cwd, (manifest) => {
       const stored = (
         manifest.workflows.find((item) => item.id === params.workflowId) as WorkflowWithRequests | undefined
@@ -4324,6 +4334,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error("requestId and decision are required to answer a request.");
     let answered: LaneRequest;
     let paneId: string | undefined;
+    let answerKind: string | undefined;
     const release = await acquireManifestLock(cwd, 10_000);
     try {
       const manifest = await loadManifest(cwd);
@@ -4363,7 +4374,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         text: `${request.id} ${request.laneId}: ${request.summary}${request.note ? ` (${request.note})` : ""}`,
       });
       workflow.updatedAt = now();
-      paneId = workflow.lanes.find((lane) => lane.id === request.laneId)?.paneId;
+      const answeredLane = workflow.lanes.find((lane) => lane.id === request.laneId);
+      paneId = answeredLane?.paneId;
+      answerKind = answeredLane ? laneAgentKind(workflow, answeredLane) : undefined;
       await saveManifest(cwd, manifest);
       answered = { ...request };
     } finally {
@@ -4375,6 +4388,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       paneId,
       `[Baa-ton request answer] ${answered.id}: ${answered.status}. ${answered.summary}${answered.note ? `. ${answered.note}` : ""}`,
       signal,
+      answerKind,
     );
     await withManifestTransaction(cwd, (manifest) => {
       const stored = (
@@ -7836,6 +7850,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const { lane, index } of pausedLanes) {
         const agentName = lane.agentName;
         if (!agentName) continue;
+        // Never type /goal-resume into a pane whose Pi agent is gone.
+        const ready = liveAgentReady(await runHerdr(["agent", "get", agentName], signal).catch(() => undefined), {
+          name: agentName,
+          agent_kind: "pi",
+          ...(lane.paneId ? { pane_id: lane.paneId } : {}),
+        });
+        if (!ready.ok) throw new Error(`Lane ${lane.id} Pi agent ${agentName} is not live and ready (${ready.reason}); /goal-resume was not sent.`);
         const receipt = clip(
           jsonText(
             await runHerdr(
