@@ -4580,6 +4580,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
+    /** Whether Herdr still finds an agent in this pane. */
+    agentPresent?(paneId: string): Promise<boolean>;
+    /** The commit on `branch` containing `tip`, or undefined when `tip` is not on it. */
+    containingCommit?(repo: string, tip: string, branch: string): Promise<string | undefined>;
     /** The loaded code's fingerprint (holds retry once it changes). */
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
@@ -4667,9 +4671,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const latest = [...events].reverse().find((event) => event.lane_id === ref.laneId)?.source?.agent_status;
         const session = lane.sessionLog?.status;
         const agentStatus = session === "gone" ? "gone" : latest ?? (session === "done" ? "done" : undefined);
+        const lastMessageAt = (workflow!.messageRequests ?? [])
+          .filter((message) => message.laneId === ref.laneId)
+          .map((message) => message.requestedAt)
+          .sort()
+          .at(-1);
         return {
           status: lane.status,
           workflowStatus: workflow!.status,
+          ...(lane.specStage ? { specStage: lane.specStage } : {}),
+          ...(lastMessageAt ? { lastMessageAt } : {}),
           ...(agentStatus ? { agentStatus } : {}),
           ...(lane.completionReceipt ? { receipt: { summary: lane.completionReceipt.summary } } : {}),
         };
@@ -4743,11 +4754,50 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, { lane?: { workflowId: string; laneId: string }; worktree?: string }]>)
         if (record.lane && record.worktree && laneView(record.lane)?.agentStatus === "gone")
           if ((await statusOf(record.worktree).catch(() => "")).trim()) dirty.add(id);
+      // The integration worktree stays reserved while any integrate or verify
+      // lane still has a live agent in its pane, whatever its item's state.
+      const agentPresent =
+        ports?.agentPresent ??
+        (async (paneId: string) => {
+          const result = await runHerdr(["agent", "get", paneId], signal).catch(() => undefined);
+          const info = isRecord(result) && isRecord(result.result) ? result.result : result;
+          return isRecord(info) && isRecord(info.agent) && typeof info.agent.agent === "string" && Boolean(info.agent.agent);
+        });
+      let integrationLive: string | undefined;
+      const closedWorkflow = new Set(["closed", "completed", "operator-closed", "superseded", "retired"]);
+      for (const workflow of manifest.workflows) {
+        if (integrationLive || closedWorkflow.has(workflow.status)) continue;
+        for (const lane of workflow.lanes)
+          if ((lane.specStage === "integrate" || lane.specStage === "verify") && lane.paneId && (await agentPresent(lane.paneId))) {
+            integrationLive = `the ${lane.specStage} lane ${workflow.id}/${lane.id} is still live`;
+            break;
+          }
+      }
+      // Queued items a batch lane already merged: record them at the
+      // commit on spec-integration that contains their branch tip.
+      const contained = new Map<string, string>();
+      const containingCommit =
+        ports?.containingCommit ??
+        (async (repoPath: string, tip: string, branch: string) => {
+          const ancestor = await gitAncestor(repoPath, tip, branch).catch(() => false);
+          if (!ancestor) return undefined;
+          const tipSha = (await execFile("git", ["-C", repoPath, "rev-parse", tip], { timeout: 30_000 })).stdout.trim();
+          const path = (await execFile("git", ["-C", repoPath, "rev-list", "--ancestry-path", "--reverse", `${tipSha}..${branch}`], { timeout: 30_000 })).stdout.trim();
+          return path.split("\n").filter(Boolean)[0] ?? tipSha;
+        });
+      for (const item of spec.items) {
+        const record = state.items?.[item.id] as { state?: string; lane?: unknown; branch?: string } | undefined;
+        if (record?.state !== "integrating" || record.lane) continue;
+        const sha = await containingCommit(repo, record.branch ?? `spec/${item.id}`, "refs/heads/spec-integration").catch(() => undefined);
+        if (sha) contained.set(item.id, sha);
+      }
       const step = advanceSpec({
         spec,
         state,
         lane: laneView,
         dirty,
+        integrationLive,
+        contained,
         capacityWaiting,
         pushed,
         released,

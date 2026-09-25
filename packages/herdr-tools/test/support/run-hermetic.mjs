@@ -39,7 +39,10 @@ export function hermeticEnvironment(env = process.env) {
 const suites = {
   extension: [
     ["packages/herdr-tools/smoke-check.mjs"],
-    ["--test", "packages/herdr-tools/test/*.test.mjs"],
+    // Bounded concurrency: every file compiles the ~10k-line extension (and
+    // some spawn MCP bridges that compile it again), so one file per CPU can
+    // exhaust memory on a busy machine and starve a bridge past its timeout.
+    ["--test", "--test-concurrency=4", "packages/herdr-tools/test/*.test.mjs"],
   ],
   controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs"]],
 };

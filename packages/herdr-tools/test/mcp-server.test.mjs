@@ -55,6 +55,12 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
+  // A bridge that exits (or is killed) fails its pending calls instead of
+  // leaving them to hang the test.
+  child.once("close", (code, signal) => {
+    for (const resolve of pending.values()) resolve({ error: { message: `mcp-server.mjs exited (${signal ?? code}) before answering` } });
+    pending.clear();
+  });
   const rpcWithId = (id, method, params = {}) =>
     new Promise((resolve) => {
       pending.set(id, resolve);
@@ -63,13 +69,15 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
       );
     });
   const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
-  const timeout = setTimeout(() => child.kill(), 15000);
+  // Generous: the bridge compiles the whole extension on start, which can take
+  // well over 15 s while the full suite runs in parallel on a loaded machine.
+  const timeout = setTimeout(() => child.kill(), 60_000);
   try {
     return await run(rpc, rpcWithId);
   } finally {
     clearTimeout(timeout);
     child.stdin.end();
-    await once(child, "close");
+    if (child.exitCode === null && child.signalCode === null) await once(child, "close");
     lines.close();
     if (stderr.trim()) throw new Error(`mcp-server.mjs stderr: ${stderr}`);
   }

@@ -14,15 +14,20 @@ export type SpecAction = {
   format?: string;
 };
 export const RECEIPT_ASK_TIMEOUT_MS: number;
+export const RECEIPT_REASK_BASE_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
   state: SpecState | undefined;
-  lane: (ref: { workflowId: string; laneId: string }) => { status?: string; workflowStatus?: string; agentStatus?: string; receipt?: { summary: string } } | undefined;
+  lane: (ref: { workflowId: string; laneId: string }) =>
+    | { status?: string; workflowStatus?: string; agentStatus?: string; specStage?: string; lastMessageAt?: string; receipt?: { summary: string } }
+    | undefined;
   /** true, or the reason dispatch must wait for capacity. */
   capacityWaiting?: boolean | string;
   pushed?: Set<string>;
   released?: Map<string, string>;
   dirty?: Set<string>;
+  integrationLive?: string;
+  contained?: Map<string, string>;
   now: string;
 }): {
   state: SpecState;
