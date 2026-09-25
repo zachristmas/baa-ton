@@ -124,11 +124,77 @@ export function commandSegments(command) {
     if (target) heredocTargets.push(unquote(target[1]));
   }
   const body = kept.join("\n");
-  const segments = body
-    .split(/\s*(?:&&|\|\||;|\||\n)\s*/)
+  const segments = splitOutsideQuotes(body)
     .map((segment) => segment.trim())
     .filter(Boolean);
   return { segments, heredocTargets, body, expandingBody };
+}
+
+/**
+ * Split on ;, &&, ||, | and newlines, but not inside single or double
+ * quotes: `grep -n "a; b" f` is one segment. A backslash escapes the next
+ * character outside single quotes.
+ */
+export function splitOutsideQuotes(body) {
+  const segments = [];
+  let current = "";
+  let quote;
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (quote) {
+      current += char;
+      if (char === "\\" && quote === '"' && index + 1 < body.length) current += body[++index];
+      else if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "\\" && index + 1 < body.length) {
+      current += char + body[++index];
+      continue;
+    }
+    const two = body.slice(index, index + 2);
+    if (two === "&&" || two === "||") {
+      segments.push(current);
+      current = "";
+      index += 1;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "\n") {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return segments;
+}
+
+/**
+ * Claude Code `ask` rules for Bash (`Bash(git push *)`, `Bash(rm:*)`) as
+ * matchers for one command segment (after leading env assignments).
+ */
+export function askRuleMatchers(rules = []) {
+  return rules
+    .map((rule) => /^Bash\((.*)\)$/.exec(String(rule))?.[1])
+    .filter((pattern) => typeof pattern === "string" && pattern.trim())
+    .map((pattern) => {
+      const prefix = pattern.endsWith(":*") ? pattern.slice(0, -2) : undefined;
+      const source = (prefix ?? pattern)
+        .split("*")
+        .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*");
+      return new RegExp(prefix !== undefined ? `^${source}(\\s|$)` : `^${source}$`, "s");
+    });
+}
+
+function segmentMatchesAsk(segment, matchers) {
+  const plain = segment.replace(/^(?:\w+=\S+\s+)+/, "").trim();
+  return matchers.some((matcher) => matcher.test(plain) || matcher.test(segment.trim()));
 }
 
 function unquote(value) {
@@ -336,7 +402,16 @@ export function classifyCommand(command, options = {}) {
     savedPatches: savedPatches(body),
   };
   const rules = new Set();
+  // Scoped to ask rules (bypassPermissions): only segments matching an ask
+  // rule caused the prompt; the rest run without one in that mode anyway.
+  const scoped = options.scopeToAskRules && Array.isArray(options.askRules) && options.askRules.length > 0;
+  const matchers = scoped ? askRuleMatchers(options.askRules) : [];
+  let asked = 0;
   for (const segment of segments) {
+    if (scoped) {
+      if (!segmentMatchesAsk(segment, matchers)) continue;
+      asked += 1;
+    }
     const redirect = redirectVerdict(segment);
     if (redirect) return { decision: "defer", reason: redirect.reason };
     let normalized = stripRedirects(segment);
@@ -357,7 +432,8 @@ export function classifyCommand(command, options = {}) {
     if (/^git show HEAD:\S+$/.test(plain) || sedInert(plain) || /^cat\s*<<-?\s*['"]?\w+['"]?$/.test(plain) || INERT.some((pattern) => pattern.test(plain))) continue;
     return { decision: "defer", reason: `not a known-safe command: ${segment.slice(0, 120)}` };
   }
-  return rules.size ? { decision: "allow", rules: [...rules] } : { decision: "defer", reason: "no known-safe rule applies" };
+  if (scoped && asked === 0) return { decision: "defer", reason: "no segment matches an ask rule; the prompt has another cause" };
+  return rules.size || (scoped && asked > 0) ? { decision: "allow", rules: [...rules] } : { decision: "defer", reason: "no known-safe rule applies" };
 }
 
 /*

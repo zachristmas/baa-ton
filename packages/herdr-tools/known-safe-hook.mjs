@@ -22,6 +22,8 @@
  */
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyCommand, laneConfinedVerdict } from "./known-safe.mjs";
 import { bridgeClient, DEFAULT_WAIT_MS, routePermission } from "./permission-route.mjs";
@@ -77,6 +79,23 @@ export function worktreeFacts(cwd, command, git = (args) => execFileSync("git", 
   return facts;
 }
 
+/**
+ * The Bash `ask` rules Claude Code applies in this session: the user's
+ * settings and the project's (shared and local), from `cwd`.
+ */
+export function loadAskRules(cwd, files = [join(homedir(), ".claude", "settings.json"), ...(cwd ? [join(cwd, ".claude", "settings.json"), join(cwd, ".claude", "settings.local.json")] : [])]) {
+  const rules = [];
+  for (const file of files) {
+    try {
+      const ask = JSON.parse(readFileSync(file, "utf8"))?.permissions?.ask;
+      if (Array.isArray(ask)) rules.push(...ask.filter((rule) => typeof rule === "string" && rule.startsWith("Bash(")));
+    } catch {
+      // A missing or unreadable settings file contributes no rules.
+    }
+  }
+  return [...new Set(rules)];
+}
+
 /** The unattended default once nobody answered: allow inside the lane, deny outside. */
 export function policyDefault(input, waitedSeconds) {
   const verdict = laneConfinedVerdict(input.tool_name, isRecord(input.tool_input) ? input.tool_input : {}, { cwd: input.cwd });
@@ -118,6 +137,13 @@ async function main() {
   if (input?.hook_event_name && input.hook_event_name !== "PermissionRequest") return;
   // Explicit options win over what the worktree says.
   if (input?.tool_name === "Bash") options = { ...worktreeFacts(input.cwd, input.tool_input?.command), ...options };
+  // In bypassPermissions only ask-rule segments can have caused this prompt,
+  // so only they must be known-safe; other segments run without a prompt in
+  // that mode anyway. Other modes classify the whole command.
+  if (input?.tool_name === "Bash" && input.permission_mode === "bypassPermissions" && options.scopeToAskRules !== false) {
+    const askRules = options.askRules ?? loadAskRules(input.cwd);
+    if (askRules.length) options = { ...options, askRules, scopeToAskRules: true };
+  }
   const known = decide(input, options);
   if (known?.output) {
     audit({ sessionId: input.session_id, decision: "allow", rules: known.result.rules, command: input.tool_input.command });

@@ -364,3 +364,65 @@ test("the hook reads its own worktree's branch, repository and cleanliness for t
     await remove(repo, { recursive: true, force: true });
   }
 });
+
+test("segments split only outside quotes", async () => {
+  const { splitOutsideQuotes } = await import("../known-safe.mjs");
+  assert.deepEqual(splitOutsideQuotes(`grep -n "a; b && c" f && ls | head -2; echo 'x|y'`).map((part) => part.trim()), [
+    `grep -n "a; b && c" f`,
+    "ls",
+    "head -2",
+    "echo 'x|y'",
+  ]);
+  assert.deepEqual(splitOutsideQuotes(String.raw`echo a\;b; ls`).map((part) => part.trim()), [String.raw`echo a\;b`, "ls"]);
+  // A quoted grep pattern no longer breaks a known-safe command apart.
+  allowed(`git checkout -q -b ink/x origin/main && grep -n "for (const [id, reason] of x); y" src/a.ts | head -8`, {}, "git-create-branch");
+});
+
+const ASK = ["Bash(rm *)", "Bash(git push *)", "Bash(git checkout *)", "Bash(git rebase:*)", "Bash(> *)"];
+
+test("ask rules become per-segment matchers", async () => {
+  const { askRuleMatchers } = await import("../known-safe.mjs");
+  const matchers = askRuleMatchers([...ASK, "Read(x)", "Bash()"]);
+  const hit = (segment) => matchers.some((matcher) => matcher.test(segment));
+  assert.equal(matchers.length, 5, "only Bash rules with a pattern");
+  for (const segment of ["rm -f a", "git push -q -u origin ink/x", "git checkout -q -b x origin/main", "git rebase", "git rebase -i main", "> out.txt"]) assert.equal(hit(segment), true, segment);
+  for (const segment of ["grep rm file", "git status", "git pushx", "rmdir a", "git rebasex"]) assert.equal(hit(segment), false, segment);
+});
+
+test("scoped to ask rules, only the segments that prompted must be known-safe", () => {
+  const scoped = { askRules: ASK, scopeToAskRules: true, cwd: WT };
+  const command = `cd ${WT} && git fetch -q && git checkout -q -b ink/x origin/main && node scripts/check.mjs && grep -n "x; y" a.ts | head -8`;
+  deferred(command, { cwd: WT }, /not a known-safe command: node scripts\/check\.mjs/, "whole-command mode still classifies node");
+  allowed(command, scoped, "git-create-branch");
+  deferred("node build.mjs && git push -q -u origin main", { ...scoped, allowOwnBranchPush: true }, /push target main/);
+  deferred("node build.mjs && rm -rf /work", scoped, /not a known-safe target/);
+  deferred("node build.mjs && ls", scoped, /no segment matches an ask rule/);
+  deferred("echo $(rm -rf x) && ls", scoped, /substitution/);
+  deferred("git status", { scopeToAskRules: true, askRules: [] }, /no known-safe rule applies/, "without ask rules scoping is off");
+});
+
+test("the hook scopes to the session's ask rules only in bypassPermissions mode", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtemp, mkdir: makeDir, rm: remove, writeFile: write } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const home = await mkdtemp(join(tmpdir(), "baa-ask-home-"));
+  try {
+    await makeDir(join(home, ".claude"), { recursive: true });
+    await write(join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { ask: ASK } }));
+    const hook = fileURLToPath(new URL("../known-safe-hook.mjs", import.meta.url));
+    const run = (mode, command) =>
+      spawnSync(process.execPath, [hook], {
+        input: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash", permission_mode: mode, cwd: home, tool_input: { command } }),
+        encoding: "utf8",
+        env: { ...process.env, HOME: home },
+      });
+    const command = "node scripts/check.mjs && git checkout -q -b ink/x origin/main";
+    assert.deepEqual(JSON.parse(run("bypassPermissions", command).stdout).hookSpecificOutput.decision, { behavior: "allow" });
+    assert.equal(run("default", command).stdout, "", "default mode still classifies the whole command");
+    assert.equal(run("bypassPermissions", "node x.mjs && git push origin main").stdout, "", "an unsafe ask-rule segment still prompts");
+  } finally {
+    await remove(home, { recursive: true, force: true });
+  }
+});
