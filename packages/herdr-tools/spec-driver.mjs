@@ -387,11 +387,15 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
 
   // 3. Dispatch ready items within the slots, capacity and ownership rules.
   const byId = new Map(spec.items.map((item) => [item.id, item]));
-  // A verifying item waiting for a deploy holds no slot.
+  // A slot is held by a live lane. A building or reviewing item without one
+  // is about to be retried (it takes a lane this pass), so it holds one too;
+  // an item only queued for the serial integration lane, or waiting for a
+  // deploy to verify, holds none.
   const inFlight = () =>
     spec.items.filter((item) => {
       const current = next.items[item.id];
-      return ACTIVE_STATES.has(current?.state) && (current.state !== "verifying" || Boolean(current.lane));
+      if (!ACTIVE_STATES.has(current?.state)) return false;
+      return Boolean(current.lane) || current.state === "building" || current.state === "reviewing";
     });
   // A review reuses its item's slot; only new builds need one.
   let slots = spec.defaults.maxParallel - inFlight().length;

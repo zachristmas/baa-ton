@@ -320,3 +320,26 @@ test("verification waits for a deploy containing the commit, then one verify lan
   assert.match(failed.state.items.A.note, /preview failed: e2e\/a\.spec\.ts/);
   assert.match(failed.rootAsks[0].reason, /verification on the preview failed after the push/);
 });
+
+test("items queued for integration hold no maxParallel slot; live lanes do", () => {
+  const queued = Array.from({ length: 10 }, (_, index) => ({ id: `Q${index}` }));
+  const ready = Array.from({ length: 6 }, (_, index) => ({ id: `R${index}`, owns: [`src/r${index}/**`] }));
+  const s = spec([...queued, ...ready], { maxParallel: 4 });
+  const items = Object.fromEntries(queued.map((item) => [item.id, { state: "integrating", attempts: 1 }]));
+  // One queued item is being merged right now: its lane holds a slot.
+  items.Q0.lane = { workflowId: "wi", laneId: "l1" };
+  for (const item of ready) items[item.id] = { state: "ready" };
+  const step = advanceSpec({ spec: s, state: { version: 1, items }, lane: lanes({ "wi/l1": { status: "working" } }), now: at(0) });
+  const builds = step.actions.filter((action) => action.kind === "build").map((action) => action.itemId);
+  assert.deepEqual(builds, ["R0", "R1", "R2"], "maxParallel 4 minus the one live integration lane");
+  assert.match(step.waits.R3, /^capacity: 4 items already in flight/);
+
+  // Verifying items waiting for a deploy hold none either; a lane-less build retry does.
+  const later = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { ...Object.fromEntries(queued.map((item) => [item.id, { state: "verifying", integratedSha: "x" }])), R0: { state: "building", attempts: 1 }, R1: { state: "ready" }, R2: { state: "ready" }, R3: { state: "ready" }, R4: { state: "ready" } } },
+    lane: lanes({}),
+    now: at(1),
+  });
+  assert.deepEqual(later.actions.filter((action) => action.kind === "build").map((action) => action.itemId), ["R0", "R1", "R2", "R3"], "the retry of R0 plus three new builds");
+});
