@@ -616,3 +616,17 @@ test("items resolved by decision count as done, are logged and announced, and ca
     await f.cleanup();
   }
 });
+
+test("lane contracts and the integration objective steer lanes away from the shared stash", async () => {
+  const { laneContract } = await jiti.import("../index.ts");
+  const { integrateObjective } = await import("../spec-driver.mjs");
+  const { validateSpec } = await import("../spec.mjs");
+  const lane = { id: "lane-1", objective: "x", readOnly: false, agentKind: "claude", status: "planned" };
+  for (const specStage of [undefined, "build", "integrate"]) {
+    const text = laneContract({ id: "herdr-s1", agentKind: "claude", lanes: [] }, { ...lane, ...(specStage ? { specStage } : {}) });
+    assert.match(text, /Never git stash drop, pop or clear: the stash is shared by every worktree/);
+    assert.match(text, /git diff > <scratch>\/x\.patch; git checkout -- <files>; later git apply <scratch>\/x\.patch\) or a throwaway commit on your own branch/);
+  }
+  const spec = validateSpec({ version: 1, target: { repo: ".", remote: "origin", branch: "b" }, items: [{ id: "A", title: "a", acceptance: { text: "a" } }] });
+  assert.match(integrateObjective(spec, spec.items[0], { integrationBranch: "spec-integration", itemBranch: "spec/A" }), /Never use git stash/);
+});

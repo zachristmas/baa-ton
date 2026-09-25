@@ -143,6 +143,13 @@ const LANE_PERMISSIONS = {
     "Bash(git push:*)",
     "Bash(git merge:*)",
     "Bash(gh pr create:*)",
+    // The stash is shared by every worktree of a repository: a positional
+    // drop or pop can remove another lane's (or the user's) stash. Lanes set
+    // changes aside with a patch file or a throwaway commit instead; list
+    // and show stay allowed.
+    "Bash(git stash drop:*)",
+    "Bash(git stash clear:*)",
+    "Bash(git stash pop:*)",
     "Bash(herdr workspace close:*)",
   ],
 };

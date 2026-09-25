@@ -398,3 +398,23 @@ test("a spec integration lane may merge locally; push, PR and every other deny s
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("every lane, the integration lane included, is denied positional stash drop, pop and clear", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-stash-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/bridge/claude-startup-attest.mjs",
+      scratchDirectory: scratch,
+    });
+    for (const context of [{}, { allowLocalMerge: true }]) {
+      const args = adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json", ...context });
+      const { permissions } = JSON.parse(await readFile(args[args.indexOf("--settings") + 1], "utf8"));
+      for (const rule of ["Bash(git stash drop:*)", "Bash(git stash clear:*)", "Bash(git stash pop:*)"])
+        assert.ok(permissions.deny.includes(rule), `${rule} (${JSON.stringify(context)})`);
+      assert.equal(permissions.deny.some((rule) => /git stash (list|show)/.test(rule)), false, "list and show stay allowed");
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
