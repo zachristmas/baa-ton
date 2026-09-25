@@ -65,7 +65,7 @@ function persistedResumeHandle(lane: Lane, workflow: Workflow): PersistenceHandl
     log.workflowId !== workflow.id ||
     log.laneId !== lane.id ||
     (log.workspaceId !== undefined &&
-      log.workspaceId !== workflow.taskBinding?.workspaceId)
+      log.workspaceId !== (workflow.laneWorkspaceId ?? workflow.taskBinding?.workspaceId))
   )
     throw new Error(
       `Lane ${lane.id} session-log ownership or workspace scope does not match workflow ${workflow.id}; resume is refused.`,
@@ -388,7 +388,9 @@ export async function dispatchTask(
     await adapter.preflight(profiles[index], catalog);
   }
   const restart = options.restart === true;
-  const workspaceId = workflow.taskBinding?.workspaceId;
+  // Lanes join the task workspace, or the workspace already holding the
+  // workflow's worktree (Herdr opens a worktree in one workspace only).
+  const workspaceId = workflow.laneWorkspaceId ?? workflow.taskBinding?.workspaceId;
   if (
     !workspaceId ||
     (workflow.ownership.workspaceId &&
@@ -698,6 +700,7 @@ export async function dispatchTask(
           const l = w.lanes[i];
           l.paneId = pane.pane_id;
           l.tabId = tab.tab_id;
+          l.workspaceId = workspaceId;
           l.agentName = childAgentName(w.id, i + 1);
           l.relationshipId = `herdr-rel-${randomUUID()}`;
           w.ownership.tabIds ??= [];
@@ -1027,7 +1030,9 @@ export async function resumeTask(
       ),
     };
   await port.verifyRoot(workflow);
-  const workspaceId = workflow.taskBinding?.workspaceId;
+  // Lanes join the task workspace, or the workspace already holding the
+  // workflow's worktree (Herdr opens a worktree in one workspace only).
+  const workspaceId = workflow.laneWorkspaceId ?? workflow.taskBinding?.workspaceId;
   if (
     !workspaceId ||
     (workflow.ownership.workspaceId &&

@@ -6639,7 +6639,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     cwd: string,
     expectedWorkspaceId?: string,
     signal?: AbortSignal,
-    options: { allowDirty?: boolean } = {},
+    options: { allowDirty?: boolean; openElsewhere?: (workspaceId: string) => void } = {},
   ): Promise<WorktreeBinding> {
     const checkoutPath = await assertCleanLocalWorktree(cwd, signal, options);
     const worktreeList = responseRecord(
@@ -6681,9 +6681,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           `Git worktree ${checkoutPath} is not open in recorded workspace ${expectedWorkspaceId}.`,
         );
     } else if (typeof targetWorkspaceId === "string" && targetWorkspaceId) {
-      throw new Error(
-        `Git worktree ${checkoutPath} is already open in workspace ${targetWorkspaceId}; this workflow must not reuse it.`,
-      );
+      // Herdr opens a worktree in one workspace only. A caller that can place
+      // its lanes there (as new tabs) takes the workspace instead of failing.
+      if (!options.openElsewhere)
+        throw new Error(
+          `Git worktree ${checkoutPath} is already open in workspace ${targetWorkspaceId}; this workflow must not reuse it.`,
+        );
+      options.openElsewhere(targetWorkspaceId);
     }
     if (samePath(parentCheckoutPath, checkoutPath))
       throw new Error(
@@ -6993,10 +6997,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         "A worktree workflow may use multiple lanes only when every lane declares readOnly: true.",
       );
-    // Read-only lanes (review, decide) may use a dirty worktree; writers need it clean.
+    // Read-only lanes (review, decide) may use a dirty worktree; writers need
+    // it clean. A worktree already open in another workspace hosts the lanes.
+    let laneWorkspaceId: string | undefined;
     const worktreeBinding = target.worktree
       ? await inspectWorktreeForWorkspace(target.worktree, undefined, undefined, {
           allowDirty: lanes.length > 0 && lanes.every((lane) => lane.readOnly),
+          openElsewhere: (workspaceId) => {
+            laneWorkspaceId = workspaceId;
+          },
         })
       : undefined;
     requireRootGoalExecutor();
@@ -7041,6 +7050,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       cwd: target.cwd,
       worktree: target.worktree,
       worktreeBinding,
+      ...(laneWorkspaceId && laneWorkspaceId !== root.workspace_id ? { laneWorkspaceId } : {}),
       taskBinding: {
         workspaceId: root.workspace_id,
         rootPaneId: root.pane_id,
@@ -7077,6 +7087,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         at: now(),
         kind: "authorization-policy-installed",
         text: `Validated ${authorizationPolicy.scope.workflow} local-only policy: ${authorizationPolicy.capabilities.join(",")}`,
+      });
+    if (workflow.laneWorkspaceId)
+      workflow.evidence.push({
+        at: stamp,
+        kind: "worktree-open-elsewhere",
+        text: `Worktree ${target.worktree} is already open in workspace ${workflow.laneWorkspaceId}; lanes join it as new tabs.`,
       });
     if (worktreeBinding)
       workflow.evidence.push({
@@ -7270,7 +7286,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 target: lane.paneId!,
                 target_kind: "pane_id",
                 pane_id: lane.paneId!,
-                workspace_id: w.taskBinding!.workspaceId,
+                workspace_id: w.laneWorkspaceId ?? w.taskBinding!.workspaceId,
                 relationship_id: lane.relationshipId,
               })),
             };
@@ -7673,7 +7689,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 target: lane.paneId!,
                 target_kind: "pane_id",
                 pane_id: lane.paneId!,
-                workspace_id: w.taskBinding!.workspaceId,
+                workspace_id: w.laneWorkspaceId ?? w.taskBinding!.workspaceId,
                 relationship_id: lane.relationshipId,
               })),
             };
@@ -8236,6 +8252,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         "Lane retirement requires the verified controller root in the workflow's recorded task workspace; no topology fallback is allowed.",
       );
 
+    // Lane tabs live in the task workspace, or in the workspace that already
+    // held the workflow's worktree.
+    const laneWorkspaceId = workflow.laneWorkspaceId ?? taskBinding.workspaceId;
     const nonTerminal = workflow.lanes.filter(
       (lane) =>
         !lane.completionReceipt && !TERMINAL_LANE_STATUSES.has(lane.status),
@@ -8247,9 +8266,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           .join(", ")}.`,
       );
 
-    if (workflow.ownership.workspaceId !== taskBinding.workspaceId)
+    if (workflow.ownership.workspaceId !== laneWorkspaceId)
       throw new Error(
-        `Lane retirement refused: recorded lane ownership workspace does not match the root's task workspace ${taskBinding.workspaceId}.`,
+        `Lane retirement refused: recorded lane ownership workspace does not match the root's task workspace ${laneWorkspaceId}.`,
       );
     const rawTabIds = workflow.ownership.tabIds;
     if (!Array.isArray(rawTabIds))
@@ -8283,7 +8302,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error("Lane retirement record has an unsupported state.");
     if (
       storedRetirement &&
-      (storedRetirement.workspaceId !== taskBinding.workspaceId ||
+      (storedRetirement.workspaceId !== laneWorkspaceId ||
         JSON.stringify(storedRetirement.tabIds) !== JSON.stringify(tabIds))
     )
       throw new Error(
@@ -8295,7 +8314,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const alreadyGoneTabIds: string[] = [];
     if (pendingTabIds.length > 0) {
       const listed = responseRecord(
-        await runHerdr(["tab", "list", "--workspace", taskBinding.workspaceId], signal),
+        await runHerdr(["tab", "list", "--workspace", laneWorkspaceId], signal),
         "task workspace tab list",
       );
       if (!Array.isArray(listed.tabs))
@@ -8307,7 +8326,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           (item: unknown): item is Record<string, unknown> =>
             isRecord(item) && item.tab_id === tabId,
         );
-        if (tab && tab.workspace_id === taskBinding.workspaceId) continue;
+        if (tab && tab.workspace_id === laneWorkspaceId) continue;
         // Not in this workspace's tab list. A tab can be manually closed
         // outside herdr_close (e.g. `herdr tab close` run directly with the
         // user's approval); that is not an error, it already accomplished
@@ -8320,13 +8339,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await runHerdr(["tab", "get", tabId], signal),
             "tab lookup",
           );
-          existsElsewhere = got.workspace_id !== taskBinding.workspaceId;
+          existsElsewhere = got.workspace_id !== laneWorkspaceId;
         } catch {
           existsElsewhere = false; // herdr has no record of this tab anywhere.
         }
         if (existsElsewhere)
           throw new Error(
-            `Lane tab ${tabId} is not in the root's task workspace ${taskBinding.workspaceId}; refusing cleanup.`,
+            `Lane tab ${tabId} is not in the root's task workspace ${laneWorkspaceId}; refusing cleanup.`,
           );
         alreadyGoneTabIds.push(tabId);
       }
@@ -8362,13 +8381,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             .map((lane) => lane.id)
             .join(", ")}.`,
         );
-      if (stored.ownership.workspaceId !== taskBinding.workspaceId)
+      if (stored.ownership.workspaceId !== laneWorkspaceId)
         throw new Error(
           "Lane retirement refused: recorded lane ownership workspace changed before cleanup.",
         );
       if (
         currentRetirement &&
-        (currentRetirement.workspaceId !== taskBinding.workspaceId ||
+        (currentRetirement.workspaceId !== laneWorkspaceId ||
           JSON.stringify(currentRetirement.tabIds) !== JSON.stringify(tabIds))
       )
         throw new Error(
@@ -8378,7 +8397,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const record: LaneRetirementRecord = currentRetirement ?? {
         version: 1,
         status: pendingTabIds.length === 0 ? "retired" : "partial",
-        workspaceId: taskBinding.workspaceId,
+        workspaceId: laneWorkspaceId,
         tabIds,
         closedTabIds: [],
         failedTabIds: [],
@@ -8407,7 +8426,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           ? "lane-retirement-retry"
           : "lane-retirement",
         text: JSON.stringify({
-          workspaceId: taskBinding.workspaceId,
+          workspaceId: laneWorkspaceId,
           tabIds,
           evidence: normalizedEvidence,
         }),
@@ -8424,7 +8443,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           at: timestamp,
           kind: "lane-retirement-completed",
           text: JSON.stringify({
-            workspaceId: taskBinding.workspaceId,
+            workspaceId: laneWorkspaceId,
             closedTabIds: record.closedTabIds,
             failedTabIds: record.failedTabIds,
             evidence: normalizedEvidence,

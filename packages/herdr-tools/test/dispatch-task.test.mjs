@@ -27,6 +27,8 @@ const profile = {
   auth: "subscription",
 };
 async function fixture(options = {}) {
+  // Where lane tabs live: the task workspace, or one already holding the worktree.
+  const laneSpace = options.laneWorkspace ?? "task-space";
   const directory = await mkdtemp(join(tmpdir(), "baa-dispatch-"));
   const calls = [],
     panes = new Map();
@@ -41,6 +43,7 @@ async function fixture(options = {}) {
     outcome: "planned",
     cwd: "/different/checkout",
     taskBinding: { workspaceId: "task-space", rootPaneId: "root-pane" },
+    ...(options.laneWorkspace ? { laneWorkspaceId: options.laneWorkspace } : {}),
     launchProfile,
     lanes: [1, 2].map((i) => ({
       id: `lane-${i}`,
@@ -110,10 +113,10 @@ async function fixture(options = {}) {
       calls.push(args);
       if (args[0] === "workspace" && args[1] === "get") {
         if (options.missingWorkspace) throw new Error("workspace_not_found");
-        return { result: { workspace: { workspace_id: "task-space" } } };
+        return { result: { workspace: { workspace_id: laneSpace } } };
       }
       if (args[0] === "tab" && args[1] === "create") {
-        assert.equal(args[args.indexOf("--workspace") + 1], "task-space");
+        assert.equal(args[args.indexOf("--workspace") + 1], laneSpace);
         assert.equal(args[args.indexOf("--cwd") + 1], "/different/checkout");
         const paneId = `opaque-pane-${++number}`,
           tabId = `opaque-tab-${number}`;
@@ -135,7 +138,7 @@ async function fixture(options = {}) {
             pane: {
               pane_id: p.paneId,
               tab_id: p.tabId,
-              workspace_id: options.wrongWorkspace ? "other" : "task-space",
+              workspace_id: options.wrongWorkspace ? "other" : laneSpace,
             },
           },
         };
@@ -205,7 +208,7 @@ async function fixture(options = {}) {
         const hello = {
           nonce: intent.nonce,
           paneId: p.paneId,
-          workspaceId: "task-space",
+          workspaceId: laneSpace,
           source: ports.source,
           sessionPath: `/sessions/${p.paneId}-${p.sessionGeneration}.jsonl`,
           profile: selectedProfile,
@@ -244,7 +247,7 @@ async function fixture(options = {}) {
             result: {
               agent: {
                 pane_id: p.paneId,
-                workspace_id: "task-space",
+                workspace_id: laneSpace,
                 agent: options.adapter?.kind ?? "pi",
                 interactive_ready: true,
                 agent_status: "idle",
@@ -256,7 +259,7 @@ async function fixture(options = {}) {
           result: {
             agent: {
               pane_id: p.paneId,
-              workspace_id: "task-space",
+              workspace_id: laneSpace,
               agent: options.adapter?.kind ?? "pi",
               interactive_ready: !options.waitingForApproval,
               agent_status: options.waitingForApproval ? "blocked" : "idle",
@@ -1006,6 +1009,23 @@ test("a proof that fails with a session present is final, without waiting", asyn
     await assert.rejects(f.run());
     assert.ok(Date.now() - started < 5_000, "a mismatched session is not retried");
     assert.equal(f.calls.some((c) => c[1] === "prompt"), false);
+  } finally {
+    await f.close();
+  }
+});
+
+
+test("a worktree already open in another workspace: lanes are created and proven there as new tabs", async () => {
+  const f = await fixture({ laneWorkspace: "old-worktree-space" });
+  try {
+    assert.equal((await f.run()).dispatched, true);
+    const creates = f.calls.filter((c) => c[0] === "tab" && c[1] === "create");
+    assert.ok(creates.length > 0);
+    assert.ok(creates.every((c) => c[c.indexOf("--workspace") + 1] === "old-worktree-space"), "tabs join the workspace holding the worktree");
+    assert.deepEqual(f.state.lanes.map((lane) => lane.workspaceId), ["old-worktree-space", "old-worktree-space"], "each lane records its workspace");
+    assert.equal(f.state.ownership.workspaceId, "old-worktree-space");
+    assert.equal(f.state.taskBinding.workspaceId, "task-space", "the root's task binding is unchanged");
+    assert.ok(f.calls.some((c) => c[0] === "workspace" && c[1] === "get" && c[2] === "old-worktree-space"));
   } finally {
     await f.close();
   }
