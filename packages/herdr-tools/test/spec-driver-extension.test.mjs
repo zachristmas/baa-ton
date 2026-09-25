@@ -73,7 +73,17 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
   const saved = Object.fromEntries(["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map((key) => [key, process.env[key]]));
   Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: rootPane, HERDR_WORKSPACE_ID: "w-spec", HERDR_PLUGIN_CONFIG_DIR: configDir });
   const tools = new Map();
-  extension({ on() {}, registerCommand() {}, registerTool: (definition) => tools.set(definition.name, definition), async exec() { throw new Error("no herdr in this test"); } });
+  const handlers = new Map();
+  extension({
+    on(event, handler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    registerCommand() {},
+    registerTool: (definition) => tools.set(definition.name, definition),
+    async exec() {
+      throw new Error("no herdr in this test");
+    },
+  });
   const calls = { worktree: [], plan: [], dispatch: [] };
   let planned = 0;
   const pushedShas = new Set();
@@ -102,7 +112,18 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     },
     now: () => "2026-09-24T12:00:00.000Z",
   };
-  const ctx = { cwd: parent, mode: "json", hasUI: false, ui: { confirm: async () => false, notify() {} }, specDriverPorts: ports };
+  const ctx = {
+    cwd: parent,
+    mode: "json",
+    hasUI: false,
+    ui: { confirm: async () => false, notify() {} },
+    specDriverPorts: ports,
+    // Pi lifecycle fields; the root is mid-turn (not idle) throughout.
+    isIdle: () => false,
+    abort() {},
+    signal: undefined,
+    sessionManager: { getSessionFile: () => "/tmp/root.jsonl", getSessionId: () => "root" },
+  };
   return {
     calls,
     pushedShas,
@@ -112,6 +133,9 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     stateDir,
     tools,
     ctx,
+    async emit(event) {
+      for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
+    },
     advance: () => tools.get("herdr_spec").execute("spec", { action: "advance" }, undefined, undefined, ctx),
     status: () => tools.get("herdr_spec").execute("spec", { action: "status" }, undefined, undefined, ctx),
     state: async () => JSON.parse(await readFile(join(stateDir, "spec-state.json"), "utf8")),
@@ -629,4 +653,95 @@ test("lane contracts and the integration objective steer lanes away from the sha
   }
   const spec = validateSpec({ version: 1, target: { repo: ".", remote: "origin", branch: "b" }, items: [{ id: "A", title: "a", acceptance: { text: "a" } }] });
   assert.match(integrateObjective(spec, spec.items[0], { integrationBranch: "spec-integration", itemBranch: "spec/A" }), /Never use git stash/);
+});
+
+function fakeClock() {
+  let now = 0;
+  let next = 1;
+  const timers = new Map();
+  return {
+    schedule(callback, ms) {
+      const id = next++;
+      timers.set(id, { at: now + ms, callback });
+      return id;
+    },
+    cancel(id) {
+      timers.delete(id);
+    },
+    async advance(ms) {
+      const until = now + ms;
+      for (;;) {
+        const due = [...timers.entries()].filter(([, timer]) => timer.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].at;
+        due[1].callback();
+        // A pass does real file I/O (state, manifest, log): let it finish.
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+      now = until;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    },
+    get pending() {
+      return timers.size;
+    },
+  };
+}
+
+test("the driver runs on a timer while the root is mid-turn: no overlap, backoff honored, passes logged", async () => {
+  const f = await fixture();
+  const clock = fakeClock();
+  f.ctx.specTimerOptions = { schedule: clock.schedule, cancel: clock.cancel, watch: () => undefined };
+  try {
+    // The root starts a long turn; no turn settles during this test.
+    await f.emit("agent_start");
+    assert.equal(f.calls.plan.length, 0, "starting the timer runs nothing yet");
+    await clock.advance(25_000);
+    assert.equal(f.calls.dispatch.length, 1, "a timer pass dispatched the ready build mid-turn");
+    assert.equal((await f.state()).items.A.state, "building");
+
+    // A slow pass: the next tick must not start a second one.
+    let release;
+    const slow = new Promise((resolve) => (release = resolve));
+    f.ports.plan = async (input) => {
+      f.calls.plan.push(input);
+      await slow;
+      return { id: "herdr-slow", lanes: [{ id: "lane-1" }] };
+    };
+    await f.laneReceipt("herdr-spec1", "Committed.");
+    await clock.advance(25_000);
+    const planned = f.calls.plan.length;
+    await clock.advance(25_000);
+    await clock.advance(25_000);
+    assert.equal(f.calls.plan.length, planned, "no overlapping pass while one is running");
+    release();
+    await clock.advance(1);
+
+    // A shell start timeout backs the driver off; timer passes honor it.
+    await f.laneReceipt("herdr-slow", "VERDICT: PASS");
+    const before = f.calls.dispatch.length;
+    f.ports.plan = async (input) => {
+      f.calls.plan.push(input);
+      return { id: `herdr-p${f.calls.plan.length}`, lanes: [{ id: "lane-1" }] };
+    };
+    f.ports.dispatch = async (workflowId) => {
+      f.calls.dispatch.push(workflowId);
+      throw new Error("Pane w-spec:p9 shell did not become ready for agent start; inspect it before retrying.");
+    };
+    await clock.advance(25_000);
+    const afterFailure = f.calls.dispatch.length;
+    assert.ok(afterFailure > before);
+    assert.match((await f.state()).dispatchBackoff.reason, /shell did not become ready/);
+    await clock.advance(25_000);
+    await clock.advance(25_000);
+    assert.equal(f.calls.dispatch.length, afterFailure, "no dispatch during the backoff");
+
+    const log = (await readFile(join(f.stateDir, "spec-driver.log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(log.some((entry) => entry.trigger === "timer" && entry.actions?.some((action) => /^build A -> /.test(action))), "each acting pass is logged");
+
+    await f.emit("session_shutdown");
+    assert.equal(clock.pending, 0, "the timer stops with the session");
+  } finally {
+    await f.cleanup();
+  }
 });

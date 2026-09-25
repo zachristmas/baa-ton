@@ -214,6 +214,16 @@ These refine the design where it meets existing invariants:
   - **Digest line:** every root digest now starts with the burn-down line (`spec N/M done · 2 building · 1 awaiting-push · 1 blocked(decision)`), computed by the controller from `spec.json` and `spec-state.json`.
   - **Not verified live:** the release-check formats beyond these parsers; a real preview run.
 
+## When the driver runs
+
+A root can stay in one LLM turn for many minutes, so the driver doesn't wait for turns. The root's extension runs it:
+
+- every 25 seconds while the root session is up;
+- 2 seconds after `manifest.json` changes, which is where lane receipts and statuses land;
+- when a turn settles, as before.
+
+Passes never overlap: a trigger during a pass leaves exactly one follow-up pass. A pass that throws backs the timer off, doubling up to 5 minutes. `maxParallel`, the capacity gate, the live memory floor and the shell-timeout backoff all apply inside every pass. Each pass that started something, needed the root, or changed its skip reason is appended to `.baa-ton/herdr-orchestrator/spec-driver.log`. The driver opens no dialog and uses no LLM, so a pass mid-turn is safe.
+
 ## Adopting a live run
 
 A run that started before the spec loop already has work: worktrees and branches, local commits, evidence reports, reviews, and legacy workflows still running. On an empty `spec-state.json` the driver would rebuild every item and double-dispatch live ones. So a live run is adopted first:

@@ -1,5 +1,6 @@
 import {
   access,
+  appendFile,
   chmod,
   lstat,
   mkdir,
@@ -13,7 +14,7 @@ import {
 import { constants as fsConstants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, watch as watchPath } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
@@ -148,6 +149,7 @@ import {
 } from "./spec.mjs";
 import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
 import { adoptSpec, adoptionTable, itemOwnedChanges } from "./spec-adopt.mjs";
+import { specDriverTimer } from "./spec-timer.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -4883,6 +4885,56 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } finally {
       specDriverRunning = false;
     }
+  }
+
+  let specTimer: ReturnType<typeof specDriverTimer> | undefined;
+  let specTimerCtx: ExtensionContext | undefined;
+
+  /**
+   * Keep the spec driver running while the root session is up, not only
+   * when an LLM turn settles: a pass every 25 s and shortly after the
+   * manifest changes (lane receipts and statuses), serialized, logged to
+   * spec-driver.log. Started for a root whose project has a spec; every
+   * lifecycle event refreshes the context the passes use.
+   */
+  function ensureSpecTimer(ctx: ExtensionContext) {
+    if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
+    specTimerCtx = ctx;
+    if (specTimer?.active || !existsSync(join(ctx.cwd, SPEC_PATH))) return;
+    const stateDir = dirname(manifestPath(ctx.cwd));
+    const logPath = join(stateDir, "spec-driver.log");
+    const write = (entry: Record<string, unknown>) =>
+      appendFile(logPath, `${JSON.stringify({ at: now(), ...entry })}\n`, { mode: 0o600 }).catch(() => undefined);
+    let lastSkip: string | undefined;
+    // Tests replace the clock and the manifest watcher through the context.
+    const overrides = (ctx as { specTimerOptions?: Partial<Parameters<typeof specDriverTimer>[0]> }).specTimerOptions ?? {};
+    specTimer = specDriverTimer({
+      run: () => runSpecDriver(specTimerCtx!, (specTimerCtx as { specDriverPorts?: Partial<SpecDriverPorts> }).specDriverPorts),
+      log: (result, reason) => {
+        const outcome = result as { skipped?: string; actions?: string[]; rootAsks?: unknown[] };
+        if (outcome.skipped !== undefined) {
+          if (outcome.skipped !== lastSkip) void write({ trigger: reason, skipped: outcome.skipped });
+          lastSkip = outcome.skipped;
+          return;
+        }
+        lastSkip = undefined;
+        if (outcome.actions?.length || outcome.rootAsks?.length) void write({ trigger: reason, actions: outcome.actions, rootAsks: outcome.rootAsks });
+      },
+      onError: (error) => void write({ error: clip((error as Error)?.message ?? String(error), 500) }),
+      watch: (onChange) => {
+        try {
+          const watcher = watchPath(stateDir, (_event, file) => {
+            if (file === MANIFEST_NAME) onChange();
+          });
+          watcher.unref?.();
+          return () => watcher.close();
+        } catch {
+          return undefined;
+        }
+      },
+      ...overrides,
+    });
+    specTimer.start();
   }
 
   /** Runs when the root's turn settles: retire lanes whose completion the
@@ -9804,17 +9856,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "active");
     await attemptActivationAck(ctx);
+    try {
+      ensureSpecTimer(ctx);
+    } catch {
+      // The timer is best effort; the settled-turn trigger remains.
+    }
   });
   pi.on("agent_settled", async (_event, ctx) => {
     await persistRootTurn(ctx, "idle");
     await autoRetireFinishedLanes(ctx);
     try {
-      if (isRootOrchestrator() && isRootForManifest(ctx.cwd)) await runSpecDriver(ctx);
+      if (isRootOrchestrator() && isRootForManifest(ctx.cwd)) {
+        ensureSpecTimer(ctx);
+        // Through the timer, so it never overlaps a timer pass.
+        if (specTimer?.active) await specTimer.kick("settled");
+        else await runSpecDriver(ctx);
+      }
     } catch {
       // The driver records its own failures in spec-state; never throw into Pi.
     }
   });
   pi.on("session_shutdown", async (_event, ctx) => {
+    specTimer?.stop();
+    specTimer = undefined;
     removeRuntimeRecord?.();
     removeRuntimeRecord = undefined;
     rootRunId = randomUUID();
@@ -9836,6 +9900,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     rootRunId = randomUUID();
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "unknown");
+    try {
+      ensureSpecTimer(ctx);
+    } catch {
+      // Best effort; agent_start and agent_settled try again.
+    }
     const startupPath = process.env.BAA_STARTUP_INTENT;
     if (startupPath) {
       const intent = parseJson(await readFile(startupPath, "utf8"));
