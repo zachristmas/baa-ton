@@ -132,6 +132,7 @@ import {
 } from "./live-identity.mjs";
 import { legacyStateStatus } from "./state-migration.mjs";
 import { classifyLocalValidation } from "./known-safe.mjs";
+import { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers } from "./root-question.mjs";
 import {
   SPEC_PATH,
   SPEC_STATE_PATH,
@@ -301,6 +302,8 @@ type ManifestWithGoalHistory = Manifest & {
   directives?: RootDirective[];
   /** Controller-owned per-root capacity gate, alerts and watchdog state. */
   rootSupervision?: RootSupervision[];
+  /** Unattended defaults (lane prompts, root questions), kept for the user's review. */
+  unattendedDecisions?: Array<Record<string, unknown>>;
 };
 type CapacityGate = {
   id: string;
@@ -874,6 +877,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
       leases?: Lease[];
       directives?: RootDirective[];
       rootSupervision?: RootSupervision[];
+      unattendedDecisions?: Array<Record<string, unknown>>;
     };
     if (
       (parsed.version === 1 || parsed.version === 2) &&
@@ -911,6 +915,7 @@ async function loadManifest(cwd: string): Promise<ManifestWithQueue> {
         ...(Array.isArray(parsed.leases) ? { leases: parsed.leases } : {}),
         ...(Array.isArray(parsed.directives) ? { directives: parsed.directives } : {}),
         ...(Array.isArray(parsed.rootSupervision) ? { rootSupervision: parsed.rootSupervision } : {}),
+        ...(Array.isArray(parsed.unattendedDecisions) ? { unattendedDecisions: parsed.unattendedDecisions } : {}),
       };
     }
     return { version: 2, workflows: [] };
@@ -10268,6 +10273,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         };
       }
     }
+    if (
+      call.toolName === "ask_user_question" &&
+      process.env.HERDR_ENV === "1" &&
+      isRootOrchestrator() &&
+      isRootForManifest(ctx.cwd)
+    ) {
+      await armRootQuestionDefault(event as { toolCallId?: string }, call.input, ctx);
+      return;
+    }
     const command = call.input?.command;
     if (call.toolName !== "bash" || typeof command !== "string") return;
     const gitPush = /(?:^|[;&|]\s*)git(?:\s+\S+)*\s+push\b/im;
@@ -10306,6 +10320,60 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           "Delegated Pi sessions and detached child jobs must be created only through Herdr dispatch.",
       };
     }
+  });
+
+  // The root's own questions in an autonomous run: the Recommended option
+  // after ROOT_QUESTION_AUTO_ANSWER_MS, unless it concerns push, deploy,
+  // production or new scope. Logged, notified, and never by screen reading.
+  const rootQuestions = createQuestionTimers({ delayMs: ROOT_QUESTION_AUTO_ANSWER_MS });
+  const rootQuestionAnswers = new Map<string, string>();
+  async function armRootQuestionDefault(
+    event: { toolCallId?: string },
+    input: unknown,
+    ctx: { cwd: string; abort?: () => void; signal?: AbortSignal },
+  ): Promise<void> {
+    const plan = autoAnswerPlan(input ?? {});
+    if (!plan.eligible) return;
+    const spec = await loadSpec(ctx.cwd).catch(() => undefined);
+    if (!spec) return;
+    const manifest = await loadManifest(ctx.cwd);
+    if (laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "dispatch")) return;
+    const id = event.toolCallId ?? `question-${randomUUID().slice(0, 8)}`;
+    const cwd = ctx.cwd;
+    rootQuestions.start(id, () => {
+      const text = autoAnswerText(plan);
+      rootQuestionAnswers.set(id, text);
+      void (async () => {
+        const at = now();
+        await withManifestTransaction(cwd, (stored) => {
+          const log = ((stored as ManifestWithQueue).unattendedDecisions ??= []);
+          log.push({ at, kind: "root-question", toolCallId: id, answers: plan.answers, reason: "no answer; took the Recommended option", reviewed: false });
+          if (log.length > 200) log.splice(0, log.length - 200);
+        }).catch(() => undefined);
+        await runHerdr(
+          ["notification", "show", "Baa-ton: root question auto-answered", "--body", clip(plan.answers.map((item) => `${item.question} -> ${item.answer}`).join("; "), 400), "--sound", "request"],
+          undefined,
+        ).catch(() => undefined);
+        // End the open dialog, then hand the root its answer as a follow-up.
+        try {
+          ctx.abort?.();
+        } catch {
+          // Nothing to abort: the dialog already closed.
+        }
+        pi.sendMessage(
+          { customType: "herdr-root-question-default", display: true, content: text },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      })();
+    });
+  }
+  pi.on("tool_result", async (event) => {
+    const result = event as unknown as { toolName?: string; toolCallId?: string };
+    if (result.toolName !== "ask_user_question" || !result.toolCallId) return;
+    const fired = rootQuestions.settle(result.toolCallId);
+    const text = rootQuestionAnswers.get(result.toolCallId);
+    rootQuestionAnswers.delete(result.toolCallId);
+    if (fired && text) return { content: [{ type: "text", text }], isError: false };
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
