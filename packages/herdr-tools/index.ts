@@ -187,6 +187,7 @@ const {
   idleLaneServices,
   isHarnessCommand,
   liveAgentReady,
+  paneShowsShell,
   paneServiceProcesses,
   parseProcessIdentity,
 } = await importRouteChildMessage();
@@ -4060,6 +4061,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       });
       if (!ready.ok) return { status: "pending", updatedAt: stamp, reason: `lane agent not ready: ${ready.reason}`, text };
       status = ready.agent.agent_status;
+      // Herdr can keep an agent record for a moment after the agent exits;
+      // a pane whose only foreground process is its shell gets nothing typed.
+      const shell = await runHerdr(["pane", "process-info", "--pane", paneId], signal).then(paneShowsShell, () => undefined);
+      if (shell === true) return { status: "pending", updatedAt: stamp, reason: "lane agent not ready: pane_shows_shell_prompt", text };
     } catch (error) {
       return { status: "pending", updatedAt: stamp, reason: `lane unavailable: ${clip((error as Error).message, 300)}`, text };
     }

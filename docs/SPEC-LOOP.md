@@ -231,6 +231,7 @@ The loop runs with nobody watching panes. Every path by which a lane or the root
 | Waiting on | Resolved by |
 | --- | --- |
 | A lane's permission prompt for a known-safe command: temp-file removal, `rmdir`, own-branch create or reset, a discard after a scratch patch, a generated-artifact revert, the lane-admin PR flow | The lane's PermissionRequest hook approves it at once (`known-safe.mjs`). |
+| (Safety) a digest, wake, root message or answer typed while the agent is gone | Every sender re-checks right before typing. `agent get` must show the expected agent, live and ready, and the pane's foreground must not be only its shell (Herdr can keep an agent record briefly after the agent exits). Otherwise the item stays pending. Nothing is ever typed into a raw shell. |
 | Any other lane permission prompt | Routed to the root as a lane request. A grant or deny reaches the waiting hook. With no answer within 300 s (or no route), the unattended policy decides: allow when the command stays inside the lane's worktree, scratch and `/tmp` with no network, credentials, publishing or system commands; otherwise deny, with a reason the lane can act on. The prompt never falls back to the pane. |
 
 ## Adopting a live run
