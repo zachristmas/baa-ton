@@ -20,8 +20,18 @@
 
 /** States that hold a lane (and a maxParallel slot). */
 export const ACTIVE_STATES = new Set(["building", "reviewing", "integrating", "verifying"]);
-const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", "done"]);
-const INTEGRATED = new Set(["awaiting-push", "verifying", "done"]);
+const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", "done", "resolved"]);
+const INTEGRATED = new Set(["awaiting-push", "verifying", "done", "resolved"]);
+/** How long a lane that went idle without its receipt has to answer the ask. */
+export const RECEIPT_ASK_TIMEOUT_MS = 30 * 60_000;
+const RECEIPT_FORMAT = {
+  decide: "QUESTION: lines for anything still open (none when settled), OWNS: and MIGRATIONS: if they differ",
+  build: "the commit SHA, the checks you ran and their results, and the evidence report path",
+  review: "a first line of exactly VERDICT: PASS or VERDICT: FAIL, then the findings",
+  integrate: "the lines INTEGRATED: <full SHA> and SUITE: pass or SUITE: fail",
+  verify: "one PREVIEW: <spec> pass|fail line per spec and REPORT: <path>",
+};
+const STAGE_OF = { deciding: "decide", building: "build", reviewing: "review", integrating: "integrate", verifying: "verify" };
 const LANE_ENDED = new Set(["operator-closed", "superseded", "dispatch-failed", "failed", "closed"]);
 
 /** Static prefix of a glob (everything before the first wildcard). */
@@ -93,10 +103,11 @@ export function integrationResult(summary) {
  * @param {boolean} [input.capacityWaiting] the root has a capacity gate waiting
  * @param {Set<string>} [input.pushed] integration SHAs the target branch already contains
  * @param {Map<string, string>} [input.released] item id -> preview release SHA that contains its commit
+ * @param {Set<string>} [input.dirty] items whose worktree has uncommitted changes
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
  */
-export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), released = new Map(), now }) {
+export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), released = new Map(), dirty = new Set(), now }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
   next.items ??= {};
   const actions = [];
@@ -111,6 +122,41 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
     (item.history ??= []).push({ at: now, from, to, ...(note ? { note } : {}) });
     if (item.history.length > 50) item.history.splice(0, item.history.length - 50);
   };
+
+  // 0. A lane that went idle (done) without its receipt is asked once for
+  // it, then handed to the root; a lane whose pane is gone is retried.
+  for (const item of spec.items) {
+    const current = record(item.id);
+    const stage = STAGE_OF[current.state];
+    if (!stage || !current.lane) continue;
+    const view = lane(current.lane);
+    if (!view || view.receipt) {
+      delete current.receiptAskedAt;
+      continue;
+    }
+    if (view.agentStatus === "gone") {
+      const attempts = current.attempts ?? 1;
+      const counts = stage === "build" && !dirty.has(item.id);
+      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `lane gone without a receipt; retried${counts ? "" : " without counting an attempt"}` });
+      delete current.lane;
+      delete current.receiptAskedAt;
+      if (counts) {
+        if (attempts >= spec.defaults.maxBuildAttempts) {
+          move(item.id, "failed", {}, "build lane gone without a receipt");
+          rootAsks.push({ itemId: item.id, reason: `${item.id}: its build lane is gone without a receipt after ${attempts} attempt(s)` });
+        } else current.attempts = attempts + 1;
+      }
+    } else if (view.agentStatus === "done") {
+      if (!current.receiptAskedAt) {
+        current.receiptAskedAt = now;
+        actions.push({ kind: "ask-receipt", itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, format: RECEIPT_FORMAT[stage] });
+      } else if (Date.parse(now) - Date.parse(current.receiptAskedAt) > RECEIPT_ASK_TIMEOUT_MS && !current.receiptEscalatedAt) {
+        current.receiptEscalatedAt = now;
+        move(item.id, "blocked", { blockedReason: "human-gate", note: `${stage} lane is idle without a receipt, even after being asked` });
+        rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lane ${current.lane.workflowId}/${current.lane.laneId} went idle without a receipt and did not answer the ask; read its pane and set the outcome` });
+      }
+    }
+  }
 
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {

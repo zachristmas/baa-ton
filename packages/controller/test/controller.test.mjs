@@ -4222,6 +4222,8 @@ test("the digest line leaves deferred spec items out of M", async () => {
     await writeFile(join(directory, ".baa-ton", "spec.json"), JSON.stringify({ items: [{ id: "A" }, { id: "B" }, { id: "C" }] }));
     await writeFile(join(stateDir, "spec-state.json"), JSON.stringify({ version: 1, items: { A: { state: "done" }, C: { state: "deferred" } } }));
     assert.equal(await specDigestLine(join(stateDir, "manifest.json")), "spec 1/2 done · 1 pending · 1 deferred");
+    await writeFile(join(stateDir, "spec-state.json"), JSON.stringify({ version: 1, items: { A: { state: "done" }, B: { state: "resolved" }, C: { state: "deferred" } } }));
+    assert.equal(await specDigestLine(join(stateDir, "manifest.json")), "spec 2/2 done (1 by decision) · 1 deferred");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

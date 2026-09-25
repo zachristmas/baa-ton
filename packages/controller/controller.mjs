@@ -2077,11 +2077,15 @@ export async function specDigestLine(manifestPath) {
     const counts = new Map();
     let done = 0;
     let deferred = 0;
+    let byDecision = 0;
     for (const item of items) {
       const record = isRecord(state[item?.id]) ? state[item.id] : {};
       const stage = typeof record.state === "string" ? record.state : "pending";
       if (stage === "done") done += 1;
-      else if (stage === "deferred") deferred += 1;
+      else if (stage === "resolved") {
+        done += 1;
+        byDecision += 1;
+      } else if (stage === "deferred") deferred += 1;
       else {
         const key = stage === "blocked" ? `blocked(${record.blockedReason ?? "?"})` : stage;
         counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -2090,7 +2094,7 @@ export async function specDigestLine(manifestPath) {
     const order = [...SPEC_LINE_STATES, ...[...counts.keys()].filter((key) => key.startsWith("blocked(")).sort()];
     // Deferred items are out of scope for now and not counted in M.
     return [
-      `spec ${done}/${items.length - deferred} done`,
+      `spec ${done}/${items.length - deferred} done${byDecision ? ` (${byDecision} by decision)` : ""}`,
       ...order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`),
       ...(deferred ? [`${deferred} deferred`] : []),
     ].join(" · ");

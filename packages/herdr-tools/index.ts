@@ -4551,6 +4551,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
+    /** Send a root-to-lane message (herdr_tell). */
+    tell?(input: { workflowId: string; laneId: string; text: string }): Promise<{ message: { delivery: { status: string } } }>;
     /** Live memory and swap sample (the controller's sampleCapacity). */
     sample?(): Promise<{ freeMemoryGb?: number; swapUsedGb?: number }>;
     /** Directory holding the spec worktrees (default ~/.herdr/worktrees/<repo>). */
@@ -4608,8 +4610,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const workflow = manifest.workflows.find((item) => item.id === ref.workflowId);
         const lane = workflow?.lanes.find((item) => item.id === ref.laneId);
         if (!lane) return undefined;
+        // Herdr's view of the agent: the lane's latest status event, or a
+        // session the observer recorded as gone or done.
+        const events = (workflow as { eventController?: { events?: Array<{ lane_id?: string; source?: { agent_status?: string } }> } }).eventController?.events ?? [];
+        const latest = [...events].reverse().find((event) => event.lane_id === ref.laneId)?.source?.agent_status;
+        const session = lane.sessionLog?.status;
+        const agentStatus = session === "gone" ? "gone" : latest ?? (session === "done" ? "done" : undefined);
         return {
           status: lane.status,
+          ...(agentStatus ? { agentStatus } : {}),
           ...(lane.completionReceipt ? { receipt: { summary: lane.completionReceipt.summary } } : {}),
         };
       };
@@ -4656,10 +4665,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             capacityWaiting = `swap used ${current.swapUsedGb} GB is above ${spec.defaults.maxSwapUsedGb} GB`;
         }
       }
+      // Worktrees with uncommitted changes, for lanes whose pane is gone: their
+      // retry in the same worktree does not count as a build attempt.
+      const statusOf =
+        ports?.status ??
+        (async (path: string) => (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], { timeout: 30_000 })).stdout);
+      const dirty = new Set<string>();
+      for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, { lane?: { workflowId: string; laneId: string }; worktree?: string }]>)
+        if (record.lane && record.worktree && laneView(record.lane)?.agentStatus === "gone")
+          if ((await statusOf(record.worktree).catch(() => "")).trim()) dirty.add(id);
       const step = advanceSpec({
         spec,
         state,
         lane: laneView,
+        dirty,
         capacityWaiting,
         pushed,
         released,
@@ -4677,7 +4696,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const record = next.items[item.id];
         // After a shell failed to start, start nothing else this pass; the
         // items keep their state and are retried after the backoff.
-        if (shellTimeout && action.kind !== "decide") continue;
+        if (shellTimeout && action.kind !== "decide" && action.kind !== "ask-receipt") continue;
+        if (action.kind === "ask-receipt") {
+          const text = `Your spec ${action.stage} lane for ${item.id} is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must contain ${action.format}.`;
+          try {
+            const told = await (ports?.tell ?? ((input: { workflowId: string; laneId: string; text: string }) => tellLane(ctx.cwd, input, signal)))({ ...action.lane!, text });
+            done.push(`asked ${item.id} for its receipt (${told.message.delivery.status})`);
+          } catch (error) {
+            record.note = `receipt ask failed: ${clip((error as Error).message, 200)}`;
+          }
+          continue;
+        }
         // An adopted item keeps its own branch and worktree.
         const branch = record.branch ?? `spec/${item.id}`;
         const worktree =
@@ -4704,9 +4733,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             // paths (never secrets) for the integration lane to commit first.
             let commitFirst;
             if (record.worktree) {
-              const porcelain = await (ports?.status ?? (async (path: string) => (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], { timeout: 30_000 })).stdout))(record.worktree).catch(() => "");
-              const changes = itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns);
-              if (changes.paths.length || changes.secrets.length) commitFirst = { worktree: record.worktree, ...changes };
+              const porcelain = await statusOf(record.worktree).catch(() => "");
+              const changes = itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns, item.sharedTouch);
+              // Anything uncommitted beyond the item's owns and sharedTouch
+              // (an item with no owns: every change) would be left out of the
+              // merge or swept in by mistake: the root decides first.
+              if (changes.outside.length) {
+                const files = changes.outside.slice(0, 20).join(", ") + (changes.outside.length > 20 ? `, and ${changes.outside.length - 20} more` : "");
+                Object.assign(record, {
+                  state: "blocked",
+                  blockedReason: "human-gate",
+                  note: `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
+                  since: use.now(),
+                });
+                record.history = [...(record.history ?? []), { at: use.now(), from: "integrating", to: "blocked", note: "uncommitted changes outside its files" }];
+                step.rootAsks.push({
+                  itemId: item.id,
+                  reason: `${item.id}: ${record.worktree} has uncommitted changes outside the item's owns and sharedTouch (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to integrating.`,
+                });
+                done.push(`integrate ${item.id} held: uncommitted changes outside its files`);
+                continue;
+              }
+              if (changes.paths.length || changes.secrets.length) commitFirst = { worktree: record.worktree, paths: changes.paths, secrets: changes.secrets };
             }
             objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch, commitFirst });
           } else if (action.kind === "build") {
@@ -10673,7 +10721,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ],
     parameters: Type.Object(
       {
-        action: Type.Union([Type.Literal("status"), Type.Literal("verify"), Type.Literal("advance"), Type.Literal("answer"), Type.Literal("adopt")]),
+        action: Type.Union([
+          Type.Literal("status"),
+          Type.Literal("verify"),
+          Type.Literal("advance"),
+          Type.Literal("answer"),
+          Type.Literal("adopt"),
+          Type.Literal("reopen"),
+        ]),
         dryRun: Type.Optional(Type.Boolean()),
         force: Type.Optional(Type.Boolean()),
         itemId: Type.Optional(Type.String()),
@@ -10683,12 +10738,58 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ),
     async execute(_id, params, signal, _update, ctx) {
       if (params.action === "adopt") {
-        requireRootManifestExecutor(ctx.cwd);
+        const scope = requireRootManifestExecutor(ctx.cwd);
         const result = await adoptSpec({ cwd: ctx.cwd, dryRun: params.dryRun ?? false, force: params.force ?? false });
+        // A resolution is a decision the user may overturn: tell the root and the user.
+        if (result.written && result.resolved.length) {
+          const text = `Spec items recorded as resolved by decision (herdr_spec action=reopen itemId=<id> undoes one): ${result.resolved.map((entry) => `${entry.itemId} (${entry.reason})`).join("; ")}`;
+          await withManifestTransaction(ctx.cwd, (manifest) => {
+            const entries = ((manifest as ManifestWithQueue).rootSupervision ??= []);
+            let entry = entries.find((item) => item.rootId === scope.rootId);
+            if (!entry) {
+              entry = { rootId: scope.rootId, alerts: [] };
+              entries.push(entry);
+            }
+            ((entry as { alerts?: unknown[] }).alerts ??= []).push({
+              id: `alert-${randomUUID().slice(0, 8)}`,
+              kind: "spec-resolved",
+              text: clip(text, 1500),
+              createdAt: now(),
+              delivery: { status: "pending", attempts: 0, updatedAt: now() },
+            });
+          });
+          await runHerdr(["notification", "show", "Baa-ton: spec items resolved by decision", "--body", clip(text, 400), "--sound", "request"], signal).catch(() => undefined);
+        }
         return {
           content: [{ type: "text", text: `${adoptionTable(result.rows)}\n${result.written ? `Wrote ${SPEC_STATE_PATH}.` : "Dry run: nothing written."}` }],
           details: result,
         };
+      }
+      if (params.action === "reopen") {
+        requireRootManifestExecutor(ctx.cwd);
+        if (!params.itemId) throw new Error("itemId is required to reopen an item.");
+        const release = await acquireManifestLock(ctx.cwd, 10_000);
+        try {
+          const state = await loadSpecState(ctx.cwd);
+          const record = state.items[params.itemId];
+          if (!record || record.state !== "resolved") throw new Error(`Spec item ${params.itemId} is not resolved by decision.`);
+          const at = now();
+          const reason = params.text?.trim() || "the user overturned the decision";
+          (state as { decisions?: unknown[] }).decisions = [
+            ...(((state as { decisions?: unknown[] }).decisions) ?? []),
+            { at, itemId: params.itemId, decision: "reopened", reason, by: "root" },
+          ];
+          record.history = [...(record.history ?? []), { at, from: "resolved", to: "pending", note: reason }];
+          Object.assign(record, { state: "pending", since: at });
+          delete record.resolution;
+          const path = join(ctx.cwd, SPEC_STATE_PATH);
+          const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+          await writeFile(temporary, `${jsonText(state)}\n`, { mode: 0o600 });
+          await rename(temporary, path);
+        } finally {
+          await release();
+        }
+        return { content: [{ type: "text", text: `Reopened ${params.itemId}; it goes through the loop again.` }], details: { itemId: params.itemId } };
       }
       if (params.action === "answer") {
         requireRootManifestExecutor(ctx.cwd);
