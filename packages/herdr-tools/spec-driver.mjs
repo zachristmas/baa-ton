@@ -28,6 +28,9 @@ const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", 
 const INTEGRATED = new Set(["awaiting-push", "verifying", "done", "resolved"]);
 /** How long a lane that went idle without its receipt has to answer the ask. */
 export const RECEIPT_ASK_TIMEOUT_MS = 30 * 60_000;
+/** A lane that answers the ask with a status message is still working: ask
+ * again after this long (doubling each time it answers with a status). */
+export const RECEIPT_REASK_BASE_MS = 60 * 60_000;
 const RECEIPT_FORMAT = {
   decide: "QUESTION: lines for anything still open (none when settled), OWNS: and MIGRATIONS: if they differ",
   build: "the commit SHA, the checks you ran and their results, and the evidence report path",
@@ -119,10 +122,23 @@ export function integrationResult(summary) {
  * @param {Set<string>} [input.pushed] integration SHAs the target branch already contains
  * @param {Map<string, string>} [input.released] item id -> preview release SHA that contains its commit
  * @param {Set<string>} [input.dirty] items whose worktree has uncommitted changes
+ * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
+ * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
  */
-export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed = new Set(), released = new Map(), dirty = new Set(), now }) {
+export function advanceSpec({
+  spec,
+  state,
+  lane,
+  capacityWaiting = false,
+  pushed = new Set(),
+  released = new Map(),
+  dirty = new Set(),
+  integrationLive,
+  contained = new Map(),
+  now,
+}) {
   const next = structuredClone(state ?? { version: 1, items: {} });
   next.items ??= {};
   const actions = [];
@@ -162,6 +178,16 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
         } else current.attempts = attempts + 1;
       }
     } else if (view.agentStatus === "done") {
+      // It answered the ask with a status message (herdr_message): still
+      // working, e.g. waiting on a long suite in a tracked background shell.
+      if (current.receiptAskedAt && view.lastMessageAt && Date.parse(view.lastMessageAt) > Date.parse(current.receiptAskedAt)) {
+        current.receiptStatusReplies = (current.receiptStatusReplies ?? 0) + 1;
+        current.receiptAskAfter = new Date(Date.parse(now) + RECEIPT_REASK_BASE_MS * 2 ** (current.receiptStatusReplies - 1)).toISOString();
+        delete current.receiptAskedAt;
+        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `lane replied with a status; asking again after ${current.receiptAskAfter}` });
+        continue;
+      }
+      if (current.receiptAskAfter && Date.parse(now) < Date.parse(current.receiptAskAfter)) continue;
       if (!current.receiptAskedAt) {
         current.receiptAskedAt = now;
         actions.push({ kind: "ask-receipt", itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, format: RECEIPT_FORMAT[stage] });
@@ -291,18 +317,46 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
   // worktree stays reserved by any integrate or verify lane whose workflow
   // is still open, even when its item was blocked or the lane went idle
   // without a receipt: a second lane there would collide.
-  const reservedBy = spec.items.find((item) => {
+  const reservedItem = spec.items.find((item) => {
     const current = next.items[item.id];
     if (!current?.lane) return false;
-    const stage = current.laneStage ?? STAGE_OF[current.state];
-    if (stage !== "integrate" && stage !== "verify") return false;
     const view = lane(current.lane);
+    const stage = current.laneStage ?? view?.specStage ?? STAGE_OF[current.state];
+    if (stage !== "integrate" && stage !== "verify") return false;
     return !view || !CLOSED_WORKFLOW.has(view.workflowStatus ?? "");
   });
+  const reservedBy = reservedItem
+    ? `${reservedItem.id}'s lane ${next.items[reservedItem.id].lane.workflowId} is still open`
+    : integrationLive;
+
+  // 1c0. A queued item whose branch is already on the integration branch
+  // (a batch lane merged it) is integrated at the commit that contains it.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    if (current?.state !== "integrating" || current.lane || !contained.has(item.id)) continue;
+    const sha = contained.get(item.id);
+    const sameCommit = spec.items
+      .map((other) => next.items[other.id])
+      .find((other) => other?.integration?.sha === sha && Array.isArray(other.tests) && other.tests.some((run) => run.sha === sha && run.result === "pass"));
+    next.integrationCounter = (next.integrationCounter ?? 0) + 1;
+    move(
+      item.id,
+      "awaiting-push",
+      {
+        integration: { sha, order: next.integrationCounter, at: now, contained: true },
+        // The suite result at that commit is known only when another item
+        // integrated there recorded it; otherwise the verifier waits.
+        ...(sameCommit
+          ? { tests: [...(Array.isArray(current.tests) ? current.tests : []), ...item.acceptance.tests.map((command) => ({ command, sha, result: "pass", at: now, by: "contained" }))] }
+          : {}),
+      },
+      `already on the integration branch at ${sha.slice(0, 12)}`,
+    );
+  }
   if (reservedBy) {
     for (const item of spec.items)
       if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
-        waits[item.id] = `integration worktree busy: ${reservedBy.id}'s lane ${next.items[reservedBy.id].lane.workflowId} is still open`;
+        waits[item.id] = `integration worktree busy: ${reservedBy}`;
   } else if (!spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane)) {
     const head = spec.items.find(
       (item) =>
@@ -349,7 +403,7 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
       continue;
     }
     if (reservedBy) {
-      waits[item.id] = `integration worktree busy: ${reservedBy.id}'s lane ${next.items[reservedBy.id].lane.workflowId} is still open`;
+      waits[item.id] = `integration worktree busy: ${reservedBy}`;
       continue;
     }
     if (item.acceptance.preview.length && spec.target.preview) {

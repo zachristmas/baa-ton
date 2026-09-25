@@ -1006,3 +1006,116 @@ test("an open integrate lane keeps spec-integration reserved, even idle without 
     await f.cleanup();
   }
 });
+
+test("a live integrate lane in Herdr keeps spec-integration reserved, whatever its item's state", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "D12", title: "Batch", acceptance: { text: "b" } }, { id: "D14", title: "Next", acceptance: { text: "n" } }],
+    },
+    // D12 was blocked and lost track of its lane: only Herdr still knows.
+    seed: { version: 1, items: { D12: { state: "blocked", blockedReason: "human-gate", attempts: 1 }, D14: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-batch", status: "running", lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p7" }], evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    let live = true;
+    f.ports.agentPresent = async (paneId) => {
+      assert.equal(paneId, "w-spec:p7");
+      return live;
+    };
+    const first = await f.advance();
+    assert.match(first.content[0].text, /D14 waits: integration worktree busy: the integrate lane herdr-batch\/lane-1 is still live/);
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0);
+    live = false;
+    await f.advance();
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 1, "once its pane has no agent, the next integration starts");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane that answers the receipt ask with a status message is still working: asked again later, not blocked", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D12", title: "Batch", acceptance: { text: "b" } }] },
+    seed: {
+      version: 1,
+      items: { D12: { state: "integrating", attempts: 1, lane: { workflowId: "herdr-338", laneId: "lane-1" }, laneStage: "integrate", receiptAskedAt: "2026-09-24T11:20:00.000Z" } },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({
+      id: "herdr-338",
+      status: "running",
+      lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p8" }],
+      eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] },
+      messageRequests: [{ id: "m1", laneId: "lane-1", summary: "Full suite still running in the background (about 40%).", requestedAt: "2026-09-24T11:25:00.000Z" }],
+      evidence: [],
+    });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => {
+      told.push(input);
+      return { message: { delivery: { status: "delivered" } } };
+    };
+    f.ports.agentPresent = async () => true;
+    // 40 minutes after the ask: past the 30-minute escalation, but the lane replied.
+    await f.advance();
+    let state = await f.state();
+    assert.equal(state.items.D12.state, "integrating", "not blocked");
+    assert.equal(state.items.D12.receiptAskAfter, "2026-09-24T13:00:00.000Z", "asked again after an hour");
+    assert.equal(told.length, 0);
+    f.ports.now = () => "2026-09-24T12:30:00.000Z";
+    await f.advance();
+    assert.equal(told.length, 0, "not before the longer interval");
+    f.ports.now = () => "2026-09-24T13:01:00.000Z";
+    await f.advance();
+    assert.equal(told.length, 1, "then asked again");
+    state = await f.state();
+    assert.equal(state.items.D12.state, "integrating");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("queued items already on spec-integration are recorded at the containing commit, not integrated again", async () => {
+  const merged = "e".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "D20", title: "In the batch", acceptance: { text: "a", tests: ["npm test"] } },
+        { id: "D21", title: "Also in the batch, no suite record", acceptance: { text: "b", tests: ["npm test"] } },
+        { id: "D22", title: "Not merged yet", acceptance: { text: "c" } },
+        { id: "D23", title: "Recorded by the batch lane", acceptance: { text: "d" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D20: { state: "integrating", attempts: 1, branch: "demo/d20" },
+        D21: { state: "integrating", attempts: 1, branch: "demo/d21" },
+        D22: { state: "integrating", attempts: 1, branch: "demo/d22" },
+        D23: { state: "awaiting-push", integration: { sha: merged, order: 1 }, tests: [{ command: "npm test", sha: merged, result: "pass" }] },
+      },
+    },
+  });
+  try {
+    f.ports.containingCommit = async (_repo, tip) => (tip === "demo/d20" ? merged : tip === "demo/d21" ? "f".repeat(40) : undefined);
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.items.D20.state, "awaiting-push");
+    assert.deepEqual([state.items.D20.integration.sha, state.items.D20.integration.contained], [merged, true]);
+    assert.deepEqual(state.items.D20.tests.map((run) => [run.command, run.sha, run.result, run.by]), [["npm test", merged, "pass", "contained"]], "the suite passed at that commit (recorded by D23)");
+    assert.equal(state.items.D21.state, "awaiting-push");
+    assert.equal(state.items.D21.tests, undefined, "no suite result known at its commit: the verifier waits");
+    const integrates = f.calls.plan.filter((call) => call.specStage === "integrate");
+    assert.deepEqual(integrates.map((call) => call.objective), ["spec D22 integrate: Not merged yet"], "only the unmerged item gets an integration lane");
+  } finally {
+    await f.cleanup();
+  }
+});
