@@ -4585,6 +4585,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
+    /** Retire one finished lane (close its tab, release its leases). */
+    retire?(candidate: RetireCandidate): Promise<unknown>;
     /** Whether Herdr still finds an agent in this pane. */
     agentPresent?(paneId: string): Promise<boolean>;
     /** The commit on `branch` containing `tip`, or undefined when `tip` is not on it. */
@@ -5032,6 +5034,31 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           Object.assign(record, { state: "done", since: use.now() });
           done.push(`done ${item.id}`);
         } else record.note = `verifier: ${verdict.failing!.name}: ${verdict.failing!.detail}`;
+      }
+      // Retire spec lanes whose receipt the driver has consumed (no item
+      // points at them any more), under the retire grant: their sessions,
+      // tabs and leases would otherwise pile up.
+      if (!laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire")) {
+        const current = new Set(
+          Object.values(next.items as Record<string, { lane?: { workflowId: string; laneId: string } }>)
+            .map((record) => record.lane && `${record.lane.workflowId}/${record.lane.laneId}`)
+            .filter(Boolean),
+        );
+        const latest = await loadManifest(ctx.cwd);
+        for (const workflow of latest.workflows)
+          for (const lane of workflow.lanes) {
+            if (!lane.specStage || !lane.completionReceipt) continue;
+            if (lane.retirement && lane.retirement.status !== "partial") continue;
+            if (current.has(`${workflow.id}/${lane.id}`)) continue;
+            const [candidate] = retireCandidates(ctx.cwd, latest, { auto: false, workflowId: workflow.id, laneId: lane.id });
+            if (!candidate) continue;
+            try {
+              await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, "spec receipt consumed (auto-retire)", signal)))(candidate);
+              done.push(`retired ${workflow.id}/${lane.id}`);
+            } catch (error) {
+              done.push(`retire ${workflow.id}/${lane.id} failed: ${clip((error as Error).message, 120)}`);
+            }
+          }
       }
       for (const [id, reason] of Object.entries(step.waits)) if (next.items[id]) next.items[id].wait = reason;
       for (const item of spec.items) if (!step.waits[item.id] && next.items[item.id]) delete next.items[item.id].wait;
