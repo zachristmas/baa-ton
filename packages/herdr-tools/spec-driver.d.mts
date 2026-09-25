@@ -42,7 +42,12 @@ export function integrationResult(summary: unknown): { sha?: string; suite?: "pa
 export function integrateObjective(
   spec: Spec,
   item: SpecItem,
-  options: { integrationBranch: string; itemBranch: string; commitFirst?: { worktree: string; paths: string[]; secrets: string[] } },
+  options: {
+    integrationBranch: string;
+    itemBranch: string;
+    commitFirst?: { worktree: string; paths: string[]; secrets: string[]; untracked?: string[] };
+  },
 ): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; report?: string };
 export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;
+export function specCommitMessage(itemId: string, subject: string): string;

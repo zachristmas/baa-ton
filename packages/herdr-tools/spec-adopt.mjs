@@ -19,7 +19,9 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { reviewVerdict } from "./spec-driver.mjs";
+import { reviewVerdict, specCommitMessage } from "./spec-driver.mjs";
+
+export { specCommitMessage };
 import { SPEC_STATE_PATH, loadSpec, reportImageCount, targetRepo } from "./spec.mjs";
 
 const TERMINAL_WORKFLOW = new Set(["completed", "closed", "operator-closed", "superseded", "retired", "close-cleanup-pending"]);
@@ -52,28 +54,42 @@ export function globToRegExp(glob) {
 
 /**
  * Sort an adopted worktree's uncommitted changes (`git status
- * --porcelain=v1`, which leaves out ignored files) for integration:
- *   paths:   item-owned (`owns` or `sharedTouch`), the explicit list to commit
- *   secrets: secret-looking files, never staged whatever they match
- *   outside: every other change; any of these blocks integration
- * An item with no `owns` commits nothing: all its changes are outside, so
- * the root decides instead of the whole worktree being swept in.
+ * --porcelain=v1`, which leaves out ignored files):
+ *   paths:     item-owned (`owns` or `sharedTouch`), the explicit list to commit
+ *   secrets:   secret-looking files, never staged whatever they match
+ *   outside:   modified or staged TRACKED files beyond the list; any blocks
+ *   untracked: untracked files beyond the list (lane harness scripts,
+ *              artifact folders): left in place, uncommitted, and noted
+ * An item with no `owns` commits nothing: all its tracked changes are
+ * outside, so the root decides instead of the worktree being swept in.
  */
 export function itemOwnedChanges(porcelain, owns = [], sharedTouch = []) {
   const patterns = owns.length ? [...owns, ...sharedTouch].map(globToRegExp) : [];
   const paths = [];
   const secrets = [];
   const outside = [];
+  const untracked = [];
   for (const line of String(porcelain ?? "").split("\n")) {
     if (line.length < 4) continue;
+    const code = line.slice(0, 2);
+    if (code === "!!") continue;
     let path = line.slice(3);
     if (path.includes(" -> ")) path = path.split(" -> ").pop();
     path = path.replace(/^"(.*)"$/, "$1");
     if (isSecretPath(path)) secrets.push(path);
     else if (patterns.some((pattern) => pattern.test(path))) paths.push(path);
+    else if (code === "??") untracked.push(path);
     else outside.push(path);
   }
-  return { paths, secrets, outside };
+  return { paths, secrets, outside, untracked };
+}
+
+/** The useful end of a failed command's output (hook messages), not the command line. */
+export function failureOutput(error, lines = 40) {
+  const stderr = typeof error?.stderr === "string" ? error.stderr : "";
+  const stdout = typeof error?.stdout === "string" ? error.stdout : "";
+  const text = (stderr.trim() ? stderr : stdout).trim() || String(error?.message ?? error).split("\n").slice(1).join("\n").trim() || String(error?.message ?? error);
+  return text.split("\n").slice(-lines).join("\n");
 }
 
 /** Deferred: the acceptance says so and the item owns no files. */

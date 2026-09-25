@@ -58,6 +58,15 @@ export function reviewVerdict(summary) {
   return match ? match[1].toLowerCase() : undefined;
 }
 
+/**
+ * A conventional-commit header (commitlint config-conventional accepts it:
+ * type "spec", the item as scope), at most 72 characters.
+ */
+export function specCommitMessage(itemId, subject) {
+  const header = `spec(${itemId}): ${subject}`;
+  return header.length <= 72 ? header : header.slice(0, 72).trimEnd();
+}
+
 /** Parse a decide lane's receipt: QUESTION:, OWNS: and MIGRATIONS: lines. */
 export function decideResult(summary) {
   const lines = String(summary ?? "").split("\n");
@@ -460,18 +469,21 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
   return [
     `Integrate spec item ${item.id}: ${item.title}.`,
     commitFirst?.paths.length
-      ? `First commit the item's uncommitted work in ${commitFirst.worktree} on ${itemBranch}, staging exactly these paths and nothing else (never git add -A or .): git -C ${commitFirst.worktree} add -- ${commitFirst.paths.map((path) => JSON.stringify(path)).join(" ")} && git -C ${commitFirst.worktree} commit -m "${item.id}: commit adopted work before integration"`
+      ? `First commit the item's uncommitted work in ${commitFirst.worktree} on ${itemBranch}, staging exactly these paths and nothing else (never git add -A or .): git -C ${commitFirst.worktree} add -- ${commitFirst.paths.map((path) => JSON.stringify(path)).join(" ")} && git -C ${commitFirst.worktree} commit -m "${specCommitMessage(item.id, "commit work before integration")}". Let the repository's hooks run; if one fails, report its output.`
+      : "",
+    commitFirst?.untracked?.length
+      ? `Leave these untracked files where they are, uncommitted (they are not part of the item): ${commitFirst.untracked.slice(0, 20).join(", ")}${commitFirst.untracked.length > 20 ? ", and more" : ""}.`
       : "",
     commitFirst?.secrets.length
       ? `Leave these uncommitted; they look like secrets and must never be staged: ${commitFirst.secrets.join(", ")}.`
       : "",
-    `This worktree is on ${integrationBranch}: the target tip plus the items already integrated. Merge ${itemBranch} into it (git merge --no-ff ${itemBranch}) and resolve any conflicts.`,
+    `This worktree is on ${integrationBranch}: the target tip plus the items already integrated. Merge ${itemBranch} into it (git merge --no-ff -m "${specCommitMessage(item.id, "integrate")}" ${itemBranch}) and resolve any conflicts.`,
     item.migrations
       ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference.`
       : "",
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
-    `Commit the result on ${integrationBranch}. Local only: never push, and never touch any other branch.`,
+    `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,
     "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
     "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then what you changed and the suite output for a failure.",
   ].filter(Boolean).join("\n");
