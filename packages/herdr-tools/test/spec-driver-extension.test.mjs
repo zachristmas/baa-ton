@@ -745,3 +745,84 @@ test("the driver runs on a timer while the root is mid-turn: no overlap, backoff
     await f.cleanup();
   }
 });
+
+test("before an adopted review, each item's own changes are committed on its branch, in order, even in a shared worktree", async () => {
+  const shared = "/work/wt-shared";
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      stages: { build: { profile: "implementation" }, review: { profile: "review", differentFrom: "build" } },
+      items: [
+        { id: "A", title: "First", owns: ["src/a/**"], sharedTouch: ["db/journal.json"], acceptance: { text: "a" } },
+        { id: "B", title: "Second", owns: ["src/b/**"], sharedTouch: ["db/journal.json"], acceptance: { text: "b" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        A: { state: "reviewing", attempts: 1, worktree: shared, branch: "demo/ab", adopted: { worktree: shared, branch: "demo/ab" } },
+        B: { state: "reviewing", attempts: 1, worktree: shared, branch: "demo/ab", adopted: { worktree: shared, branch: "demo/ab" } },
+      },
+    },
+  });
+  try {
+    let porcelain = [" M src/a/one.ts", "?? src/a/two.ts", " M db/journal.json", " M src/b/three.ts", "?? src/b/.env.local"];
+    const commits = [];
+    f.ports.status = async () => porcelain.join("\n");
+    f.ports.commit = async ({ worktree, paths, message }) => {
+      commits.push({ worktree, paths, message });
+      porcelain = porcelain.filter((line) => !paths.includes(line.slice(3)));
+      return `sha-${commits.length}`;
+    };
+    await f.advance();
+    assert.deepEqual(commits, [
+      { worktree: shared, paths: ["src/a/one.ts", "src/a/two.ts", "db/journal.json"], message: "spec A: adopt work as built" },
+      { worktree: shared, paths: ["src/b/three.ts"], message: "spec B: adopt work as built" },
+    ], "A first (it claims the shared journal), then B; the secret stays uncommitted");
+    const reviews = f.calls.plan.filter((call) => call.specStage === "review");
+    assert.deepEqual(reviews.map((call) => [call.worktree, call.readOnly]), [[shared, true], [shared, true]]);
+    const state = await f.state();
+    assert.deepEqual(state.items.A.adoptCommit.paths, ["src/a/one.ts", "src/a/two.ts", "db/journal.json"]);
+    assert.equal(state.items.B.adoptCommit.sha, "sha-2");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an adopted review is held when the worktree has changes no item owns, or the commit fails", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "A", title: "Stray", owns: ["src/a/**"], acceptance: { text: "a" } },
+        { id: "C", title: "Hook", owns: ["src/c/**"], acceptance: { text: "c" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        A: { state: "reviewing", attempts: 1, worktree: "/work/wt-a", branch: "demo/a", adopted: { worktree: "/work/wt-a" } },
+        C: { state: "reviewing", attempts: 1, worktree: "/work/wt-c", branch: "demo/c", adopted: { worktree: "/work/wt-c" } },
+      },
+    },
+  });
+  try {
+    f.ports.status = async (worktree) => (worktree === "/work/wt-a" ? " M src/a/x.ts\n?? artifacts/run/log.txt" : " M src/c/y.ts");
+    const commits = [];
+    f.ports.commit = async (input) => {
+      commits.push(input);
+      throw new Error("pre-commit hook failed");
+    };
+    const result = await f.advance();
+    assert.match(result.content[0].text, /review A held: uncommitted changes outside the item's owns and sharedTouch: artifacts\/run\/log\.txt/);
+    assert.match(result.content[0].text, /review C held: committing the adopted work failed: pre-commit hook failed/);
+    assert.deepEqual(commits.map((input) => input.worktree), ["/work/wt-c"], "nothing is committed for A");
+    const state = await f.state();
+    assert.deepEqual([state.items.A.state, state.items.C.state], ["blocked", "blocked"]);
+    assert.equal(f.calls.plan.length, 0, "no review lane for a held item");
+  } finally {
+    await f.cleanup();
+  }
+});
