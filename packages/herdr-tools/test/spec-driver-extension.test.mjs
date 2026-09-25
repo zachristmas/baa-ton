@@ -416,20 +416,24 @@ test("integrating adopted work: the lane commits exactly the item-owned paths fi
     specDocument: {
       version: 1,
       target: { repo: ".", remote: "origin", branch: "feature/release" },
-      items: [{ id: "ACC", title: "Accepted", owns: ["src/acc/**"], acceptance: { text: "a" } }],
+      items: [{ id: "ACC", title: "Accepted", owns: ["src/acc/**"], sharedTouch: ["db/migrations/meta/_journal.json"], acceptance: { text: "a" } }],
     },
     seed: { version: 1, items: { ACC: { state: "integrating", attempts: 1, worktree: "/work/wt-acc", branch: "demo/acc" } } },
   });
   try {
     f.ports.status = async (worktree) => {
       assert.equal(worktree, "/work/wt-acc");
-      return [" M src/acc/rules.ts", "?? src/acc/new.test.ts", "?? src/acc/.env.local", "?? src/acc/stack.lane-secrets.json", " M src/other/unrelated.ts"].join("\n");
+      return [" M src/acc/rules.ts", "?? src/acc/new.test.ts", " M db/migrations/meta/_journal.json", "?? src/acc/.env.local", "?? src/acc/stack.lane-secrets.json"].join("\n");
     };
     await f.advance();
     const merge = f.calls.plan[0];
     assert.equal(merge.specStage, "integrate");
     assert.match(merge.laneObjective, /git merge --no-ff demo\/acc/, "integrates from the adopted branch");
-    assert.match(merge.laneObjective, /git -C \/work\/wt-acc add -- "src\/acc\/rules\.ts" "src\/acc\/new\.test\.ts" && git -C \/work\/wt-acc commit/);
+    assert.match(
+      merge.laneObjective,
+      /git -C \/work\/wt-acc add -- "src\/acc\/rules\.ts" "src\/acc\/new\.test\.ts" "db\/migrations\/meta\/_journal\.json" && git -C \/work\/wt-acc commit/,
+      "the shared migration journal is committed with the item",
+    );
     assert.match(merge.laneObjective, /never git add -A/);
     assert.match(merge.laneObjective, /Leave these uncommitted; they look like secrets and must never be staged: src\/acc\/\.env\.local, src\/acc\/stack\.lane-secrets\.json\./);
     assert.doesNotMatch(merge.laneObjective.split("Leave these")[0], /\.env|lane-secrets|unrelated/);
@@ -476,6 +480,138 @@ test("memory-aware dispatch: a live memory floor holds builds, and a shell start
     state = await f.state();
     assert.equal(state.dispatchBackoff, undefined, "the backoff clears once it has passed");
     assert.ok(f.calls.dispatch.length > 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an adopted branch with uncommitted changes outside its files, or with no owns, goes to the root instead", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "MIX", title: "Mixed", owns: ["src/mix/**"], acceptance: { text: "m" } },
+        { id: "NONE", title: "No owns", acceptance: { text: "n" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        MIX: { state: "integrating", attempts: 1, worktree: "/work/wt-mix", branch: "demo/mix" },
+        NONE: { state: "integrating", attempts: 1, worktree: "/work/wt-none", branch: "demo/none" },
+      },
+    },
+  });
+  try {
+    f.ports.status = async (worktree) =>
+      worktree === "/work/wt-mix" ? " M src/mix/a.ts\n?? artifacts/run/screenshot.png\n M src/other.ts" : "?? artifacts/run/trace.zip";
+    const first = await f.advance();
+    assert.match(first.content[0].text, /integrate MIX held: uncommitted changes outside its files/);
+    let state = await f.state();
+    assert.equal(state.items.MIX.state, "blocked");
+    assert.match(state.items.MIX.note, /artifacts\/run\/screenshot\.png, src\/other\.ts/);
+    // With MIX held, NONE is next in the queue on the following pass.
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.items.NONE.state, "blocked", "no owns: commit nothing and ask the root");
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0, "nothing was merged");
+    const asks = (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-needs-root").map((alert) => alert.text);
+    assert.ok(asks.some((text) => /MIX: \/work\/wt-mix has uncommitted changes outside/.test(text)));
+    assert.ok(asks.some((text) => /NONE: \/work\/wt-none has uncommitted changes outside[\s\S]*artifacts\/run\/trace\.zip/.test(text)));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane idle without its receipt is asked once, then handed to the root; a gone lane is retried in place", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "IDLE", title: "Idle", owns: ["src/idle/**"], acceptance: { text: "i" } },
+        { id: "GONE", title: "Gone", owns: ["src/gone/**"], acceptance: { text: "g" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        IDLE: { state: "reviewing", attempts: 1, worktree: "/work/wt-idle", branch: "demo/idle", lane: { workflowId: "herdr-idle", laneId: "lane-1" } },
+        GONE: { state: "building", attempts: 1, worktree: "/work/wt-gone", branch: "demo/gone", lane: { workflowId: "herdr-gone", laneId: "lane-1" } },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push(
+      { id: "herdr-idle", status: "running", lanes: [{ id: "lane-1", status: "running" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "working" } }, { lane_id: "lane-1", source: { agent_status: "done" } }] }, evidence: [] },
+      { id: "herdr-gone", status: "running", lanes: [{ id: "lane-1", status: "running", sessionLog: { status: "gone" } }], evidence: [] },
+    );
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => {
+      told.push(input);
+      return { message: { delivery: { status: "delivered" } } };
+    };
+    f.ports.status = async (worktree) => (worktree === "/work/wt-gone" ? " M src/gone/half-done.ts" : "");
+
+    const first = await f.advance();
+    assert.equal(told.length, 1);
+    assert.deepEqual([told[0].workflowId, told[0].laneId], ["herdr-idle", "lane-1"]);
+    assert.match(told[0].text, /review lane for IDLE is idle without its completion receipt[\s\S]*VERDICT: PASS or VERDICT: FAIL/);
+    assert.match(first.content[0].text, /asked IDLE for its receipt \(delivered\)/);
+    // The gone build lane is retried in the same worktree, not counted: its worktree has changes.
+    const rebuild = f.calls.plan.find((call) => call.specStage === "build");
+    assert.equal(rebuild.worktree, "/work/wt-gone");
+    let state = await f.state();
+    assert.equal(state.items.GONE.attempts, 1, "a retry with work in the worktree is not an attempt");
+
+    await f.advance();
+    assert.equal(told.length, 1, "asked once");
+    f.ports.now = () => "2026-09-24T12:31:00.000Z";
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.items.IDLE.state, "blocked");
+    const asks = (await f.manifest()).rootSupervision[0].alerts.map((alert) => alert.text);
+    assert.ok(asks.some((text) => /IDLE: its review lane herdr-idle\/lane-1 went idle without a receipt and did not answer the ask/.test(text)));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("items resolved by decision count as done, are logged and announced, and can be reopened", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "RES", title: "Resolved", owns: ["src/res/**"], adopt: { resolved: "the user decided the old flow stays" }, acceptance: { text: "r" } },
+        { id: "NEW", title: "New", owns: ["src/new/**"], acceptance: { text: "n" } },
+      ],
+    },
+  });
+  try {
+    const adopted = await f.tools.get("herdr_spec").execute("spec", { action: "adopt" }, undefined, undefined, f.ctx);
+    assert.match(adopted.content[0].text, /RES\s+resolved\s+resolved by decision: the user decided the old flow stays/);
+    const state = await f.state();
+    assert.deepEqual(state.decisions.map((entry) => [entry.itemId, entry.decision, entry.reason]), [["RES", "resolved", "the user decided the old flow stays"]]);
+    const alerts = (await f.manifest()).rootSupervision[0].alerts.filter((alert) => alert.kind === "spec-resolved");
+    assert.match(alerts[0].text, /herdr_spec action=reopen/);
+    assert.match(alerts[0].text, /RES \(the user decided the old flow stays\)/);
+    const status = await f.status();
+    assert.match(status.content[0].text, /^spec 1\/2 done \(1 by decision\)/);
+    assert.match(status.content[0].text, /RES\s+resolved\s+-\s+\S+\s+by decision: the user decided the old flow stays/);
+
+    const reopened = await f.tools.get("herdr_spec").execute("spec", { action: "reopen", itemId: "RES", text: "the user wants it built after all" }, undefined, undefined, f.ctx);
+    assert.match(reopened.content[0].text, /Reopened RES/);
+    const after = await f.state();
+    assert.equal(after.items.RES.state, "pending");
+    assert.deepEqual(after.decisions.map((entry) => entry.decision), ["resolved", "reopened"]);
+    await assert.rejects(
+      f.tools.get("herdr_spec").execute("spec", { action: "reopen", itemId: "NEW" }, undefined, undefined, f.ctx),
+      /not resolved by decision/,
+    );
   } finally {
     await f.cleanup();
   }

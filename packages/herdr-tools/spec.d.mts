@@ -4,7 +4,7 @@ export const STAGES: string[];
 export const ITEM_STATES: string[];
 
 export type SpecItem = {
-  adopt?: { worktree?: string; branch?: string; report?: string; workflow?: string; review?: string; accepted?: boolean };
+  adopt?: { worktree?: string; branch?: string; report?: string; workflow?: string; review?: string; accepted?: boolean; resolved?: string };
   id: string;
   title: string;
   dependsOn: string[];
@@ -41,7 +41,13 @@ export type ItemVerification = {
   checks: Array<{ name: string; ok: boolean; detail: string }>;
   failing?: { name: string; ok: boolean; detail: string };
 };
-export type SpecVerification = { done: number; total: number; deferred?: number; results: Array<ItemVerification & { deferred?: boolean }> };
+export type SpecVerification = {
+  done: number;
+  total: number;
+  byDecision?: number;
+  deferred?: number;
+  results: Array<ItemVerification & { deferred?: boolean; resolved?: boolean }>;
+};
 
 export function validateSpec(input: unknown): Spec;
 export function validateSpecState(input: unknown): SpecState;

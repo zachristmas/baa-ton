@@ -54,8 +54,17 @@ test("secret-looking files are never staged, tracked or not", () => {
   assert.deepEqual(itemOwnedChanges(porcelain, ["src/orders/**"]), {
     paths: ["src/orders/checkout.ts", "src/orders/new-rule.ts", "src/orders/renamed.ts", "src/orders/with space.ts"],
     secrets: ["src/orders/.env.local", "src/orders/db.lane-secrets.json"],
+    outside: ["src/admin/other.ts"],
   });
-  assert.deepEqual(itemOwnedChanges(" M a.ts\n?? .env", []), { paths: ["a.ts"], secrets: [".env"] }, "no owns: every change, still no secrets");
+  // Shared files the item touches are committed too, by explicit path.
+  const shared = [" M src/orders/a.ts", " M db/migrations/meta/_journal.json", " M api/openapi.yaml", " M .gitignore", "?? artifacts/run-1/log.txt"].join("\n");
+  assert.deepEqual(itemOwnedChanges(shared, ["src/orders/**"], ["db/migrations/meta/_journal.json", "api/*.yaml", ".gitignore"]), {
+    paths: ["src/orders/a.ts", "db/migrations/meta/_journal.json", "api/openapi.yaml", ".gitignore"],
+    secrets: [],
+    outside: ["artifacts/run-1/log.txt"],
+  });
+  // No owns: commit nothing; every change goes to the root.
+  assert.deepEqual(itemOwnedChanges(" M a.ts\n?? artifacts/x.png\n?? .env", [], ["a.ts"]), { paths: [], secrets: [".env"], outside: ["a.ts", "artifacts/x.png"] });
   assert.equal(globToRegExp("src/**/*.ts").test("src/a/b/c.ts"), true);
   assert.equal(globToRegExp("src/**/*.ts").test("src/c.ts"), true);
   assert.equal(globToRegExp("src/*.ts").test("src/a/c.ts"), false);

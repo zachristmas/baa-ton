@@ -6,6 +6,7 @@
  * Per item, the optional `adopt` field in spec.json names what exists:
  *   { worktree, branch, report, workflow, review, accepted }
  * and the starting state follows, first match wins:
+ *   0. `resolved: "<reason>"` (settled by a decision)    -> resolved
  *   1. acceptance says deferred and `owns` is empty      -> deferred
  *   2. `accepted: true`, or a VERDICT: PASS receipt on the
  *      adopted or review workflow                          -> integrating
@@ -50,25 +51,29 @@ export function globToRegExp(glob) {
 }
 
 /**
- * The explicit path list the integration lane commits in an adopted
- * worktree: changed or untracked paths (from `git status --porcelain=v1`)
- * that the item owns (every change when it declares no `owns`), never a
- * secret. Returns { paths, secrets } so skipped secrets can be reported.
+ * Sort an adopted worktree's uncommitted changes (`git status
+ * --porcelain=v1`, which leaves out ignored files) for integration:
+ *   paths:   item-owned (`owns` or `sharedTouch`), the explicit list to commit
+ *   secrets: secret-looking files, never staged whatever they match
+ *   outside: every other change; any of these blocks integration
+ * An item with no `owns` commits nothing: all its changes are outside, so
+ * the root decides instead of the whole worktree being swept in.
  */
-export function itemOwnedChanges(porcelain, owns = []) {
-  const patterns = owns.map(globToRegExp);
+export function itemOwnedChanges(porcelain, owns = [], sharedTouch = []) {
+  const patterns = owns.length ? [...owns, ...sharedTouch].map(globToRegExp) : [];
   const paths = [];
   const secrets = [];
+  const outside = [];
   for (const line of String(porcelain ?? "").split("\n")) {
     if (line.length < 4) continue;
     let path = line.slice(3);
     if (path.includes(" -> ")) path = path.split(" -> ").pop();
     path = path.replace(/^"(.*)"$/, "$1");
-    if (patterns.length && !patterns.some((pattern) => pattern.test(path))) continue;
     if (isSecretPath(path)) secrets.push(path);
-    else paths.push(path);
+    else if (patterns.some((pattern) => pattern.test(path))) paths.push(path);
+    else outside.push(path);
   }
-  return { paths, secrets };
+  return { paths, secrets, outside };
 }
 
 /** Deferred: the acceptance says so and the item owns no files. */
@@ -121,7 +126,11 @@ export async function proposeAdoption({ spec, manifest, repo, now, readReport = 
         : undefined;
     let state;
     let reason;
-    if (itemDeferred(item)) {
+    if (typeof adopt.resolved === "string") {
+      state = "resolved";
+      reason = `resolved by decision: ${adopt.resolved}`;
+      record.resolution = { reason: adopt.resolved, at: now };
+    } else if (itemDeferred(item)) {
       state = "deferred";
       reason = "acceptance says deferred and it owns no files";
     } else if (adopt.accepted === true || verdicts.includes("pass")) {
@@ -144,7 +153,11 @@ export async function proposeAdoption({ spec, manifest, repo, now, readReport = 
     items[item.id] = { ...record, state, attempts: state === "pending" || state === "deferred" ? 0 : 1, since: now, history: [{ at: now, from: "adopt", to: state, note: reason }] };
     rows.push({ id: item.id, state, reason, warnings });
   }
-  return { state: { version: 1, items }, rows };
+  // Every resolution is a decision the user can overturn: log it.
+  const decisions = rows
+    .filter((row) => row.state === "resolved")
+    .map((row) => ({ at: now, itemId: row.id, decision: "resolved", reason: items[row.id].resolution.reason, by: "adopt" }));
+  return { state: { version: 1, items, ...(decisions.length ? { decisions } : {}) }, rows, resolved: decisions };
 }
 
 export function adoptionTable(rows) {

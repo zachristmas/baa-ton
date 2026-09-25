@@ -35,6 +35,9 @@ export const ITEM_STATES = [
   "failed",
   // Out of scope for now (acceptance says deferred, no owned files): not counted in M.
   "deferred",
+  // Settled by a decision, no code (the user resolved it, or it was verified
+  // absent): counted as done by decision.
+  "resolved",
 ];
 const BLOCK_REASONS = ["decision", "dependency", "capacity", "human-gate"];
 const ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
@@ -173,7 +176,7 @@ export function validateSpec(input) {
       // Existing work in a live run (see spec-adopt.mjs). Paths are absolute:
       // lanes kept worktrees and reports outside the target repository.
       if (!isRecord(item.adopt)) throw new Error(`${label}.adopt must be an object.`);
-      onlyKeys(item.adopt, ["worktree", "branch", "report", "workflow", "review", "accepted"], `${label}.adopt`);
+      onlyKeys(item.adopt, ["worktree", "branch", "report", "workflow", "review", "accepted", "resolved"], `${label}.adopt`);
       adopt = {};
       for (const key of ["worktree", "report"])
         if (item.adopt[key] !== undefined) {
@@ -198,6 +201,7 @@ export function validateSpec(input) {
         if (typeof item.adopt.accepted !== "boolean") throw new Error(`${label}.adopt.accepted must be true or false.`);
         adopt.accepted = item.adopt.accepted;
       }
+      if (item.adopt.resolved !== undefined) adopt.resolved = text(item.adopt.resolved, `${label}.adopt.resolved`, { max: 500 });
       if (adopt.worktree && !adopt.branch) throw new Error(`${label}.adopt.worktree needs adopt.branch.`);
     }
     return {
@@ -398,11 +402,21 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
 /** Verify every item; the loop's exit condition and the burn-down. */
 export async function verifySpec(spec, state, options = {}) {
   const results = [];
-  for (const item of spec.items)
-    if (state.items?.[item.id]?.state === "deferred") results.push({ id: item.id, done: false, deferred: true, checks: [] });
+  for (const item of spec.items) {
+    const record = state.items?.[item.id];
+    if (record?.state === "deferred") results.push({ id: item.id, done: false, deferred: true, checks: [] });
+    else if (record?.state === "resolved")
+      results.push({ id: item.id, done: true, resolved: true, checks: [{ name: "resolved", ok: true, detail: `by decision: ${record.resolution?.reason ?? "recorded"}` }] });
     else results.push(await verifyItem(spec, state, item, options));
+  }
   const counted = results.filter((result) => !result.deferred);
-  return { done: counted.filter((result) => result.done).length, total: counted.length, deferred: results.length - counted.length, results };
+  return {
+    done: counted.filter((result) => result.done).length,
+    byDecision: counted.filter((result) => result.resolved).length,
+    total: counted.length,
+    deferred: results.length - counted.length,
+    results,
+  };
 }
 
 export function finalReportPath(spec, report) {
@@ -434,6 +448,7 @@ export function releaseShaFrom(body) {
 
 /** Item stage for display: done only when the verifier says so. */
 export function itemStage(state, id, verified) {
+  if (verified?.resolved) return "resolved";
   if (verified?.done) return "done";
   const recorded = state.items?.[id]?.state ?? "pending";
   return recorded === "done" ? "verifying" : recorded;
@@ -446,17 +461,18 @@ export function specSummaryLine(spec, state, verification) {
   const counts = new Map();
   for (const item of spec.items) {
     const stage = itemStage(state, item.id, byId.get(item.id));
-    if (stage === "done") continue;
+    if (stage === "done" || stage === "resolved") continue;
     const key = stage === "blocked" ? `blocked(${state.items?.[item.id]?.blockedReason})` : stage;
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   const order = [
-    ...ITEM_STATES.filter((stage) => stage !== "blocked" && stage !== "done" && stage !== "deferred"),
+    ...ITEM_STATES.filter((stage) => !["blocked", "done", "deferred", "resolved"].includes(stage)),
     ...BLOCK_REASONS.map((reason) => `blocked(${reason})`),
     "deferred",
   ];
   const parts = order.filter((key) => counts.has(key)).map((key) => `${counts.get(key)} ${key}`);
-  return [`spec ${verification.done}/${verification.total} done`, ...parts].join(" · ");
+  const byDecision = verification.byDecision ? ` (${verification.byDecision} by decision)` : "";
+  return [`spec ${verification.done}/${verification.total} done${byDecision}`, ...parts].join(" · ");
 }
 
 function age(since, now) {
@@ -474,8 +490,10 @@ export function specStatusTable(spec, state, verification, now = Date.now()) {
     const verified = byId.get(item.id);
     const stage = itemStage(state, item.id, verified);
     const blocker =
-      stage === "done"
-        ? ""
+      stage === "resolved"
+        ? `by decision: ${record.resolution?.reason ?? ""}`
+        : stage === "done"
+          ? ""
         : stage === "blocked"
           ? `${record.blockedReason}${record.note ? `: ${record.note}` : ""}`
           : record.note

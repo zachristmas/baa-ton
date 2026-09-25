@@ -229,6 +229,13 @@ A run that started before the spec loop already has work: worktrees and branches
 4. The report's path, SHA-256 and image count are recorded at adopt time. The verifier reads a recorded path, even outside the repo.
 5. **Adopted branches and worktrees** replace `spec/<id>` for build, review and integration. Before merging an adopted branch, the driver lists the item-owned uncommitted paths in its worktree (all changes when `owns` is empty). It never lists anything matching `*secret*`, `.env*` or `*.lane-secrets.json`, tracked or not. The integration lane commits exactly those paths first and leaves any listed secrets uncommitted.
 
+Fixes from the first dry run on a live run:
+
+- **Shared files:** the commit list for an adopted worktree is the item's `owns` plus `sharedTouch` (migration journals, module and OpenAPI files, generated contracts, shared schema index files, `.gitignore`), staged by explicit path.
+- **Refusals:** integration refuses an adopted branch that still has uncommitted changes outside that list (other than secrets; ignored files never appear). The item goes to the root with the file list. An item with no `owns` commits nothing; any uncommitted change sends it to the root instead of sweeping the worktree.
+- **Stalled lanes:** a lane Herdr reports `done` with no receipt is asked once, through `herdr_tell`, for its receipt in its stage's format. If nothing comes within 30 minutes, the item goes to the root. A lane whose session is `gone` is retried in the same worktree; a gone build lane counts as an attempt only when its worktree has no uncommitted changes.
+- **Resolved by decision:** `adopt.resolved: "<reason>"` records an item settled by a decision with no code (the user resolved it, or it was verified absent) as `resolved`. The verifier counts it as done by decision (`spec 3/30 done (1 by decision)`). Adopting logs it in `spec-state.json` `decisions` and alerts the root and the user, and `herdr_spec action=reopen itemId=<id>` overturns it (also logged).
+
 Memory-aware dispatch: besides a waiting capacity gate, the driver samples free memory and swap before dispatching when `defaults.minFreeMemoryGb` or `defaults.maxSwapUsedGb` is set. After a dispatch fails with "shell did not become ready", it starts nothing else that pass and backs off for 10 minutes. Retries of an undispatched stage honor the same hold.
 
 ## Open questions for Zach
