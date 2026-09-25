@@ -102,3 +102,42 @@ export function paneServiceProcesses(paneInfo) {
     .filter((item) => !isHarnessCommand(item.name ?? item.command))
     .map((item) => ({ pid: item.pid, name: String(item.name ?? item.command ?? "") }));
 }
+
+/** Long-lived helpers an agent keeps running that are not its own work. */
+const AGENT_HELPER = /mcp-server\.mjs|known-safe-hook\.mjs|claude-startup-attest|typescript-language-server|tsserver|language-server|caffeinate|(^|\/)(zsh|bash|sh|fish)$/;
+
+/**
+ * Background work a lane's agent is still running: descendants of the
+ * pane's shell, below the agent process itself, that are not long-lived
+ * helpers. `processes` is `ps -axo pid=,ppid=,command=` parsed into
+ * { pid, ppid, command }. Returns a short description, or undefined.
+ */
+export function laneBackgroundWork(shellPid, processes) {
+  const children = new Map();
+  for (const item of processes) {
+    const list = children.get(item.ppid) ?? [];
+    list.push(item);
+    children.set(item.ppid, list);
+  }
+  const agents = children.get(shellPid) ?? [];
+  const work = [];
+  const walk = (pid, depth) => {
+    for (const child of children.get(pid) ?? []) {
+      const helper = AGENT_HELPER.test(child.command.split(/\s+/)[0]) || AGENT_HELPER.test(child.command);
+      if (!helper) work.push(child.command);
+      if (depth < 6) walk(child.pid, depth + 1);
+    }
+  };
+  for (const agent of agents) walk(agent.pid, 0);
+  if (!work.length) return undefined;
+  const first = work[0].length > 80 ? `${work[0].slice(0, 79)}…` : work[0];
+  return work.length > 1 ? `${first} (+${work.length - 1} more)` : first;
+}
+
+export function parseProcessTable(stdout) {
+  return String(stdout ?? "")
+    .split("\n")
+    .map((line) => /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line))
+    .filter(Boolean)
+    .map((match) => ({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3].trim() }));
+}

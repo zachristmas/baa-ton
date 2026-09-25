@@ -63,3 +63,5 @@ export function liveAgentReady(
   expected: { pane_id?: string; workspace_id?: string; name?: string; agent_kind?: string },
 ): { ok: true; agent: Record<string, unknown> } | { ok: false; reason: string };
 export function paneShowsShell(processInfo: unknown): boolean | undefined;
+export function laneBackgroundWork(shellPid: number, processes: Array<{ pid: number; ppid: number; command: string }>): string | undefined;
+export function parseProcessTable(stdout: string): Array<{ pid: number; ppid: number; command: string }>;

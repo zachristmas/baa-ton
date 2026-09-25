@@ -122,6 +122,7 @@ export function integrationResult(summary) {
  * @param {Set<string>} [input.pushed] integration SHAs the target branch already contains
  * @param {Map<string, string>} [input.released] item id -> preview release SHA that contains its commit
  * @param {Set<string>} [input.dirty] items whose worktree has uncommitted changes
+ * @param {Map<string, string>} [input.background] "workflowId/laneId" -> the background work a lane is still running
  * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
  * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
  * @param {string} input.now        ISO timestamp
@@ -135,6 +136,7 @@ export function advanceSpec({
   pushed = new Set(),
   released = new Map(),
   dirty = new Set(),
+  background = new Map(),
   integrationLive,
   contained = new Map(),
   now,
@@ -177,7 +179,18 @@ export function advanceSpec({
           rootAsks.push({ itemId: item.id, reason: `${item.id}: its build lane is gone without a receipt after ${attempts} attempt(s)` });
         } else current.attempts = attempts + 1;
       }
+    } else if (view.agentStatus === "done" && background.has(`${current.lane.workflowId}/${current.lane.laneId}`)) {
+      // Idle only on the surface: its tracked background shell or monitor is
+      // still running. Not stuck: no receipt ask, no block.
+      const work = background.get(`${current.lane.workflowId}/${current.lane.laneId}`);
+      if (current.backgroundWork !== work) {
+        current.backgroundWork = work;
+        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `idle while its background work runs: ${work}` });
+      }
+      delete current.receiptAskedAt;
+      continue;
     } else if (view.agentStatus === "done") {
+      delete current.backgroundWork;
       // It answered the ask with a status message (herdr_message): still
       // working, e.g. waiting on a long suite in a tracked background shell.
       if (current.receiptAskedAt && view.lastMessageAt && Date.parse(view.lastMessageAt) > Date.parse(current.receiptAskedAt)) {

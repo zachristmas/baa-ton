@@ -4,9 +4,11 @@ import {
   describeIdleServices,
   idleLaneServices,
   isHarnessCommand,
+  laneBackgroundWork,
   laneFinished,
   paneServiceProcesses,
   parseProcessIdentity,
+  parseProcessTable,
 } from "../lane-services.mjs";
 
 test("finished lanes are those with a receipt or terminal status and no completed retirement", () => {
@@ -64,4 +66,20 @@ test("a pane service stops its foreground processes, never the shell or an agent
   };
   assert.deepEqual(paneServiceProcesses(info).map((item) => item.pid), [101, 102]);
   assert.deepEqual(paneServiceProcesses({}), []);
+});
+
+test("background work is a non-helper descendant of the pane's agent", () => {
+  const table = parseProcessTable([
+    "  100     1 -zsh",
+    "  200   100 claude --session-id x",
+    "  210   200 node /opt/tools/mcp-server.mjs",
+    "  220   200 caffeinate -i",
+    "  230   200 /bin/zsh -c node --test packages/a.test.mjs",
+    "  231   230 node --test packages/a.test.mjs",
+    "  300     1 node --test elsewhere.test.mjs",
+  ].join("\n"));
+  assert.deepEqual(table[1], { pid: 200, ppid: 100, command: "claude --session-id x" });
+  assert.equal(laneBackgroundWork(100, table), "node --test packages/a.test.mjs", "shell wrappers are skipped, their children counted");
+  assert.equal(laneBackgroundWork(100, table.filter((item) => item.pid < 230)), undefined, "helpers only");
+  assert.equal(laneBackgroundWork(999, table), undefined, "another pane's shell");
 });

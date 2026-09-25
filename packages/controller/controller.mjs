@@ -36,6 +36,8 @@ import { describeIdleServices, idleLaneServices } from "./lane-services.mjs";
 export {
   describeIdleServices,
   idleLaneServices,
+  laneBackgroundWork,
+  parseProcessTable,
   isHarnessCommand,
   laneFinished,
   paneServiceProcesses,

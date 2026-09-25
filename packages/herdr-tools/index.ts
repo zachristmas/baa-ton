@@ -185,6 +185,8 @@ const {
   gitCommit,
   describeIdleServices,
   idleLaneServices,
+  laneBackgroundWork,
+  parseProcessTable,
   isHarnessCommand,
   liveAgentReady,
   paneShowsShell,
@@ -4589,6 +4591,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     retire?(candidate: RetireCandidate): Promise<unknown>;
     /** Whether Herdr still finds an agent in this pane. */
     agentPresent?(paneId: string): Promise<boolean>;
+    /** Background work (a suite, build or monitor) the idle agent in this pane still runs, if any. */
+    backgroundWork?(paneId: string): Promise<string | undefined>;
     /** The commit on `branch` containing `tip`, or undefined when `tip` is not on it. */
     containingCommit?(repo: string, tip: string, branch: string): Promise<string | undefined>;
     /** The loaded code's fingerprint (holds retry once it changes). */
@@ -4761,6 +4765,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, { lane?: { workflowId: string; laneId: string }; worktree?: string }]>)
         if (record.lane && record.worktree && laneView(record.lane)?.agentStatus === "gone")
           if ((await statusOf(record.worktree).catch(() => "")).trim()) dirty.add(id);
+      // Lanes that went idle while their own background shell or monitor
+      // still runs are not stuck: no receipt ask and no block. Read from the
+      // pane's process tree, never from the transcript.
+      const backgroundWork =
+        ports?.backgroundWork ??
+        (async (paneId: string) => {
+          const raw = await runHerdr(["pane", "process-info", "--pane", paneId], signal);
+          const result = isRecord(raw) && isRecord(raw.result) ? raw.result : raw;
+          const info = isRecord(result) && isRecord(result.process_info) ? result.process_info : result;
+          const shellPid = isRecord(info) ? Number(info.shell_pid) : NaN;
+          if (!Number.isInteger(shellPid) || shellPid <= 0) return undefined;
+          const { stdout } = await execFile("ps", ["-axo", "pid=,ppid=,command="], { timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
+          return laneBackgroundWork(shellPid, parseProcessTable(stdout));
+        });
+      const background = new Map<string, string>();
+      for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; lane?: { workflowId: string; laneId: string } }>) {
+        if (!record.lane) continue;
+        const view = laneView(record.lane);
+        const paneId = manifest.workflows.find((item) => item.id === record.lane!.workflowId)?.lanes.find((item) => item.id === record.lane!.laneId)?.paneId;
+        if (view?.agentStatus !== "done" || view.receipt || !paneId) continue;
+        const work = await backgroundWork(paneId).catch(() => undefined);
+        if (work) background.set(`${record.lane.workflowId}/${record.lane.laneId}`, work);
+      }
       // The integration worktree stays reserved while any integrate or verify
       // lane still has a live agent in its pane, whatever its item's state.
       const agentPresent =
@@ -4803,6 +4830,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         state,
         lane: laneView,
         dirty,
+        background,
         integrationLive,
         contained,
         capacityWaiting,
