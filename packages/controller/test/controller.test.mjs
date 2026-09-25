@@ -2767,7 +2767,7 @@ test("a non-Pi named root receives done and blocked wakes without Pi semantics",
       [root.target, root.target],
     );
     assert.equal(requestsFor(mock, "agent.read").filter((request) => request.params.source !== "visible").length, 0, "no Pi pause probe");
-    assert.equal(requestsFor(mock, "agent.read").filter((request) => request.params.source === "visible").length, 1, "one screen read, on blocked");
+    assert.equal(requestsFor(mock, "agent.read").filter((request) => request.params.source === "visible").length, 2, "one screen read each on done and blocked");
     const events = (await fixture.manifest()).workflows[0].eventController
       .events;
     assert.deepEqual(

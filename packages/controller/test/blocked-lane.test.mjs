@@ -5,10 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   SCREEN_PROMPT_DEFAULT_MS,
+  classifyIdleScreen,
   classifyScreen,
   claudeTranscriptPath,
   commandFromTail,
   handleBlockedLane,
+  handleIdleLane,
   readTail,
   resolveScreenPrompts,
 } from "../blocked-lane.mjs";
@@ -210,4 +212,44 @@ test("a truncated command is read from at most the transcript tail, then classif
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+const idleScreen = `
+⏺ The migration builds, but two tests depend on the old column name.
+
+  I can either rename the column in the fixtures, or keep a
+  compatibility view for one release. Which approach do you want?
+
+╭──────────────────────────────────────────────╮
+│ >                                            │
+╰──────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+
+test("an idle lane asking for direction in plain text is routed, and told to decide after the bounded wait", async () => {
+  assert.match(classifyIdleScreen(idleScreen).question, /Which approach do you want\?$/);
+  assert.equal(classifyIdleScreen("⏺ Done. All tests pass.\n\n> \n"), undefined);
+  assert.equal(classifyIdleScreen("⏺ Is this the right file? It seems so.\n> "), undefined, "a rhetorical question is not a request for direction");
+
+  const herdr = fakeHerdr({ screens: idleScreen, status: "done" });
+  const manifest = {};
+  const workflow = workflowFixture();
+  const result = await handleIdleLane({ herdr, workflow, laneId: "lane-1", paneId: PANE, timestamp: "2026-09-25T10:00:00.000Z" });
+  assert.equal(result.status, "routed");
+  const [request] = workflow.laneRequests;
+  assert.equal(request.kind, "approval");
+  assert.match(request.payload.text, /compatibility view/);
+  assert.equal((await handleIdleLane({ herdr, workflow, laneId: "lane-1", paneId: PANE, timestamp: "2026-09-25T10:01:00.000Z" })).status, "already-open");
+
+  await resolveScreenPrompts({ herdr, manifest, workflow, timestamp: "2026-09-25T10:10:00.000Z" });
+  assert.equal(request.status, "granted");
+  assert.equal(request.answeredBy, "policy");
+  assert.equal(request.answerDelivery.status, "pending");
+  assert.match(request.answerDelivery.text, /Decide it yourself under your goal rules/);
+  assert.equal(herdr.calls.keys.length, 0, "never answered with keys");
+  assert.equal(manifest.unattendedDecisions[0].kind, "lane-idle-question");
+
+  const done = workflowFixture();
+  done.lanes[0].completionReceipt = { summary: "ok" };
+  assert.equal((await handleIdleLane({ herdr, workflow: done, laneId: "lane-1", paneId: PANE, timestamp: "2026-09-25T10:00:00.000Z" })).status, "has-receipt");
 });

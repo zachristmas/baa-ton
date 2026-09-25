@@ -45,7 +45,7 @@ export {
 } from "./lane-services.mjs";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
-import { handleBlockedLane, resolveScreenPrompts } from "./blocked-lane.mjs";
+import { handleBlockedLane, handleIdleLane, resolveScreenPrompts } from "./blocked-lane.mjs";
 import {
   enqueueWakeHint,
   makeEnvelope,
@@ -4078,6 +4078,17 @@ export async function handleHook({
         timestamp: record.received_at ?? now(),
       });
       if (blocked.status === "approved" || blocked.status === "routed") await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+    } else if (created && event.data.agent_status === "done" && !postCompletionObservation) {
+      // Idle without a receipt, asking for direction in plain text.
+      blocked = await handleIdleLane({
+        herdr: api,
+        workflow,
+        laneId: mapping.lane.lane_id,
+        paneId: event.data.pane_id,
+        target: mapping.lane.target ?? event.data.pane_id,
+        timestamp: record.received_at ?? now(),
+      });
+      if (blocked.status === "routed") await atomicWriteJson(mapping.workflow.manifest_path, manifest);
     }
     // A queue continuation is evaluated after every mapped lifecycle hook;
     // inbox occurrence dedupe makes repeated post-completion observations safe.
