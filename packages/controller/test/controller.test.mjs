@@ -4326,3 +4326,32 @@ test("a root digest is not typed when the root agent exits between the readiness
     await s.fixture.cleanup();
   }
 });
+
+test("nothing is typed when Herdr still reports the agent but the pane shows a bare shell", async () => {
+  const { paneShowsShell } = await import("../controller.mjs");
+  assert.equal(paneShowsShell({ result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 10, name: "zsh" }] } } }), true);
+  assert.equal(paneShowsShell({ process_info: { shell_pid: 10, foreground_processes: [{ pid: 10 }, { pid: 11, name: "pi" }] } }), false);
+  assert.equal(paneShowsShell({ process_info: { foreground_processes: [] } }), undefined, "unknown without a shell pid");
+
+  const s = await supervisionFixture({ gate: capacityGate, events: [workingEvent("2026-09-14T01:00:00.000Z")] });
+  const base = digestApi();
+  let piExited = false;
+  const api = {
+    prompts: base.prompts,
+    request: (method, params) => base.request(method, params),
+    // Pi has exited: Herdr's agent record lingers, but only zsh is in the foreground.
+    processInfo: async () => ({ process_info: { shell_pid: 500, foreground_processes: piExited ? [{ pid: 500, name: "zsh" }] : [{ pid: 500, name: "zsh" }, { pid: 501, name: "pi" }] } }),
+  };
+  try {
+    await s.tick(1, api);
+    s.setSample({ freeMemoryGb: 11.5, swapUsedGb: 6, load1PerCpu: 0.3 });
+    piExited = true;
+    await s.tick(2, api);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("capacity-available")).length, 0, "no digest into the raw shell");
+    piExited = false;
+    await s.tick(5, api);
+    assert.equal(api.prompts.filter((prompt) => prompt.text.includes("capacity-available")).length, 1, "delivered once Pi runs again");
+  } finally {
+    await s.fixture.cleanup();
+  }
+});

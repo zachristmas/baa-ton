@@ -1942,13 +1942,40 @@ export function liveAgentReady(result, expected) {
   return { ok: true, agent };
 }
 
+/**
+ * Whether the pane shows a bare shell prompt: its only foreground process is
+ * the shell. Herdr can keep an agent record for a moment after the agent
+ * exits, so this is checked as well. undefined when process info is
+ * unavailable (the agent check alone then decides).
+ */
+export function paneShowsShell(processInfo) {
+  const result = isRecord(processInfo) && isRecord(processInfo.result) ? processInfo.result : processInfo;
+  const info = isRecord(result?.process_info) ? result.process_info : result;
+  if (!isRecord(info) || !Array.isArray(info.foreground_processes) || !info.shell_pid) return undefined;
+  return info.foreground_processes.length > 0 && info.foreground_processes.every((item) => isRecord(item) && item.pid === info.shell_pid);
+}
+
+async function paneProcessInfo(herdr, paneId) {
+  if (typeof herdr.processInfo === "function") return herdr.processInfo(paneId);
+  const { stdout } = await execFileAsync("herdr", ["pane", "process-info", "--pane", paneId], { timeout: 5_000 });
+  return JSON.parse(stdout);
+}
+
 /** Fetch and check the agent right before a send; never throws. */
 async function agentReadyForSend(herdr, target, expected) {
+  let ready;
   try {
-    return liveAgentReady(await herdr.request("agent.get", { target }), expected);
+    ready = liveAgentReady(await herdr.request("agent.get", { target }), expected);
   } catch (error) {
     return { ok: false, reason: unavailable(error) ? `agent_unavailable:${error.code}` : `agent_check_failed:${error instanceof Error ? error.message : String(error)}` };
   }
+  if (!ready.ok) return ready;
+  const paneId = expected.pane_id ?? ready.agent.pane_id;
+  if (typeof paneId === "string" && paneId) {
+    const shell = await paneProcessInfo(herdr, paneId).then(paneShowsShell, () => undefined);
+    if (shell === true) return { ok: false, reason: "pane_shows_shell_prompt" };
+  }
+  return ready;
 }
 
 const rootExpectation = (root) => ({
@@ -2963,7 +2990,7 @@ async function deliverQueueHeadWake(item, root, herdr) {
     const rootInfo = await herdr.request("agent.get", { target: root.target });
     if (!rootMatches(rootInfo, root))
       return { status: "pending", reason: "recorded_root_unavailable_or_mismatched" };
-    const ready = liveAgentReady(rootInfo, rootExpectation(root));
+    const ready = await agentReadyForSend(herdr, root.target, rootExpectation(root));
     if (!ready.ok) return { status: "pending", reason: `root_not_ready:${ready.reason}` };
   } catch (error) {
     if (unavailable(error))
@@ -3195,7 +3222,7 @@ async function deliverSupervisorNudge(goal, root, herdr, reasons) {
         status: "pending",
         reason: "recorded_root_unavailable_or_mismatched",
       };
-    const ready = liveAgentReady(rootInfo, rootExpectation(root));
+    const ready = await agentReadyForSend(herdr, root.target, rootExpectation(root));
     if (!ready.ok) return { status: "pending", reason: `root_not_ready:${ready.reason}` };
     if (agent.agent_status !== "idle" && agent.agent_status !== "done")
       return {

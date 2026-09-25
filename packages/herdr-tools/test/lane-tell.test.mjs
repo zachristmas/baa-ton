@@ -74,6 +74,8 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
   const status = { "w-tell:p2": "idle", "w-tell:p3": "working" };
   // What Herdr reports running in each pane (undefined: the fixture default).
   const agentKind = {};
+  // Panes whose only foreground process is the shell (the agent exited).
+  const shellOnly = new Set();
   const tools = new Map();
   Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w-tell", HERDR_PLUGIN_CONFIG_DIR: f.configDir, HERDR_PANE_ID: f.rootPane });
   extension({
@@ -83,6 +85,11 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
     async exec(command, args) {
       if (command === "herdr" && args[0] === "agent" && args[1] === "get")
         return { code: 0, stdout: JSON.stringify({ result: { type: "agent_info", agent: { agent: agentKind[args[2]] ?? "pi", pane_id: args[2], agent_status: status[args[2]] } } }), stderr: "" };
+      if (command === "herdr" && args[0] === "pane" && args[1] === "process-info") {
+        const pane = args[args.indexOf("--pane") + 1];
+        const foreground = shellOnly.has(pane) ? [{ pid: 700, name: "zsh" }] : [{ pid: 700, name: "zsh" }, { pid: 701, name: "node" }];
+        return { code: 0, stdout: JSON.stringify({ result: { process_info: { shell_pid: 700, foreground_processes: foreground } } }), stderr: "" };
+      }
       if (command === "herdr" && args[0] === "agent" && args[1] === "prompt") {
         prompts.push({ pane: args[2], text: args[3] });
         return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
@@ -139,6 +146,13 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
     assert.match(other.details.message.delivery.reason, /agent_kind_mismatch/);
     assert.equal(prompts.length, typedBefore, "nothing typed into a shell or the wrong agent");
     delete agentKind["w-tell:p2"];
+    // Herdr still reports the agent, but the pane shows a bare shell.
+    shellOnly.add("w-tell:p2");
+    const exited = await tell({ workflowId: "herdr-tell0001", laneId: "lane-idle", text: "After exit?" });
+    assert.equal(exited.details.message.delivery.status, "pending");
+    assert.match(exited.details.message.delivery.reason, /pane_shows_shell_prompt/);
+    assert.equal(prompts.length, typedBefore, "nothing typed into the bare shell");
+    shellOnly.delete("w-tell:p2");
 
     await assert.rejects(tell({ workflowId: "herdr-tell0001", laneId: "lane-planned", text: "x" }), /has not been dispatched/);
     await assert.rejects(tell({ workflowId: "herdr-tell0001", laneId: "lane-nope", text: "x" }), /has no lane lane-nope/);

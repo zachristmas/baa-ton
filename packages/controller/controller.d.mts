@@ -62,3 +62,4 @@ export function liveAgentReady(
   result: unknown,
   expected: { pane_id?: string; workspace_id?: string; name?: string; agent_kind?: string },
 ): { ok: true; agent: Record<string, unknown> } | { ok: false; reason: string };
+export function paneShowsShell(processInfo: unknown): boolean | undefined;
