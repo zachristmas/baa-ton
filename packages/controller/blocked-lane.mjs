@@ -127,6 +127,77 @@ export function classifyScreen(text) {
   return { kind: "unknown", fingerprint: sha(lines.join("\n")) };
 }
 
+const DIRECTION_CUE =
+  /\b(should I|shall I|do you want|would you like|want me to|which (?:one|option|approach)|how (?:should|do you want)|let me know|please confirm|your call|ok to proceed|okay to proceed|go ahead\?|approve)\b/i;
+const INPUT_LINE = /^\s*(?:[>❯›]\s*|\? for shortcuts|esc to interrupt|⏵⏵|bypass permissions|accept edits)/i;
+
+/**
+ * An idle lane whose last output asks for direction in plain text (not a
+ * dialog). Returns the question block, or undefined.
+ */
+export function classifyIdleScreen(text) {
+  const lines = screenLines(text);
+  let end = lines.length - 1;
+  // Skip the input box and status footer below the agent's last output.
+  while (end >= 0 && (!lines[end].trim() || INPUT_LINE.test(lines[end]))) end -= 1;
+  for (let index = end; index >= Math.max(0, end - 8); index -= 1) {
+    const line = lines[index];
+    if (!DIRECTION_CUE.test(line) || !(/\?\s*$/.test(line) || /let me know|please confirm/i.test(line))) continue;
+    let start = index;
+    while (start > 0 && index - start < 6 && lines[start - 1].trim()) start -= 1;
+    const question = lines.slice(start, end + 1).map((item) => item.trim()).filter(Boolean).join("\n");
+    return { kind: "idle-question", question, fingerprint: sha(question) };
+  }
+  return undefined;
+}
+
+/**
+ * On `done` for a mapped lane without a receipt: a plain-text question for
+ * direction becomes a lane request for the root, with a default message
+ * after the bounded wait.
+ */
+export async function handleIdleLane({ herdr, workflow, laneId, paneId, target = paneId, timestamp }) {
+  const lane = (workflow.lanes ?? []).find((item) => item.id === laneId);
+  if (lane?.completionReceipt) return { status: "has-receipt" };
+  let text;
+  try {
+    text = await readScreen(herdr, target, paneId);
+  } catch (error) {
+    return { status: "unread", reason: error instanceof Error ? error.message : String(error) };
+  }
+  const screen = classifyIdleScreen(text);
+  if (!screen) return { status: "no-question" };
+  const requests = (workflow.laneRequests ??= []);
+  const existing = requests.find((request) => request.laneId === laneId && request.screenPrompt?.fingerprint === screen.fingerprint);
+  if (existing) return { status: "already-open", requestId: existing.id };
+  const id = `req-idle-${screen.fingerprint.slice(0, 10)}`;
+  const defaultAt = new Date(Date.parse(timestamp) + SCREEN_PROMPT_DEFAULT_MS).toISOString();
+  requests.push({
+    id,
+    workflowId: workflow.id,
+    laneId,
+    kind: "approval",
+    payload: { text: screen.question },
+    summary: `lane stopped with a question: ${screen.question.replace(/\s+/g, " ").slice(0, 200)}`,
+    status: "open",
+    requestedAt: timestamp,
+    note: `answer with herdr_request grant and the answer in the note (it reaches the lane). Default at ${defaultAt}: the lane decides under its goal rules`,
+    screenPrompt: {
+      kind: "idle-question",
+      paneId,
+      fingerprint: screen.fingerprint,
+      defaultAt,
+      default: {
+        decision: "granted",
+        reason: "no answer; the lane decides under its goal rules",
+        text: "Nobody answered your question in time. Decide it yourself under your goal rules: take the option you recommended, or else the most conservative one that stays inside your item's scope. Say which one in your receipt, and carry on without asking again.",
+      },
+    },
+  });
+  (workflow.evidence ??= []).push({ at: timestamp, kind: "idle-question-routed", text: `${id} ${laneId}: ${screen.question.replace(/\s+/g, " ").slice(0, 200)}` });
+  return { status: "routed", requestId: id };
+}
+
 /** Claude Code's transcript for a session in a worktree. */
 export function claudeTranscriptPath(worktree, sessionId, home = os.homedir()) {
   return join(home, ".claude", "projects", String(worktree).replace(/[^A-Za-z0-9]/g, "-"), `${sessionId}.jsonl`);
@@ -363,11 +434,18 @@ export async function resolveScreenPrompts({ herdr, manifest, workflow, timestam
       request.answeredBy = "policy";
       request.answeredAt = timestamp;
       request.note = `unattended default after ${Math.round(SCREEN_PROMPT_DEFAULT_MS / 60_000)} min with no answer: ${prompt.default.reason}`;
-      prompt.keys = prompt.default.keys;
+      if (prompt.default.keys) prompt.keys = prompt.default.keys;
       if (prompt.default.text) request.answerDelivery = { status: "pending", updatedAt: timestamp, text: `[Baa-ton request answer] ${request.id}: ${request.status}. ${prompt.default.text}` };
       recordUnattendedDecision(manifest, { at: timestamp, kind: `lane-${prompt.kind}`, workflowId: workflow.id, laneId: request.laneId, requestId: request.id, summary: request.summary, decision: request.status, reason: prompt.default.reason });
       (workflow.evidence ??= []).push({ at: timestamp, kind: "unattended-default", text: `${request.id} ${request.laneId}: ${request.status}: ${prompt.default.reason}` });
       changed = true;
+    }
+    if (prompt.kind === "idle-question") {
+      // Answered by message, never by keys: the root's answer went out with
+      // herdr_request, the default through the lane queue.
+      prompt.applied = { at: timestamp, via: request.answeredBy === "policy" ? "default-message" : "root-answer" };
+      changed = true;
+      continue;
     }
     if (!prompt.keys) {
       if (request.status === "granted") {
