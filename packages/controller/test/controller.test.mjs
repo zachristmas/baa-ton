@@ -4364,3 +4364,45 @@ test("nothing is typed when Herdr still reports the agent but the pane shows a b
     await s.fixture.cleanup();
   }
 });
+
+test("every blocked event runs the blocked-lane handler and reports its outcome in the hook output", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const dialog = [
+    " ←  ☐ D24 gate  ✔ Submit  →",
+    "",
+    "Do you confirm the D24 gate is cleared?",
+    "",
+    "❯ 1. Yes, proceed",
+    "     Continue with the integration.",
+    "  2. No, still on hold",
+    "     Keep it blocked.",
+    "  3. Need to check...",
+    "  4. Type something.",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+  const mock = await startHerdrMock((request) => {
+    if (request.method === "agent.read" && request.params.source === "visible")
+      return { result: { type: "pane_read", read: { pane_id: CHILD.pane_id, text: dialog } } };
+    if (request.method === "agent.get") return rootAgentInfo();
+    if (request.method === "agent.prompt") return { result: { type: "agent_prompted", agent: { name: ROOT.target } } };
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const first = await handleHook({ eventName: "pane.agent_status_changed", eventJson: statusEvent("blocked", "claude"), stateDir: fixture.stateDir, herdr: client(mock) });
+    const output = hookResponse(first);
+    assert.equal(output.blocked.status, "routed");
+    assert.equal(output.blocked.kind, "question");
+    const request = (await fixture.manifest()).workflows[0].laneRequests.find((item) => item.screenPrompt);
+    assert.match(request.summary, /question dialog on screen: Do you confirm the D24 gate is cleared\?/);
+    // The same blocked status again (deduplicated as an event) still runs the handler.
+    const repeat = await handleHook({ eventName: "pane.agent_status_changed", eventJson: statusEvent("blocked", "claude"), stateDir: fixture.stateDir, herdr: client(mock) });
+    assert.equal(repeat.deduplicated, true);
+    assert.equal(hookResponse(repeat).blocked.status, "routed");
+    assert.match(hookResponse(repeat).blocked.reason, /already open/);
+    assert.equal((await fixture.manifest()).workflows[0].laneRequests.filter((item) => item.screenPrompt).length, 1);
+  } finally {
+    await mock.close();
+    await fixture.cleanup();
+  }
+});
