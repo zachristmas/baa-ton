@@ -17,7 +17,7 @@ export const RECEIPT_ASK_TIMEOUT_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
   state: SpecState | undefined;
-  lane: (ref: { workflowId: string; laneId: string }) => { status?: string; agentStatus?: string; receipt?: { summary: string } } | undefined;
+  lane: (ref: { workflowId: string; laneId: string }) => { status?: string; workflowStatus?: string; agentStatus?: string; receipt?: { summary: string } } | undefined;
   /** true, or the reason dispatch must wait for capacity. */
   capacityWaiting?: boolean | string;
   pushed?: Set<string>;

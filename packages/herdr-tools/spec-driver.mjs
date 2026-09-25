@@ -36,6 +36,8 @@ const RECEIPT_FORMAT = {
   verify: "one PREVIEW: <spec> pass|fail line per spec and REPORT: <path>",
 };
 const STAGE_OF = { deciding: "decide", building: "build", reviewing: "review", integrating: "integrate", verifying: "verify" };
+/** Workflow statuses after which a lane no longer occupies its worktree. */
+const CLOSED_WORKFLOW = new Set(["closed", "completed", "operator-closed", "superseded", "retired"]);
 const LANE_ENDED = new Set(["operator-closed", "superseded", "dispatch-failed", "failed", "closed"]);
 
 /** Static prefix of a glob (everything before the first wildcard). */
@@ -285,8 +287,23 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
       move(item.id, "verifying", { integratedSha: current.integration.sha }, "pushed to the target branch");
   }
 
-  // 1c. One serial integration queue, in dependency order.
-  if (!spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane)) {
+  // 1c. One serial integration queue, in dependency order. The integration
+  // worktree stays reserved by any integrate or verify lane whose workflow
+  // is still open, even when its item was blocked or the lane went idle
+  // without a receipt: a second lane there would collide.
+  const reservedBy = spec.items.find((item) => {
+    const current = next.items[item.id];
+    if (!current?.lane) return false;
+    const stage = current.laneStage ?? STAGE_OF[current.state];
+    if (stage !== "integrate" && stage !== "verify") return false;
+    const view = lane(current.lane);
+    return !view || !CLOSED_WORKFLOW.has(view.workflowStatus ?? "");
+  });
+  if (reservedBy) {
+    for (const item of spec.items)
+      if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
+        waits[item.id] = `integration worktree busy: ${reservedBy.id}'s lane ${next.items[reservedBy.id].lane.workflowId} is still open`;
+  } else if (!spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane)) {
     const head = spec.items.find(
       (item) =>
         next.items[item.id]?.state === "integrating" &&
@@ -329,6 +346,10 @@ export function advanceSpec({ spec, state, lane, capacityWaiting = false, pushed
     const needsLane = item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
     if (!needsLane) {
       current.verified = now;
+      continue;
+    }
+    if (reservedBy) {
+      waits[item.id] = `integration worktree busy: ${reservedBy.id}'s lane ${next.items[reservedBy.id].lane.workflowId} is still open`;
       continue;
     }
     if (item.acceptance.preview.length && spec.target.preview) {

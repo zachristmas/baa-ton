@@ -933,3 +933,76 @@ test("build and integration objectives, and the lane contract, forbid detached j
   const contract = laneContract({ id: "w", agentKind: "claude", lanes: [] }, { id: "l", objective: "x", readOnly: false, agentKind: "claude", status: "planned" });
   assert.match(contract, /never with &, disown, nohup or setsid/);
 });
+
+test("a build into an adopted worktree commits the adopted work first; a refusal holds the build", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "D02", title: "Adopted build", owns: ["src/d02/**"], sharedTouch: ["db/journal.json"], acceptance: { text: "d" } },
+        { id: "D10", title: "Stray", owns: ["src/d10/**"], acceptance: { text: "s" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D02: { state: "ready", worktree: "/work/wt-d02", branch: "demo/d02", adopted: { worktree: "/work/wt-d02", branch: "demo/d02" } },
+        D10: { state: "ready", worktree: "/work/wt-d10", branch: "demo/d10", adopted: { worktree: "/work/wt-d10", branch: "demo/d10" } },
+      },
+    },
+  });
+  try {
+    f.ports.status = async (worktree) =>
+      worktree === "/work/wt-d02" ? " M src/d02/a.ts\n M db/journal.json\n?? harness/run.sh" : " M src/d10/b.ts\n M lib/other.ts";
+    const commits = [];
+    f.ports.commit = async (input) => {
+      commits.push(input);
+      return "sha-d02";
+    };
+    const result = await f.advance();
+    assert.deepEqual(commits, [{ worktree: "/work/wt-d02", paths: ["src/d02/a.ts", "db/journal.json"], message: "spec(D02): adopt work as built" }]);
+    const build = f.calls.plan.find((call) => call.specStage === "build");
+    assert.equal(build.worktree, "/work/wt-d02", "then the build is dispatched into the adopted worktree");
+    assert.match(result.content[0].text, /build D10 held: uncommitted changes outside the item's owns and sharedTouch: lib\/other\.ts/);
+    const state = await f.state();
+    assert.equal(state.items.D10.state, "blocked");
+    assert.equal(state.items.D10.history.at(-1).from, "building", "a deploy retry resumes the build");
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "build").length, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an open integrate lane keeps spec-integration reserved, even idle without a receipt on a blocked item", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "D11", title: "Earlier", acceptance: { text: "e" } }, { id: "D12", title: "Next", acceptance: { text: "n" } }],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D11: { state: "blocked", blockedReason: "human-gate", attempts: 1, lane: { workflowId: "herdr-int1", laneId: "lane-1" }, laneStage: "integrate", note: "integrate lane is idle without a receipt, even after being asked" },
+        D12: { state: "integrating", attempts: 1 },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-int1", status: "running", lanes: [{ id: "lane-1", status: "awaiting-explicit-outcome" }], evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const first = await f.advance();
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0, "no second integrate lane in spec-integration");
+    assert.match(first.content[0].text, /D12 waits: integration worktree busy: D11's lane herdr-int1 is still open/);
+
+    const closed = await f.manifest();
+    closed.workflows.find((item) => item.id === "herdr-int1").status = "closed";
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(closed));
+    await f.advance();
+    assert.deepEqual(f.calls.plan.filter((call) => call.specStage === "integrate").map((call) => call.objective), ["spec D12 integrate: Next"], "once that workflow is closed, the next integration starts");
+  } finally {
+    await f.cleanup();
+  }
+});
