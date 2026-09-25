@@ -1922,6 +1922,42 @@ function rootMatches(result, root) {
   return rootAgent(result, root) !== undefined;
 }
 
+/**
+ * Whether an `agent get` result shows the expected agent live in its pane,
+ * ready for input. Text is only ever typed into such an agent: a pane whose
+ * agent exited holds a raw shell, and typing a digest there leaves the shell
+ * broken (an unclosed quote) so the agent cannot restart.
+ */
+export function liveAgentReady(result, expected) {
+  const info = isRecord(result) && isRecord(result.result) ? result.result : result;
+  if (!isRecord(info) || info.type !== "agent_info" || !isRecord(info.agent)) return { ok: false, reason: "no_agent_in_pane" };
+  const agent = info.agent;
+  if (typeof agent.agent !== "string" || !agent.agent) return { ok: false, reason: "no_agent_in_pane" };
+  if (expected.pane_id && agent.pane_id !== expected.pane_id) return { ok: false, reason: "agent_pane_mismatch" };
+  if (expected.workspace_id && agent.workspace_id !== undefined && agent.workspace_id !== expected.workspace_id) return { ok: false, reason: "agent_workspace_mismatch" };
+  if (expected.name && agent.name !== undefined && agent.name !== expected.name) return { ok: false, reason: "agent_name_mismatch" };
+  if (expected.agent_kind && agent.agent !== expected.agent_kind) return { ok: false, reason: "agent_kind_mismatch" };
+  if (agent.interactive_ready === false || agent.launch_pending === true) return { ok: false, reason: "agent_not_interactive_ready" };
+  if (agent.agent_status === "unknown") return { ok: false, reason: "agent_status_unknown" };
+  return { ok: true, agent };
+}
+
+/** Fetch and check the agent right before a send; never throws. */
+async function agentReadyForSend(herdr, target, expected) {
+  try {
+    return liveAgentReady(await herdr.request("agent.get", { target }), expected);
+  } catch (error) {
+    return { ok: false, reason: unavailable(error) ? `agent_unavailable:${error.code}` : `agent_check_failed:${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+const rootExpectation = (root) => ({
+  pane_id: root.pane_id,
+  workspace_id: root.workspace_id,
+  ...(root.target_kind === "name" ? { name: root.target } : {}),
+  ...(root.agent_kind !== undefined ? { agent_kind: root.agent_kind } : {}),
+});
+
 function rootEventMatches(event, root) {
   return (
     event.data.pane_id === root.pane_id &&
@@ -2182,6 +2218,9 @@ async function rootReadyForDigest(goal, root, herdr) {
 }
 
 async function deliverRootPrompt(root, herdr, text) {
+  // Checked right before the send, not only when the digest was planned.
+  const ready = await agentReadyForSend(herdr, root.target, rootExpectation(root));
+  if (!ready.ok) return { status: "pending", reason: `root_not_ready:${ready.reason}` };
   try {
     // Deliberately omit `wait`: this is a wake notification, never a foreground wait.
     await herdr.request("agent.prompt", { target: root.target, text });
@@ -2924,6 +2963,8 @@ async function deliverQueueHeadWake(item, root, herdr) {
     const rootInfo = await herdr.request("agent.get", { target: root.target });
     if (!rootMatches(rootInfo, root))
       return { status: "pending", reason: "recorded_root_unavailable_or_mismatched" };
+    const ready = liveAgentReady(rootInfo, rootExpectation(root));
+    if (!ready.ok) return { status: "pending", reason: `root_not_ready:${ready.reason}` };
   } catch (error) {
     if (unavailable(error))
       return { status: "pending", reason: `root_unavailable:${error.code}` };
@@ -3154,6 +3195,8 @@ async function deliverSupervisorNudge(goal, root, herdr, reasons) {
         status: "pending",
         reason: "recorded_root_unavailable_or_mismatched",
       };
+    const ready = liveAgentReady(rootInfo, rootExpectation(root));
+    if (!ready.ok) return { status: "pending", reason: `root_not_ready:${ready.reason}` };
     if (agent.agent_status !== "idle" && agent.agent_status !== "done")
       return {
         status: "pending",
@@ -3293,6 +3336,7 @@ const LANE_DELIVERY_BUSY = new Set(["working", "blocked"]);
  */
 export async function deliverLaneQueue({ workflow, herdr, timestamp = now() }) {
   const lanes = new Map((Array.isArray(workflow?.lanes) ? workflow.lanes : []).map((lane) => [lane.id, lane]));
+  const kindOf = (lane) => lane?.agentKind ?? workflow?.agentKind;
   const queued = [];
   for (const message of Array.isArray(workflow?.laneMessages) ? workflow.laneMessages : [])
     if (isRecord(message) && message.delivery?.status === "pending")
@@ -3303,16 +3347,13 @@ export async function deliverLaneQueue({ workflow, herdr, timestamp = now() }) {
   let changed = false;
   const busy = new Set();
   for (const item of queued) {
-    const paneId = lanes.get(item.laneId)?.paneId;
+    const lane = lanes.get(item.laneId);
+    const paneId = lane?.paneId;
     if (!paneId || busy.has(paneId)) continue;
     const previous = item.record[item.key];
-    let agent;
-    try {
-      const info = await herdr.request("agent.get", { target: paneId });
-      agent = isRecord(info?.agent) && info.agent.pane_id === paneId ? info.agent : undefined;
-    } catch {
-      agent = undefined;
-    }
+    // Only into the lane's own agent, live and ready; never into a shell.
+    const ready = await agentReadyForSend(herdr, paneId, { pane_id: paneId, ...(kindOf(lane) ? { agent_kind: kindOf(lane) } : {}) });
+    const agent = ready.ok ? ready.agent : undefined;
     if (!agent || LANE_DELIVERY_BUSY.has(agent.agent_status)) {
       busy.add(paneId);
       continue;

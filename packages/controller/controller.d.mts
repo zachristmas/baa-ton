@@ -58,3 +58,7 @@ export function isHarnessCommand(command: unknown): boolean;
 export function laneFinished(lane: unknown): boolean;
 export function parseProcessIdentity(stdout: string): { start: string; command: string } | undefined;
 export function paneServiceProcesses(paneInfo: unknown): Array<{ pid: number; name: string }>;
+export function liveAgentReady(
+  result: unknown,
+  expected: { pane_id?: string; workspace_id?: string; name?: string; agent_kind?: string },
+): { ok: true; agent: Record<string, unknown> } | { ok: false; reason: string };
