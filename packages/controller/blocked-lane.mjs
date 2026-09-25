@@ -48,12 +48,24 @@ export function screenLines(text) {
     .slice(-SCREEN_LINES);
 }
 
+const FOOTER = /Enter to (?:select|confirm)|Esc to cancel|↑\/↓ to navigate|Tab\/Arrow keys|arrow keys to navigate/i;
+/** Free-text and chat entries Claude adds to every question; never an answer. */
+const FREE_TEXT = /^(?:Type something\.?|Chat about this|Other)$/i;
+
+/**
+ * Numbered options from `from` on, numbered 1, 2, 3... Lines between them
+ * (the option descriptions Claude's question dialog shows, separators) are
+ * skipped; the footer or a non-consecutive number ends the list.
+ */
 function parseOptions(lines, from) {
   const options = [];
   for (let index = from; index < lines.length; index += 1) {
+    if (FOOTER.test(lines[index])) break;
     const match = OPTION.exec(lines[index]);
-    if (!match) {
-      if (options.length && lines[index].trim()) break;
+    const expected = options.length ? options.at(-1).number + 1 : 1;
+    if (!match || Number(match[2]) !== expected) {
+      // Before the first option only blank lines may come.
+      if (!options.length && lines[index].trim()) break;
       continue;
     }
     const label = match[3].trim();
@@ -62,6 +74,7 @@ function parseOptions(lines, from) {
       label,
       selected: Boolean(match[1]),
       ...(/\(recommended\)/i.test(label) ? { recommended: true } : {}),
+      ...(FREE_TEXT.test(label) ? { freeText: true } : {}),
     });
   }
   return options;
@@ -108,16 +121,28 @@ export function classifyScreen(text) {
       };
     }
   }
-  // A question dialog: numbered options under a line that asks something.
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (!/\?\s*$/.test(lines[index])) continue;
-    const options = parseOptions(lines, index + 1);
-    if (options.length < 2) continue;
-    const block = lines.slice(index, index + 1 + options.length + 1).join("\n");
-    const recommended = options.find((option) => option.recommended);
+  // A question dialog: the newest "1." option list with at least two real
+  // options, under the question text (which may wrap over lines and need
+  // not end in "?"), with the dialog footer, a cursor or a "?" to tell it
+  // from an ordinary numbered list in the output.
+  const footer = lines.some((line) => FOOTER.test(line));
+  for (let first = lines.length - 1; first >= 0; first -= 1) {
+    const match = OPTION.exec(lines[first]);
+    if (!match || match[2] !== "1") continue;
+    const options = parseOptions(lines, first);
+    if (options.filter((option) => !option.freeText).length < 2) continue;
+    let end = first - 1;
+    while (end >= 0 && !lines[end].trim()) end -= 1;
+    let start = end;
+    while (start > 0 && end - start < 3 && lines[start - 1].trim() && !OPTION.test(lines[start - 1])) start -= 1;
+    const questionLines = lines.slice(Math.max(0, start), end + 1).map((line) => line.trim()).filter((line) => line && !/[←→]|✔ Submit/.test(line));
+    const question = questionLines.join(" ");
+    if (!question || !(footer || options.some((option) => option.selected) || /\?/.test(question))) continue;
+    const recommended = options.find((option) => option.recommended && !option.freeText);
+    const block = [question, ...options.map((option) => `${option.number}. ${option.label}`)].join("\n");
     return {
       kind: "question",
-      question: lines[index].trim(),
+      question,
       options,
       ...(recommended ? { recommended: recommended.number } : {}),
       denyKeys: ["esc"],
@@ -336,15 +361,15 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   try {
     text = await readScreen(herdr, target, paneId);
   } catch (error) {
-    return { status: "unread", reason: error instanceof Error ? error.message : String(error) };
+    return { status: "skipped", reason: `screen read failed: ${error instanceof Error ? error.message : String(error)}` };
   }
   const screen = classifyScreen(text);
-  if (screen.kind === "unknown") return { status: "unknown" };
+  if (screen.kind === "unknown") return { status: "none", reason: "no permission prompt or question dialog on the visible screen", lines: screenLines(text).length };
   let rules;
   try {
     rules = await loadKnownSafe();
   } catch (error) {
-    return { status: "unavailable", reason: `known-safe rules could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
+    return { status: "skipped", reason: `known-safe rules could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
   }
   const lane = (workflow.lanes ?? []).find((item) => item.id === laneId);
   const worktree = laneWorktree(workflow, lane);
@@ -360,7 +385,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   }
   const requests = (workflow.laneRequests ??= []);
   const existing = requests.find((request) => request.laneId === laneId && request.screenPrompt?.fingerprint === screen.fingerprint && !request.screenPrompt.applied);
-  if (existing) return { status: "already-open", requestId: existing.id };
+  if (existing) return { status: "routed", reason: "request already open for this prompt", requestId: existing.id, kind: screen.kind };
   if (screen.kind === "permission" && screen.toolName === "Bash" && !screen.truncated && screen.command) {
     const verdict = rules.classifyCommand(screen.command, { cwd: worktree });
     if (verdict.decision === "allow") {
@@ -369,7 +394,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
       try {
         await sendKeys(herdr, paneId, screen.approveKeys);
       } catch (error) {
-        return { status: "send-failed", reason: error instanceof Error ? error.message : String(error) };
+        return { status: "skipped", reason: `send-keys failed: ${error instanceof Error ? error.message : String(error)}` };
       }
       (workflow.evidence ??= []).push({ at: timestamp, kind: "screen-prompt-approved", text: `${laneId}: known-safe (${verdict.rules.join(", ")}): ${screen.command.replace(/\s+/g, " ").slice(0, 200)}` });
       return { status: "approved", rules: verdict.rules };
@@ -407,7 +432,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   };
   requests.push(request);
   (workflow.evidence ??= []).push({ at: timestamp, kind: "screen-prompt-routed", text: `${id} ${laneId}: ${request.summary}` });
-  return { status: "routed", requestId: id };
+  return { status: "routed", requestId: id, kind: screen.kind };
 }
 
 function optionFromNote(note, options) {

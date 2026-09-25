@@ -4064,8 +4064,10 @@ export async function handleHook({
     }
     // A lane that turned blocked: read its screen once, approve a known-safe
     // permission prompt, or route the prompt to the root with a default.
+    // Every blocked event, repeats included: a lane can move from one prompt
+    // to the next without another status, and the handler dedupes by prompt.
     let blocked;
-    if (created && event.data.agent_status === "blocked") {
+    if (event.data.agent_status === "blocked") {
       const lane = (workflow.lanes ?? []).find((item) => item.id === mapping.lane.lane_id);
       blocked = await handleBlockedLane({
         herdr: api,
@@ -4077,7 +4079,7 @@ export async function handleHook({
         agentKind: lane?.agentKind ?? workflow.agentKind,
         timestamp: record.received_at ?? now(),
       });
-      if (blocked.status === "approved" || blocked.status === "routed") await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+      if (blocked.status === "approved" || (blocked.status === "routed" && !blocked.reason)) await atomicWriteJson(mapping.workflow.manifest_path, manifest);
     } else if (created && event.data.agent_status === "done" && !postCompletionObservation) {
       // Idle without a receipt, asking for direction in plain text.
       blocked = await handleIdleLane({
@@ -4353,6 +4355,8 @@ export function hookResponse(result) {
     deduplicated: result.deduplicated,
     identity: result.record.identity,
     wake: result.record.wake.status,
+    // The blocked-lane (or idle-question) outcome, for `herdr plugin log`.
+    ...(result.blocked ? { blocked: result.blocked } : {}),
   };
 }
 
