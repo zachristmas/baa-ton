@@ -29,6 +29,8 @@ export type Spec = {
     finalReport: "alongside" | "replace";
     minFreeMemoryGb?: number;
     maxSwapUsedGb?: number;
+    /** Globs of generated files restored to HEAD when an item does not own them. */
+    generatedArtifacts: string[];
   };
   stages: Record<string, { profile: string; differentFrom?: string }>;
   items: SpecItem[];
@@ -75,3 +77,4 @@ export function gitAncestor(repo: string, ancestor: string, descendant: string):
 export function finalReportPath(spec: Spec, report: string): string;
 /** The deployed SHA from a release-check response body (JSON or text). */
 export function releaseShaFrom(body: string): string | undefined;
+export const DEFAULT_GENERATED_ARTIFACTS: string[];
