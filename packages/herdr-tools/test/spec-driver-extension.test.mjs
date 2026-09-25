@@ -110,6 +110,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
       calls.dispatch.push(workflowId);
       return { dispatched: true };
     },
+    // No lane runs background work unless a test says so.
+    backgroundWork: async () => undefined,
     now: () => "2026-09-24T12:00:00.000Z",
   };
   const ctx = {
@@ -1075,6 +1077,60 @@ test("a lane that answers the receipt ask with a status message is still working
     await f.advance();
     assert.equal(told.length, 1, "then asked again");
     state = await f.state();
+    assert.equal(state.items.D12.state, "integrating");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane idle while its own background work runs is not asked for a receipt, not blocked, and keeps its worktree", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D12", title: "Batch", acceptance: { text: "b" } }, { id: "D14", title: "Next", acceptance: { text: "n" } }] },
+    seed: {
+      version: 1,
+      items: {
+        D12: { state: "integrating", attempts: 1, lane: { workflowId: "herdr-338", laneId: "lane-1" }, laneStage: "integrate", receiptAskedAt: "2026-09-24T11:20:00.000Z" },
+        D14: { state: "integrating", attempts: 1 },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({
+      id: "herdr-338",
+      status: "running",
+      lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p8" }],
+      eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] },
+      evidence: [],
+    });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => {
+      told.push(input);
+      return { message: { delivery: { status: "delivered" } } };
+    };
+    f.ports.agentPresent = async () => true;
+    let work = "node --test packages/**/*.test.mjs";
+    const asked = [];
+    f.ports.backgroundWork = async (paneId) => {
+      asked.push(paneId);
+      return work;
+    };
+    // 40 minutes after an earlier ask, with no reply: would block, but the suite still runs.
+    const first = await f.advance();
+    let state = await f.state();
+    assert.deepEqual(asked, ["w-spec:p8"]);
+    assert.equal(state.items.D12.state, "integrating", "not blocked");
+    assert.equal(state.items.D12.receiptAskedAt, undefined);
+    assert.equal(state.items.D12.backgroundWork, work);
+    assert.equal(told.length, 0, "no receipt ask");
+    assert.match(first.content[0].text, /D14 waits: integration worktree busy/, "its worktree stays reserved");
+    work = undefined;
+    f.ports.now = () => "2026-09-24T12:05:00.000Z";
+    await f.advance();
+    state = await f.state();
+    assert.equal(told.length, 1, "once the work ends, the receipt ask resumes");
+    assert.equal(state.items.D12.backgroundWork, undefined);
     assert.equal(state.items.D12.state, "integrating");
   } finally {
     await f.cleanup();

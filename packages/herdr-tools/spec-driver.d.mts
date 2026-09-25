@@ -26,6 +26,7 @@ export function advanceSpec(input: {
   pushed?: Set<string>;
   released?: Map<string, string>;
   dirty?: Set<string>;
+  background?: Map<string, string>;
   integrationLive?: string;
   contained?: Map<string, string>;
   now: string;
