@@ -3619,7 +3619,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function assertCleanLocalWorktree(
     cwd: string,
     signal?: AbortSignal,
-    options: { allowDirty?: boolean } = {},
+    options: { allowDirty?: boolean; allowUntracked?: boolean } = {},
   ): Promise<string> {
     const root = (await pi.exec(
       "git",
@@ -3645,7 +3645,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       throw new Error(
         `worktreeCwd must be an existing local Git worktree: ${clip(result.stderr || result.stdout, 1000)}`,
       );
-    if (result.stdout.trim())
+    // Spec-loop lanes may share a worktree with untracked files the driver
+    // deliberately leaves uncommitted (lane harness scripts, artifacts).
+    const dirty = result.stdout
+      .split("\n")
+      .filter((line) => line.trim() && !(options.allowUntracked && line.startsWith("??")));
+    if (dirty.length)
       throw new Error("worktreeCwd must be clean before Herdr dispatch.");
     return checkoutPath;
   }
@@ -3671,6 +3676,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               cleanWorktree: async () => {
                 await assertCleanLocalWorktree(workflow.worktree!, signal, {
                   allowDirty: workflow.lanes.length > 0 && workflow.lanes.every((lane) => lane.readOnly),
+                  allowUntracked: workflow.lanes.length > 0 && workflow.lanes.every((lane) => Boolean(lane.specStage)),
                 });
               },
             }
@@ -4649,6 +4655,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const agentStatus = session === "gone" ? "gone" : latest ?? (session === "done" ? "done" : undefined);
         return {
           status: lane.status,
+          workflowStatus: workflow!.status,
           ...(agentStatus ? { agentStatus } : {}),
           ...(lane.completionReceipt ? { receipt: { summary: lane.completionReceipt.summary } } : {}),
         };
@@ -4707,7 +4714,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           (!record.blockedCause && /^(committing the adopted work failed|uncommitted changes outside the item's owns)/.test(record.note ?? ""));
         if (!retryable || record.blockedByCode === codeVersion) continue;
         const resume = [...(record.history ?? [])].reverse().find((entry: { to?: string; from?: string }) => entry.to === "blocked")?.from;
-        if (resume !== "reviewing" && resume !== "integrating") continue;
+        if (resume !== "reviewing" && resume !== "integrating" && resume !== "building") continue;
         record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: resume, note: "retried after a deploy" }];
         Object.assign(record, { state: resume, since: use.now() });
         for (const key of ["blockedReason", "blockedCause", "blockedByCode", "note", "lane"]) delete record[key];
@@ -4745,7 +4752,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
        * commits; anything else holds the item for the root. Returns true
        * when the item is held.
        */
-      const commitAdoptedWork = async (item: (typeof spec.items)[number], record: Record<string, any>, branch: string) => {
+      const commitAdoptedWork = async (item: (typeof spec.items)[number], record: Record<string, any>, branch: string, stage: "reviewing" | "building" = "reviewing") => {
         const worktree = record.worktree as string;
         const porcelain = await statusOf(worktree).catch(() => "");
         if (!porcelain.trim()) return false;
@@ -4759,23 +4766,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const untracked = changes.untracked.filter((path) => !siblingPaths.has(path));
         const hold = (note: string, reason: string, cause: string) => {
           Object.assign(record, { state: "blocked", blockedReason: "human-gate", blockedCause: cause, blockedByCode: codeVersion, note, since: use.now() });
-          record.history = [...(record.history ?? []), { at: use.now(), from: "reviewing", to: "blocked", note }];
+          record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: "blocked", note }];
           step.rootAsks.push({ itemId: item.id, reason });
-          done.push(`review ${item.id} held: ${note.split("\n")[0]}`);
+          done.push(`${stage === "building" ? "build" : "review"} ${item.id} held: ${note.split("\n")[0]}`);
           return true;
         };
         if (outside.length) {
           const files = outside.slice(0, 20).join(", ") + (outside.length > 20 ? `, and ${outside.length - 20} more` : "");
           return hold(
             `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
-            `${item.id}: ${worktree} has modified tracked files that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to reviewing.`,
+            `${item.id}: ${worktree} has modified tracked files that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to ${stage}.`,
             "tracked-outside",
           );
         }
         if (untracked.length)
           record.history = [
             ...(record.history ?? []),
-            { at: use.now(), from: "reviewing", to: "reviewing", note: `left untracked, uncommitted: ${untracked.slice(0, 20).join(", ")}${untracked.length > 20 ? `, and ${untracked.length - 20} more` : ""}` },
+            { at: use.now(), from: stage, to: stage, note: `left untracked, uncommitted: ${untracked.slice(0, 20).join(", ")}${untracked.length > 20 ? `, and ${untracked.length - 20} more` : ""}` },
           ];
         if (!changes.paths.length) return false;
         const message = specCommitMessage(item.id, "adopt work as built");
@@ -4789,7 +4796,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           const output = failureOutput(error);
           return hold(
             `committing the adopted work failed:\n${output}`,
-            `${item.id}: committing its adopted work in ${worktree} failed. Hook output:\n${output}\nFix the cause and it retries after the next deploy, or commit it by hand and set the item back to reviewing.`,
+            `${item.id}: committing its adopted work in ${worktree} failed. Hook output:\n${output}\nFix the cause and it retries after the next deploy, or commit it by hand and set the item back to ${stage}.`,
             "adopt-commit",
           );
         }
@@ -4871,6 +4878,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch, commitFirst });
           } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
+            // A build into an adopted worktree starts from the adopted work,
+            // committed the same way as before a review.
+            if (record.adopted && record.worktree) {
+              const held = await commitAdoptedWork(item, record, branch, "building");
+              if (held) continue;
+            }
             await use.worktree({ repo, path: worktree, branch, base: `refs/remotes/${spec.target.remote}/${spec.target.branch}` }, signal);
             objective = buildObjective(spec, item, { branch, findings: action.findings, decided: record.decided, answers: record.answers });
           } else {
@@ -4910,6 +4923,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           }
           if (action.kind === "build") record.buildWorkflows = [...(record.buildWorkflows ?? []), workflow.id];
           record.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+          record.laneStage = action.kind;
           delete record.note;
           const result = await use.dispatch(workflow.id);
           if (!result.dispatched) record.note = `${action.kind} planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
@@ -6639,7 +6653,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     cwd: string,
     expectedWorkspaceId?: string,
     signal?: AbortSignal,
-    options: { allowDirty?: boolean; openElsewhere?: (workspaceId: string) => void } = {},
+    options: { allowDirty?: boolean; allowUntracked?: boolean; openElsewhere?: (workspaceId: string) => void } = {},
   ): Promise<WorktreeBinding> {
     const checkoutPath = await assertCleanLocalWorktree(cwd, signal, options);
     const worktreeList = responseRecord(
@@ -7003,6 +7017,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const worktreeBinding = target.worktree
       ? await inspectWorktreeForWorkspace(target.worktree, undefined, undefined, {
           allowDirty: lanes.length > 0 && lanes.every((lane) => lane.readOnly),
+          allowUntracked: lanes.length > 0 && lanes.every((lane) => Boolean(lane.specStage)),
           openElsewhere: (workspaceId) => {
             laneWorkspaceId = workspaceId;
           },

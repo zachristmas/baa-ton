@@ -343,3 +343,15 @@ test("items queued for integration hold no maxParallel slot; live lanes do", () 
   });
   assert.deepEqual(later.actions.filter((action) => action.kind === "build").map((action) => action.itemId), ["R0", "R1", "R2", "R3"], "the retry of R0 plus three new builds");
 });
+
+test("an open verify lane also reserves the integration worktree", () => {
+  const s = spec([{ id: "V" }, { id: "I" }]);
+  const step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { V: { state: "verifying", integratedSha: "x", lane: { workflowId: "wv", laneId: "l" } }, I: { state: "integrating", attempts: 1 } } },
+    lane: lanes({ "wv/l": { status: "working", workflowStatus: "running" } }),
+    now: at(0),
+  });
+  assert.equal(step.actions.some((action) => action.kind === "integrate"), false);
+  assert.match(step.waits.I, /integration worktree busy: V's lane wv is still open/);
+});
