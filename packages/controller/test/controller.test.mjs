@@ -240,7 +240,15 @@ async function startHerdrMock(respond) {
       if (newline === -1) return;
       const request = JSON.parse(input.slice(0, newline));
       requests.push(request);
-      const reply = await respond(request);
+      let reply;
+      try {
+        reply = await respond(request);
+      } catch (error) {
+        // The blocked-lane screen read: tests that do not script it see an
+        // empty screen (nothing to classify).
+        if (request.method !== "agent.read" || request.params?.source !== "visible") throw error;
+        reply = { result: { type: "pane_read", read: { pane_id: request.params.target, text: "" } } };
+      }
       socket.end(`${JSON.stringify({ id: request.id, ...reply })}\n`);
     });
   });
@@ -2758,7 +2766,8 @@ test("a non-Pi named root receives done and blocked wakes without Pi semantics",
       requestsFor(mock, "agent.prompt").map((request) => request.params.target),
       [root.target, root.target],
     );
-    assert.equal(requestsFor(mock, "agent.read").length, 0);
+    assert.equal(requestsFor(mock, "agent.read").filter((request) => request.params.source !== "visible").length, 0, "no Pi pause probe");
+    assert.equal(requestsFor(mock, "agent.read").filter((request) => request.params.source === "visible").length, 1, "one screen read, on blocked");
     const events = (await fixture.manifest()).workflows[0].eventController
       .events;
     assert.deepEqual(

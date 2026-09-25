@@ -45,6 +45,7 @@ export {
 } from "./lane-services.mjs";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
+import { handleBlockedLane, resolveScreenPrompts } from "./blocked-lane.mjs";
 import {
   enqueueWakeHint,
   makeEnvelope,
@@ -3489,8 +3490,11 @@ export async function runSupervisorTick({
             status: queueWake.status,
           });
       }
-      // Root-to-lane deliveries the lane was too busy to take earlier.
+      // Screen prompts first (the root's answer or the due default, as keys),
+      // then root-to-lane deliveries the lane was too busy to take earlier.
       let laneQueueChanged = false;
+      for (const stored of matchedWorkflows)
+        if (await resolveScreenPrompts({ herdr: api, manifest, workflow: stored, timestamp })) laneQueueChanged = true;
       for (const stored of matchedWorkflows)
         if (await deliverLaneQueue({ workflow: stored, herdr: api, timestamp })) laneQueueChanged = true;
       if (laneQueueChanged) await atomicWriteJson(manifestPath, manifest);
@@ -4058,6 +4062,23 @@ export async function handleHook({
           );
       }
     }
+    // A lane that turned blocked: read its screen once, approve a known-safe
+    // permission prompt, or route the prompt to the root with a default.
+    let blocked;
+    if (created && event.data.agent_status === "blocked") {
+      const lane = (workflow.lanes ?? []).find((item) => item.id === mapping.lane.lane_id);
+      blocked = await handleBlockedLane({
+        herdr: api,
+        manifest,
+        workflow,
+        laneId: mapping.lane.lane_id,
+        paneId: event.data.pane_id,
+        target: mapping.lane.target ?? event.data.pane_id,
+        agentKind: lane?.agentKind ?? workflow.agentKind,
+        timestamp: record.received_at ?? now(),
+      });
+      if (blocked.status === "approved" || blocked.status === "routed") await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+    }
     // A queue continuation is evaluated after every mapped lifecycle hook;
     // inbox occurrence dedupe makes repeated post-completion observations safe.
     queueWake = await processQueueHeadWake({
@@ -4070,8 +4091,8 @@ export async function handleHook({
       goal,
       shared: sharedManifest,
     });
-    if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) {
-      return { accepted: true, deduplicated: !created, record, queueWake };
+    if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification) || blocked?.status === "approved") {
+      return { accepted: true, deduplicated: !created, record, queueWake, ...(blocked ? { blocked } : {}) };
     }
     const digest = await dispatchRootDigest({
       orchestrator: mapping.orchestrator,
@@ -4081,7 +4102,7 @@ export async function handleHook({
       configDir,
       herdr: api,
     });
-    return { accepted: true, deduplicated: !created, record, queueWake, digest };
+    return { accepted: true, deduplicated: !created, record, queueWake, digest, ...(blocked ? { blocked } : {}) };
   } finally {
     await release();
   }
