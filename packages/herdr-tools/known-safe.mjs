@@ -41,8 +41,10 @@ const INERT = [
   /^(pwd|ls|cat|head|tail|wc|grep|rg|echo|printf|true|false|test|date|which|stat|du|sort|uniq|cut|tr|diff|cmp|basename|dirname|realpath|jq)(\s|$)/,
   /^\[ .* \]$/,
   /^(mkdir -p|touch)(\s+"?[\w./$-]+"?)+$/,
-  /^\w+="?SUBST"?$/,
-  /^\w+="?[\w./:@-]*"?$/,
+  // A copy whose destination is a relative path in the worktree.
+  /^cp(?:\s+-[a-z]+)*\s+"?[^\s;&|"]+"?\s+"?[\w.][\w./-]*"?$/,
+  /^(?:export )?\w+="?SUBST"?$/,
+  /^(?:export )?\w+="?[\w./:@-]*"?$/,
   /^git (status|log|diff|show|fetch|branch --show-current|rev-parse|ls-files|merge-base)(\s|$)/,
   /^(npm test|node --test|npx tsc|tsc)(\s|$)/,
   /^for \w+ in [^;]+$/,
@@ -67,6 +69,36 @@ function sedInert(segment) {
     const pieces = part.slice(2).split(substitute[1]);
     return pieces.length === 3 && /^[gIp0-9]*$/.test(pieces[2]);
   });
+}
+
+const RELATIVE_FILE = /^(?![/~])[\w.][\w./-]*$/;
+
+/**
+ * Files the command itself creates (so removing them later in the same
+ * command is safe): `cat > f <<EOF`, `git show HEAD:x > f`, a relative `>`
+ * redirect, `touch f`, or the destination of `cp src dst`. Only relative
+ * paths without `..` count; cd confinement keeps them in the worktree.
+ */
+function createdFiles(body, heredocTargets) {
+  const found = [
+    ...heredocTargets,
+    ...[...body.matchAll(/git show HEAD:\S+(?:\s*\|\s*sed\s+[^>\n]*?)?\s>\s*("?[\w./$-]+"?)/g)].map((match) => unquote(match[1])),
+    ...[...body.matchAll(/(?<![>&\d])>\s*("?[\w.][\w./-]*"?)/g)].map((match) => unquote(match[1])),
+    ...[...body.matchAll(/(?:^|[\s;&|(])touch((?:\s+"?[\w.][\w./-]*"?)+)/g)].flatMap((match) => match[1].trim().split(/\s+/).map(unquote)),
+    ...[...body.matchAll(/(?:^|[\s;&|(])cp(?:\s+-\w+)*\s+\S+\s+("?[\w.][\w./-]*"?)(?=[\s;&|]|$)/g)].map((match) => unquote(match[1])),
+  ];
+  return new Set(found.filter((path) => path && !path.includes("..") && (RELATIVE_FILE.test(path) || path.startsWith("$"))));
+}
+
+/** `git diff [--] [files] > <session scratchpad>/x.patch` earlier in the command. */
+function savedPatches(body) {
+  return [...body.matchAll(/git diff(?: HEAD)?((?:\s+(?!>)[^\s;&|>]+)*)\s*>\s*"?(\/(?:private\/)?tmp\/claude-\d+\/[\w.-]+\/[\w.-]+\/scratchpad\/[\w./-]+\.(?:patch|diff))"?/g)]
+    .filter((match) => !match[2].includes(".."))
+    .map((match) => {
+      const args = match[1].trim().split(/\s+/).filter(Boolean);
+      const files = args.filter((arg) => arg !== "--" && !arg.startsWith("-")).map(unquote);
+      return { all: files.length === 0, files };
+    });
 }
 
 /** Split a command into segments, treating heredoc bodies as data. */
@@ -115,6 +147,12 @@ function bindings(body, variable) {
 
 /** The mktemp -d variables and scratchpad loop variables the rm rule trusts. */
 function trustedVariables(body) {
+  // A variable assigned exactly once to a session scratchpad (or a subfolder).
+  const assigned = (name) => [...body.matchAll(new RegExp(`(?:^|[\\s;&|(])(?:export\\s+)?${name}=`, "g"))].length;
+  const scratchAssignments = [...body.matchAll(/(?:^|[\s;&|(])(?:export\s+)?(\w+)="?(\/(?:private\/)?tmp\/claude-\d+\/[\w.-]+\/[\w.-]+\/scratchpad(?:\/[\w.-]+)*)"?(?=[\s;&|]|$)/g)]
+    .filter((match) => !match[2].includes("..") && assigned(match[1]) === 1 && bindings(body, match[1]) === 1);
+  const scratchRoots = new Set(scratchAssignments.filter((match) => /\/scratchpad$/.test(match[2])).map((match) => match[1]));
+  const scratchSubs = new Set(scratchAssignments.filter((match) => !/\/scratchpad$/.test(match[2])).map((match) => match[1]));
   const mktemp = new Set(
     [...body.matchAll(/(?:^|[\s;&|(])(\w+)="?\$\(mktemp -d\b/g)].map((match) => match[1]).filter((name) => bindings(body, name) === 1),
   );
@@ -124,7 +162,7 @@ function trustedVariables(body) {
       .map((match) => match[1])
       .filter((name) => bindings(body, name) === 1),
   );
-  return { mktemp, loop };
+  return { mktemp, loop, scratchRoots, scratchSubs };
 }
 
 function normalizeFlags(flagText) {
@@ -141,6 +179,9 @@ function normalizeFlags(flagText) {
 
 function rmVerdict(segment, context) {
   if (/^find \. -maxdepth 1 -type d -name '?selftest-\*'? -exec rm -rf \{\} (\+|\\;)$/.test(segment)) return { safe: true, rule: "rm-selftest" };
+  // rmdir removes only empty folders.
+  const rmdir = /^rmdir((?:\s+-[p]+)*)\s+(.+)$/.exec(segment);
+  if (rmdir) return rmdir[2].split(/\s+/).some((target) => target.includes("..")) ? { safe: false, reason: "rmdir target contains .." } : { safe: true, rule: "rmdir-empty" };
   const match = /^rm((?:\s+-\S+)*)\s+(.+)$/.exec(segment);
   if (!match) return /^(rm|rmdir|unlink)(\s|$)/.test(segment) || /-exec\s+rm\b|-delete\b/.test(segment) ? { safe: false, reason: `unrecognized removal: ${segment}` } : undefined;
   const flags = normalizeFlags(match[1]);
@@ -151,7 +192,11 @@ function rmVerdict(segment, context) {
     const target = unquote(raw);
     if (target.includes("..")) return { safe: false, reason: `rm target ${target} contains ..` };
     const variable = /^\$\{?(\w+)\}?$/.exec(target)?.[1];
+    const underRoot = /^\$\{?(\w+)\}?\/([\w.-]+(?:\/[\w.-]+)*)$/.exec(target);
     if (flags === "-rf" && /^(runtime\/)?selftest-[A-Za-z0-9]{8}$/.test(target)) rule = "rm-selftest";
+    else if (underRoot && trusted.scratchRoots.has(underRoot[1])) rule = "rm-under-scratchpad-variable";
+    else if (flags === "-rf" && variable && trusted.scratchSubs.has(variable)) rule = "rm-scratchpad-subfolder-variable";
+    else if (flags === "-f" && /^\/(?:private\/)?tmp\/[\w.-]+$/.test(target)) rule = "rm-tmp-file";
     else if (flags === "-rf" && variable && trusted.mktemp.has(variable)) rule = "rm-mktemp-dir";
     else if (flags === "-rf" && variable && trusted.loop.has(variable)) rule = "rm-scratchpad-loop";
     else if (flags === "-f" && SESSION_SCRATCHPAD.test(target)) rule = "rm-scratchpad-file";
@@ -167,10 +212,36 @@ function rmVerdict(segment, context) {
   return { safe: true, rule };
 }
 
-function gitVerdict(segment, options) {
+/** Build outputs a lane may put back to HEAD after a build rewrote them. */
+const GENERATED_ARTIFACTS = [/(^|\/)openapi(-spec)?\.(json|ya?ml)$/, /\.generated\.[\w]+$/, /(^|\/)(__generated__|generated)\//, /\.gen\.[jt]sx?$/];
+
+function gitVerdict(segment, options, context = {}) {
   if (!/^git\s/.test(segment)) return undefined;
-  if (/\s(--force\S*|-f|-B|-C)(\s|$)|\breset --hard\b|\s\+\S/.test(segment)) return { safe: false, reason: "force, hard reset or forced ref update" };
   const branch = options.branchPattern ?? DEFAULT_BRANCH;
+  // Recreate the lane's own branch at origin/main: only in a clean worktree,
+  // and only when that branch does not exist yet or is already merged, so no
+  // unmerged commit can be lost.
+  const reset = /^git (?:checkout|switch) (?:-q )?(?:-B|-C) (\S+) origin\/main$/.exec(segment);
+  if (reset) {
+    if (!branch.test(reset[1])) return { safe: false, reason: `branch name ${reset[1]}` };
+    if (options.worktreeClean !== true) return { safe: false, reason: "resetting a branch needs a clean worktree" };
+    const state = options.branchStates?.[reset[1]];
+    if (state !== "missing" && state !== "merged") return { safe: false, reason: `branch ${reset[1]} has commits not on origin/main` };
+    return { safe: true, rule: "git-reset-own-branch" };
+  }
+  // Discard working-tree changes to named files, only when the same command
+  // saved them to a patch in a session scratchpad first, or when every file
+  // is a generated build artifact.
+  const discard = /^git (?:checkout(?: HEAD)? --|restore(?: --source=HEAD)?(?: --worktree)?(?: --)?) ((?:"?[\w.][\w./-]*"?\s*)+)$/.exec(segment);
+  if (discard) {
+    const files = discard[1].trim().split(/\s+/).map(unquote);
+    if (files.some((file) => file.includes("..") || file === "." || file.startsWith("/"))) return { safe: false, reason: "discard target escapes or covers the whole tree" };
+    if (files.every((file) => GENERATED_ARTIFACTS.some((pattern) => pattern.test(file)))) return { safe: true, rule: "git-revert-generated-artifact" };
+    const saved = context.savedPatches ?? [];
+    if (files.every((file) => saved.some((patch) => patch.all || patch.files.includes(file)))) return { safe: true, rule: "git-discard-after-patch" };
+    return { safe: false, reason: "discarding changes needs a patch of them saved to scratch first" };
+  }
+  if (/\s(--force\S*|-f|-B|-C)(\s|$)|\breset --hard\b|\s\+\S/.test(segment)) return { safe: false, reason: "force, hard reset or forced ref update" };
   const create = /^git (?:checkout|switch) (?:-q )?(?:-b|-c) (\S+) origin\/main$/.exec(segment);
   if (create) return branch.test(create[1]) ? { safe: true, rule: "git-create-branch" } : { safe: false, reason: `branch name ${create[1]}` };
   if (/^git (?:checkout|switch) (?:-q )?--detach origin\/main$/.test(segment)) return { safe: true, rule: "git-detach-origin-main" };
@@ -187,6 +258,21 @@ function gitVerdict(segment, options) {
 }
 
 function ghVerdict(segment, options) {
+  const repoOk = (repo) => !options.mergeRepo || repo === options.mergeRepo;
+  const ownBranch = (name) => (options.branchPattern ?? DEFAULT_BRANCH).test(name) && (!options.ownBranch || name === options.ownBranch);
+  if (/^(?:GH_TOKEN=\S+ )?gh pr (create|view)\b/.test(segment)) {
+    if (!options.allowMergeByBranch) return { safe: false, reason: "pull requests are not enabled here" };
+    const create = /^(?:GH_TOKEN=\S+ )?gh pr create((?:\s+(?:-R [\w.-]+\/[\w.-]+|--head \S+|--base main|--title "[^"]*"|--body-file -))+)(?:\s+<<-?\s*['"]?\w+['"]?)?$/.exec(segment);
+    if (create) {
+      const repo = /-R ([\w.-]+\/[\w.-]+)/.exec(create[1])?.[1];
+      const head = /--head (\S+)/.exec(create[1])?.[1];
+      if (!repo || !head || !repoOk(repo) || !ownBranch(head)) return { safe: false, reason: "a PR may be created only for this worktree's own branch in its own repository" };
+      return { safe: true, rule: "gh-pr-create-own-branch" };
+    }
+    const view = /^(?:GH_TOKEN=\S+ )?gh pr view (\S+) -R ([\w.-]+\/[\w.-]+)(?: --json [\w,]+(?: -q '[^'|]*')?)?$/.exec(segment);
+    if (view && !/^#?\d+$/.test(view[1]) && ownBranch(view[1]) && repoOk(view[2])) return { safe: true, rule: "gh-pr-view-own-branch" };
+    return { safe: false, reason: "gh pr create/view must name this worktree's own branch, never a number" };
+  }
   if (!/^(?:GH_TOKEN=\S+ )?gh pr merge\b/.test(segment)) return undefined;
   const merge = /^(?:GH_TOKEN=\S+ )?gh pr merge (\S+) (?:-R ([\w.-]+\/[\w.-]+) --merge|--merge -R ([\w.-]+\/[\w.-]+))$/.exec(segment);
   if (!merge) return { safe: false, reason: "merge must be `gh pr merge <branch> -R <owner/repo> --merge`" };
@@ -194,7 +280,7 @@ function ghVerdict(segment, options) {
     return { safe: false, reason: "merging by PR number is refused (numbers collide between sessions); merge by branch name" };
   if (!options.allowMergeByBranch) return { safe: false, reason: "merging is not enabled here" };
   if (options.mergeRepo && (merge[2] ?? merge[3]) !== options.mergeRepo) return { safe: false, reason: `repository ${merge[2] ?? merge[3]}` };
-  if (!(options.branchPattern ?? DEFAULT_BRANCH).test(merge[1])) return { safe: false, reason: `branch name ${merge[1]}` };
+  if (!ownBranch(merge[1])) return { safe: false, reason: `branch name ${merge[1]}` };
   return { safe: true, rule: "gh-merge-by-branch" };
 }
 
@@ -245,11 +331,9 @@ export function classifyCommand(command, options = {}) {
   if (/`|\$\(|<\(|>\(/.test(scrubbed)) return { decision: "defer", reason: "command or process substitution" };
   const context = {
     body,
-    created: new Set([
-      ...heredocTargets,
-      ...[...body.matchAll(/git show HEAD:\S+(?:\s*\|\s*sed\s+[^>\n]*?)?\s>\s*("?[\w./$-]+"?)/g)].map((match) => unquote(match[1])),
-    ]),
+    created: createdFiles(body, heredocTargets),
     trusted: trustedVariables(body),
+    savedPatches: savedPatches(body),
   };
   const rules = new Set();
   for (const segment of segments) {
@@ -258,7 +342,7 @@ export function classifyCommand(command, options = {}) {
     let normalized = stripRedirects(segment);
     for (const pattern of KNOWN_SUBSTITUTIONS) normalized = normalized.replace(pattern, "SUBST");
     const plain = normalized.replace(/^(?:(?!GH_TOKEN=)\w+=[\w./:@-]*\s+)+(?=\S)/, "");
-    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options) ?? ghVerdict(plain, options);
+    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options, context) ?? ghVerdict(plain, options);
     if (verdict) {
       if (!verdict.safe) return { decision: "defer", reason: verdict.reason };
       rules.add(verdict.rule);
@@ -412,4 +496,41 @@ export function classifyLocalValidation(command, options = {}) {
     return { matched: false, reason: `not a local validation command: ${segment.slice(0, 120)}` };
   }
   return classes.size ? { matched: true, classes: [...classes] } : { matched: false, reason: "no validation command" };
+}
+
+/*
+ * The unattended default for a lane's routed permission prompt that nobody
+ * answered: allow what stays inside the lane (its worktree, a session
+ * scratchpad, /tmp) and uses no network, credentials, publishing or system
+ * commands; deny the rest with a reason the lane can act on.
+ */
+const OUTSIDE_COMMANDS = /(^|[\s;&|(])(sudo|su|curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet|ftp|docker|podman|kubectl|helm|terraform|aws|gcloud|az|psql|mysql|mongosh|redis-cli|launchctl|crontab|osascript|open|shutdown|reboot|chown|security|gh)(\s|$)/;
+const OUTSIDE_SUBCOMMANDS = /\bgit\s+(push|remote|config\s+--global|credential)\b|\b(npm|pnpm|yarn|bun)\s+(publish|login|adduser|dist-tag|deprecate|unpublish)\b|\bgit\s+.*--global\b/;
+
+function pathInside(path, cwd) {
+  const roots = [cwd, "/tmp", "/private/tmp", "/dev/null", "/dev/stdout", "/dev/stderr"].filter(Boolean).map((root) => root.replace(/\/+$/, ""));
+  return roots.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+export function laneConfinedVerdict(toolName, toolInput, { cwd } = {}) {
+  if (toolName === "Bash") {
+    const command = String(toolInput?.command ?? "");
+    if (!command.trim()) return { allow: false, reason: "empty command" };
+    const outside = OUTSIDE_COMMANDS.exec(command) ?? OUTSIDE_SUBCOMMANDS.exec(command);
+    if (outside) return { allow: false, reason: `\`${outside[0].trim()}\` reaches outside the lane (network, credentials, publishing or the system)` };
+    if (/(^|[\s"'=:])(~|\$HOME)(\/|\s|$)/.test(command)) return { allow: false, reason: "it touches the home directory" };
+    if (/(^|[\s"'=/])\.\.(\/|\s|$)/.test(command)) return { allow: false, reason: "it uses a .. path out of the worktree" };
+    const absolute = [...command.matchAll(/(?:^|[\s"'=:>])(\/[\w.@+-][^\s"';&|)]*)/g)].map((match) => match[1]);
+    const escaped = absolute.find((path) => !pathInside(path, cwd) && !/^\/(usr|bin|sbin|opt|System|Library|Applications)\//.test(path));
+    if (escaped) return { allow: false, reason: `${escaped} is outside the lane's worktree and scratch` };
+    const writesSystem = absolute.find((path) => /^\/(usr|bin|sbin|opt|System|Library|Applications)\//.test(path) && new RegExp(`(>|\\b(rm|mv|cp|chmod|tee|ln|install)\\b[^;&|]*)\\s*${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(command));
+    if (writesSystem) return { allow: false, reason: `it writes to the system path ${writesSystem}` };
+    return { allow: true, reason: "the command stays inside the lane's worktree and scratch" };
+  }
+  if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(toolName)) {
+    const path = String(toolInput?.file_path ?? toolInput?.notebook_path ?? "");
+    if (path && pathInside(path, cwd) && !path.split("/").includes("..")) return { allow: true, reason: "the edit is inside the lane's worktree or scratch" };
+    return { allow: false, reason: `${path || "the file"} is outside the lane's worktree and scratch` };
+  }
+  return { allow: false, reason: `${toolName} is not covered by the unattended policy` };
 }
