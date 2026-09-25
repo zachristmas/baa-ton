@@ -916,3 +916,20 @@ test("the real commit path: conventional header, hooks run and may rewrite stage
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+test("build and integration objectives, and the lane contract, forbid detached jobs", async () => {
+  const { buildObjective, integrateObjective } = await import("../spec-driver.mjs");
+  const { validateSpec } = await import("../spec.mjs");
+  const { laneContract } = await jiti.import("../index.ts");
+  const spec = validateSpec({
+    version: 1,
+    target: { repo: ".", remote: "origin", branch: "b", suite: ["pnpm test"] },
+    items: [{ id: "A", title: "a", acceptance: { text: "a", tests: ["pnpm --filter a test"] } }],
+  });
+  for (const text of [buildObjective(spec, spec.items[0], { branch: "spec/A" }), integrateObjective(spec, spec.items[0], { integrationBranch: "spec-integration", itemBranch: "spec/A" })]) {
+    assert.match(text, /tracked background mode \(Claude: the Bash tool's run_in_background; Pi: its equivalent\)/);
+    assert.match(text, /Never use &, disown, nohup or setsid/);
+  }
+  const contract = laneContract({ id: "w", agentKind: "claude", lanes: [] }, { id: "l", objective: "x", readOnly: false, agentKind: "claude", status: "planned" });
+  assert.match(contract, /never with &, disown, nohup or setsid/);
+});

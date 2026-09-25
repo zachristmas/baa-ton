@@ -2704,7 +2704,7 @@ function contract(workflow: Workflow, lane: Lane): string {
       ? "This lane is declared read-only: do not modify files, Git state, or external systems."
       : "Contract: work only in the assigned cwd; report concise progress, commands, tests, evidence, and blockers.",
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
-    "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane.",
+    "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane. A command that outlasts the normal timeout runs with a longer timeout or in your harness's own tracked background mode (Claude: the Bash tool's run_in_background), never with &, disown, nohup or setsid.",
     "Never git stash drop, pop or clear: the stash is shared by every worktree of the repository and holds other sessions' work. Set temporary changes aside with a patch file outside the repository (git diff > <scratch>/x.patch; git checkout -- <files>; later git apply <scratch>/x.patch) or a throwaway commit on your own branch.",
     "Frozen installs, builds, codegen, typecheck, lint and tests in this worktree are routine: run them. When the root's policy grants local-validation, a permission prompt for one is answered by policy; never ask for them in chat.",
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",

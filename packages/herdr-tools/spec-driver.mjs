@@ -18,6 +18,10 @@
  * - A lane that ends without a receipt counts as a failed attempt.
  */
 
+/** How build and integration lanes run a suite that outlasts a normal command timeout. */
+const LONG_COMMANDS =
+  "Run long suites synchronously with a long timeout, or with your harness's own tracked background mode (Claude: the Bash tool's run_in_background; Pi: its equivalent), and wait for the result. Never use &, disown, nohup or setsid: a detached job is invisible to Herdr and Baa-ton.";
+
 /** States that hold a lane (and a maxParallel slot). */
 export const ACTIVE_STATES = new Set(["building", "reviewing", "integrating", "verifying"]);
 const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", "done", "resolved"]);
@@ -428,6 +432,7 @@ export function buildObjective(spec, item, { branch, findings, decided, answers 
     item.owns.length ? `You own: ${item.owns.join(", ")}.${item.sharedTouch.length ? ` Shared (edit minimally): ${item.sharedTouch.join(", ")}.` : ""}` : "",
     item.migrations ? `It needs ${item.migrations} migration(s); ask for the slot with herdr_request instead of picking a number.` : "",
     item.acceptance.tests.length ? `Run until green: ${item.acceptance.tests.join("; ")}.` : "",
+    LONG_COMMANDS,
     item.acceptance.evidence ? `Write the evidence report ${item.acceptance.evidence.report} with at least ${item.acceptance.evidence.minImages} screenshots.` : "",
     `Commit your work on ${branch} in this worktree (local commits only).`,
     findings ? `The previous attempt failed review. Findings to address:\n${findings}` : "",
@@ -482,6 +487,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
       ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference.`
       : "",
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
+    LONG_COMMANDS,
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,
     "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
