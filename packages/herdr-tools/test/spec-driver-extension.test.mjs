@@ -112,6 +112,11 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     },
     // No lane runs background work unless a test says so.
     backgroundWork: async () => undefined,
+    // Every item branch has its own commits unless a test says so.
+    aheadOf: async () => 1,
+    async restore(input) {
+      calls.restore = [...(calls.restore ?? []), input];
+    },
     now: () => "2026-09-24T12:00:00.000Z",
   };
   const ctx = {
@@ -1171,6 +1176,99 @@ test("queued items already on spec-integration are recorded at the containing co
     assert.equal(state.items.D21.tests, undefined, "no suite result known at its commit: the verifier waits");
     const integrates = f.calls.plan.filter((call) => call.specStage === "integrate");
     assert.deepEqual(integrates.map((call) => call.objective), ["spec D22 integrate: Not merged yet"], "only the unmerged item gets an integration lane");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a branch with no commits of its own, or with owned work uncommitted, is not already integrated", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "D29", title: "No commits yet", owns: ["src/d29/**"], acceptance: { text: "a" } },
+        { id: "D30", title: "Work still uncommitted", owns: ["src/d30/**"], acceptance: { text: "b" } },
+        { id: "D31", title: "Really merged", owns: ["src/d31/**"], acceptance: { text: "c" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D29: { state: "integrating", attempts: 1, branch: "demo/d29", worktree: "/work/wt-d29" },
+        D30: { state: "integrating", attempts: 1, branch: "demo/d30", worktree: "/work/wt-d30" },
+        D31: { state: "integrating", attempts: 1, branch: "demo/d31", worktree: "/work/wt-d31" },
+      },
+    },
+  });
+  try {
+    const merged = "2".repeat(40);
+    // Every tip is an ancestor of spec-integration; D29's tip is the base itself.
+    f.ports.containingCommit = async () => merged;
+    const asked = [];
+    f.ports.aheadOf = async (_repo, branch, base) => {
+      asked.push([branch, base]);
+      return branch === "demo/d29" ? 0 : 2;
+    };
+    f.ports.status = async (worktree) => (worktree === "/work/wt-d30" ? " M src/d30/a.ts" : "");
+    await f.advance();
+    const state = await f.state();
+    assert.deepEqual(asked[0], ["demo/d29", "refs/remotes/origin/feature/release"], "counted against the target base");
+    assert.notEqual(state.items.D29.state, "awaiting-push", "no commits beyond the base: not integrated");
+    assert.equal(state.items.D29.integration, undefined);
+    assert.notEqual(state.items.D30.state, "awaiting-push", "owned work uncommitted: not integrated");
+    assert.equal(state.items.D31.state, "awaiting-push");
+    assert.equal(state.items.D31.integration.contained, true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("generated artifacts the item does not own are restored to HEAD before the outside-owns check", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [
+        { id: "D02", title: "Payments", owns: ["src/d02/**"], acceptance: { text: "d" } },
+        { id: "D10", title: "Owns the spec", owns: ["src/d10/**", "apps/services/payment/openapi-spec.json"], acceptance: { text: "s" } },
+        { id: "D13", title: "Custom list", owns: ["src/d13/**"], acceptance: { text: "t" } },
+      ],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D02: { state: "ready", worktree: "/work/wt-d02", branch: "demo/d02", adopted: { worktree: "/work/wt-d02", branch: "demo/d02" } },
+        D10: { state: "ready", worktree: "/work/wt-d10", branch: "demo/d10", adopted: { worktree: "/work/wt-d10", branch: "demo/d10" } },
+        D13: { state: "ready", worktree: "/work/wt-d13", branch: "demo/d13", adopted: { worktree: "/work/wt-d13", branch: "demo/d13" } },
+      },
+    },
+  });
+  try {
+    const restored = new Set();
+    const status = {
+      "/work/wt-d02": [" M src/d02/a.ts", " M apps/services/payment/openapi-spec.json", " M packages/shared/api-clients/src/api/payments.ts"],
+      "/work/wt-d10": [" M src/d10/b.ts", " M apps/services/payment/openapi-spec.json"],
+      "/work/wt-d13": [" M src/d13/c.ts", " M lib/stray.ts"],
+    };
+    f.ports.status = async (worktree) => status[worktree].filter((line) => !restored.has(`${worktree}:${line.slice(3)}`)).join("\n");
+    f.ports.restore = async ({ worktree, paths }) => {
+      f.calls.restore = [...(f.calls.restore ?? []), { worktree, paths }];
+      for (const path of paths) restored.add(`${worktree}:${path}`);
+    };
+    const commits = [];
+    f.ports.commit = async (input) => {
+      commits.push(input);
+      return `sha-${commits.length}`;
+    };
+    const result = await f.advance();
+    assert.deepEqual(f.calls.restore, [{ worktree: "/work/wt-d02", paths: ["apps/services/payment/openapi-spec.json", "packages/shared/api-clients/src/api/payments.ts"] }], "only where the item does not own them");
+    const state = await f.state();
+    assert.notEqual(state.items.D02.state, "blocked");
+    assert.ok(state.items.D02.history.some((entry) => /restored generated artifacts to HEAD/.test(entry.note ?? "")), "logged");
+    assert.deepEqual(commits.map((commit) => commit.paths), [["src/d02/a.ts"], ["src/d10/b.ts", "apps/services/payment/openapi-spec.json"]], "an item that owns the spec commits it");
+    assert.equal(state.items.D13.state, "blocked", "other stray files still hold the build");
+    assert.match(result.content[0].text, /build D13 held: .*lib\/stray\.ts/);
   } finally {
     await f.cleanup();
   }

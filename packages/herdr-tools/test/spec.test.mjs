@@ -64,7 +64,7 @@ test("a spec validates strictly", () => {
     item("I08"),
     item("I10", { dependsOn: ["I08"], owns: ["src/a/**"], migrations: 1, acceptance: { tests: ["npm test"], evidence: { report: "artifacts/i10.docx", minImages: 2 } } }),
   ]));
-  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside" });
+  assert.deepEqual(spec.defaults, { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside", generatedArtifacts: ["**/openapi-spec.json", "packages/shared/api-clients/src/api/**"] });
   assert.equal(spec.items[1].acceptance.evidence.minImages, 2);
   assert.deepEqual(spec.items[0].acceptance.tests, []);
   for (const [bad, pattern] of [
@@ -225,4 +225,12 @@ test("release checks report the deployed SHA as JSON or text; final reports sit 
   assert.equal(finalReportPath(alongside, "artifacts/report"), "artifacts/report.final");
   assert.equal(finalReportPath(replace, "artifacts/a/evidence.docx"), "artifacts/a/evidence.docx");
   assert.throws(() => validateSpec({ ...baseSpec([item("A")]), defaults: { finalReport: "both" } }), /finalReport/);
+});
+
+test("spec.defaults.generatedArtifacts defaults to the known generated files and accepts relative globs only", async () => {
+  const base = { version: 1, target: { repo: ".", remote: "origin", branch: "b" }, items: [{ id: "A", title: "a", acceptance: { text: "a" } }] };
+  assert.deepEqual(validateSpec(base).defaults.generatedArtifacts, ["**/openapi-spec.json", "packages/shared/api-clients/src/api/**"]);
+  assert.deepEqual(validateSpec({ ...base, defaults: { generatedArtifacts: ["gen/**"] } }).defaults.generatedArtifacts, ["gen/**"]);
+  assert.deepEqual(validateSpec({ ...base, defaults: { generatedArtifacts: [] } }).defaults.generatedArtifacts, []);
+  for (const bad of [["/abs/**"], ["../x"], [""], "gen/**"]) assert.throws(() => validateSpec({ ...base, defaults: { generatedArtifacts: bad } }), /generatedArtifacts/);
 });

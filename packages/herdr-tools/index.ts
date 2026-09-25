@@ -149,7 +149,7 @@ import {
   verifySpec,
 } from "./spec.mjs";
 import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
-import { adoptSpec, adoptionTable, failureOutput, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
+import { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
 
 // routeChildMessage lives in the controller package, which is a sibling of
@@ -4600,6 +4600,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     backgroundWork?(paneId: string): Promise<string | undefined>;
     /** The commit on `branch` containing `tip`, or undefined when `tip` is not on it. */
     containingCommit?(repo: string, tip: string, branch: string): Promise<string | undefined>;
+    /** Commits on `branch` that `base` does not have (`git rev-list --count base..branch`). */
+    aheadOf?(repo: string, branch: string, base: string): Promise<number>;
+    /** Put `paths` in `worktree` back to HEAD (generated build artifacts). */
+    restore?(input: { worktree: string; paths: string[] }): Promise<void>;
     /** The loaded code's fingerprint (holds retry once it changes). */
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
@@ -4824,10 +4828,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           const path = (await execFile("git", ["-C", repoPath, "rev-list", "--ancestry-path", "--reverse", `${tipSha}..${branch}`], { timeout: 30_000 })).stdout.trim();
           return path.split("\n").filter(Boolean)[0] ?? tipSha;
         });
+      // Only real work counts: a branch with no commit beyond the target
+      // (its tip is the base, an ancestor of everything) or with its owned
+      // work still uncommitted is not integrated.
+      const aheadOf =
+        ports?.aheadOf ??
+        (async (repoPath: string, branch: string, base: string) =>
+          Number((await execFile("git", ["-C", repoPath, "rev-list", "--count", `${base}..${branch}`], { timeout: 30_000 })).stdout.trim()) || 0);
       for (const item of spec.items) {
-        const record = state.items?.[item.id] as { state?: string; lane?: unknown; branch?: string } | undefined;
+        const record = state.items?.[item.id] as { state?: string; lane?: unknown; branch?: string; worktree?: string; decided?: { owns?: string[] } } | undefined;
         if (record?.state !== "integrating" || record.lane) continue;
-        const sha = await containingCommit(repo, record.branch ?? `spec/${item.id}`, "refs/heads/spec-integration").catch(() => undefined);
+        const branch = record.branch ?? `spec/${item.id}`;
+        if (!((await aheadOf(repo, branch, targetRef).catch(() => 0)) > 0)) continue;
+        if (record.worktree) {
+          const porcelain = await statusOf(record.worktree).catch(() => "");
+          if (itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns, item.sharedTouch).paths.length) continue;
+        }
+        const sha = await containingCommit(repo, branch, "refs/heads/spec-integration").catch(() => undefined);
         if (sha) contained.set(item.id, sha);
       }
       const step = advanceSpec({
@@ -4856,9 +4873,40 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
        * commits; anything else holds the item for the root. Returns true
        * when the item is held.
        */
+      /**
+       * Put generated build artifacts the item does not own (a stale
+       * committed baseline every build regenerates) back to HEAD before the
+       * outside-owns check, and log it. Returns the worktree's status after.
+       */
+      const generatedPatterns = (spec.defaults.generatedArtifacts ?? []).map(globToRegExp);
+      const restoreGenerated = async (item: (typeof spec.items)[number], record: Record<string, any>, stage: string, porcelain: string, ownsList: string[]) => {
+        if (!generatedPatterns.length || !porcelain.trim()) return porcelain;
+        const { outside } = itemOwnedChanges(porcelain, ownsList, item.sharedTouch);
+        // Never one that a sibling item sharing the worktree owns.
+        const siblingOwned = new Set(
+          spec.items
+            .filter((other) => other.id !== item.id && next.items[other.id]?.worktree === record.worktree)
+            .flatMap((other) => itemOwnedChanges(porcelain, (next.items[other.id]?.decided?.owns as string[] | undefined) ?? other.owns, other.sharedTouch).paths),
+        );
+        const generated = outside.filter((path) => !siblingOwned.has(path) && generatedPatterns.some((pattern) => pattern.test(path)));
+        if (!generated.length) return porcelain;
+        try {
+          await (ports?.restore ??
+            (async ({ worktree, paths }: { worktree: string; paths: string[] }) => {
+              await execFile("git", ["-C", worktree, "checkout", "--", ...paths], { timeout: 30_000 });
+            }))({ worktree: record.worktree, paths: generated });
+        } catch {
+          return porcelain;
+        }
+        const listed = generated.slice(0, 10).join(", ") + (generated.length > 10 ? `, and ${generated.length - 10} more` : "");
+        record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: stage, note: `restored generated artifacts to HEAD (not owned by ${item.id}): ${listed}` }];
+        done.push(`restored ${generated.length} generated artifact(s) in ${item.id}'s worktree`);
+        return statusOf(record.worktree).catch(() => "");
+      };
       const commitAdoptedWork = async (item: (typeof spec.items)[number], record: Record<string, any>, branch: string, stage: "reviewing" | "building" = "reviewing") => {
         const worktree = record.worktree as string;
-        const porcelain = await statusOf(worktree).catch(() => "");
+        const ownsOf = (next.items[item.id]?.decided?.owns as string[] | undefined) ?? item.owns;
+        const porcelain = await restoreGenerated(item, record, stage, await statusOf(worktree).catch(() => ""), ownsOf);
         if (!porcelain.trim()) return false;
         const owns = (id: string, fallback: string[]) => (next.items[id]?.decided?.owns as string[] | undefined) ?? fallback;
         const changes = itemOwnedChanges(porcelain, owns(item.id, item.owns), item.sharedTouch);
@@ -4948,7 +4996,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             // paths (never secrets) for the integration lane to commit first.
             let commitFirst;
             if (record.worktree) {
-              const porcelain = await statusOf(record.worktree).catch(() => "");
+              const porcelain = await restoreGenerated(item, record, "integrating", await statusOf(record.worktree).catch(() => ""), record.decided?.owns ?? item.owns);
               const changes = itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns, item.sharedTouch);
               // Anything uncommitted beyond the item's owns and sharedTouch
               // (an item with no owns: every change) would be left out of the

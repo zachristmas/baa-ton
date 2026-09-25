@@ -80,6 +80,13 @@ function positiveInteger(value, label, { max = 1000, optional = true, min = 1 } 
 }
 
 /** Validate a spec document strictly; throws with the first problem. */
+/**
+ * Build outputs every build regenerates (a stale committed baseline shows as
+ * a modified file in each worktree). Put back to HEAD, when the item does not
+ * own them, before the uncommitted-outside-owns check.
+ */
+export const DEFAULT_GENERATED_ARTIFACTS = ["**/openapi-spec.json", "packages/shared/api-clients/src/api/**"];
+
 export function validateSpec(input) {
   if (!isRecord(input)) throw new Error("spec must be a JSON object.");
   onlyKeys(input, ["version", "target", "defaults", "stages", "items"], "spec");
@@ -105,11 +112,17 @@ export function validateSpec(input) {
         : {}),
     };
   }
-  const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside" };
+  const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside", generatedArtifacts: [...DEFAULT_GENERATED_ARTIFACTS] };
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts"], "spec.defaults");
+    if (input.defaults.generatedArtifacts !== undefined) {
+      const globs = input.defaults.generatedArtifacts;
+      if (!Array.isArray(globs) || globs.some((glob) => typeof glob !== "string" || !glob.trim() || glob.startsWith("/") || glob.split("/").includes("..")))
+        throw new Error("spec.defaults.generatedArtifacts must be a list of repository-relative globs.");
+      defaults.generatedArtifacts = globs.map((glob) => glob.trim());
+    }
     for (const key of ["minFreeMemoryGb", "maxSwapUsedGb"])
       if (input.defaults[key] !== undefined) {
         if (typeof input.defaults[key] !== "number" || !(input.defaults[key] >= 0) || input.defaults[key] > 4096)
