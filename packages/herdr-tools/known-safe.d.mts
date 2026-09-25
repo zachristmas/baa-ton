@@ -29,3 +29,5 @@ export function laneConfinedVerdict(
   toolInput: Record<string, unknown> | undefined,
   options?: { cwd?: string },
 ): { allow: boolean; reason: string };
+export function splitOutsideQuotes(body: string): string[];
+export function askRuleMatchers(rules?: string[]): RegExp[];
