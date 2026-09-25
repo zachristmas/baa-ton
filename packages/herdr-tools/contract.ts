@@ -337,7 +337,7 @@ export type LaneInput =
       dependsOn?: string[];
       /** Set only by the spec loop's driver (not the herdr_plan schema):
        * the stage this lane runs, which selects its stage-specific rule. */
-      specStage?: "decide" | "build" | "review" | "integrate" | "verify";
+      specStage?: "decide" | "build" | "review" | "integrate" | "verify" | "baseline";
     };
 
 export type GoalStatus =
@@ -444,7 +444,7 @@ export type Lane = {
   /** The Herdr workspace holding this lane's tab. */
   workspaceId?: string;
   /** The spec-loop stage this lane runs (see LaneInput.specStage). */
-  specStage?: "decide" | "build" | "review" | "integrate" | "verify";
+  specStage?: "decide" | "build" | "review" | "integrate" | "verify" | "baseline";
   agentKind: AgentKind;
   status: string;
   agentName?: string;

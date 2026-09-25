@@ -17,6 +17,7 @@
  *   maxBuildAttempts, then the item fails and the root is asked.
  * - A lane that ends without a receipt counts as a failed attempt.
  */
+import { BASELINES_KEPT, baselineNote, baselineResult, compareToBaseline, formatFailures, knownFailures, suiteFailures } from "./spec-baseline.mjs";
 
 /** How build and integration lanes run a suite that outlasts a normal command timeout. */
 const LONG_COMMANDS =
@@ -35,7 +36,7 @@ const RECEIPT_FORMAT = {
   decide: "QUESTION: lines for anything still open (none when settled), OWNS: and MIGRATIONS: if they differ",
   build: "the commit SHA, the checks you ran and their results, and the evidence report path",
   review: "a first line of exactly VERDICT: PASS or VERDICT: FAIL, then the findings",
-  integrate: "the lines INTEGRATED: <full SHA> and SUITE: pass or SUITE: fail",
+  integrate: "the lines INTEGRATED: <full SHA> and SUITE: pass or SUITE: fail, plus FAILED: <package> <task> for each failing task",
   verify: "one PREVIEW: <spec> pass|fail line per spec and REPORT: <path>",
 };
 const STAGE_OF = { deciding: "decide", building: "build", reviewing: "review", integrating: "integrate", verifying: "verify" };
@@ -124,6 +125,7 @@ export function integrationResult(summary) {
  * @param {Set<string>} [input.dirty] items whose worktree has uncommitted changes
  * @param {Map<string, string>} [input.background] "workflowId/laneId" -> the background work a lane is still running
  * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
+ * @param {string} [input.targetSha] the target tip's SHA (the suite baseline is recorded per SHA)
  * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
@@ -139,6 +141,7 @@ export function advanceSpec({
   background = new Map(),
   integrationLive,
   contained = new Map(),
+  targetSha,
   now,
 }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
@@ -155,6 +158,46 @@ export function advanceSpec({
     (item.history ??= []).push({ at: now, from, to, ...(note ? { note } : {}) });
     if (item.history.length > 50) item.history.splice(0, item.history.length - 50);
   };
+
+  // B. The suite baseline at the target tip: a baseline lane's receipt
+  // records it once per target SHA; a fix-baseline lane's receipt records
+  // what is still failing after its fixes.
+  const useBaseline = spec.target.suite.length > 0 && typeof targetSha === "string" && targetSha.length > 0;
+  if (useBaseline && next.baselineRun?.lane) {
+    const run = next.baselineRun;
+    const view = lane(run.lane);
+    if (view?.receipt) {
+      const result = baselineResult(view.receipt.summary);
+      next.baselines ??= {};
+      if (run.kind === "baseline") {
+        const unclear = !result.suite || (result.suite === "fail" && !result.failures.length);
+        next.baselines[run.targetSha] = unclear
+          ? { unknown: true, at: now, lane: run.lane, note: "the baseline receipt names no SUITE result or no FAILED lines" }
+          : { suite: result.suite, failures: result.suite === "pass" ? [] : result.failures, at: now, lane: run.lane };
+        if (unclear) rootAsks.push({ itemId: "baseline", reason: `the suite baseline at ${run.targetSha.slice(0, 12)} is unclear (no SUITE line, or SUITE: fail without FAILED: <package> <task> lines); integrations are judged on SUITE: pass alone` });
+      } else {
+        const sha = /^\s*INTEGRATED\s*:\s*([0-9a-f]{40})\s*$/im.exec(view.receipt.summary)?.[1];
+        const base = (next.baselines[run.targetSha] ??= { suite: "fail", failures: [], at: now });
+        base.fix = result.suite
+          ? { sha, suite: result.suite, remaining: result.suite === "pass" ? [] : result.failures, at: now, lane: run.lane }
+          : { gaveUp: true, at: now, note: "the fix-baseline receipt has no SUITE line" };
+      }
+      delete next.baselineRun;
+      const shas = Object.keys(next.baselines);
+      for (const old of shas.slice(0, Math.max(0, shas.length - BASELINES_KEPT))) delete next.baselines[old];
+    } else if (!view || LANE_ENDED.has(view.status)) {
+      run.attempts = (run.attempts ?? 1) + 1;
+      delete run.lane;
+      if (run.attempts > 2) {
+        next.baselines ??= {};
+        if (run.kind === "baseline") next.baselines[run.targetSha] = { unknown: true, at: now, note: "the baseline lane ended twice without a receipt" };
+        else if (next.baselines[run.targetSha]) next.baselines[run.targetSha].fix = { gaveUp: true, at: now, note: "the fix-baseline lane ended twice without a receipt" };
+        delete next.baselineRun;
+      }
+    }
+  }
+  const baseline = useBaseline ? next.baselines?.[targetSha] : undefined;
+  const known = knownFailures(baseline);
 
   // 0. A lane that went idle (done) without its receipt is asked once for
   // it, then handed to the root; a lane whose pane is gone is retried.
@@ -254,7 +297,22 @@ export function advanceSpec({
       if (!view) continue;
       if (view.receipt) {
         const result = integrationResult(view.receipt.summary);
-        if (result.sha && result.suite === "pass") {
+        // Baseline-relative: a failing suite whose every failure already
+        // fails at the target tip, per package and task, is a pass.
+        let relative;
+        if (result.sha && result.suite === "fail" && useBaseline) {
+          const failures = suiteFailures(view.receipt.summary);
+          if (failures.length && !baseline) {
+            waits[item.id] = `waiting for the suite baseline at ${targetSha.slice(0, 12)} to judge its failures (${formatFailures(failures)})`;
+            continue;
+          }
+          if (failures.length && known) {
+            const verdict = compareToBaseline(failures, known);
+            if (verdict.pass) relative = verdict.known;
+            else current.newFailures = verdict.fresh;
+          }
+        }
+        if (result.sha && (result.suite === "pass" || relative)) {
           next.integrationCounter = (next.integrationCounter ?? 0) + 1;
           move(
             item.id,
@@ -262,17 +320,25 @@ export function advanceSpec({
             {
               integrateLane: current.lane,
               lane: undefined,
-              integration: { sha: result.sha, order: next.integrationCounter, at: now },
+              integration: {
+                sha: result.sha,
+                order: next.integrationCounter,
+                at: now,
+                ...(relative ? { baselineSha: targetSha, baselineFailures: relative } : {}),
+              },
               tests: [
                 ...(Array.isArray(current.tests) ? current.tests : []),
-                ...item.acceptance.tests.map((command) => ({ command, sha: result.sha, result: "pass", at: now, by: "integrate" })),
+                ...item.acceptance.tests.map((command) => ({ command, sha: result.sha, result: "pass", at: now, by: "integrate", ...(relative ? { relativeToBaseline: true } : {}) })),
               ],
             },
-            "integrated",
+            relative ? `integrated; the suite fails only where the target already fails: ${formatFailures(relative)}` : "integrated",
           );
+          delete next.items[item.id].newFailures;
         } else if (result.suite === "fail") {
           const attempts = current.attempts ?? 1;
-          const findings = `Integration onto spec-integration failed its suite. Rebase spec/${item.id} onto spec-integration and fix:\n${view.receipt.summary}`;
+          const fresh = current.newFailures;
+          delete current.newFailures;
+          const findings = `Integration onto spec-integration failed its suite${fresh?.length ? ` in tasks the target does not already fail: ${formatFailures(fresh)}` : ""}. Rebase spec/${item.id} onto spec-integration and fix:\n${view.receipt.summary}`;
           if (attempts >= spec.defaults.maxBuildAttempts) {
             move(item.id, "failed", { findings, lane: undefined }, "integration suite failed");
             rootAsks.push({ itemId: item.id, reason: `${item.id} failed integration after ${attempts} build attempt(s)` });
@@ -366,7 +432,30 @@ export function advanceSpec({
       `already on the integration branch at ${sha.slice(0, 12)}`,
     );
   }
-  if (reservedBy) {
+  // B2. Record the baseline once per target SHA when an item is queued for
+  // integration; with defaults.fixBaseline, one lane fixes its failures on
+  // the integration branch before any item is merged there.
+  const queued = spec.items.some((item) => next.items[item.id]?.state === "integrating");
+  if (useBaseline && queued && !next.baselineRun) {
+    if (!baseline) next.baselineRun = { kind: "baseline", targetSha, attempts: 1, requestedAt: now };
+    else if (spec.defaults.fixBaseline && known?.length && !baseline.fix && !reservedBy && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane))
+      next.baselineRun = { kind: "fix-baseline", targetSha, attempts: 1, requestedAt: now };
+  }
+  if (next.baselineRun && next.baselineRun.targetSha !== targetSha && !next.baselineRun.lane) delete next.baselineRun;
+  if (useBaseline && next.baselineRun && !next.baselineRun.lane && !capacityWaiting)
+    actions.push({
+      kind: next.baselineRun.kind,
+      itemId: "",
+      attempt: next.baselineRun.attempts ?? 1,
+      targetSha: next.baselineRun.targetSha,
+      ...(next.baselineRun.kind === "fix-baseline" ? { failures: known ?? [] } : {}),
+    });
+  const fixing = next.baselineRun?.kind === "fix-baseline";
+  if (fixing) {
+    for (const item of spec.items)
+      if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
+        waits[item.id] = `integration queue: fixing the target's baseline failures first (${formatFailures(known ?? [])})`;
+  } else if (reservedBy) {
     for (const item of spec.items)
       if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
         waits[item.id] = `integration worktree busy: ${reservedBy}`;
@@ -388,18 +477,26 @@ export function advanceSpec({
   const awaiting = spec.items
     .filter((item) => next.items[item.id]?.state === "awaiting-push")
     .sort((a, b) => (next.items[a.id].integration?.order ?? 0) - (next.items[b.id].integration?.order ?? 0));
+  // Known baseline failures the push carries (the target already fails them).
+  const knownAt = (items) => {
+    const failures = [];
+    for (const item of items)
+      for (const failure of next.items[item.id].integration?.baselineFailures ?? [])
+        if (!failures.some((other) => other.package === failure.package && other.task === failure.task)) failures.push(failure);
+    return failures.length ? { baselineFailures: failures } : {};
+  };
   if (awaiting.length) {
     if (spec.defaults.pushGate === "item") {
       for (const item of awaiting)
         if (!next.items[item.id].pushAskedAt) {
           next.items[item.id].pushAskedAt = now;
-          rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: next.items[item.id].integration.sha, reason: `push ${item.id}` });
+          rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: next.items[item.id].integration.sha, reason: `push ${item.id}`, ...knownAt([item]) });
         }
     } else if (!spec.items.some((item) => next.items[item.id]?.state === "integrating")) {
       const head = next.items[awaiting.at(-1).id].integration.sha;
       if (next.pushGate?.askedSha !== head) {
         next.pushGate = { askedSha: head, items: awaiting.map((item) => item.id), at: now };
-        rootAsks.push({ itemId: awaiting.at(-1).id, kind: "push", items: awaiting.map((item) => item.id), sha: head, reason: `push round of ${awaiting.length}` });
+        rootAsks.push({ itemId: awaiting.at(-1).id, kind: "push", items: awaiting.map((item) => item.id), sha: head, reason: `push round of ${awaiting.length}`, ...knownAt(awaiting) });
       }
     }
   }
@@ -562,7 +659,7 @@ export function verifyObjective(spec, item, { releaseSha, reportPath }) {
 }
 
 /** The integration lane's objective: merge locally, renumber, run the suite, never push. */
-export function integrateObjective(spec, item, { integrationBranch, itemBranch, commitFirst }) {
+export function integrateObjective(spec, item, { integrationBranch, itemBranch, commitFirst, baseline }) {
   return [
     `Integrate spec item ${item.id}: ${item.title}.`,
     commitFirst?.paths.length
@@ -580,10 +677,11 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
       : "",
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     LONG_COMMANDS,
+    spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,
     "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
-    "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then what you changed and the suite output for a failure.",
+    "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then the FAILED lines, what you changed and the suite output for a failure.",
   ].filter(Boolean).join("\n");
 }
 

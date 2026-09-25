@@ -149,6 +149,7 @@ import {
   verifySpec,
 } from "./spec.mjs";
 import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
+import { baselineObjective, fixBaselineObjective, knownFailures } from "./spec-baseline.mjs";
 import { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
 
@@ -4588,7 +4589,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   type SpecDriverPorts = {
     /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
-    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" }): Promise<Workflow>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" | "baseline" }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
@@ -4600,6 +4601,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     backgroundWork?(paneId: string): Promise<string | undefined>;
     /** The commit on `branch` containing `tip`, or undefined when `tip` is not on it. */
     containingCommit?(repo: string, tip: string, branch: string): Promise<string | undefined>;
+    /** The SHA a ref points at (the target tip, for the suite baseline); undefined when unknown. */
+    revParse?(repo: string, ref: string): Promise<string | undefined>;
     /** Commits on `branch` that `base` does not have (`git rev-list --count base..branch`). */
     aheadOf?(repo: string, branch: string, base: string): Promise<number>;
     /** Put `paths` in `worktree` back to HEAD (generated build artifacts). */
@@ -4847,9 +4850,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const sha = await containingCommit(repo, branch, "refs/heads/spec-integration").catch(() => undefined);
         if (sha) contained.set(item.id, sha);
       }
+      const targetSha = await (
+        ports?.revParse ??
+        (async (repoPath: string, ref: string) => (await execFile("git", ["-C", repoPath, "rev-parse", "--verify", "-q", ref], { timeout: 30_000 })).stdout.trim() || undefined)
+      )(repo, targetRef).catch(() => undefined);
       const step = advanceSpec({
         spec,
         state,
+        targetSha,
         lane: laneView,
         dirty,
         background,
@@ -4955,6 +4963,36 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
       let shellTimeout = false;
       for (const action of step.actions) {
+        if (action.kind === "baseline" || action.kind === "fix-baseline") {
+          if (shellTimeout) continue;
+          const run = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string }; note?: string } }).baselineRun;
+          if (!run) continue;
+          try {
+            const fix = action.kind === "fix-baseline";
+            const worktree = fix ? integrationWorktree : join(worktreeRoot, "spec-baseline");
+            await use.worktree({ repo, path: worktree, branch: fix ? "spec-integration" : "spec-baseline", base: targetRef }, signal);
+            const workflow = await use.plan({
+              objective: fix ? `spec fix-baseline at ${action.targetSha!.slice(0, 12)}` : `spec baseline suite at ${action.targetSha!.slice(0, 12)}`,
+              laneObjective: fix
+                ? fixBaselineObjective(spec, { sha: action.targetSha!, failures: action.failures ?? [], integrationBranch: "spec-integration" })
+                : baselineObjective(spec, { sha: action.targetSha! }),
+              readOnly: false,
+              taskProfile: spec.stages.integrate?.profile ?? "balanced",
+              worktree,
+              // The fix lane holds the integration worktree like an integration.
+              specStage: fix ? "integrate" : "baseline",
+            });
+            run.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+            delete run.note;
+            const result = await use.dispatch(workflow.id);
+            if (!result.dispatched) run.note = `planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
+            done.push(`${action.kind} ${action.targetSha!.slice(0, 12)} -> ${workflow.id}`);
+          } catch (error) {
+            run.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
+            done.push(`${action.kind} failed: ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
         const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
         const record = next.items[item.id];
         // After a shell failed to start, start nothing else this pass; the
@@ -5027,7 +5065,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               if (changes.paths.length || changes.secrets.length || changes.untracked.length)
                 commitFirst = { worktree: record.worktree, paths: changes.paths, secrets: changes.secrets, untracked: changes.untracked };
             }
-            objective = integrateObjective(spec, item, { integrationBranch: "spec-integration", itemBranch: branch, commitFirst });
+            const knownBaseline = targetSha ? knownFailures((next as { baselines?: Record<string, any> }).baselines?.[targetSha]) : undefined;
+            objective = integrateObjective(spec, item, {
+              integrationBranch: "spec-integration",
+              itemBranch: branch,
+              commitFirst,
+              ...(knownBaseline?.length ? { baseline: { sha: targetSha!, failures: knownBaseline } } : {}),
+            });
           } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
             // A build into an adopted worktree starts from the adopted work,
@@ -5125,6 +5169,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             .map((record) => record.lane && `${record.lane.workflowId}/${record.lane.laneId}`)
             .filter(Boolean),
         );
+        const baselineLane = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane;
+        if (baselineLane) current.add(`${baselineLane.workflowId}/${baselineLane.laneId}`);
         const latest = await loadManifest(ctx.cwd);
         for (const workflow of latest.workflows)
           for (const lane of workflow.lanes) {
@@ -5178,7 +5224,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 ask.kind === "decisions"
                   ? `Spec decision round (${ask.items!.length} item(s)); ask the user all of these in one round:\n${ask.questions!.map((question) => `- ${question}`).join("\n")}\nThen record each item's answers with herdr_spec action=answer itemId=<id> text=<answers>.`
                   : ask.kind === "push"
-                  ? `${ask.items!.length} integrated spec item(s) ready to push: ${ask.items!.join(", ")} (spec-integration at ${ask.sha!.slice(0, 12)}). Ask the user; pushing always needs their approval. Then run: git -C ${integrationWorktree} push ${spec.target.remote} ${ask.sha}:refs/heads/${spec.target.branch} and fetch ${spec.target.remote}; the driver moves the items to verification once ${targetRef} contains ${ask.sha!.slice(0, 12)}.`
+                  ? `${ask.items!.length} integrated spec item(s) ready to push: ${ask.items!.join(", ")} (spec-integration at ${ask.sha!.slice(0, 12)}).${ask.baselineFailures?.length ? ` The suite still fails only where the target already fails (known baseline failures, not from these items): ${ask.baselineFailures.map((failure) => `${failure.package} ${failure.task}`).join(", ")}.` : ""} Ask the user; pushing always needs their approval. Then run: git -C ${integrationWorktree} push ${spec.target.remote} ${ask.sha}:refs/heads/${spec.target.branch} and fetch ${spec.target.remote}; the driver moves the items to verification once ${targetRef} contains ${ask.sha!.slice(0, 12)}.`
                   : ask.reason,
               createdAt: use.now(),
               delivery: { status: "pending", attempts: 0, updatedAt: use.now() },

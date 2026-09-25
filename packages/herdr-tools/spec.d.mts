@@ -31,6 +31,8 @@ export type Spec = {
     maxSwapUsedGb?: number;
     /** Globs of generated files restored to HEAD when an item does not own them. */
     generatedArtifacts: string[];
+    /** Dispatch one lane to fix the target's own suite failures before integrating. */
+    fixBaseline?: boolean;
   };
   stages: Record<string, { profile: string; differentFrom?: string }>;
   items: SpecItem[];
