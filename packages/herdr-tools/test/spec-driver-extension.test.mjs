@@ -1119,3 +1119,46 @@ test("queued items already on spec-integration are recorded at the containing co
     await f.cleanup();
   }
 });
+
+test("spec lanes whose receipt the driver consumed are retired under the retire grant", async () => {
+  const receipt = { id: "r", summary: "Done.", delivery: "delivered" };
+  const seedManifest = async (f) => {
+    const manifest = await f.manifest();
+    manifest.workflows.push(
+      { id: "herdr-b1", status: "completed", ownership: { createdBy: "herdr-orchestrator", paneIds: [] }, lanes: [{ id: "lane-1", status: "completion-reported", specStage: "build", completionReceipt: receipt, tabId: "t1" }], evidence: [] },
+      { id: "herdr-r1", status: "running", ownership: { createdBy: "herdr-orchestrator", paneIds: [] }, lanes: [{ id: "lane-1", status: "completion-reported", specStage: "review", completionReceipt: receipt, tabId: "t2" }], evidence: [] },
+      { id: "herdr-old", status: "completed", ownership: { createdBy: "herdr-orchestrator", paneIds: [] }, lanes: [{ id: "lane-1", status: "completion-reported", completionReceipt: receipt, tabId: "t3" }], evidence: [] },
+      { id: "herdr-done", status: "completed", ownership: { createdBy: "herdr-orchestrator", paneIds: [] }, lanes: [{ id: "lane-1", status: "completion-reported", specStage: "build", completionReceipt: receipt, retirement: { status: "retired" } }], evidence: [] },
+    );
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+  };
+  const spec = {
+    version: 1,
+    target: { repo: ".", remote: "origin", branch: "feature/release" },
+    items: [{ id: "A", title: "A", acceptance: { text: "a" } }],
+  };
+  // The review lane herdr-r1 has a receipt the driver has not consumed yet
+  // only if the item still points at it: make it point there.
+  const seed = { version: 1, items: { A: { state: "blocked", blockedReason: "human-gate", attempts: 1, lane: { workflowId: "herdr-r1", laneId: "lane-1" } } } };
+  const f = await fixture({ grants: ["dispatch", "integrate", "retire"], specDocument: spec, seed });
+  try {
+    await seedManifest(f);
+    const retired = [];
+    f.ports.retire = async (candidate) => retired.push(`${candidate.workflowId}/${candidate.laneId}`);
+    const result = await f.advance();
+    assert.deepEqual(retired, ["herdr-b1/lane-1"], "only the consumed spec lane: not the item's current lane, a non-spec lane or an already retired one");
+    assert.match(result.content[0].text, /retired herdr-b1\/lane-1/);
+  } finally {
+    await f.cleanup();
+  }
+  const noGrant = await fixture({ specDocument: spec, seed });
+  try {
+    await seedManifest(noGrant);
+    const retired = [];
+    noGrant.ports.retire = async (candidate) => retired.push(candidate.workflowId);
+    await noGrant.advance();
+    assert.deepEqual(retired, [], "without the retire grant nothing is retired");
+  } finally {
+    await noGrant.cleanup();
+  }
+});
