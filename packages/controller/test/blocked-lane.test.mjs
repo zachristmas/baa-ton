@@ -343,3 +343,59 @@ test("a registered standalone agent's prompts: known-safe approved, others recor
     await rm(home, { recursive: true, force: true });
   }
 });
+
+// The shape of a live Claude AskUserQuestion that Herdr reported as done: a
+// long plain-text preamble, a ☐ header, the question in │-prefixed lines,
+// numbered options with several description lines each, the free-text
+// entries around a separator, and the footer.
+const d17Screen = `
+⏺ The integration branch builds and the footer tests pass. Before I commit the
+  merge on spec-integration I need a decision on scope: the item branch also
+  carries a demo script folder that is not in the item's owns, and merging it
+  would put those scripts on the integration branch for every later item.
+
+  The footer changes touch apps/web/src/components/footer/** and its tests only.
+  The demo scripts under scripts/demo-d17/** seed a local database for the
+  evidence run and were committed on the item branch by the build lane.
+
+☐ D17 merge scope
+
+│ Which files should the D17 integration merge onto spec-integration?
+│ The demo scripts are outside the item's owns.
+
+❯ 1. Merge only the footer files
+     Merge apps/web/src/components/footer/** and its tests.
+     Drop scripts/demo-d17/** from the merge.
+     Keeps the integration inside the item's owns.
+  2. Merge everything on the branch
+     Include scripts/demo-d17/** as well.
+     The demo scripts land on spec-integration for every later item.
+  3. Hold the integration
+     Leave D17 unmerged until the owner decides.
+     Nothing is committed on spec-integration.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+`;
+
+test("a real-shaped Claude question dialog reported as done is routed, not missed as no-question", async () => {
+  const screen = classifyScreen(d17Screen);
+  assert.equal(screen.kind, "question");
+  assert.equal(screen.question, "Which files should the D17 integration merge onto spec-integration? The demo scripts are outside the item's owns.");
+  assert.deepEqual(screen.options.map((option) => option.label), ["Merge only the footer files", "Merge everything on the branch", "Hold the integration", "Type something.", "Chat about this"]);
+  // With the question scrolled above the visible screen, the ☐ header stands in.
+  const scrolled = d17Screen.replace(/│ Which files[^\n]*\n│ The demo[^\n]*\n/, "");
+  assert.equal(classifyScreen(scrolled).question, "D17 merge scope");
+
+  const herdr = fakeHerdr({ screens: d17Screen, status: "done" });
+  const workflow = workflowFixture();
+  const result = await handleIdleLane({ herdr, manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "2026-09-26T06:29:10.000Z" });
+  assert.deepEqual([result.status, result.kind], ["routed", "question"]);
+  assert.match(workflow.laneRequests[0].summary, /question dialog on screen: Which files should the D17 integration merge/);
+  // Herdr still says done when the answer is due: the keys go in on the fingerprint.
+  Object.assign(workflow.laneRequests[0], { status: "granted", answeredBy: "root", note: "1" });
+  await resolveScreenPrompts({ herdr, manifest: {}, workflow, timestamp: "2026-09-26T06:31:00.000Z" });
+  assert.deepEqual(herdr.calls.keys, [{ paneId: PANE, keys: ["1"] }]);
+});

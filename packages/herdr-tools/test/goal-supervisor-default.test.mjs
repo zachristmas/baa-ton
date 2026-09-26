@@ -75,6 +75,13 @@ test("a new goal, including after reset, is supervised unless the previous goal 
     assert.equal(afterPause.supervisor.pauseReason, "Zach paused the run.");
     assert.equal(afterPause.supervisor.nextNudgeAt, null);
 
+    // Setting the goal back to a live state ends the pause: it is supervised again.
+    const blocked = await goal({ action: "set-state", status: "blocked", nextAction: "Recover the held items." });
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.supervisor.state, "running", "a goal that left its pause is nudged again");
+    assert.equal(blocked.supervisor.pauseReason, undefined);
+    assert.ok(blocked.supervisor.nextNudgeAt, "with a nudge scheduled");
+
     await goal({ action: "start" });
     await goal({ action: "stop" });
     const afterStop = await fresh({ nudgeIntervalSeconds: 60 });

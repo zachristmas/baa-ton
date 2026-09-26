@@ -936,6 +936,8 @@ try {
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
   assert.equal((await tick(11)).results[0].status, "delivered");
   assert.equal(supervisorPrompts, 3);
+  // A reload while Pi is busy cannot manufacture a settled run.
+  rootIdle = false;
   await eventHandlers.get("session_shutdown")(
     { reason: "reload" },
     headlessRootCtx,
@@ -948,10 +950,26 @@ try {
   assert.equal(
     (await persistedGoal()).supervisor.rootTurn.state,
     "unknown",
-    "reload cannot manufacture a settled run",
+    "a busy reload cannot manufacture a settled run",
   );
   assert.equal((await tick(12)).results[0].status, "root-turn-not-idle");
-  assert.equal(supervisorPrompts, 3, "a reload never counts as a settled turn");
+  assert.equal(supervisorPrompts, 3, "a busy reload never counts as a settled turn");
+  // A reload while Pi is idle (a deploy's /reload between turns) is idle, so
+  // the supervisor can still nudge a root that just reloaded.
+  rootIdle = true;
+  await eventHandlers.get("session_shutdown")(
+    { reason: "reload" },
+    headlessRootCtx,
+  );
+  await eventHandlers.get("session_start")(
+    { reason: "reload" },
+    headlessRootCtx,
+  );
+  assert.equal(
+    (await persistedGoal()).supervisor.rootTurn.state,
+    "idle",
+    "an idle reload records the root as idle",
+  );
   rootIdle = false;
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
   await tools
