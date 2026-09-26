@@ -149,6 +149,27 @@ export function profileAfterDeclines(spec, stage, count) {
   return index === 0 ? { index } : { index, profile: fallbacks[index - 1] };
 }
 
+/**
+ * The commit that integrated item `id`, from `git log --format=%H%x09%s`
+ * output of the integration branch (newest first): its own spec(<id>)
+ * commit, or a merge or integrate commit naming it. The id must match
+ * exactly (D1 never matches D12).
+ */
+export function integrationCommitFor(log, id) {
+  const escaped = String(id).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const named = new RegExp(`(^|[^A-Za-z0-9])${escaped}([^A-Za-z0-9]|$)`);
+  const own = new RegExp(`^\\w+\\(${escaped}\\)!?:`);
+  let merged;
+  for (const line of String(log ?? "").split("\n")) {
+    const [sha, ...rest] = line.split("\t");
+    const subject = rest.join("\t");
+    if (!/^[0-9a-f]{40}$/.test(sha ?? "")) continue;
+    if (own.test(subject)) return sha;
+    if (!merged && named.test(subject) && /\b(merge|integrat)/i.test(subject)) merged = sha;
+  }
+  return merged;
+}
+
 /** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
 export function integrationResult(summary) {
   const text = String(summary ?? "");
@@ -279,6 +300,22 @@ export function advanceSpec({
       delete next.baselineRun;
       const shas = Object.keys(next.baselines);
       for (const old of shas.slice(0, Math.max(0, shas.length - BASELINES_KEPT))) delete next.baselines[old];
+    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !LANE_ENDED.has(view.status ?? "")) {
+      // Idle without its receipt: asked once, then replaced by a fresh lane.
+      if (!run.askedAt) {
+        run.askedAt = now;
+        actions.push({ kind: "ask-baseline-receipt", itemId: "", attempt: run.attempts ?? 1, lane: run.lane, targetSha: run.targetSha });
+      } else if (Date.parse(now) - Date.parse(run.askedAt) > RECEIPT_ASK_TIMEOUT_MS) {
+        run.attempts = (run.attempts ?? 1) + 1;
+        delete run.lane;
+        delete run.askedAt;
+        if (run.attempts > 3) {
+          next.baselines ??= {};
+          if (run.kind === "baseline") next.baselines[run.targetSha] = { unknown: true, at: now, note: "baseline lanes went idle without a receipt three times" };
+          else if (next.baselines[run.targetSha]) next.baselines[run.targetSha].fix = { gaveUp: true, at: now, note: "fix-baseline lanes went idle without a receipt three times" };
+          delete next.baselineRun;
+        }
+      }
     } else if (!view || LANE_ENDED.has(view.status)) {
       run.attempts = (run.attempts ?? 1) + 1;
       delete run.lane;
@@ -630,7 +667,10 @@ export function advanceSpec({
           next.items[item.id].pushAskedAt = now;
           rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: next.items[item.id].integration.sha, reason: `push ${item.id}`, ...knownAt([item]) });
         }
-    } else if (!spec.items.some((item) => next.items[item.id]?.state === "integrating")) {
+    } else {
+      // Push what is ready, without waiting for the rest of the queue: the
+      // push goes to the last ready item's integration commit, so items still
+      // integrating (or stuck) never ride along or hold the others back.
       const head = next.items[awaiting.at(-1).id].integration.sha;
       if (next.pushGate?.askedSha !== head) {
         next.pushGate = { askedSha: head, items: awaiting.map((item) => item.id), at: now };

@@ -142,7 +142,7 @@ export function validateSpec(input) {
     }
     if (input.defaults.pushGate !== undefined) {
       if (!["round", "item"].includes(input.defaults.pushGate))
-        throw new Error('spec.defaults.pushGate must be "round" (one push prompt per integration round) or "item".');
+        throw new Error('spec.defaults.pushGate must be "round" (one push prompt for the items ready so far) or "item".');
       defaults.pushGate = input.defaults.pushGate;
     }
     defaults.maxParallel = positiveInteger(input.defaults.maxParallel, "spec.defaults.maxParallel", { max: 32 }) ?? defaults.maxParallel;

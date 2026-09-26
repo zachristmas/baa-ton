@@ -136,7 +136,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -4600,6 +4600,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     containingCommit?(repo: string, tip: string, branch: string): Promise<string | undefined>;
     /** The SHA a ref points at (the target tip, for the suite baseline); undefined when unknown. */
     revParse?(repo: string, ref: string): Promise<string | undefined>;
+    /** The newest commit on `branch` (not on `base`) that integrated item `id`: its spec(<id>) or merge commit. */
+    historyCommit?(repo: string, id: string, branch: string, base: string): Promise<string | undefined>;
     /** Commits on `branch` that `base` does not have (`git rev-list --count base..branch`). */
     aheadOf?(repo: string, branch: string, base: string): Promise<number>;
     /** Put `paths` in `worktree` back to HEAD (generated build artifacts). */
@@ -4857,6 +4859,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // Only real work counts: a branch with no commit beyond the target
       // (its tip is the base, an ancestor of everything) or with its owned
       // work still uncommitted is not integrated.
+      const historyCommit =
+        ports?.historyCommit ??
+        (async (repoPath: string, id: string, branch: string, base: string) => {
+          const log = (await execFile("git", ["-C", repoPath, "log", "--format=%H%x09%s", `${base}..${branch}`], { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 })).stdout;
+          return integrationCommitFor(log, id);
+        });
       const aheadOf =
         ports?.aheadOf ??
         (async (repoPath: string, branch: string, base: string) =>
@@ -4874,7 +4882,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           const porcelain = await statusOf(record.worktree).catch(() => "");
           if (itemOwnedChanges(porcelain, record.decided?.owns ?? item.owns, item.sharedTouch).paths.length) continue;
         }
-        const sha = await containingCommit(repo, branch, "refs/heads/spec-integration").catch(() => undefined);
+        let sha = await containingCommit(repo, branch, "refs/heads/spec-integration").catch(() => undefined);
+        // A merge that rewrote the item's commits (squash, cherry-pick,
+        // renumbering) leaves its tip off the branch: find the item's own
+        // spec(<id>) or merge commit in the integration history instead.
+        if (!sha) sha = await historyCommit(repo, item.id, "refs/heads/spec-integration", targetRef).catch(() => undefined);
         if (sha) contained.set(item.id, sha);
       }
       const targetSha = await (
@@ -4992,6 +5004,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
       let shellTimeout = false;
       for (const action of step.actions) {
+        if (action.kind === "ask-baseline-receipt") {
+          const text = `Your spec baseline lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must start with BASELINE: ${action.targetSha} and SUITE: pass or SUITE: fail, then one FAILED: <package> <task> line per failing task.`;
+          try {
+            const told = await (ports?.tell ?? ((input: { workflowId: string; laneId: string; text: string }) => tellLane(ctx.cwd, input, signal)))({ ...action.lane!, text });
+            done.push(`asked the baseline lane for its receipt (${told.message.delivery.status})`);
+          } catch (error) {
+            done.push(`baseline receipt ask failed: ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
         if (action.kind === "baseline" || action.kind === "fix-baseline") {
           if (shellTimeout) continue;
           const run = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string }; note?: string; declined?: { reason: string; count: number } } }).baselineRun;
@@ -5216,7 +5238,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               reportAt: record.verified,
             };
         }
-        const verdict = await verifyItem(spec, next, item, { repo, ...(ports?.ancestor ? { ancestor: ports.ancestor } : {}) });
+        let verdict = await verifyItem(spec, next, item, { repo, ...(ports?.ancestor ? { ancestor: ports.ancestor } : {}) });
+        // A report rewritten by a newer run that still meets the evidence bar
+        // is re-recorded instead of holding the item forever.
+        if (verdict.failing?.name === "evidence" && /report changed since it was recorded/.test(verdict.failing.detail) && item.acceptance.evidence && record.evidence?.path) {
+          const buffer = await readFile(record.evidence.path).catch(() => undefined);
+          const images = buffer ? reportImageCount(record.evidence.path, buffer) : undefined;
+          if (buffer && images !== undefined && images >= item.acceptance.evidence.minImages) {
+            record.evidence = { ...record.evidence, sha256: createHash("sha256").update(buffer).digest("hex"), images, reRecordedAt: use.now() };
+            record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "verifying", note: `evidence report changed by a newer run (${images} images): re-recorded` }];
+            verdict = await verifyItem(spec, next, item, { repo, ...(ports?.ancestor ? { ancestor: ports.ancestor } : {}) });
+          }
+        }
         if (verdict.done) {
           record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "done", note: "verifier passed" }];
           Object.assign(record, { state: "done", since: use.now() });
