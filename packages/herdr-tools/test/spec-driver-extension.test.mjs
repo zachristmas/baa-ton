@@ -151,8 +151,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     stateDir,
     tools,
     ctx,
-    async emit(event) {
-      for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
+    async emit(event, payload = {}, context = ctx) {
+      for (const handler of handlers.get(event) ?? []) await handler(payload, context);
     },
     advance: () => tools.get("herdr_spec").execute("spec", { action: "advance" }, undefined, undefined, ctx),
     status: () => tools.get("herdr_spec").execute("spec", { action: "status" }, undefined, undefined, ctx),
@@ -757,6 +757,55 @@ test("the driver runs on a timer while the root is mid-turn: no overlap, backoff
 
     await f.emit("session_shutdown");
     assert.equal(clock.pending, 0, "the timer stops with the session");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a /reload restarts the driver on the fresh context; a stale context stops the old timer; a turn boundary starts one", async () => {
+  const f = await fixture();
+  const clock = fakeClock();
+  let stale = false;
+  const passes = [];
+  const options = (label) => ({
+    schedule: clock.schedule,
+    cancel: clock.cancel,
+    watch: () => undefined,
+    run: async () => {
+      passes.push(label);
+      if (stale && label === "old") throw new Error("This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.reload().");
+      return { actions: [], rootAsks: [], waits: {} };
+    },
+  });
+  f.ctx.specTimerOptions = options("old");
+  try {
+    await f.emit("agent_start");
+    await clock.advance(25_000);
+    assert.deepEqual(passes, ["old"]);
+    // The context goes stale (a /reload): the old timer logs it and stops.
+    stale = true;
+    await clock.advance(25_000);
+    assert.equal(clock.pending, 0, "the stale timer stopped instead of retrying");
+    const log = await readFile(join(f.stateDir, "spec-driver.log"), "utf8");
+    assert.match(log, /ctx is stale/);
+    assert.match(log, /"stopped":"this extension instance's context went stale after a reload/);
+    // The reloaded instance's session_start (reason reload) starts it again.
+    const fresh = { ...f.ctx, specTimerOptions: options("fresh") };
+    await f.emit("session_start", { reason: "reload" }, fresh);
+    await clock.advance(25_000);
+    assert.equal(passes.at(-1), "fresh", "the driver runs on the fresh context");
+    // A reload of a running timer replaces it rather than keeping the old one.
+    const again = { ...f.ctx, specTimerOptions: options("again") };
+    await f.emit("session_start", { reason: "reload" }, again);
+    await clock.advance(25_000);
+    assert.equal(passes.at(-1), "again");
+    assert.equal(clock.pending, 1, "one timer, not two");
+    // With no timer, a turn boundary (a reloaded instance mid-turn) starts one.
+    await f.emit("session_shutdown");
+    assert.equal(clock.pending, 0);
+    await f.emit("turn_end", {}, { ...f.ctx, specTimerOptions: options("turn") });
+    await clock.advance(25_000);
+    assert.equal(passes.at(-1), "turn");
   } finally {
     await f.cleanup();
   }

@@ -49,3 +49,4 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | 2026-09-26 | Self-update refused a green commit: the suite timed out while starting a process took 15-55s | Self-update waits while spawns are slow and retries a red run up to 3 times |
 | 2026-09-26 | A root reload was never retried: the root stayed working for hours | A root busy 30 min past a due reload is reported as an anomaly |
 | 2026-09-26 | A repeated-alert anomaly fired for an item that had moved on (the alert list is history) | Repeats count only alerts from the last 6 h whose item is still blocked |
+| 2026-09-26 | Every root /reload killed the spec driver: the timer kept the old instance's context, which went stale | The timer restarts on session_start(reload) and on turn boundaries, stops on a stale context, and logs that it is alive every 10 min |
