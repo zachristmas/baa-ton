@@ -10243,6 +10243,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       );
   }
   pi.on("agent_start", async (_event, ctx) => {
+    recordExtensionRuntime(ctx);
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "active");
     await attemptActivationAck(ctx);
@@ -10275,7 +10276,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await persistRootTurn(ctx, "unknown");
   });
   let removeRuntimeRecord: (() => void) | undefined;
-  pi.on("session_start", async (_event, ctx) => {
+  // What this extension instance loaded, for herdr_doctor and the
+  // supervisor's self-update (which sends /reload to a root on older code).
+  // /reload does not fire session_start, so agent_start records it too.
+  const recordExtensionRuntime = (ctx: { sessionManager?: { getSessionFile?: () => string | undefined } }) => {
     if (process.env.HERDR_ENV === "1" && process.env.BAA_TON_NO_RUNTIME_RECORDS !== "1" && !removeRuntimeRecord)
       removeRuntimeRecord = recordRuntime(dirname(rootConfigPath()), {
         role: "extension",
@@ -10287,6 +10291,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         sessionPath: ctx.sessionManager?.getSessionFile?.(),
         agentKind: "pi",
       });
+  };
+  pi.on("session_start", async (_event, ctx) => {
+    recordExtensionRuntime(ctx);
     rootRunId = randomUUID();
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "unknown");
