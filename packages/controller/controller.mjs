@@ -18,9 +18,10 @@ import {
 import net from "node:net";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { appendFileSync, realpathSync, renameSync, statSync } from "node:fs";
 import {
   codeChangeWatcher,
+  listRuntime,
   loadedCode,
   recordRuntime,
 } from "./code-version.mjs";
@@ -4256,6 +4257,30 @@ async function acquireSupervisorLease(leaseDirectory) {
   }
 }
 
+const SUPERVISOR_LOG_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Append one line to <configDir>/supervisor.log (and stderr), so a
+ * supervisor failure is visible without reading any pane. Capped at 1 MB with
+ * one rotated file; never throws.
+ */
+export function supervisorLog(configDir, message) {
+  const line = `${new Date().toISOString()} [${process.pid}] ${message}\n`;
+  process.stderr.write(`herdr-orchestrator-controller supervisor: ${message}\n`);
+  if (!configDir) return;
+  const path = join(configDir, "supervisor.log");
+  try {
+    if (statSync(path).size > SUPERVISOR_LOG_MAX_BYTES) renameSync(path, `${path}.1`);
+  } catch {
+    // No log yet.
+  }
+  try {
+    appendFileSync(path, line, { mode: 0o600 });
+  } catch {
+    // Best effort: stderr has it too.
+  }
+}
+
 /** Exit code the supervisor runner uses to ask its launcher for a restart. */
 export const SUPERVISOR_RESTART_EXIT_CODE = 75;
 
@@ -4296,11 +4321,17 @@ export async function runSupervisorLoop({
         commit: code.commit,
       })
     : () => {};
+  supervisorLog(resolvedConfigDir, `started${code ? ` on ${code.commit?.slice(0, 12) ?? "?"} (${code.fingerprint}) from ${code.checkout}` : ""}`);
   let updater = selfUpdate;
   if (!updater && onCodeChange && code) {
     try {
       const { createSelfUpdater } = await import("./self-update.mjs");
-      const api = herdr ?? new JsonLineHerdrClient();
+      // Created on first use: a missing socket must not disable deploys.
+      let client;
+      const api = {
+        request: (method, params) => (client ??= herdr ?? new JsonLineHerdrClient()).request(method, params),
+        ...(typeof herdr?.processInfo === "function" ? { processInfo: herdr.processInfo.bind(herdr) } : {}),
+      };
       updater = createSelfUpdater({
         configDir: resolvedConfigDir,
         ownCheckout: code.checkout,
@@ -4315,14 +4346,17 @@ export async function runSupervisorLoop({
           }
         },
       });
-    } catch {
+    } catch (error) {
       updater = undefined;
+      supervisorLog(resolvedConfigDir, `self-update disabled: could not start the updater: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   let stopping = false;
   let ticking = false;
   let timer;
   let inFlightTick;
+  let lastTickError;
+  let lastUpdateError;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
@@ -4343,9 +4377,7 @@ export async function runSupervisorLoop({
       return;
     }
     if (!fingerprint) return;
-    process.stderr.write(
-      `herdr-orchestrator-controller supervisor: code changed on disk (${code?.fingerprint ?? "?"} -> ${fingerprint}); restarting.\n`,
-    );
+    supervisorLog(resolvedConfigDir, `code changed on disk (${code?.fingerprint ?? "?"} -> ${fingerprint}); restarting.`);
     void stop().then(() => onCodeChange(fingerprint));
   };
   process.once("SIGINT", () => void stop());
@@ -4355,19 +4387,33 @@ export async function runSupervisorLoop({
     ticking = true;
     const current = (async () => {
       try {
-        await runSupervisorTick({
-          stateDir: resolvedStateDir,
-          configDir: resolvedConfigDir,
-          herdr,
-        });
-        if (updater && !stopping) {
-          const update = await updater.tick().catch((error) => ({ events: [`self-update: ${error instanceof Error ? error.message : String(error)}`] }));
-          for (const event of update?.events ?? []) process.stderr.write(`herdr-orchestrator-controller supervisor: ${event}\n`);
+        try {
+          await runSupervisorTick({
+            stateDir: resolvedStateDir,
+            configDir: resolvedConfigDir,
+            herdr,
+          });
+          if (lastTickError) supervisorLog(resolvedConfigDir, "tick recovered");
+          lastTickError = undefined;
+        } catch (error) {
+          // Logged once per distinct error, not every 5 seconds.
+          const message = error instanceof Error ? error.message : String(error);
+          if (message !== lastTickError) supervisorLog(resolvedConfigDir, `tick failed: ${message}`);
+          lastTickError = message;
         }
-      } catch (error) {
-        process.stderr.write(
-          `herdr-orchestrator-controller supervisor: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
+        // Deploys do not depend on the rest of the tick succeeding.
+        if (updater && !stopping) {
+          try {
+            const update = await updater.tick();
+            if (lastUpdateError) supervisorLog(resolvedConfigDir, "self-update recovered");
+            lastUpdateError = undefined;
+            for (const event of update?.events ?? []) supervisorLog(resolvedConfigDir, `self-update: ${event}`);
+          } catch (error) {
+            const message = error instanceof Error ? error.stack ?? error.message : String(error);
+            if (message !== lastUpdateError) supervisorLog(resolvedConfigDir, `self-update failed: ${message}`);
+            lastUpdateError = message;
+          }
+        }
       } finally {
         ticking = false;
       }
