@@ -18,7 +18,7 @@ import {
 import net from "node:net";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
-import { appendFileSync, realpathSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, realpathSync, renameSync, statSync } from "node:fs";
 import {
   codeChangeWatcher,
   listRuntime,
@@ -728,7 +728,8 @@ function pendingForUser(manifest, owned) {
  * answer. Otherwise it nudges only when there is actionable work, and the
  * reasons name it.
  */
-export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
+export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run }) {
+  if (run?.state === "paused") return { quiet: "run-paused" };
   if (QUIET_PARENT_GOAL_STATUSES.has(goal.status)) return { quiet: `goal-${goal.status}` };
   const routes = orchestrator.workflows.filter(
     (route) => resolve(route.manifest_path) === resolve(manifestPath),
@@ -778,6 +779,25 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
   }
   for (const directive of openDirectives(manifest, orchestrator))
     reasons.push(`directive ${directive.id} from ${directive.from} is open: ${clipText(directive.text, 160)}`);
+  // Spec items waiting with no lane working: the loop has stalled, whatever
+  // the goal says (a root that believes it is paused is exactly this case).
+  const liveLanes = owned.flatMap((workflow) =>
+    (Array.isArray(workflow.lanes) ? workflow.lanes : [])
+      .filter((lane) => isRecord(lane) && !lane.completionReceipt && !["completed", "closed", "operator-closed", "superseded", "retired"].includes(workflow.status))
+      .map((lane) => latestLaneStatus(workflow, lane.id))
+      .filter((status) => status === "working" || status === "blocked"),
+  );
+  let specStall = false;
+  if (!liveLanes.length && !awaitingUser.length) {
+    const waiting = specWaiting(manifestPath);
+    if (waiting.size) {
+      specStall = true;
+      const total = [...waiting.values()].reduce((sum, count) => sum + count, 0);
+      reasons.push(
+        `spec: ${total} item(s) are waiting (${[...waiting].map(([stage, count]) => `${stage}: ${count}`).join(", ")}) and no lane is working. The run state is ${run?.state ?? "running"}: advance them now (herdr_spec status names the next action).`,
+      );
+    }
+  }
   // A wait on an event only holds while someone can send it: with no lane
   // working or blocked (and nobody owing an answer), the wait is a stall.
   if ((goal.status === "waiting-for-event" || goal.status === "blocked") && !awaitingUser.length && !reasons.length) {
@@ -793,7 +813,7 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
       );
   }
   if (!reasons.length) return { quiet: "no-actionable-work", awaitingUser };
-  return { reasons, awaitingUser };
+  return { reasons, awaitingUser, ...(specStall ? { specStall } : {}) };
 }
 
 const SUPERVISOR_DIAGNOSTICS_NAME = "supervisor-diagnostics.json";
@@ -2976,7 +2996,9 @@ export async function dispatchRootDigest({
         attempts: attemptsFor[index],
       });
 
-  const outcome = await deliverRootPrompt(root, herdr, digestText(items, open, await specDigestLine(manifestPath)));
+  const runLine = await runStateDigestLine();
+  const specLine = await specDigestLine(manifestPath);
+  const outcome = await deliverRootPrompt(root, herdr, digestText(items, open, [runLine, specLine].filter(Boolean).join("\n") || undefined));
   const finishedAt = now();
   for (const [index, item] of items.entries()) {
     if (item.kind === "event")
@@ -3424,6 +3446,48 @@ export async function deliverLaneQueue({ workflow, herdr, timestamp = now() }) {
   return changed;
 }
 
+/** The operator's durable run state (running unless an operator paused it); never throws. */
+export async function operatorRunState() {
+  try {
+    const { operatorStorePath, readOperatorStore, runState } = await import("../herdr-tools/operator.mjs");
+    return runState(await readOperatorStore(operatorStorePath()));
+  } catch {
+    return { state: "running", implicit: true };
+  }
+}
+
+async function runStateDigestLine() {
+  try {
+    const { runStateLine } = await import("../herdr-tools/operator.mjs");
+    return runStateLine(await operatorRunState());
+  } catch {
+    return undefined;
+  }
+}
+
+/** Spec items waiting for the root's loop to move them (read-only), by state. */
+function specWaiting(manifestPath) {
+  try {
+    const spec = JSON.parse(readFileSync(join(dirname(dirname(manifestPath)), "spec.json"), "utf8"));
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(join(dirname(manifestPath), "spec-state.json"), "utf8"))?.items ?? {};
+    } catch {
+      state = {};
+    }
+    const counts = new Map();
+    for (const item of Array.isArray(spec?.items) ? spec.items : []) {
+      const record = isRecord(state[item?.id]) ? state[item.id] : {};
+      const stage = typeof record.state === "string" ? record.state : "pending";
+      const waiting = ["awaiting-push", "pending", "ready", "failed"].includes(stage) || (stage === "blocked" && record.blockedReason === "exhausted") || (stage === "integrating" && !record.lane);
+      if (waiting) counts.set(stage, (counts.get(stage) ?? 0) + 1);
+    }
+    return counts;
+  } catch {
+    return new Map();
+  }
+}
+
 /**
  * Operator messages (docs/OPERATOR-MESSAGES.md) waiting for their target:
  * the same live, idle, never-retype rules as root-to-lane delivery.
@@ -3660,6 +3724,22 @@ export async function runSupervisorTick({
         await atomicWriteJson(manifestPath, manifest);
       };
       if (upgradeNudgeInterval(manifest, orchestrator, supervisor, timestamp)) await persist();
+      // The operator's run state is the only pause: when an operator set it
+      // to running, a pause the root put on its own goal is lifted.
+      const run = await operatorRunState();
+      if (!run.implicit && run.state === "running" && (supervisor.state === "paused" || goal.status === "paused")) {
+        supervisor.state = "running";
+        delete supervisor.pauseReason;
+        if (goal.status === "paused") goal.status = "active";
+        supervisor.nextNudgeAt = timestamp;
+        queueRootAlert(
+          supervisionFor(manifest, orchestrator, true),
+          "run-resumed",
+          `The run state is running (set by ${run.by} at ${run.at}). Your own pause is lifted: continue the work.`,
+          timestamp,
+        );
+        await persist();
+      }
       if (supervisor.state !== "running") {
         results.push({ manifestPath, status: "not-running" });
         continue;
@@ -3677,7 +3757,12 @@ export async function runSupervisorTick({
         results.push({ manifestPath, status: "uncertain" });
         continue;
       }
-      const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath });
+      const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath, run });
+      // A stall episode ends as soon as the spec no longer stalls.
+      if (!decision.specStall && supervisionFor(manifest, orchestrator)?.stall) {
+        delete supervisionFor(manifest, orchestrator).stall;
+        await persist();
+      }
       if (decision.quiet) {
         results.push({ manifestPath, status: "quiet", reason: decision.quiet });
         continue;
@@ -3810,6 +3895,19 @@ export async function runSupervisorTick({
       if (outcome.status === "delivered") {
         supervisor.nudgeCount += 1;
         supervisor.lastNudgeAt = supervisor.lastDelivery.deliveredAt;
+        // Two stall nudges the root did not act on: tell the user, once.
+        if (decision.specStall) {
+          const entry = supervisionFor(manifest, orchestrator, true);
+          entry.stall = { since: entry.stall?.since ?? timestamp, nudges: (entry.stall?.nudges ?? 0) + 1, ...(entry.stall?.notifiedAt ? { notifiedAt: entry.stall.notifiedAt } : {}) };
+          if (entry.stall.nudges >= 2 && !entry.stall.notifiedAt) {
+            entry.stall.notifiedAt = timestamp;
+            const specReason = decision.reasons.find((reason) => reason.startsWith("spec: ")) ?? "spec items are waiting";
+            entry.stall.notification = await notify({
+              title: "Baa-ton: the root is not moving",
+              body: clipText(`${orchestrator.id}: ${entry.stall.nudges} nudges unanswered since ${entry.stall.since}; ${specReason.replace(/ The run state is.*$/, "")}`, 300),
+            });
+          }
+        }
       }
       // Repeat while the condition holds: every outcome, including an
       // uncertain send, waits one full interval before the next nudge.

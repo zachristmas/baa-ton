@@ -253,3 +253,35 @@ export async function deliverOperatorMessages(store, { ready, prompt, at = nowIs
   }
   return changed;
 }
+
+/**
+ * The run state: running unless an operator paused it. It is durable (the
+ * operator store), set only by an operator STOP/PAUSE/RESUME message or
+ * `baa-ton run pause|resume`, and shown to the root every turn, so a pause
+ * is never inferred from conversation memory.
+ */
+export function runState(store) {
+  const state = store?.runState;
+  return state && (state.state === "paused" || state.state === "running") ? state : { state: "running", implicit: true };
+}
+
+export function setRunState(store, { state, reason, by = "operator", at = nowIso() }) {
+  if (state !== "paused" && state !== "running") throw new Error("The run state is paused or running.");
+  store.runState = { state, ...(reason ? { reason: String(reason).slice(0, 300) } : {}), by: String(by).slice(0, 64), at };
+  return store.runState;
+}
+
+/** The run state an operator message sets, from its first word: STOP / PAUSE (EVERYTHING) or RESUME. */
+export function runStateFromText(text) {
+  const head = String(text ?? "").trim();
+  if (/^(STOP|PAUSE)\b/i.test(head)) return "paused";
+  if (/^RESUME\b/i.test(head)) return "running";
+  return undefined;
+}
+
+/** One line for the root's prompt and digest. */
+export function runStateLine(state) {
+  if (state.state === "paused")
+    return `Run state: PAUSED by ${state.by}${state.reason ? ` (${state.reason})` : ""} at ${state.at}. Take no new action until an operator resumes it.`;
+  return `Run state: running${state.implicit ? "" : ` (set by ${state.by} at ${state.at})`}. A pause exists only when this line says PAUSED; never infer one from conversation memory, an earlier message or a summary.`;
+}

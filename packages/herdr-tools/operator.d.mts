@@ -24,6 +24,11 @@ export function operatorMessageText(message: OperatorMessage): string;
 export function addOperatorMessage(store: OperatorStore, input: { target: string; resolved: OperatorTarget; text: string; from?: string; notify?: boolean; at?: string }): OperatorMessage;
 export function addOperatorReply(store: OperatorStore, input: { id: string; text: string; from?: string; at?: string }): { message: OperatorMessage; reply: OperatorReply };
 export function operatorInbox(store: OperatorStore, options?: { all?: boolean; unread?: boolean; limit?: number }): OperatorMessage[];
+export type RunState = { state: "running" | "paused"; reason?: string; by?: string; at?: string; implicit?: boolean };
+export function runState(store: unknown): RunState;
+export function setRunState(store: OperatorStore, input: { state: "running" | "paused"; reason?: string; by?: string; at?: string }): RunState;
+export function runStateFromText(text: unknown): "running" | "paused" | undefined;
+export function runStateLine(state: RunState): string;
 export function deliverOperatorMessages(
   store: OperatorStore,
   effects: {

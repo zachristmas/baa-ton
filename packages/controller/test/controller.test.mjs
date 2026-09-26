@@ -2707,7 +2707,7 @@ test("a supervisor tick drains a pending lane wake once the root is ready, even 
     assert.equal(requestsFor(mock, "agent.prompt").length, 1);
     assert.match(
       requestsFor(mock, "agent.prompt")[0].params.text,
-      /^\[Baa-ton digest\] 1 update since your last turn:\n1\. blocked: herdr-bb029\/lane-child/,
+      /^\[Baa-ton digest\] 1 update since your last turn:\n(?:Run state: [^\n]*\n)?1\. blocked: herdr-bb029\/lane-child/,
     );
     const manifest = await fixture.manifest();
     const events = manifest.workflows[0].eventController.events;
@@ -3341,7 +3341,7 @@ test("a root Herdr reports as working defers the digest even without a turn reco
     });
     assert.equal(tick.pendingWakes[0].status, "delivered");
     assert.equal(api.prompts.length, 1);
-    assert.match(api.prompts[0].text, /1 update since your last turn:\n1\. done: herdr-bb029\/lane-child/);
+    assert.match(api.prompts[0].text, /1 update since your last turn:\n(?:Run state: [^\n]*\n)?1\. done: herdr-bb029\/lane-child/);
   } finally {
     await fixture.cleanup();
   }
@@ -4480,6 +4480,69 @@ test("a blocked event from a registered operator agent's pane is handled, not ig
     if (saved === undefined) delete process.env.BAATON_OPERATOR_STORE;
     else process.env.BAATON_OPERATOR_STORE = saved;
     await mock.close();
+    await fixture.cleanup();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("spec items waiting with no lane working are a stall: nudged, escalated once after two nudges, quiet while paused", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("active"), laneRequests: [] });
+  const storeDir = await mkdtemp(join(tmpdir(), "baa-run-state-"));
+  const saved = process.env.BAATON_OPERATOR_STORE;
+  process.env.BAATON_OPERATOR_STORE = join(storeDir, "operator.json");
+  const specDir = dirname(dirname(fixture.manifestPath));
+  await writeFile(join(specDir, "spec.json"), JSON.stringify({ version: 1, items: [{ id: "D03" }, { id: "D04" }, { id: "D05" }] }));
+  await writeFile(join(dirname(fixture.manifestPath), "spec-state.json"), JSON.stringify({ version: 1, items: { D03: { state: "awaiting-push" }, D04: { state: "awaiting-push" }, D05: { state: "done" } } }));
+  const texts = [];
+  const notes = [];
+  const api = recoveryApi();
+  const capture = { async request(method, params) { if (method === "agent.prompt") texts.push(params.text); return api.request(method, params); } };
+  const notify = async (note) => (notes.push(note), { status: "shown" });
+  try {
+    // A digest may take the first interval's wake; nudges follow each interval.
+    const statuses = [];
+    for (let step = 0; step < 5; step += 1) {
+      const result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, notify, timestamp: new Date(Date.parse("2026-09-26T08:00:00.000Z") + step * 6 * 60_000).toISOString() });
+      statuses.push(result.results[0].status);
+    }
+    const nudges = texts.filter((text) => text.startsWith("[Baa-ton supervisor]"));
+    assert.ok(nudges.length >= 2, `an active goal with items awaiting push is nudged (${statuses.join(", ")})`);
+    assert.match(nudges[0], /spec: 2 item\(s\) are waiting \(awaiting-push: 2\) and no lane is working/);
+    const escalations = notes.filter((note) => note.title === "Baa-ton: the root is not moving");
+    assert.equal(escalations.length, 1, "after two unanswered nudges, one notification, once per episode");
+    assert.match(escalations[0].body, /2 nudges unanswered .*awaiting-push: 2/);
+    let result;
+    // An operator pause silences it.
+    await writeFile(process.env.BAATON_OPERATOR_STORE, JSON.stringify({ version: 1, agents: {}, messages: [], runState: { state: "paused", by: "zach", at: "t" } }));
+    result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, notify, timestamp: "2026-09-26T08:18:00.000Z" });
+    assert.deepEqual([result.results[0].status, result.results[0].reason], ["quiet", "run-paused"]);
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_OPERATOR_STORE;
+    else process.env.BAATON_OPERATOR_STORE = saved;
+    await fixture.cleanup();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("an operator's running run state lifts a pause the root put on its own goal", async () => {
+  const goal = statusGoal("paused");
+  goal.supervisor = { ...goal.supervisor, state: "paused", pauseReason: "PAUSE EVERYTHING is still active", nextNudgeAt: null };
+  const fixture = await createFixture({ parentGoal: goal, laneRequests: [] });
+  const storeDir = await mkdtemp(join(tmpdir(), "baa-run-state-"));
+  const saved = process.env.BAATON_OPERATOR_STORE;
+  process.env.BAATON_OPERATOR_STORE = join(storeDir, "operator.json");
+  await writeFile(process.env.BAATON_OPERATOR_STORE, JSON.stringify({ version: 1, agents: {}, messages: [], runState: { state: "running", by: "zach", at: "2026-09-26T04:30:00.000Z" } }));
+  try {
+    await runSupervisorTick({ stateDir: fixture.stateDir, herdr: recoveryApi(), timestamp: "2026-09-26T08:00:00.000Z" });
+    const after = (await fixture.manifest()).parentGoal;
+    assert.equal(after.supervisor.state, "running");
+    assert.equal(after.status, "active");
+    assert.equal(after.supervisor.pauseReason, undefined);
+    const alerts = (await fixture.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
+    assert.ok(alerts.some((alert) => alert.kind === "run-resumed" && /Your own pause is lifted/.test(alert.text)));
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_OPERATOR_STORE;
+    else process.env.BAATON_OPERATOR_STORE = saved;
     await fixture.cleanup();
     await rm(storeDir, { recursive: true, force: true });
   }

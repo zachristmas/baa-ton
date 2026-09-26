@@ -682,7 +682,7 @@ test("tools/call outside a Herdr session and unknown tools still fail predictabl
   await withMcpServer({ HERDR_ENV: "0", BAATON_OPERATOR_STORE: join(storeDir, "operator.json"), HERDR_SOCKET_PATH: undefined }, async (rpc) => {
     const listed = await rpc("tools/list");
     // Only the operator channel is open to callers outside Herdr.
-    assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ["herdr_operator_inbox", "herdr_operator_message", "herdr_operator_reply"]);
+    assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ["herdr_operator_inbox", "herdr_operator_message", "herdr_operator_reply", "herdr_operator_run"]);
     const unknownTarget = await rpc("tools/call", { name: "herdr_operator_message", arguments: { target: "nobody", text: "hi" } });
     assert.equal(unknownTarget.result.isError, true);
     assert.match(unknownTarget.result.content[0].text, /Unknown target nobody/);

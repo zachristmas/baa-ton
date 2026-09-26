@@ -133,8 +133,8 @@ const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } 
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
-const { OPERATOR_AUTHORITY } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
-const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
+const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
+const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
 const { DECLINE_RULE, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
@@ -3835,7 +3835,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function laneLeaseRefusal(
     cwd: string,
     ack: ApprovalPolicyAck | undefined,
-    grant: "lease" | "runtime-launch" | "retire" | "local-validation" | "dispatch" | "integrate" = "lease",
+    grant: "lease" | "runtime-launch" | "retire" | "local-validation" | "dispatch" | "integrate" | "spec-push" = "lease",
   ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
@@ -4608,6 +4608,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
     commit?(input: { worktree: string; paths: string[]; message: string }): Promise<string>;
+    /** Push `sha` to `remote`'s `branch` from the integration worktree (spec-push grant). */
+    push?(input: { worktree: string; remote: string; sha: string; branch: string }): Promise<void>;
     /** Send a root-to-lane message (herdr_tell). */
     tell?(input: { workflowId: string; laneId: string; text: string }): Promise<{ message: { delivery: { status: string } } }>;
     /** Live memory and swap sample (the controller's sampleCapacity). */
@@ -4659,6 +4661,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "dispatch") ??
       laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "integrate");
     if (refusal) return { skipped: `the spec driver needs the dispatch and integrate grants (${refusal})` };
+    // An operator pause (the durable run state) stops the driver too.
+    const run = await readRunState().catch(() => ({ state: "running" as const }));
+    if (run.state === "paused") return { skipped: `the run is paused by ${(run as { by?: string }).by ?? "an operator"}; nothing is dispatched or pushed until it is resumed` };
     specDriverRunning = true;
     try {
       const scope = requireRootManifestExecutor(ctx.cwd);
@@ -5244,6 +5249,31 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               done.push(`retire ${workflow.id}/${lane.id} failed: ${clip((error as Error).message, 120)}`);
             }
           }
+      }
+      // Pre-approved pushes (the spec-push grant): a green round is pushed
+      // by the driver, fast-forward only, instead of waiting on a root turn.
+      if (!laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "spec-push")) {
+        for (const ask of [...step.rootAsks]) {
+          if (ask.kind !== "push" || !ask.sha) continue;
+          try {
+            await (ports?.push ??
+              (async ({ worktree, remote, sha, branch }: { worktree: string; remote: string; sha: string; branch: string }) => {
+                await execFile("git", ["-C", worktree, "push", "-q", remote, `${sha}:refs/heads/${branch}`], { timeout: 180_000 });
+                await execFile("git", ["-C", repo, "fetch", "-q", remote, branch], { timeout: 180_000 });
+              }))({ worktree: integrationWorktree, remote: spec.target.remote, sha: ask.sha, branch: spec.target.branch });
+            step.rootAsks.splice(step.rootAsks.indexOf(ask), 1);
+            for (const id of ask.items ?? []) {
+              const record = next.items[id];
+              if (record) record.history = [...(record.history ?? []), { at: use.now(), from: record.state, to: record.state, note: `pushed to ${spec.target.remote}/${spec.target.branch} at ${ask.sha.slice(0, 12)} under the spec-push grant` }];
+            }
+            (next as { pushGate?: Record<string, unknown> }).pushGate = { ...((next as { pushGate?: Record<string, unknown> }).pushGate ?? {}), pushedSha: ask.sha, pushedAt: use.now() };
+            done.push(`pushed ${(ask.items ?? []).join(", ")} to ${spec.target.remote}/${spec.target.branch} (${ask.sha.slice(0, 12)})`);
+            await runHerdr(["notification", "show", "Baa-ton: spec round pushed", "--body", clip(`${(ask.items ?? []).length} item(s) pushed to ${spec.target.branch} at ${ask.sha.slice(0, 12)}: ${(ask.items ?? []).join(", ")}`, 400)], signal).catch(() => undefined);
+          } catch (error) {
+            ask.reason = `${ask.reason ?? "push"}; the pre-approved push failed: ${clip(failureOutput(error), 300)}`;
+            done.push(`push of ${ask.sha.slice(0, 12)} failed: ${clip((error as Error).message, 120)}`);
+          }
+        }
       }
       for (const [id, reason] of Object.entries(step.waits)) if (next.items[id]) next.items[id].wait = reason;
       for (const item of spec.items) if (!step.waits[item.id] && next.items[item.id]) delete next.items[item.id].wait;
@@ -10324,7 +10354,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     try {
       const active = pi.getActiveTools() as unknown[];
       const names = active.map((tool) => (typeof tool === "string" ? tool : (tool as { name?: string })?.name)).filter(Boolean) as string[];
-      const missing = ["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox"].filter((name) => !names.includes(name));
+      const missing = ["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox", "herdr_operator_run"].filter((name) => !names.includes(name));
       if (missing.length && names.length) pi.setActiveTools([...names, ...missing]);
     } catch {
       // Older Pi without tool control: the tools are active by default.
@@ -10613,7 +10643,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "active");
     return {
-      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY}${await rootBootstrapPrompt(ctx.cwd)}`,
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY} ${runStateLine(await readRunState().catch(() => ({ state: "running" as const, implicit: true })))}${await rootBootstrapPrompt(ctx.cwd)}`,
     };
   });
 
@@ -11943,6 +11973,25 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     async execute(_id, params) {
       const result = await replyToOperator(params);
       return { content: [{ type: "text", text: `reply stored on ${result.id}` }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_operator_run",
+    label: "Run State",
+    description:
+      "The durable run state (running or paused). status reads it; pause and resume set it, and only when the user or an operator explicitly says so now: never from conversation memory.",
+    promptSnippet: "Read or set the durable run state (running/paused).",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("status"), Type.Literal("pause"), Type.Literal("resume")]),
+      reason: Type.Optional(Type.String()),
+      from: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params) {
+      const state =
+        params.action === "status"
+          ? await readRunState()
+          : await changeRunState({ state: params.action === "pause" ? "paused" : "running", reason: params.reason, from: params.from });
+      return { content: [{ type: "text", text: runStateLine(state) }], details: state };
     },
   });
   pi.registerTool({

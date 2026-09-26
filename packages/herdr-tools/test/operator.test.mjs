@@ -181,3 +181,29 @@ test("CLI flags", () => {
   assert.deepEqual(parseArgs(["lane-admin", "hi", "--from", "me", "--notify", "there"]), { positional: ["lane-admin", "hi", "there"], flags: { from: "me", notify: true } });
   assert.deepEqual(parseArgs(["x", "--", "--not-a-flag"]).positional, ["x", "--not-a-flag"]);
 });
+
+test("the run state is durable: operator STOP/RESUME to a root and baa-ton run set it; other text never does", async () => {
+  const { runStateFromText, runStateLine } = await import("../operator.mjs");
+  assert.equal(runStateFromText("PAUSE EVERYTHING until I say so"), "paused");
+  assert.equal(runStateFromText("stop now"), "paused");
+  assert.equal(runStateFromText("RESUME: the pause is over"), "running");
+  assert.equal(runStateFromText("Please pause after D12 if it fails"), undefined, "only the first word counts");
+  const { env, cleanup } = await scratch();
+  try {
+    const lines = [];
+    const out = (text) => lines.push(text);
+    await runOperatorCli(["run", "status"], { env, out });
+    assert.match(lines.at(-1), /^Run state: running\. A pause exists only when this line says PAUSED/);
+    await sendOperatorMessage({ target: "root", text: "PAUSE EVERYTHING, driving home", from: "ops-assistant", env, config: CONFIG, deliver: async () => [] });
+    await runOperatorCli(["run", "status"], { env, out });
+    assert.match(lines.at(-1), /^Run state: PAUSED by ops-assistant \(PAUSE EVERYTHING, driving home\)/);
+    await sendOperatorMessage({ target: "herdr-a1/lane-1", text: "RESUME your build", env, config: CONFIG, deliver: async () => [] });
+    await runOperatorCli(["run", "status"], { env, out });
+    assert.match(lines.at(-1), /PAUSED/, "a message to a lane does not change the run state");
+    await runOperatorCli(["run", "resume", "--from", "zach"], { env, out });
+    assert.match(lines.at(-1), /^Run state: running \(set by zach at /);
+    assert.equal(runStateLine({ state: "running", implicit: true }).includes("set by"), false);
+  } finally {
+    await cleanup();
+  }
+});
