@@ -19,6 +19,9 @@ import { promisify } from "node:util";
 
 export const SELF_UPDATE_CHECK_MS = 10 * 60_000;
 export const SELF_UPDATE_TEST_TIMEOUT_MS = 30 * 60_000;
+/** How long a /reload has to show up in the root's runtime record. */
+export const RELOAD_CONFIRM_MS = 60_000;
+export const RELOAD_ATTEMPTS = 5;
 const execFileAsync = promisify(execFile);
 
 async function defaultRun(command, args, options = {}) {
@@ -83,6 +86,8 @@ export function createSelfUpdater({
   // Root panes (from the controller config): only roots get /reload, never
   // the Pi extension records of lanes. Undefined means no filter.
   rootPanes = async () => undefined,
+  // Whether a dialog (question or permission prompt) is on the pane's screen.
+  dialogOpen = async () => false,
   prune = () => 0,
   now = () => new Date().toISOString(),
   env = process.env,
@@ -118,26 +123,59 @@ export function createSelfUpdater({
   };
 
   /** An idle Pi root still running older code than its checkout gets /reload, once per commit. */
+  /**
+   * An idle or done Pi root on older code than its checkout gets /reload,
+   * never while a dialog is on its screen. A reload counts only once the
+   * root's runtime record shows the new commit; otherwise it is retried
+   * after RELOAD_CONFIRM_MS, up to RELOAD_ATTEMPTS times, then the user is
+   * told once.
+   */
   const reloadRoots = async (state) => {
     const events = [];
     const roots = await Promise.resolve(rootPanes()).catch(() => undefined);
+    const reloads = (state.reloads ??= {});
     for (const record of runtime()) {
       if (record.role !== "extension" || !record.paneId || !record.checkout) continue;
       if (roots && !roots.has(record.paneId)) continue;
       const disk = await headOf(record.checkout);
-      if (!disk || !record.commit || disk === record.commit) continue;
-      if ((state.reloads ??= {})[record.paneId] === disk) continue;
+      if (!disk || !record.commit) continue;
+      // Older state kept a bare commit: treat it as sent, not confirmed.
+      let entry = typeof reloads[record.paneId] === "string" ? { commit: reloads[record.paneId], attempts: 1 } : reloads[record.paneId];
+      if (disk === record.commit) {
+        if (entry?.commit === disk && !entry.confirmedAt) {
+          reloads[record.paneId] = { ...entry, confirmedAt: now() };
+          events.push(`root reload in ${record.paneId} confirmed on ${disk.slice(0, 12)}`);
+        }
+        continue;
+      }
+      if (entry?.commit !== disk) entry = undefined;
+      if (entry?.gaveUpAt) continue;
+      if (entry?.sentAt && Date.parse(now()) - Date.parse(entry.sentAt) < RELOAD_CONFIRM_MS) continue;
+      if ((entry?.attempts ?? 0) >= RELOAD_ATTEMPTS) {
+        reloads[record.paneId] = { ...entry, gaveUpAt: now() };
+        events.push(`root reload in ${record.paneId} not confirmed after ${entry.attempts} attempts`);
+        await notify({ title: "Baa-ton: root did not reload", body: `${record.paneId} still runs ${String(record.commit).slice(0, 12)} after ${entry.attempts} /reload attempts onto ${disk.slice(0, 12)}; reload it by hand.` });
+        continue;
+      }
+      // A dialog was on screen: look again at most once a minute.
+      if (entry?.waitingOnDialogAt && Date.parse(now()) - Date.parse(entry.waitingOnDialogAt) < RELOAD_CONFIRM_MS) continue;
       if (!(await clean(record.checkout).catch(() => false))) continue;
       const check = await ready(record.paneId, { pane_id: record.paneId, agent_kind: record.agentKind ?? "pi" });
       // Herdr reports a Pi root that finished its turn as done, or as idle.
       if (!check?.ok || !["idle", "done"].includes(check.agent?.agent_status)) continue;
+      // Typed into a dialog, /reload would answer it instead of reloading.
+      if (await Promise.resolve(dialogOpen(record.paneId)).catch(() => true)) {
+        if (!entry?.waitingOnDialogAt) events.push(`root reload in ${record.paneId} waits: a dialog is on screen`);
+        reloads[record.paneId] = { ...(entry ?? { commit: disk, attempts: 0 }), waitingOnDialogAt: now() };
+        continue;
+      }
+      const attempts = (entry?.attempts ?? 0) + 1;
       try {
         await prompt(record.paneId, "/reload");
-        state.reloads[record.paneId] = disk;
-        events.push(`reloaded the root in ${record.paneId} onto ${disk.slice(0, 12)}`);
+        reloads[record.paneId] = { commit: disk, sentAt: now(), attempts };
+        events.push(`sent /reload to the root in ${record.paneId} onto ${disk.slice(0, 12)} (attempt ${attempts})`);
       } catch (error) {
-        // A send that may have landed is not retried for this commit.
-        if (error?.sent !== false) state.reloads[record.paneId] = disk;
+        reloads[record.paneId] = { commit: disk, sentAt: now(), attempts, error: error instanceof Error ? error.message : String(error) };
         events.push(`root reload in ${record.paneId} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }

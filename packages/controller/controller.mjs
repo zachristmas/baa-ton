@@ -4459,6 +4459,10 @@ export async function runSupervisorLoop({
         ownCheckout: code.checkout,
         runtime: () => listRuntime(resolvedConfigDir),
         prune: () => pruneRuntime(resolvedConfigDir),
+        dialogOpen: async (paneId) => {
+          const { classifyScreen, readScreen } = await import("./blocked-lane.mjs");
+          return classifyScreen(await readScreen(api, paneId, paneId)).kind !== "unknown";
+        },
         // Fail closed: an unreadable config means no root is known, so no reload.
         rootPanes: async () => new Set((await loadConfig(resolvedConfigDir).catch(() => ({ orchestrators: [] }))).orchestrators.map((orchestrator) => orchestrator.root.pane_id)),
         notify: herdrNotification,

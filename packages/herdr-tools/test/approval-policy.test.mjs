@@ -11,6 +11,7 @@ const {
   standingDecision,
   authorizeStanding,
   approvalPolicySummary,
+  approvalAckMatches,
 } = await jiti.import("../approval-policy.ts");
 
 const policy = {
@@ -222,4 +223,16 @@ test("local-validation is grantable, sorts last and leaves existing policy hashe
   assert.match(summary, /Local validation: a lane's frozen install, build, codegen, typecheck, lint and tests/);
   assert.match(summary, /Always asks: package or lockfile edits, shared databases or services, push, merge/);
   assert.doesNotMatch(approvalPolicySummary(validateApprovalPolicy(policy), "h"), /Local validation/);
+});
+
+test("adding the spec-push grant keeps the acknowledgement; any other change needs a new one", () => {
+  const before = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate"] });
+  const ack = { hash: approvalPolicyHash(before) };
+  const withPush = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate", "spec-push"] });
+  assert.equal(approvalAckMatches(ack, withPush), true, "no Record-this-policy dialog for spec-push");
+  assert.equal(approvalAckMatches(ack, before), true);
+  const widened = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate", "retire", "spec-push"] });
+  assert.equal(approvalAckMatches(ack, widened), false, "another new grant still needs the root");
+  assert.equal(approvalAckMatches(undefined, withPush), false);
+  assert.equal(approvalAckMatches({ hash: approvalPolicyHash(withPush) }, withPush), true);
 });

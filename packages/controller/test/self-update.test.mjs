@@ -134,25 +134,32 @@ test("a dirty or diverged checkout is left alone; the switch turns it all off", 
   }
 });
 
-test("an idle or done Pi root on older code gets /reload once per commit; a busy one waits; lanes never", async () => {
+test("a root on older code gets /reload when idle or done and no dialog is open; it retries until the record confirms it", async () => {
   const r = await repos();
   try {
     const old = git(r.installed, "rev-parse", "HEAD");
     const target = await r.advance("two\n");
     git(r.installed, "pull", "-q", "--ff-only");
+    const time = clock();
     let status = "working";
+    let dialog = false;
+    let loaded = old;
     const prompts = [];
+    const notes = [];
     const updater = createSelfUpdater({
       configDir: r.configDir,
       ownCheckout: r.installed,
       env: {},
+      now: time.now,
+      notify: async (note) => notes.push(note),
       startTests: async () => ({ ok: true, output: "" }),
       runtime: () => [
-        { role: "extension", checkout: r.installed, commit: old, paneId: "w1:p1", agentKind: "pi" },
+        { role: "extension", checkout: r.installed, commit: loaded, paneId: "w1:p1", agentKind: "pi" },
         // A Pi lane runs the same extension: never reloaded by the updater.
         { role: "extension", checkout: r.installed, commit: old, paneId: "w1:p40", agentKind: "pi" },
       ],
       rootPanes: async () => new Set(["w1:p1"]),
+      dialogOpen: async () => dialog,
       ready: async (paneId, expected) => {
         assert.deepEqual(expected, { pane_id: "w1:p1", agent_kind: "pi" });
         return { ok: true, agent: { agent_status: status } };
@@ -161,13 +168,61 @@ test("an idle or done Pi root on older code gets /reload once per commit; a busy
     });
     await updater.tick();
     assert.equal(prompts.length, 0, "never mid-turn");
-    // Herdr reports a Pi root that finished its turn as done.
     status = "done";
-    const result = await updater.tick();
+    dialog = true;
+    let result = await updater.tick();
+    assert.equal(prompts.length, 0, "never into a dialog");
+    assert.ok(result.events.includes("root reload in w1:p1 waits: a dialog is on screen"));
+    dialog = false;
+    time.advance(61_000);
+    result = await updater.tick();
     assert.deepEqual(prompts, [{ paneId: "w1:p1", text: "/reload" }]);
-    assert.ok(result.events.includes(`reloaded the root in w1:p1 onto ${target.slice(0, 12)}`));
+    assert.ok(result.events.includes(`sent /reload to the root in w1:p1 onto ${target.slice(0, 12)} (attempt 1)`));
     await updater.tick();
-    assert.equal(prompts.length, 1, "once per commit");
+    assert.equal(prompts.length, 1, "it waits a minute for the runtime record to confirm");
+    // The record still shows the old commit: the reload did not take; retry.
+    time.advance(61_000);
+    await updater.tick();
+    assert.equal(prompts.length, 2);
+    loaded = target;
+    result = await updater.tick();
+    assert.ok(result.events.includes(`root reload in w1:p1 confirmed on ${target.slice(0, 12)}`));
+    time.advance(120_000);
+    await updater.tick();
+    assert.equal(prompts.length, 2, "confirmed: no more reloads");
+    assert.equal(notes.filter((note) => note.title === "Baa-ton: root did not reload").length, 0);
+  } finally {
+    await r.cleanup();
+  }
+});
+
+test("a reload that never shows up is tried 5 times, then the user is told once", async () => {
+  const r = await repos();
+  try {
+    const old = git(r.installed, "rev-parse", "HEAD");
+    await r.advance("two\n");
+    git(r.installed, "pull", "-q", "--ff-only");
+    const time = clock();
+    const prompts = [];
+    const notes = [];
+    const updater = createSelfUpdater({
+      configDir: r.configDir,
+      ownCheckout: r.installed,
+      env: {},
+      now: time.now,
+      notify: async (note) => notes.push(note),
+      startTests: async () => ({ ok: true, output: "" }),
+      runtime: () => [{ role: "extension", checkout: r.installed, commit: old, paneId: "w1:p1", agentKind: "pi" }],
+      rootPanes: async () => new Set(["w1:p1"]),
+      ready: async () => ({ ok: true, agent: { agent_status: "idle" } }),
+      prompt: async (paneId, text) => prompts.push({ paneId, text }),
+    });
+    for (let step = 0; step < 8; step += 1) {
+      await updater.tick();
+      time.advance(61_000);
+    }
+    assert.equal(prompts.length, 5);
+    assert.equal(notes.filter((note) => note.title === "Baa-ton: root did not reload").length, 1);
   } finally {
     await r.cleanup();
   }
