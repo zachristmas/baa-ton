@@ -63,6 +63,20 @@ What an update does and doesn't change:
 - **Supervisor:** the controller supervisor restarts itself when its code on disk changes and stays stable for two checks. Herdr runs plugin startup hooks only when its server starts, so a supervisor started before this version must be restarted once.
 - **Version skew:** roots and lanes keep the code they loaded. `herdr_doctor` reports `runtime-version-skew` (installed commit versus what the root, each lane's MCP bridge and the supervisor loaded) and `controller-plugin-install` (the controller plugin linked from a different checkout than the one being updated). Reload what it lists before starting new work: a root in the same session (`pi --session <path>`), and a lane through `/mcp` reconnect or `herdr_resume`.
 
+### Automatic deploys
+
+Once the supervisor runs from a new enough version, merged fixes deploy themselves:
+- **Check:** every 10 minutes the supervisor fetches `origin/main` for its own checkout and for the checkout the root extension runs from (read from its runtime record).
+- **Test:** when a checkout is behind, the supervisor runs `npm test` on the new commit in a scratch worktree under its config directory. `npm ci` runs first only when `package.json` or `package-lock.json` changed. The run is a tracked child of the supervisor, never detached, with a 30-minute limit. A result is recorded once per commit.
+- **Deploy:** when the tests are green, each checkout that is clean, on `main` and able to fast-forward is fast-forwarded, followed by `npm ci` when the lockfile changed. A Herdr notification names the new commit.
+  - A red commit is never deployed. It raises one notification and is not retested.
+  - A checkout with local changes, on another branch, or diverged is left alone and logged.
+- **Reload:**
+  - The supervisor restarts on its code-change watcher. Hooks start a fresh process each time, so they need nothing.
+  - An idle Pi root running an older commit than its checkout is sent `/reload` once per commit. `/reload` keeps its session, and the live-agent check applies, so it is never typed mid-turn or into a shell.
+  - Lanes keep the code they loaded until they end.
+- **Off switch:** `BAATON_SELF_UPDATE=0` in the supervisor's environment, or `{"enabled": false}` in `<controller config dir>/self-update.json`. That file also records the last check, each tested commit's result and the reloads sent.
+
 Older installs kept orchestrator state in `.pi/herdr-orchestrator`. Setup copies it to `.baa-ton/herdr-orchestrator`, rewrites the absolute paths and route ids in it and in the controller's `config.json` and `inbox.json`, and leaves the old directory in place as an archive with a `MIGRATED-TO-BAA-TON.json` marker. Update at a quiet point: an old Baa-ton still running against `.pi` after the copy is reported by `herdr_doctor`. To migrate by hand, run `node packages/herdr-tools/state-migration.mjs --project-root <project> --controller-config-dir "$(herdr plugin config-dir herdr-orchestrator-controller)"`; `--status` only reports.
 
 ## Re-run project setup

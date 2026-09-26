@@ -4252,6 +4252,9 @@ export async function runSupervisorLoop({
   onCodeChange,
   codeChanged,
   loaded,
+  // Deploy without anyone (self-update.mjs): the real supervisor run tests
+  // and fast-forwards new commits; tests pass a fake or nothing.
+  selfUpdate,
 } = {}) {
   assert(
     Number.isSafeInteger(intervalMs) && intervalMs >= 5_000,
@@ -4276,6 +4279,29 @@ export async function runSupervisorLoop({
         commit: code.commit,
       })
     : () => {};
+  let updater = selfUpdate;
+  if (!updater && onCodeChange && code) {
+    try {
+      const { createSelfUpdater } = await import("./self-update.mjs");
+      const api = herdr ?? new JsonLineHerdrClient();
+      updater = createSelfUpdater({
+        configDir: resolvedConfigDir,
+        ownCheckout: code.checkout,
+        runtime: () => listRuntime(resolvedConfigDir),
+        notify: herdrNotification,
+        ready: (paneId, expected) => agentReadyForSend(api, paneId, expected),
+        prompt: async (paneId, text) => {
+          try {
+            await api.request("agent.prompt", { target: paneId, text });
+          } catch (error) {
+            throw Object.assign(error instanceof Error ? error : new Error(String(error)), { sent: Boolean(error?.sent) || !unavailable(error) });
+          }
+        },
+      });
+    } catch {
+      updater = undefined;
+    }
+  }
   let stopping = false;
   let ticking = false;
   let timer;
@@ -4317,6 +4343,10 @@ export async function runSupervisorLoop({
           configDir: resolvedConfigDir,
           herdr,
         });
+        if (updater && !stopping) {
+          const update = await updater.tick().catch((error) => ({ events: [`self-update: ${error instanceof Error ? error.message : String(error)}`] }));
+          for (const event of update?.events ?? []) process.stderr.write(`herdr-orchestrator-controller supervisor: ${event}\n`);
+        }
       } catch (error) {
         process.stderr.write(
           `herdr-orchestrator-controller supervisor: ${error instanceof Error ? error.message : String(error)}\n`,
