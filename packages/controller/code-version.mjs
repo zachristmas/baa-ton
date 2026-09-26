@@ -143,6 +143,39 @@ export function recordRuntime(configDir, record) {
   return remove;
 }
 
+/**
+ * Remove the records of pieces whose process is gone (they pile up: every
+ * lane bridge and extension writes one). Returns how many were removed.
+ */
+export function pruneRuntime(configDir) {
+  if (!configDir) return 0;
+  let names;
+  try {
+    names = readdirSync(runtimeDirectory(configDir));
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const path = join(runtimeDirectory(configDir), name);
+    let pid;
+    try {
+      pid = JSON.parse(readFileSync(path, "utf8")).pid;
+    } catch {
+      pid = Number(/-(\d+)\.json$/.exec(name)?.[1]);
+    }
+    if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) continue;
+    try {
+      rmSync(path, { force: true });
+      removed += 1;
+    } catch {
+      // Best effort.
+    }
+  }
+  return removed;
+}
+
 /** Records of pieces whose process is still alive. */
 export function listRuntime(configDir) {
   if (!configDir) return [];

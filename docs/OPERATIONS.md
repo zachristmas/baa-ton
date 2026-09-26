@@ -73,7 +73,7 @@ Once the supervisor runs from a new enough version, merged fixes deploy themselv
   - A checkout with local changes, on another branch, or diverged is left alone and logged.
 - **Reload:**
   - The supervisor restarts on its code-change watcher. Hooks start a fresh process each time, so they need nothing.
-  - An idle Pi root running an older commit than its checkout is sent `/reload` once per commit. `/reload` keeps its session, and the live-agent check applies, so it is never typed mid-turn or into a shell.
+  - A Pi root (a root pane from the controller config, never a lane) that is idle or done and running an older commit than its checkout is sent `/reload` once per commit. Each update check also prunes the runtime records of processes that have ended. `/reload` keeps its session, and the live-agent check applies, so it is never typed mid-turn or into a shell.
   - Lanes keep the code they loaded until they end.
 - **Log:** the supervisor writes its start (commit and fingerprint), tick failures, every self-update event, updater failures and restarts to `<controller config dir>/supervisor.log`. It is capped at 1 MB with one rotated `supervisor.log.1`. A repeated failure is logged once, and so is its recovery. Deploys run even when the rest of a tick fails.
 - **Off switch:** `BAATON_SELF_UPDATE=0` in the supervisor's environment, or `{"enabled": false}` in `<controller config dir>/self-update.json`. That file also records the last check, each tested commit's result and the reloads sent.

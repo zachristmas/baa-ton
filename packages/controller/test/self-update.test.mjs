@@ -134,7 +134,7 @@ test("a dirty or diverged checkout is left alone; the switch turns it all off", 
   }
 });
 
-test("an idle Pi root on older code gets /reload once per commit; a busy one waits", async () => {
+test("an idle or done Pi root on older code gets /reload once per commit; a busy one waits; lanes never", async () => {
   const r = await repos();
   try {
     const old = git(r.installed, "rev-parse", "HEAD");
@@ -147,7 +147,12 @@ test("an idle Pi root on older code gets /reload once per commit; a busy one wai
       ownCheckout: r.installed,
       env: {},
       startTests: async () => ({ ok: true, output: "" }),
-      runtime: () => [{ role: "extension", checkout: r.installed, commit: old, paneId: "w1:p1", agentKind: "pi" }],
+      runtime: () => [
+        { role: "extension", checkout: r.installed, commit: old, paneId: "w1:p1", agentKind: "pi" },
+        // A Pi lane runs the same extension: never reloaded by the updater.
+        { role: "extension", checkout: r.installed, commit: old, paneId: "w1:p40", agentKind: "pi" },
+      ],
+      rootPanes: async () => new Set(["w1:p1"]),
       ready: async (paneId, expected) => {
         assert.deepEqual(expected, { pane_id: "w1:p1", agent_kind: "pi" });
         return { ok: true, agent: { agent_status: status } };
@@ -156,7 +161,8 @@ test("an idle Pi root on older code gets /reload once per commit; a busy one wai
     });
     await updater.tick();
     assert.equal(prompts.length, 0, "never mid-turn");
-    status = "idle";
+    // Herdr reports a Pi root that finished its turn as done.
+    status = "done";
     const result = await updater.tick();
     assert.deepEqual(prompts, [{ paneId: "w1:p1", text: "/reload" }]);
     assert.ok(result.events.includes(`reloaded the root in w1:p1 onto ${target.slice(0, 12)}`));
@@ -164,5 +170,24 @@ test("an idle Pi root on older code gets /reload once per commit; a busy one wai
     assert.equal(prompts.length, 1, "once per commit");
   } finally {
     await r.cleanup();
+  }
+});
+
+test("runtime records of ended processes are pruned", async () => {
+  const { pruneRuntime, listRuntime } = await import("../code-version.mjs");
+  const directory = await mkdtemp(join(tmpdir(), "baa-runtime-"));
+  try {
+    const { mkdir: makeDir } = await import("node:fs/promises");
+    await makeDir(join(directory, "runtime"), { recursive: true });
+    await writeFile(join(directory, "runtime", `bridge-${process.pid}.json`), JSON.stringify({ role: "bridge", pid: process.pid }));
+    // A child that has already exited: its pid is gone.
+    const { spawnSync } = await import("node:child_process");
+    const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
+    await writeFile(join(directory, "runtime", `bridge-${dead}.json`), JSON.stringify({ role: "bridge", pid: Number(dead) }));
+    await writeFile(join(directory, "runtime", "extension-99999999.json"), "not json");
+    assert.equal(pruneRuntime(directory), 2);
+    assert.deepEqual(listRuntime(directory).map((record) => record.pid), [process.pid], "the live record stays");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

@@ -80,6 +80,10 @@ export function createSelfUpdater({
   ready = async () => ({ ok: false, reason: "no Herdr" }),
   prompt = async () => undefined,
   commitOf,
+  // Root panes (from the controller config): only roots get /reload, never
+  // the Pi extension records of lanes. Undefined means no filter.
+  rootPanes = async () => undefined,
+  prune = () => 0,
   now = () => new Date().toISOString(),
   env = process.env,
 } = {}) {
@@ -116,14 +120,17 @@ export function createSelfUpdater({
   /** An idle Pi root still running older code than its checkout gets /reload, once per commit. */
   const reloadRoots = async (state) => {
     const events = [];
+    const roots = await Promise.resolve(rootPanes()).catch(() => undefined);
     for (const record of runtime()) {
       if (record.role !== "extension" || !record.paneId || !record.checkout) continue;
+      if (roots && !roots.has(record.paneId)) continue;
       const disk = await headOf(record.checkout);
       if (!disk || !record.commit || disk === record.commit) continue;
       if ((state.reloads ??= {})[record.paneId] === disk) continue;
       if (!(await clean(record.checkout).catch(() => false))) continue;
       const check = await ready(record.paneId, { pane_id: record.paneId, agent_kind: record.agentKind ?? "pi" });
-      if (!check?.ok || check.agent?.agent_status !== "idle") continue;
+      // Herdr reports a Pi root that finished its turn as done, or as idle.
+      if (!check?.ok || !["idle", "done"].includes(check.agent?.agent_status)) continue;
       try {
         await prompt(record.paneId, "/reload");
         state.reloads[record.paneId] = disk;
@@ -176,6 +183,8 @@ export function createSelfUpdater({
         }
       } else if (!active && (!state.lastCheckAt || Date.parse(now()) - Date.parse(state.lastCheckAt) >= SELF_UPDATE_CHECK_MS)) {
         state.lastCheckAt = now();
+        const pruned = prune();
+        if (pruned) events.push(`pruned ${pruned} runtime record(s) of ended processes`);
         const base = checkouts()[0];
         if (base) {
           await git(base, "fetch", "-q", "origin", "main").catch(() => undefined);
