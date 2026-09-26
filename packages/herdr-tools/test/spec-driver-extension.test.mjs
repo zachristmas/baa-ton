@@ -116,6 +116,14 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     aheadOf: async () => 1,
     // No target SHA (no suite baseline) unless a test says so.
     revParse: async () => undefined,
+    async detachedWorktree(input) {
+      calls.detached = [...(calls.detached ?? []), input];
+    },
+    async removeWorktree(input) {
+      calls.removed = [...(calls.removed ?? []), input];
+    },
+    // A clean integration worktree unless a test says so.
+    cleanIntegration: async () => undefined,
     async restore(input) {
       calls.restore = [...(calls.restore ?? []), input];
     },
@@ -391,11 +399,12 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     const verify = f.calls.plan[0];
     assert.equal(verify.specStage, "verify");
     assert.equal(verify.taskProfile, "quick");
-    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-integration"));
+    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-verify-A"), "never the integration worktree");
+    assert.deepEqual(f.calls.detached, [{ repo: f.calls.detached[0].repo, path: join(f.worktreeRoot, "spec-verify-A"), sha }], "detached at the pushed commit");
     assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
 
-    await mkdir(join(f.worktreeRoot, "spec-integration", "artifacts"), { recursive: true });
-    await writeFile(join(f.worktreeRoot, "spec-integration", "artifacts", "a.final.docx"), docx(2));
+    await mkdir(join(f.worktreeRoot, "spec-verify-A", "artifacts"), { recursive: true });
+    await writeFile(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), docx(2));
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
     result = await f.advance();
@@ -403,7 +412,9 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     const state = await f.state();
     assert.equal(state.items.A.state, "done");
     assert.equal(state.items.A.evidence.images, 2);
-    assert.equal(state.items.A.evidence.path, join(f.worktreeRoot, "spec-integration", "artifacts", "a.final.docx"));
+    assert.equal(state.items.A.evidence.path, join(f.stateDir, "evidence", "A", "a.final.docx"), "kept in the state folder");
+    assert.deepEqual(f.calls.removed.map((call) => call.path), [join(f.worktreeRoot, "spec-verify-A")], "the verify worktree is removed once done");
+    assert.equal(state.items.A.verifyWorktree, undefined);
   } finally {
     await f.cleanup();
   }
@@ -1731,6 +1742,27 @@ test("an evidence report rewritten by a newer valid run is re-recorded, and the 
   } finally {
     await f.cleanup();
     await rm(reportDir, { recursive: true, force: true });
+  }
+});
+
+test("a fresh integrate lane starts from a clean integration worktree: leftover staged or half-merged work is saved and aborted", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D17", title: "Footer", acceptance: { text: "f" } }] },
+    seed: { version: 1, items: { D17: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    const cleaned = [];
+    f.ports.cleanIntegration = async (input) => (cleaned.push(input), { merging: true, files: 4 });
+    const result = await f.advance();
+    assert.equal(cleaned.length, 1);
+    assert.equal(cleaned[0].worktree, join(f.worktreeRoot, "spec-integration"));
+    assert.match(cleaned[0].patchPath, /aborted-integrations\/D17-.*\.patch$/);
+    assert.match(result.content[0].text, /cleaned spec-integration before integrating D17/);
+    const integrate = f.calls.plan.find((call) => call.specStage === "integrate");
+    assert.match(integrate.laneObjective, /git merge --abort/, "and lanes are told never to leave it staged");
+    assert.ok((await f.state()).items.D17.history.some((entry) => /half-done merge \(4 file\(s\)\).*saved as a patch and aborted/.test(entry.note ?? "")));
+  } finally {
+    await f.cleanup();
   }
 });
 

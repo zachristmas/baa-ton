@@ -4611,6 +4611,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
     commit?(input: { worktree: string; paths: string[]; message: string }): Promise<string>;
+    /** A fresh detached worktree at `sha` (verification never uses the integration worktree). */
+    detachedWorktree?(input: { repo: string; path: string; sha: string }): Promise<void>;
+    /** Remove a verify worktree once its item left verification. */
+    removeWorktree?(input: { repo: string; path: string }): Promise<void>;
+    /** Save and abort a half-done merge or staged changes left in the integration worktree; undefined when clean. */
+    cleanIntegration?(input: { worktree: string; patchPath: string }): Promise<{ merging: boolean; files: number } | undefined>;
     /** Push `sha` to `remote`'s `branch` from the integration worktree (spec-push grant). */
     push?(input: { worktree: string; remote: string; sha: string; branch: string }): Promise<void>;
     /** Send a root-to-lane message (herdr_tell). */
@@ -5070,10 +5076,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         }
         // An adopted item keeps its own branch and worktree.
         const branch = record.branch ?? `spec/${item.id}`;
+        // Verification never shares the integration worktree: each pushed
+        // item is verified in its own detached worktree at its pushed commit.
         const worktree =
-          action.kind === "integrate" || action.kind === "verify"
+          action.kind === "integrate"
             ? integrationWorktree
-            : record.worktree ?? join(worktreeRoot, `spec-${item.id}`);
+            : action.kind === "verify"
+              ? join(worktreeRoot, `spec-verify-${item.id}`)
+              : record.worktree ?? join(worktreeRoot, `spec-${item.id}`);
         try {
           let profile: string;
           let objective: string;
@@ -5082,7 +5092,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             objective = decideObjective(spec, item);
           } else if (action.kind === "verify") {
             profile = spec.stages.verify?.profile ?? "quick";
-            await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
+            await (ports?.detachedWorktree ??
+              (async ({ repo: repoPath, path, sha }: { repo: string; path: string; sha: string }) => {
+                await execFile("git", ["-C", repoPath, "worktree", "remove", "--force", path], { timeout: 60_000 }).catch(() => undefined);
+                await rm(path, { recursive: true, force: true });
+                await mkdir(dirname(path), { recursive: true });
+                await execFile("git", ["-C", repoPath, "worktree", "add", "--detach", path, sha], { signal, timeout: 120_000 });
+              }))({ repo, path: worktree, sha: record.integratedSha ?? record.integration?.sha });
+            record.verifyWorktree = worktree;
             objective = verifyObjective(spec, item, {
               releaseSha: record.releaseSha,
               reportPath: item.acceptance.evidence ? finalReportPath(spec, item.acceptance.evidence.report) : "",
@@ -5090,6 +5107,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           } else if (action.kind === "integrate") {
             profile = spec.stages.integrate?.profile ?? "balanced";
             await use.worktree({ repo, path: worktree, branch: "spec-integration", base: targetRef }, signal);
+            // An earlier lane that stopped mid-merge left it staged: save that
+            // work as a patch in the state folder, then put the worktree back
+            // to its last commit, so this lane starts (and dispatches) clean.
+            const leftover = await (ports?.cleanIntegration ??
+              (async ({ worktree: path, patchPath }: { worktree: string; patchPath: string }) => {
+                const porcelain = (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=no"], { timeout: 30_000 })).stdout;
+                const merging = await execFile("git", ["-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD"], { timeout: 30_000 }).then(() => true, () => false);
+                if (!porcelain.trim() && !merging) return undefined;
+                await mkdir(dirname(patchPath), { recursive: true });
+                const diff = (await execFile("git", ["-C", path, "diff", "HEAD"], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 })).stdout;
+                await writeFile(patchPath, diff);
+                await execFile("git", ["-C", path, merging ? "merge" : "reset", merging ? "--abort" : "--merge"], { timeout: 60_000 });
+                return { merging, files: porcelain.split("\n").filter(Boolean).length };
+              }))({ worktree, patchPath: join(ctx.cwd, ".baa-ton", "herdr-orchestrator", "aborted-integrations", `${item.id}-${use.now().replace(/[:.]/g, "-")}.patch`) });
+            if (leftover) {
+              record.history = [...(record.history ?? []), { at: use.now(), from: record.state, to: record.state, note: `spec-integration had ${leftover.merging ? "a half-done merge" : "staged changes"} (${leftover.files} file(s)) from an earlier lane: saved as a patch and aborted before this lane` }];
+              done.push(`cleaned spec-integration before integrating ${item.id}`);
+            }
             // Adopted work may be uncommitted: list exactly the item-owned
             // paths (never secrets) for the integration lane to commit first.
             let commitFirst;
@@ -5229,8 +5264,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const record = next.items[item.id];
         if (record?.state !== "verifying" || !record.verified) continue;
         if (item.acceptance.evidence && record.finalReport && record.evidence?.reportAt !== record.verified) {
-          const path = isAbsolute(record.finalReport) ? record.finalReport : join(integrationWorktree, record.finalReport);
-          const buffer = await readFile(path).catch(() => undefined);
+          const written = isAbsolute(record.finalReport) ? record.finalReport : join((record.verifyWorktree as string | undefined) ?? integrationWorktree, record.finalReport);
+          const buffer = await readFile(written).catch(() => undefined);
+          // Kept in the state folder: the verify worktree is removed afterwards.
+          const path = join(ctx.cwd, ".baa-ton", "herdr-orchestrator", "evidence", item.id, basename(written));
+          if (buffer) {
+            await mkdir(dirname(path), { recursive: true });
+            await writeFile(path, buffer);
+          }
           if (buffer)
             record.evidence = {
               path,
@@ -5307,6 +5348,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ask.reason = `${ask.reason ?? "push"}; the pre-approved push failed: ${clip(failureOutput(error), 300)}`;
             done.push(`push of ${ask.sha.slice(0, 12)} failed: ${clip((error as Error).message, 120)}`);
           }
+        }
+      }
+      // Verify worktrees go once their item left verification (its report
+      // was copied to the state folder when it was recorded).
+      for (const item of spec.items) {
+        const record = next.items[item.id];
+        if (!record?.verifyWorktree || record.state === "verifying") continue;
+        const path = record.verifyWorktree as string;
+        try {
+          await (ports?.removeWorktree ??
+            (async ({ repo: repoPath, path: target }: { repo: string; path: string }) => {
+              await execFile("git", ["-C", repoPath, "worktree", "remove", "--force", target], { timeout: 60_000 }).catch(() => undefined);
+              await rm(target, { recursive: true, force: true });
+            }))({ repo, path });
+          delete record.verifyWorktree;
+          done.push(`removed the verify worktree of ${item.id}`);
+        } catch (error) {
+          done.push(`removing the verify worktree of ${item.id} failed: ${clip((error as Error).message, 120)}`);
         }
       }
       for (const [id, reason] of Object.entries(step.waits)) if (next.items[id]) next.items[id].wait = reason;
