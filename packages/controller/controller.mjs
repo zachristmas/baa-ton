@@ -48,6 +48,7 @@ export {
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import { handleBlockedLane, handleIdleLane, resolveScreenPrompts } from "./blocked-lane.mjs";
+import { writeHeartbeat } from "./supervisor-keepalive.mjs";
 import {
   enqueueWakeHint,
   inboxRoutable,
@@ -4466,7 +4467,13 @@ const SUPERVISOR_LOG_MAX_BYTES = 1024 * 1024;
  */
 export function supervisorLog(configDir, message) {
   const line = `${new Date().toISOString()} [${process.pid}] ${message}\n`;
-  process.stderr.write(`herdr-orchestrator-controller supervisor: ${message}\n`);
+  // stderr is whatever Herdr's startup hook gave us, a pipe that may close:
+  // a failed write there must never take the supervisor down.
+  try {
+    process.stderr.write(`herdr-orchestrator-controller supervisor: ${message}\n`);
+  } catch {
+    // The file below has it.
+  }
   if (!configDir) return;
   const path = join(configDir, "supervisor.log");
   try {
@@ -4662,6 +4669,8 @@ export async function runSupervisorLoop({
     ticking = true;
     const current = (async () => {
       try {
+        // The plugin hook's keepalive reads this (supervisor-keepalive.mjs).
+        writeHeartbeat(resolvedConfigDir, { commit: code?.commit });
         try {
           await runSupervisorTick({
             stateDir: resolvedStateDir,
@@ -4732,25 +4741,48 @@ export async function runSupervisorLoop({
 export async function runSupervisorLauncher({
   spawnRunner = spawnSupervisorRunner,
   restartDelayMs = 1_000,
+  crashDelayMs = 5_000,
   maxRestarts = 5,
   windowMs = 10 * 60_000,
   clock = () => Date.now(),
+  log = (message) => supervisorLog(process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR, message),
 } = {}) {
   const restarts = [];
   while (true) {
     const exitCode = await spawnRunner();
-    if (exitCode !== SUPERVISOR_RESTART_EXIT_CODE) return exitCode;
+    // 0 is a clean stop (a signal, or another supervisor holds the lease).
+    if (exitCode === 0) return exitCode;
+    // A crash restarts the runner too; it counts toward the runaway guard.
+    const crashed = exitCode !== SUPERVISOR_RESTART_EXIT_CODE;
+    if (crashed) log(`launcher: the runner exited with code ${exitCode}; restarting it`);
     const at = clock();
     restarts.push(at);
     while (restarts.length && at - restarts[0] > windowMs) restarts.shift();
     if (restarts.length > maxRestarts) {
-      process.stderr.write(
-        `herdr-orchestrator-controller supervisor: ${restarts.length} code-change restarts in ${Math.round(windowMs / 60_000)} min; stopping.\n`,
-      );
+      log(`launcher: ${restarts.length} restarts in ${Math.round(windowMs / 60_000)} min; stopping (the plugin hook's keepalive starts it again later)`);
       return exitCode;
     }
-    if (restartDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, restartDelayMs));
+    const delay = crashed ? crashDelayMs : restartDelayMs;
+    if (delay > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
   }
+}
+
+/**
+ * Log why a supervisor process ends, and survive what it can: a failed
+ * stderr write (EPIPE), a hangup from whoever started it, an unhandled
+ * rejection. An uncaught exception is logged and exits non-zero, so the
+ * launcher restarts the runner.
+ */
+export function guardSupervisorProcess(role, configDir, { proc = process, log = (message) => supervisorLog(configDir, message) } = {}) {
+  proc.stderr?.on?.("error", () => undefined);
+  proc.stdout?.on?.("error", () => undefined);
+  proc.on("SIGHUP", () => log(`${role}: received SIGHUP; ignored (the supervisor outlives the process that started it)`));
+  proc.on("unhandledRejection", (reason) => log(`${role}: unhandled rejection (kept running): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`.slice(0, 2000)));
+  proc.on("uncaughtException", (error) => {
+    log(`${role}: crashed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`.slice(0, 2000));
+    proc.exit(1);
+  });
+  proc.on("exit", (code) => log(`${role}: exiting with code ${code}`));
 }
 
 function spawnSupervisorRunner() {
@@ -4793,9 +4825,28 @@ export function hookResponse(result) {
 
 async function main() {
   const command = process.argv[2];
+  const supervisorDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR;
   if (command === "hook") {
-    const result = await handleHook();
-    process.stdout.write(`${JSON.stringify(hookResponse(result))}\n`);
+    try {
+      const result = await handleHook();
+      process.stdout.write(`${JSON.stringify(hookResponse(result))}\n`);
+    } finally {
+      // Every hook, whatever its event did, checks that the supervisor is
+      // alive and starts it again when it died (Herdr runs the startup
+      // command only at its own start).
+      try {
+        const { ensureSupervisor } = await import("./supervisor-keepalive.mjs");
+        await ensureSupervisor({
+          configDir: supervisorDir,
+          anomaly: async (anomaly) => {
+            const { reportAnomaly } = await import("./anomalies.mjs");
+            return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+          },
+        });
+      } catch {
+        // Best effort: the next hook tries again.
+      }
+    }
     return;
   }
   if (command === "supervisor-once") {
@@ -4803,10 +4854,12 @@ async function main() {
     return;
   }
   if (command === "supervisor") {
+    guardSupervisorProcess("launcher", supervisorDir);
     process.exitCode = await runSupervisorLauncher();
     return;
   }
   if (command === "supervisor-run") {
+    guardSupervisorProcess("runner", supervisorDir);
     await runSupervisorLoop({
       onCodeChange: () => process.exit(SUPERVISOR_RESTART_EXIT_CODE),
     });

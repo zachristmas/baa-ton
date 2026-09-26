@@ -4062,15 +4062,18 @@ test("the supervisor releases its lease, drops its runtime record and asks for a
   }
 });
 
-test("the supervisor launcher restarts on the restart exit code, stops on any other, and guards against loops", async () => {
-  const exits = [SUPERVISOR_RESTART_EXIT_CODE, SUPERVISOR_RESTART_EXIT_CODE, 0];
+test("the supervisor launcher restarts on the restart exit code and on a crash, stops on a clean exit, and guards against loops", async () => {
+  const exits = [SUPERVISOR_RESTART_EXIT_CODE, 1, SUPERVISOR_RESTART_EXIT_CODE, 0];
   let runs = 0;
-  assert.equal(await runSupervisorLauncher({ restartDelayMs: 0, spawnRunner: async () => { runs += 1; return exits.shift(); } }), 0);
-  assert.equal(runs, 3, "two code-change restarts, then a normal exit");
+  const logged = [];
+  assert.equal(await runSupervisorLauncher({ restartDelayMs: 0, crashDelayMs: 0, log: (line) => logged.push(line), spawnRunner: async () => { runs += 1; return exits.shift(); } }), 0);
+  assert.equal(runs, 4, "code-change restarts and a crash restart, then a clean exit");
+  assert.deepEqual(logged, ["launcher: the runner exited with code 1; restarting it"], "a crash is logged");
   let clock = 0;
   let loops = 0;
   const code = await runSupervisorLauncher({
     restartDelayMs: 0,
+    log: () => undefined,
     maxRestarts: 3,
     windowMs: 60_000,
     clock: () => (clock += 1_000),

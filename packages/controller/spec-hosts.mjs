@@ -44,6 +44,9 @@ function defaultSpawnHost({ orchestrator, configDir, script = HOST_SCRIPT }) {
   });
   let stderr = "";
   child.stderr?.on("data", (chunk) => (stderr = (stderr + chunk).slice(-2000)));
+  // A failed spawn or IPC error is the child's problem, never an uncaught
+  // 'error' that takes the supervisor down; its exit is handled by the caller.
+  child.on("error", (error) => (stderr = `${stderr}\n${error instanceof Error ? error.message : String(error)}`.slice(-2000)));
   child.stderrTail = () => stderr;
   return child;
 }
