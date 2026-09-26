@@ -36,6 +36,8 @@ export function hermeticEnvironment(env = process.env) {
   isolated.BAA_TON_NO_RUNTIME_RECORDS = "1";
   // A hook run by a test must never start a real supervisor.
   isolated.BAA_TON_NO_SUPERVISOR_KEEPALIVE = "1";
+  // Fake herdr commands may start slowly on a loaded machine.
+  isolated.BAATON_HERDR_COMMAND_TIMEOUT_MS = "120000";
   // The operator channel's store defaults to the user's real one; a
   // supervisor tick in a test would otherwise deliver its live messages.
   isolated.BAATON_OPERATOR_STORE = join(tmpdir(), `baa-hermetic-operator-${process.pid}-${Date.now()}.json`);

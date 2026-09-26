@@ -852,6 +852,11 @@ export function advanceSpec({
   for (const item of spec.items) {
     const current = next.items[item.id];
     if (current?.state !== "verifying" || current.lane || current.verified) continue;
+    // A demo lane after an evidence failure waits out its backoff.
+    if (typeof current.evidenceRetryAfter === "string" && Date.parse(now) < Date.parse(current.evidenceRetryAfter)) {
+      waits[item.id] = `evidence: a demo lane after ${current.evidenceRetryAfter}`;
+      continue;
+    }
     const needsLane = item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
     if (!needsLane) {
       current.verified = now;
@@ -996,9 +1001,12 @@ export function decideObjective(spec, item) {
 }
 
 /** The verify lane's objective: preview specs against the deployed release, then the final report. */
-export function verifyObjective(spec, item, { worktree, releaseSha, reportPath }) {
+export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, evidenceProblem }) {
   return [
     `Verify spec item ${item.id}: ${item.title}, now pushed to ${spec.target.remote}/${spec.target.branch}${releaseSha ? ` and deployed (release ${releaseSha})` : ""}.`,
+    evidenceProblem
+      ? `The last run's demo evidence failed the check: ${evidenceProblem}. Producing that evidence is this lane's main job: run the feature in the browser, capture a captioned screenshot for every navigation or action with demo-report.mjs, and write the .docx and its steps manifest at ${reportPath || "the configured report path"}.`
+      : "",
     worktree
       ? `Your worktree is ${worktree} (a detached checkout of the pushed commit), and you start in it: run every command from it with relative paths, never cd into a retyped absolute path.`
       : "",
@@ -1051,7 +1059,9 @@ export function reviewObjective(spec, item, { branch, buildSummary }) {
     `Diff: git diff ${spec.target.remote}/${spec.target.branch}...${branch}`,
     `Acceptance: ${item.acceptance.text}`,
     item.acceptance.tests.length ? `Its tests: ${item.acceptance.tests.join("; ")}.` : "",
-    item.acceptance.evidence ? `Check the evidence report ${item.acceptance.evidence.report}: at least ${item.acceptance.evidence.minImages} screenshots, one per navigation or action, each with a caption.` : "",
+    item.acceptance.evidence
+      ? "Do not judge the demo evidence or runtime proof that needs a running stack: the verify stage produces the demo report after integration, and a deterministic check verifies it. Judge the code, its tests and the acceptance logic; a missing, stale or pre-fix demo is never a reason to fail this review."
+      : "",
     buildSummary ? `The builder reported:\n${buildSummary}` : "",
     "Finish with herdr_complete. The summary's first line must be exactly VERDICT: PASS or VERDICT: FAIL, followed by the findings (file:line and what is wrong) for a FAIL.",
   ].filter(Boolean).join("\n");
