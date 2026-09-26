@@ -214,9 +214,31 @@ These refine the design where it meets existing invariants:
   - **Digest line:** every root digest now starts with the burn-down line (`spec N/M done · 2 building · 1 awaiting-push · 1 blocked(decision)`), computed by the controller from `spec.json` and `spec-state.json`.
   - **Not verified live:** the release-check formats beyond these parsers; a real preview run.
 
+## Who drives
+
+A root stayed in one turn for hours doing lane work. Its extension's driver went silent, and the root never took the `/reload` that would have brought new driver code. So the driver now runs in the **supervisor**, not in the root:
+
+- **Spec host.** For every Pi root whose project has `.baa-ton/spec.json`, the supervisor keeps one spec host process running (`packages/herdr-tools/spec-host.mjs`). The host loads the extension headless, as that root, and runs `herdr_spec action=advance` on its own timer.
+  - The supervisor restarts a host that exits, backing off from 30 s up to 10 min.
+  - Each host stops with the supervisor, so every deploy restarts the driver on the new code.
+  - A pass that runs over 20 min ends the host, and the supervisor starts a fresh one.
+- **Hand-over** (`spec-handover.mjs`). The host renews a lease (`spec-driver-host.json`) every 15 s.
+  - While the lease is live, the root's extension stands down between its own passes and records that (`spec-driver-defer.json`).
+  - The host drives once the root has stood down since the host started, so two drivers never overlap. It also drives when the root pane has no Pi agent at all. After that it never waits on the root: a root that is busy, hung or gone does not stop the loop.
+  - A root on older code never stands down and keeps driving until it reloads. A dead host's lease goes stale in 90 s, and the root drives again.
+- **Root identity in the host.** Planning and dispatch bind a lane to the root's session and check that binding before dispatch. The host has no Pi session of its own, so it presents the root's.
+  - Each pass, the host reads the root's live session from Herdr, meaning the session file and the id in its header.
+  - It keeps the last session it saw in its lease, including across host restarts, so a busy or dead root does not block dispatch.
+  - The root mapping comes from the controller config, not from a live agent in the pane.
+  - This applies only in a process the supervisor started with `BAATON_SPEC_HOST=1`, for the configured root pane.
+  - The trade-off: the check now proves which root session a lane belongs to, not that the caller is that session. Everything runs as the same user.
+- **The root** gets rootAsks and decisions through its digest, as before: the driver writes them as root alerts in the manifest and the supervisor delivers them to the root pane. Receipts and operator messages route as before. Its `herdr_spec` tools (status, answer) stay clients of the same state under the manifest lock.
+- **Root turns.** A root turn that runs 30 minutes or longer is interrupted with Escape (at most once per 30 minutes) and reported as a `root-turn-too-long` anomaly. The idle root then takes any due `/reload`.
+- **Root contract.** The root decides and dispatches. It never does lane work itself, such as debugging a lane's failure: it dispatches a lane or decides.
+
 ## When the driver runs
 
-A root can stay in one LLM turn for many minutes, so the driver doesn't wait for turns. The root's extension runs it:
+A root can stay in one LLM turn for many minutes, so the driver doesn't wait for turns. The spec host runs it (or, until hand-over, the root's extension):
 
 - every 25 seconds while the root session is up;
 - 2 seconds after `manifest.json` changes, which is where lane receipts and statuses land;

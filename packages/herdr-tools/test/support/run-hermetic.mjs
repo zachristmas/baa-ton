@@ -48,7 +48,7 @@ const suites = {
     // exhaust memory on a busy machine and starve a bridge past its timeout.
     ["--test", "--test-concurrency=4", "packages/herdr-tools/test/*.test.mjs"],
   ],
-  controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs", "packages/controller/test/blocked-lane.test.mjs", "packages/controller/test/self-update.test.mjs", "packages/controller/test/root-dialog.test.mjs", "packages/controller/test/supervisor-self-update.test.mjs", "packages/controller/test/anomalies.test.mjs"]],
+  controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs", "packages/controller/test/blocked-lane.test.mjs", "packages/controller/test/self-update.test.mjs", "packages/controller/test/root-dialog.test.mjs", "packages/controller/test/supervisor-self-update.test.mjs", "packages/controller/test/anomalies.test.mjs", "packages/controller/test/spec-hosts.test.mjs"]],
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

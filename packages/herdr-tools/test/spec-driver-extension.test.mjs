@@ -237,6 +237,45 @@ test("a review profile on the builder's model blocks the item and asks the root"
   }
 });
 
+test("while the supervisor's spec host holds a live lease the root stands down, hands over, and then the host drives", async () => {
+  const f = await fixture();
+  const saved = process.env.BAATON_SPEC_HOST;
+  try {
+    // A live host (the parent process stands in for it) started a minute ago.
+    const startedAt = new Date(Date.now() - 60_000).toISOString();
+    await writeFile(join(f.stateDir, "spec-driver-host.json"), JSON.stringify({ pid: process.ppid, startedAt, at: new Date().toISOString() }));
+    const root = await f.advance();
+    assert.match(root.content[0].text, /Spec driver skipped: the supervisor's spec host \(pid \d+\) drives the spec loop/);
+    assert.equal(f.calls.plan.length, 0, "the root starts nothing");
+    const defer = JSON.parse(await readFile(join(f.stateDir, "spec-driver-defer.json"), "utf8"));
+    assert.equal(defer.pid, process.pid);
+    // The same extension in host mode now drives.
+    process.env.BAATON_SPEC_HOST = "1";
+    const host = await f.advance();
+    assert.match(host.content[0].text, /Started: build A -> herdr-spec1\./);
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_SPEC_HOST;
+    else process.env.BAATON_SPEC_HOST = saved;
+    await f.cleanup();
+  }
+});
+
+test("a spec host waits until the root has handed over", async () => {
+  const f = await fixture();
+  const saved = process.env.BAATON_SPEC_HOST;
+  try {
+    process.env.BAATON_SPEC_HOST = "1";
+    await writeFile(join(f.stateDir, "spec-driver-host.json"), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), at: new Date().toISOString() }));
+    const result = await f.advance();
+    assert.match(result.content[0].text, /waiting for the root's extension to hand the driver over/);
+    assert.equal(f.calls.plan.length, 0);
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_SPEC_HOST;
+    else process.env.BAATON_SPEC_HOST = saved;
+    await f.cleanup();
+  }
+});
+
 test("without the dispatch and integrate grants the driver does nothing", async () => {
   const f = await fixture({ grants: ["dispatch"] });
   try {

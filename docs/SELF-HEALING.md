@@ -12,6 +12,7 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | A lane still without a receipt 30 minutes after the driver's pointed ask | The supervisor tick, from `spec-state.json` | Item state, whether inference was requested |
 | A self-update commit that failed `npm test` 3 times | The self-updater | The last 30 lines of the test output |
 | A root reload not confirmed after 5 attempts, or a root busy 30 minutes past a due reload | The self-updater | The runtime record's commit and the checkout's |
+| A root turn of 30 minutes or longer (interrupted with Escape) | The supervisor's root turn watch | The root and its manifest |
 
 ## Routing
 
@@ -50,3 +51,4 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | 2026-09-26 | A root reload was never retried: the root stayed working for hours | A root busy 30 min past a due reload is reported as an anomaly |
 | 2026-09-26 | A repeated-alert anomaly fired for an item that had moved on (the alert list is history) | Repeats count only alerts from the last 6 h whose item is still blocked |
 | 2026-09-26 | Every root /reload killed the spec driver: the timer kept the old instance's context, which went stale | The timer restarts on session_start(reload) and on turn boundaries, stops on a stale context, and logs that it is alive every 10 min |
+| 2026-09-26 | The spec driver went silent for hours while the root sat in one multi-hour turn and never reloaded | The driver runs in a supervisor-owned spec host; root turns over 30 min are interrupted; the root contract forbids lane work |
