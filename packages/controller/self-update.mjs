@@ -88,6 +88,8 @@ export function createSelfUpdater({
   rootPanes = async () => undefined,
   // Whether a dialog (question or permission prompt) is on the pane's screen.
   dialogOpen = async () => false,
+  // Self-healing: a failed update test or an unconfirmed reload is an anomaly.
+  anomaly = async () => undefined,
   prune = () => 0,
   now = () => new Date().toISOString(),
   env = process.env,
@@ -154,6 +156,7 @@ export function createSelfUpdater({
       if ((entry?.attempts ?? 0) >= RELOAD_ATTEMPTS) {
         reloads[record.paneId] = { ...entry, gaveUpAt: now() };
         events.push(`root reload in ${record.paneId} not confirmed after ${entry.attempts} attempts`);
+        await Promise.resolve(anomaly({ kind: "reload-unconfirmed", signature: `reload:${record.paneId}:${disk}`, summary: `the root in ${record.paneId} did not reload onto ${disk.slice(0, 12)} after ${entry.attempts} /reload attempts`, evidence: [`runtime record commit ${String(record.commit).slice(0, 12)}`, `checkout ${disk.slice(0, 12)}`] })).catch(() => undefined);
         await notify({ title: "Baa-ton: root did not reload", body: `${record.paneId} still runs ${String(record.commit).slice(0, 12)} after ${entry.attempts} /reload attempts onto ${disk.slice(0, 12)}; reload it by hand.` });
         continue;
       }
@@ -217,6 +220,7 @@ export function createSelfUpdater({
         if (result.ok) events.push(...(await apply(state, sha)));
         else {
           events.push(`${sha.slice(0, 12)} failed npm test; not deployed`);
+          await Promise.resolve(anomaly({ kind: "self-update-test-failed", signature: `update-test:${sha}`, summary: `${sha.slice(0, 12)} failed npm test and was not deployed`, evidence: result.output.split("\n").slice(-30) })).catch(() => undefined);
           await notify({ title: "Baa-ton update failed its tests", body: `${sha.slice(0, 12)} is not deployed. ${result.output.slice(-300)}` });
         }
       } else if (!active && (!state.lastCheckAt || Date.parse(now()) - Date.parse(state.lastCheckAt) >= SELF_UPDATE_CHECK_MS)) {

@@ -412,7 +412,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
     return { status: "skipped", reason: `screen read failed: ${error instanceof Error ? error.message : String(error)}` };
   }
   const screen = classifyScreen(text);
-  if (screen.kind === "unknown") return { status: "none", reason: "no permission prompt or question dialog on the visible screen", lines: screenLines(text).length };
+  if (screen.kind === "unknown") return { status: "none", reason: "no permission prompt or question dialog on the visible screen", lines: screenLines(text).length, excerpt: screenLines(text).join("\n") };
   let rules;
   try {
     rules = await loadKnownSafe();

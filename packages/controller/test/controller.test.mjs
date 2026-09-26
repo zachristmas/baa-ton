@@ -4508,7 +4508,7 @@ test("spec items waiting with no lane working are a stall: nudged, escalated onc
     const nudges = texts.filter((text) => text.startsWith("[Baa-ton supervisor]"));
     assert.ok(nudges.length >= 2, `an active goal with items awaiting push is nudged (${statuses.join(", ")})`);
     assert.match(nudges[0], /spec: 2 item\(s\) are waiting \(awaiting-push: 2\) and no lane is working/);
-    const escalations = notes.filter((note) => note.title === "Baa-ton: the root is not moving");
+    const escalations = notes.filter((note) => note.title === "Baa-ton bug report: the root is not moving");
     assert.equal(escalations.length, 1, "after two unanswered nudges, one notification, once per episode");
     assert.match(escalations[0].body, /2 nudges unanswered .*awaiting-push: 2/);
     let result;

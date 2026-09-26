@@ -2,6 +2,9 @@
 // version of the code on disk (fresh-modules.mjs), so a deploy takes effect.
 import { freshImport, modulesVersion } from "./fresh-modules.mjs";
 const MODULES_VERSION = modulesVersion();
+/** The user is asked only about unclear requirements; everything else is decided and logged. */
+const ESCALATION_POLICY =
+  "Escalation policy: ask the user only about unclear requirements, and tag such a question [unclear-requirements]. Decide everything else yourself with the driver's recommendation or the policy default, log the decision, and keep going; never park work waiting for the user. Pushes of green work are pre-approved.";
 import {
   access,
   appendFile,
@@ -2715,9 +2718,10 @@ function contract(workflow: Workflow, lane: Lane): string {
     "Never git stash drop, pop or clear: the stash is shared by every worktree of the repository and holds other sessions' work. Set temporary changes aside with a patch file outside the repository (git diff > <scratch>/x.patch; git checkout -- <files>; later git apply <scratch>/x.patch) or a throwaway commit on your own branch.",
     "Frozen installs, builds, codegen, typecheck, lint and tests in this worktree are routine: run them. When the root's policy grants local-validation, a permission prompt for one is answered by policy; never ask for them in chat.",
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
-    "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
+    "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow only for unclear requirements (tag them [unclear-requirements]) and herdr_complete for the one lane receipt.",
     "Ask for ports, database names, runtime launches and approvals with herdr_request (lease, runtime-launch, approval), never in chat; policy-matching requests are answered at once and the rest stay open until the root answers.",
     OPERATOR_AUTHORITY,
+    ESCALATION_POLICY,
     lane.specStage === "integrate"
       ? "Spec integration lane: you may merge spec/* branches and commit on this worktree's integration branch (local only). Never push, deploy, create a PR, mutate production or external services, or close Herdr resources."
       : "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
@@ -10815,7 +10819,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "active");
     return {
-      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY} ${runStateLine(await readRunState().catch(() => ({ state: "running" as const, implicit: true })))}${await rootBootstrapPrompt(ctx.cwd)}`,
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY} ${ESCALATION_POLICY} ${runStateLine(await readRunState().catch(() => ({ state: "running" as const, implicit: true })))}${await rootBootstrapPrompt(ctx.cwd)}`,
     };
   });
 
