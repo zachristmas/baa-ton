@@ -252,7 +252,7 @@ test("while starting a process is slow the test run waits, then runs once the ma
       startTests: async () => ((runs += 1), { ok: true, output: "" }),
     });
     const first = await updater.tick();
-    assert.ok(first.events.some((event) => /waits: starting a process takes 25s/.test(event)));
+    assert.ok(first.events.some((event) => /waits: starting a process takes 35s/.test(event)));
     assert.equal(runs, 0);
     time.advance(SELF_UPDATE_CHECK_MS + 1);
     const second = await updater.tick();
