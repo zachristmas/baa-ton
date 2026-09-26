@@ -4,7 +4,7 @@ export const ACTIVE_STATES: Set<string>;
 export function globsOverlap(left: string, right: string): boolean;
 export function reviewVerdict(summary: unknown): "pass" | "fail" | undefined;
 export type SpecAction = {
-  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt";
+  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline";
   itemId: string;
   attempt: number;
   findings?: string;
@@ -12,6 +12,9 @@ export type SpecAction = {
   stage?: string;
   lane?: { workflowId: string; laneId: string };
   format?: string;
+  /** baseline / fix-baseline: the target SHA, and the failures to fix. */
+  targetSha?: string;
+  failures?: Array<{ package: string; task: string }>;
 };
 export const RECEIPT_ASK_TIMEOUT_MS: number;
 export const RECEIPT_REASK_BASE_MS: number;
@@ -29,11 +32,12 @@ export function advanceSpec(input: {
   background?: Map<string, string>;
   integrationLive?: string;
   contained?: Map<string, string>;
+  targetSha?: string;
   now: string;
 }): {
   state: SpecState;
   actions: SpecAction[];
-  rootAsks: Array<{ itemId: string; reason: string; kind?: "push" | "decisions"; items?: string[]; sha?: string; questions?: string[] }>;
+  rootAsks: Array<{ itemId: string; reason: string; kind?: "push" | "decisions"; items?: string[]; sha?: string; questions?: string[]; baselineFailures?: Array<{ package: string; task: string }> }>;
   waits: Record<string, string>;
 };
 export function buildObjective(
@@ -52,6 +56,7 @@ export function integrateObjective(
     integrationBranch: string;
     itemBranch: string;
     commitFirst?: { worktree: string; paths: string[]; secrets: string[]; untracked?: string[] };
+    baseline?: { sha: string; failures: Array<{ package: string; task: string }> };
   },
 ): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; report?: string };

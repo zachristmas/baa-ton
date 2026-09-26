@@ -116,7 +116,11 @@ export function validateSpec(input) {
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline"], "spec.defaults");
+    if (input.defaults.fixBaseline !== undefined) {
+      if (typeof input.defaults.fixBaseline !== "boolean") throw new Error("spec.defaults.fixBaseline must be true or false.");
+      if (input.defaults.fixBaseline) defaults.fixBaseline = true;
+    }
     if (input.defaults.generatedArtifacts !== undefined) {
       const globs = input.defaults.generatedArtifacts;
       if (!Array.isArray(globs) || globs.some((glob) => typeof glob !== "string" || !glob.trim() || glob.startsWith("/") || glob.split("/").includes("..")))

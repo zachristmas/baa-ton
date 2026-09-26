@@ -114,6 +114,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     backgroundWork: async () => undefined,
     // Every item branch has its own commits unless a test says so.
     aheadOf: async () => 1,
+    // No target SHA (no suite baseline) unless a test says so.
+    revParse: async () => undefined,
     async restore(input) {
       calls.restore = [...(calls.restore ?? []), input];
     },
@@ -1269,6 +1271,111 @@ test("generated artifacts the item does not own are restored to HEAD before the 
     assert.deepEqual(commits.map((commit) => commit.paths), [["src/d02/a.ts"], ["src/d10/b.ts", "apps/services/payment/openapi-spec.json"]], "an item that owns the spec commits it");
     assert.equal(state.items.D13.state, "blocked", "other stray files still hold the build");
     assert.match(result.content[0].text, /build D13 held: .*lib\/stray\.ts/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+/** Record a lane's receipt in the manifest (the fake plan port writes no workflows). */
+async function receive(f, ref, summary, specStage = "integrate") {
+  const manifest = await f.manifest();
+  manifest.workflows = manifest.workflows.filter((workflow) => workflow.id !== ref.workflowId);
+  manifest.workflows.push({ id: ref.workflowId, status: "completed", lanes: [{ id: ref.laneId, status: "completion-reported", specStage, completionReceipt: { summary } }], evidence: [] });
+  await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+}
+
+test("the integration gate is baseline-relative: failures the target tip already has do not block a push", async () => {
+  const target = "2".repeat(40);
+  const merged = "a".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release", suite: ["pnpm turbo run lint test"] },
+      items: [{ id: "D03", title: "Batch", acceptance: { text: "b" } }, { id: "D04", title: "Breaks", acceptance: { text: "c" } }],
+    },
+    seed: { version: 1, items: { D03: { state: "integrating", attempts: 1 }, D04: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    f.ports.revParse = async (_repo, ref) => (ref === "refs/remotes/origin/feature/release" ? target : undefined);
+    // Pass 1: the baseline lane is dispatched at the target tip, and D03's integration too.
+    await f.advance();
+    const baselinePlan = f.calls.plan.find((call) => call.specStage === "baseline");
+    assert.ok(baselinePlan, "a baseline lane runs the suite at the target tip");
+    assert.match(baselinePlan.laneObjective, new RegExp(`git checkout -q --detach ${target}`));
+    assert.match(baselinePlan.laneObjective, /FAILED: <package> <task>/);
+    assert.ok(f.calls.worktree.some((call) => call.branch === "spec-baseline"));
+    let state = await f.state();
+    const baselineLane = state.baselineRun.lane;
+    const d03 = state.items.D03.lane;
+    // Turborepo output pasted into both receipts: the same three lint errors.
+    const turbo = [
+      "@acme/ticket-service#lint: command (/repo/apps/services/ticket) /usr/bin/pnpm run lint exited (1)",
+      " Tasks:    41 successful, 42 total",
+      "Failed:    @acme/ticket-service#lint",
+    ].join("\n");
+    await receive(f, baselineLane, `BASELINE: ${target}\nSUITE: fail\n${turbo}`, "baseline");
+    await receive(f, d03, `INTEGRATED: ${merged}\nSUITE: fail\nFAILED: @acme/ticket-service lint`);
+    await f.advance();
+    state = await f.state();
+    assert.deepEqual(state.baselines[target].failures, [{ package: "@acme/ticket-service", task: "lint" }]);
+    assert.equal(state.baselineRun, undefined);
+    assert.equal(state.items.D03.state, "awaiting-push", "its only failure is the target's own");
+    assert.deepEqual(state.items.D03.integration.baselineFailures, [{ package: "@acme/ticket-service", task: "lint" }]);
+    assert.deepEqual(state.items.D03.tests, [], "no acceptance tests of its own");
+    // D04's integration names the known failures, then fails a new task too.
+    const d04Plan = f.calls.plan.filter((call) => call.specStage === "integrate").at(-1);
+    assert.match(d04Plan.laneObjective, /already fails these suite tasks at 222222222222 \(its baseline\): @acme\/ticket-service lint/);
+    state = await f.state();
+    const d04 = state.items.D04.lane;
+    await receive(f, d04, `INTEGRATED: ${"b".repeat(40)}\nSUITE: fail\nFAILED: @acme/ticket-service lint\nFAILED: @acme/payment-service test`);
+    const result = await f.advance();
+    state = await f.state();
+    assert.ok(["ready", "building"].includes(state.items.D04.state), "a new failure is a real one: back to its builder");
+    assert.equal(state.items.D04.integration, undefined);
+    assert.match(state.items.D04.findings, /tasks the target does not already fail: @acme\/payment-service test/);
+    assert.match(result.content[0].text, /push/i);
+    const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
+    assert.ok(alerts.some((alert) => alert.kind === "spec-push-ready" && /known baseline failures, not from these items\): @acme\/ticket-service lint/.test(alert.text)), "the push ask lists them");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("with defaults.fixBaseline one lane fixes the baseline first; integrations wait, then judge against what remains", async () => {
+  const target = "3".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release", suite: ["pnpm -r lint", "pnpm -r test"] },
+      defaults: { fixBaseline: true },
+      items: [{ id: "D12", title: "Batch", acceptance: { text: "b" } }],
+    },
+    seed: {
+      version: 1,
+      items: { D12: { state: "integrating", attempts: 1 } },
+      baselines: { [target]: { suite: "fail", failures: [{ package: "@acme/ticket-service", task: "lint" }, { package: "@acme/web", task: "test" }], at: "t" } },
+    },
+  });
+  try {
+    f.ports.revParse = async () => target;
+    const first = await f.advance();
+    const fix = f.calls.plan.find((call) => call.objective.startsWith("spec fix-baseline"));
+    assert.ok(fix, "one fix-baseline lane");
+    assert.equal(fix.specStage, "integrate", "it holds the integration worktree");
+    assert.match(fix.laneObjective, /already fails: @acme\/ticket-service lint, @acme\/web test/);
+    assert.equal(f.calls.plan.filter((call) => call.objective.startsWith("spec D12 integrate")).length, 0, "no integration while it runs");
+    assert.match(first.content[0].text, /fixing the target's baseline failures first/);
+    let state = await f.state();
+    const lane = state.baselineRun.lane;
+    // pnpm output: the lint error is fixed, one test failure remains.
+    await receive(f, lane, `INTEGRATED: ${"c".repeat(40)}\nSUITE: fail\n ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @acme/web@1.0.0 test: \`vitest run\``);
+    await f.advance();
+    state = await f.state();
+    assert.deepEqual(state.baselines[target].fix.remaining, [{ package: "@acme/web", task: "test" }]);
+    const integrate = f.calls.plan.find((call) => call.objective.startsWith("spec D12 integrate"));
+    assert.ok(integrate, "then the item integrates");
+    assert.match(integrate.laneObjective, /its baseline\): @acme\/web test\./);
+    assert.doesNotMatch(integrate.laneObjective, /ticket-service/, "the fixed failure is no longer known");
   } finally {
     await f.cleanup();
   }
