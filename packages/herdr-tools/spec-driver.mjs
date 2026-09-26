@@ -106,6 +106,49 @@ export function verifyResult(summary) {
   return { previews, ...(report ? { report } : {}) };
 }
 
+/** Every spec lane's instruction for declining, so a decline is a receipt, never a stall in chat. */
+export const DECLINE_RULE =
+  "If you will not do this work, do not stop in chat: finish with herdr_complete whose summary starts with DECLINED: <the specific reason>. If only one step is impossible, do the rest and name that step in your receipt instead of declining the whole task.";
+
+const DECLINE_LANGUAGE =
+  /\b(I (?:must |have to |will |need to |'ll )?declin\w*|I(?: am|'m) declining|I (?:can(?:no|')t|won't|will not|am unable to|am not able to) (?:do|proceed|complete|perform|carry out|continue|take on)|refus(?:e|ing) to)\b/i;
+
+/**
+ * Why a lane declined its work, from its receipt: an explicit DECLINED:
+ * line, or (for stages whose receipt has required lines, when they are
+ * missing) plain decline language. undefined when it did not decline.
+ */
+export function declineReason(summary, stage) {
+  const text = String(summary ?? "");
+  const explicit = /^\s*DECLINED\s*:\s*(.+)$/im.exec(text)?.[1];
+  if (explicit) return explicit.trim();
+  const required = {
+    review: /^\s*VERDICT\s*:/im,
+    integrate: /^\s*INTEGRATED\s*:/im,
+    verify: /^\s*(PREVIEW|REPORT)\s*:/im,
+  }[stage];
+  if (!required || required.test(text)) return undefined;
+  const head = text.slice(0, 1200);
+  const match = DECLINE_LANGUAGE.exec(head);
+  if (!match) return undefined;
+  const sentence = head.slice(Math.max(0, head.lastIndexOf(".", match.index) + 1)).split(/(?<=[.!?])\s/)[0];
+  return sentence.trim().slice(0, 500);
+}
+
+/**
+ * The profile for the next attempt after `count` declines of a stage:
+ * index 0 is the stage's own profile, then spec.stages[stage].fallbackProfiles
+ * in order, each for defaults.maxDeclines attempts. undefined when every
+ * configured profile has declined.
+ */
+export function profileAfterDeclines(spec, stage, count) {
+  const per = spec.defaults.maxDeclines ?? 2;
+  const fallbacks = spec.stages?.[stage]?.fallbackProfiles ?? [];
+  const index = Math.floor(count / per);
+  if (index > fallbacks.length) return undefined;
+  return index === 0 ? { index } : { index, profile: fallbacks[index - 1] };
+}
+
 /** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
 export function integrationResult(summary) {
   const text = String(summary ?? "");
@@ -167,7 +210,12 @@ export function advanceSpec({
   if (useBaseline && next.baselineRun?.lane) {
     const run = next.baselineRun;
     const view = lane(run.lane);
-    if (view?.receipt) {
+    const declined = view?.receipt ? declineReason(view.receipt.summary, "integrate") : undefined;
+    if (declined && (run.declined?.count ?? 0) < 3) {
+      // A declined baseline or fix lane is retried with its reason.
+      run.declined = { reason: declined, count: (run.declined?.count ?? 0) + 1, at: now };
+      delete run.lane;
+    } else if (view?.receipt) {
       const result = baselineResult(view.receipt.summary);
       next.baselines ??= {};
       if (run.kind === "baseline") {
@@ -254,6 +302,43 @@ export function advanceSpec({
         rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lane ${current.lane.workflowId}/${current.lane.laneId} went idle without a receipt and did not answer the ask; read its pane and set the outcome` });
       }
     }
+  }
+
+  // 1-. A lane that declined its work is retried in the same stage with its
+  // reason; after defaults.maxDeclines declines, with the stage's next
+  // fallback profile. Only when every configured profile declined is the
+  // item held for the root.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    const stage = current ? STAGE_OF[current.state] : undefined;
+    if (!stage || !current.lane) continue;
+    const view = lane(current.lane);
+    if (!view?.receipt) continue;
+    const reason = declineReason(view.receipt.summary, stage);
+    if (!reason) {
+      if (current.declined?.stage === stage) delete current.declined;
+      continue;
+    }
+    const declines = (current.declines ??= []);
+    declines.push({ at: now, stage, reason, lane: current.lane, ...(current.declined?.profile ? { profile: current.declined.profile } : {}) });
+    if (declines.length > 20) declines.splice(0, declines.length - 20);
+    const count = declines.filter((entry) => entry.stage === stage).length;
+    const choice = profileAfterDeclines(spec, stage, count);
+    const declinedLane = current.lane;
+    delete current.lane;
+    delete current.receiptAskedAt;
+    if (!choice) {
+      move(item.id, "blocked", { blockedReason: "human-gate", note: `${stage} lanes declined ${count} time(s) with every configured profile: ${reason}` }, `${stage} declined`);
+      rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lanes declined ${count} time(s), with every profile in spec.stages.${stage} (profile, fallbackProfiles). Last reason: ${reason}. Decide how to proceed or add a fallback profile.` });
+      continue;
+    }
+    current.declined = { stage, reason, count, ...(choice.profile ? { profile: choice.profile } : {}) };
+    (current.history ??= []).push({
+      at: now,
+      from: current.state,
+      to: current.state,
+      note: `${stage} lane ${declinedLane.workflowId} declined (${count}): ${reason.slice(0, 200)}; retrying${choice.profile ? ` with profile ${choice.profile}` : ""}`,
+    });
   }
 
   // 1. Receipts and lane endings advance in-flight items.
