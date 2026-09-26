@@ -5497,19 +5497,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const latest = await loadManifest(ctx.cwd);
         for (const workflow of latest.workflows)
           for (const lane of workflow.lanes) {
-            if (!lane.specStage) continue;
+            // Any lane of a workflow whose dispatch failed (the root's own
+            // lanes too) never started: once its agent is gone, retiring it
+            // records that outcome. It needs no grace: the dispatch is over.
+            const neverStarted = workflow.status === "dispatch-failed" && workflow.ownership?.createdBy === OWNER;
+            if (!lane.specStage && !neverStarted) continue;
             if (lane.retirement && lane.retirement.status !== "partial") continue;
             if (current.has(`${workflow.id}/${lane.id}`)) continue;
             const orphan = !lane.completionReceipt;
             if (orphan) {
               const started = Date.parse(lane.agentStartedAt ?? (lane as { tabCreateAttemptedAt?: string }).tabCreateAttemptedAt ?? "");
-              if (!Number.isFinite(started) || Date.parse(use.now()) - started < SPEC_ORPHAN_GRACE_MS) continue;
+              if (!neverStarted && (!Number.isFinite(started) || Date.parse(use.now()) - started < SPEC_ORPHAN_GRACE_MS)) continue;
               if (lane.paneId && (await agentPresent(lane.paneId).catch(() => true))) continue;
             }
             const [candidate] = retireCandidates(ctx.cwd, latest, { auto: false, workflowId: workflow.id, laneId: lane.id, force: orphan });
             if (!candidate) continue;
+            const reason = !orphan ? "spec receipt consumed (auto-retire)" : neverStarted ? "dispatch failed; the lane never started (auto-retire)" : "spec lane no item maps any more (auto-retire)";
             try {
-              await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, orphan ? "spec lane no item maps any more (auto-retire)" : "spec receipt consumed (auto-retire)", signal)))(candidate);
+              await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, reason, signal)))(candidate);
               done.push(`retired ${workflow.id}/${lane.id}`);
             } catch (error) {
               done.push(`retire ${workflow.id}/${lane.id} failed: ${clip((error as Error).message, 120)}`);
