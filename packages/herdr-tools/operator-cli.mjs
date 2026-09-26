@@ -22,7 +22,10 @@ import {
   replyToOperator,
   sendOperatorMessage,
   unregisterAgent,
+  readRunState,
+  changeRunState,
 } from "./operator-api.mjs";
+import { runStateLine } from "./operator.mjs";
 
 const USAGE = `Usage:
   baa-ton message <target> <text...> [--from <name>] [--notify] [--json]
@@ -32,7 +35,8 @@ const USAGE = `Usage:
   baa-ton operator register <name> [--pane <id>] [--workspace <id>] [--kind <agent>] [--cwd <folder>]
   baa-ton operator unregister <name>
   baa-ton operator agents
-  baa-ton deliver`;
+  baa-ton deliver
+  baa-ton run status|pause|resume [--reason <text>] [--from <name>]`;
 
 /** Split argv into positionals and --flags (a flag takes the next word unless boolean). */
 export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread"])) {
@@ -75,6 +79,20 @@ export async function runOperatorCli(argv, { env = process.env, out = (text) => 
       const messages = await readOperatorInbox({ all: flags.all, unread: flags.unread, env });
       out(flags.json ? JSON.stringify(messages) : formatInbox(messages));
       return messages;
+    }
+    case "run": {
+      const [sub] = positional;
+      if (sub === "status") {
+        const state = await readRunState({ env });
+        out(runStateLine(state));
+        return state;
+      }
+      if (sub === "pause" || sub === "resume") {
+        const state = await changeRunState({ state: sub === "pause" ? "paused" : "running", reason: flags.reason, from: flags.from, env });
+        out(runStateLine(state));
+        return state;
+      }
+      throw new Error(USAGE);
     }
     case "deliver": {
       const changed = await deliverOperatorNow({ env });

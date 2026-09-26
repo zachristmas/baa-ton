@@ -22,6 +22,10 @@ export const STANDING_GRANTS = [
   // integration stage, local commits and merges on the integration branch.
   // Never push, deploy or production.
   "integrate",
+  // Narrow: the spec driver may fast-forward the spec's own target branch to
+  // a green integration head (no force, nothing else). General push stays
+  // never-grantable below.
+  "spec-push",
 ] as const;
 export type StandingGrant = (typeof STANDING_GRANTS)[number];
 export type StandingOperation = "dispatch" | "retry" | "resume";
@@ -240,6 +244,10 @@ export function approvalPolicySummary(policy: ApprovalPolicy, hash: string): str
   if (policy.grants.includes("integrate"))
     lines.push(
       "Integrate: the spec loop creates spec/<item> worktrees from the target tip and makes local commits and merges on its integration branch. Never pushes.",
+    );
+  if (policy.grants.includes("spec-push"))
+    lines.push(
+      "Spec push: the spec driver fast-forwards the spec's target branch to a green integration round (every item integrated with its gate passed). No force push; no other branch or remote.",
     );
   if (policy.grants.includes("local-validation"))
     lines.push(

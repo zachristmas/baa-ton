@@ -14,6 +14,9 @@ import {
   readOperatorStore,
   registerOperatorAgent,
   resolveOperatorTarget,
+  runState,
+  runStateFromText,
+  setRunState,
   withOperatorStore,
 } from "./operator.mjs";
 
@@ -44,7 +47,11 @@ export async function sendOperatorMessage({ target, text, from, notify: notifyOn
   const controllerConfig = config ?? (await readControllerConfig(env));
   const message = await withOperatorStore(path, (store) => {
     const resolved = resolveOperatorTarget(target, { config: controllerConfig, agents: store.agents });
-    return addOperatorMessage(store, { target, resolved, text, from: from || env.BAATON_OPERATOR || "operator", notify: notifyOnReply });
+    const added = addOperatorMessage(store, { target, resolved, text, from: from || env.BAATON_OPERATOR || "operator", notify: notifyOnReply });
+    // STOP / PAUSE / RESUME to a root sets the durable run state.
+    const wanted = resolved.kind === "root" ? runStateFromText(text) : undefined;
+    if (wanted) added.runState = setRunState(store, { state: wanted, reason: String(text).slice(0, 200), by: added.from });
+    return added;
   });
   await deliverNow({ env, deliver });
   const stored = (await readOperatorStore(path)).messages.find((item) => item.id === message.id) ?? message;
@@ -86,6 +93,14 @@ export async function listAgents({ env = process.env } = {}) {
 }
 
 export { deliverNow as deliverOperatorNow };
+
+export async function readRunState({ env = process.env } = {}) {
+  return runState(await readOperatorStore(operatorStorePath(env)));
+}
+
+export async function changeRunState({ state, reason, from, env = process.env } = {}) {
+  return withOperatorStore(operatorStorePath(env), (store) => setRunState(store, { state, reason, by: from || env.BAATON_OPERATOR || "operator" }));
+}
 
 /** One line per message for the CLI and tools. */
 export function formatInbox(messages) {

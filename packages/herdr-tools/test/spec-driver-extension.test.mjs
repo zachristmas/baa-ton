@@ -1605,6 +1605,68 @@ test("a lane that cannot start climbs the ladder: a fresh try, then the fallback
   }
 });
 
+test("under the spec-push grant a green round is pushed by the driver, with no root turn", async () => {
+  const head = "9".repeat(40);
+  const f = await fixture({
+    grants: ["dispatch", "integrate", "spec-push"],
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D03", title: "A", acceptance: { text: "a" } }, { id: "D04", title: "B", acceptance: { text: "b" } }] },
+    seed: {
+      version: 1,
+      items: {
+        D03: { state: "awaiting-push", integration: { sha: "8".repeat(40), order: 1 } },
+        D04: { state: "awaiting-push", integration: { sha: head, order: 2 } },
+      },
+    },
+  });
+  try {
+    const pushes = [];
+    f.ports.push = async (input) => {
+      pushes.push(input);
+      f.pushedShas.add(head);
+      f.pushedShas.add("8".repeat(40));
+    };
+    const result = await f.advance();
+    assert.deepEqual(pushes.map((push) => [push.remote, push.sha, push.branch]), [["origin", head, "feature/release"]]);
+    assert.match(result.content[0].text, /pushed D03, D04 to origin\/feature\/release/);
+    const alerts = ((await f.manifest()).rootSupervision ?? []).flatMap((entry) => entry.alerts ?? []);
+    assert.equal(alerts.filter((alert) => alert.kind === "spec-push-ready").length, 0, "no push ask for the root");
+    const state = await f.state();
+    assert.match(state.items.D04.history.at(-1).note, /pushed to origin\/feature\/release at 999999999999 under the spec-push grant/);
+    await f.advance();
+    assert.ok(["verifying", "done"].includes((await f.state()).items.D04.state), "the next pass sees it on the target");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("without the grant the push stays with the root; while the run is paused the driver does nothing", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D03", title: "A", acceptance: { text: "a" } }, { id: "D06", title: "Next", acceptance: { text: "n" } }] },
+    seed: { version: 1, items: { D03: { state: "awaiting-push", integration: { sha: "8".repeat(40), order: 1 } } } },
+  });
+  const saved = process.env.BAATON_OPERATOR_STORE;
+  const { mkdtemp: mkd } = await import("node:fs/promises");
+  const { tmpdir: tmp } = await import("node:os");
+  const storeDir = await mkd(join(tmp(), "baa-run-"));
+  try {
+    f.ports.push = async () => assert.fail("no push without the grant");
+    await f.advance();
+    const alerts = ((await f.manifest()).rootSupervision ?? []).flatMap((entry) => entry.alerts ?? []);
+    assert.equal(alerts.filter((alert) => alert.kind === "spec-push-ready").length, 1);
+    process.env.BAATON_OPERATOR_STORE = join(storeDir, "operator.json");
+    await writeFile(process.env.BAATON_OPERATOR_STORE, JSON.stringify({ version: 1, agents: {}, messages: [], runState: { state: "paused", by: "zach", at: "t" } }));
+    const plans = f.calls.plan.length;
+    const paused = await f.advance();
+    assert.match(paused.content[0].text, /the run is paused by zach/);
+    assert.equal(f.calls.plan.length, plans, "nothing dispatched while paused");
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_OPERATOR_STORE;
+    else process.env.BAATON_OPERATOR_STORE = saved;
+    await rm(storeDir, { recursive: true, force: true });
+    await f.cleanup();
+  }
+});
+
 test("spec lanes whose receipt the driver consumed are retired under the retire grant", async () => {
   const receipt = { id: "r", summary: "Done.", delivery: "delivered" };
   const seedManifest = async (f) => {

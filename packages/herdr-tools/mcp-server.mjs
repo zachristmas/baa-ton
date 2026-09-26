@@ -804,7 +804,7 @@ function requestKey(id) {
  * Baa-ton too (an external assistant, a standalone agent): listed and
  * callable without a Herdr session, and with no root or lane identity.
  */
-const OPERATOR_TOOLS = new Set(["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox"]);
+const OPERATOR_TOOLS = new Set(["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox", "herdr_operator_run"]);
 
 async function callOperatorTool(definition, args) {
   if (!Value.Check(definition.parameters, args)) {
