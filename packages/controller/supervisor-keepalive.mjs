@@ -84,6 +84,14 @@ export async function ensureSupervisor({
   if (Number.isFinite(beat) && now - beat < HEARTBEAT_STALE_MS && alive(heartbeat.pid)) return { status: "alive" };
   const owner = read(join(configDir, LEASE));
   const holder = owner && alive(owner.pid) ? owner.pid : undefined;
+  // A runner that took the lease a moment ago (a restart on new code) has
+  // not written its first heartbeat yet; the last one is its predecessor's.
+  // It gets the full HEARTBEAT_STALE_MS from when it took the lease.
+  const leased = Date.parse(owner?.created_at ?? "");
+  if (holder && heartbeat?.pid !== holder && Number.isFinite(leased) && now - leased < HEARTBEAT_STALE_MS) return { status: "starting", pid: holder };
+  // Between one runner releasing the lease and the next taking it nobody
+  // holds it: a recent heartbeat means a restart in progress, not a death.
+  if (!holder && Number.isFinite(beat) && now - beat < HEARTBEAT_STALE_MS) return { status: "restarting" };
   const since = Number.isFinite(beat) ? new Date(beat).toISOString() : "never";
   const minutes = Number.isFinite(beat) ? Math.round((now - beat) / 60_000) : undefined;
   await Promise.resolve(
