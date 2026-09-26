@@ -3,7 +3,7 @@ type Env = Record<string, string | undefined>;
 export function sendOperatorMessage(input: { target: string; text: string; from?: string; notify?: boolean; env?: Env; config?: unknown; deliver?: () => Promise<string[]> }): Promise<OperatorMessage>;
 export function replyToOperator(input: { id: string; text: string; from?: string; env?: Env; runHerdr?: (args: string[]) => Promise<unknown> }): Promise<{ id: string; target: string; reply: OperatorReply }>;
 export function readOperatorInbox(input?: { all?: boolean; unread?: boolean; limit?: number; env?: Env }): Promise<OperatorMessage[]>;
-export function registerAgent(input: { name: string; paneId?: string; workspaceId?: string; agentKind?: string; env?: Env }): Promise<OperatorStore["agents"][string] & { name: string; instructions: string }>;
+export function registerAgent(input: { name: string; paneId?: string; workspaceId?: string; agentKind?: string; cwd?: string; env?: Env }): Promise<OperatorStore["agents"][string] & { name: string; instructions: string }>;
 export function unregisterAgent(input: { name: string; env?: Env }): Promise<boolean>;
 export function listAgents(input?: { env?: Env }): Promise<OperatorStore["agents"]>;
 export function deliverOperatorNow(input?: { env?: Env; deliver?: () => Promise<string[]> }): Promise<string[]>;

@@ -74,3 +74,15 @@ Reply with: baa-ton reply op-1a2b3c4d "<answer>" (or the herdr_operator_reply to
 - CLI: `baa-ton message <target> <text> [--from name] [--notify]`, `baa-ton reply <id> <text>`, `baa-ton inbox [--all|--unread] [--json]`, `baa-ton operator register <name> [--pane id]`, `baa-ton operator unregister <name>`, `baa-ton operator agents`, `baa-ton deliver`.
 - MCP (the stdio bridge, also outside a Herdr session): `herdr_operator_message`, `herdr_operator_reply`, `herdr_operator_inbox`.
 - Pi root: the same three tools, registered by the extension.
+
+### Registered agents' prompts
+
+A registered agent is covered by the blocked handler like a lane, but it has no workflow, so its prompts live in the operator store:
+- When its pane turns `blocked`, a known-safe permission prompt is approved at once, after the re-check.
+- Anything else is recorded in the store's `prompts`, and the operator gets one notification.
+- After 10 minutes the supervisor applies the same default as for a lane:
+  - a permission prompt gets the unattended policy, bounded by the folder the agent registered from (`--cwd`, default the current folder);
+  - a question dialog gets its Recommended option;
+  - otherwise the dialog is dismissed and the agent is told to decide.
+- The reason for a denial reaches the agent as an operator message.
+- Each default is logged in the store's `decisions`.

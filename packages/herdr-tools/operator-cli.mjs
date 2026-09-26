@@ -29,7 +29,7 @@ const USAGE = `Usage:
       target: root | root:<id> | <workflowId>/<laneId> | <registered agent>
   baa-ton reply <id> <text...> [--from <name>]
   baa-ton inbox [--all | --unread] [--json]
-  baa-ton operator register <name> [--pane <id>] [--workspace <id>] [--kind <agent>]
+  baa-ton operator register <name> [--pane <id>] [--workspace <id>] [--kind <agent>] [--cwd <folder>]
   baa-ton operator unregister <name>
   baa-ton operator agents
   baa-ton deliver`;
@@ -84,7 +84,7 @@ export async function runOperatorCli(argv, { env = process.env, out = (text) => 
     case "operator": {
       const [sub, name] = positional;
       if (sub === "register" && name) {
-        const agent = await registerAgent({ name, paneId: flags.pane, workspaceId: flags.workspace, agentKind: flags.kind, env });
+        const agent = await registerAgent({ name, paneId: flags.pane, workspaceId: flags.workspace, agentKind: flags.kind, cwd: flags.cwd, env });
         out(`registered ${name} at pane ${agent.paneId}. Add this to the agent's own instructions:\n${agent.instructions}`);
         return agent;
       }

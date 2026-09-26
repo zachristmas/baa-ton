@@ -3846,6 +3846,10 @@ export async function runSupervisorTick({
   // Operator messages ride the same tick (best effort, never blocks it).
   let operator = [];
   try {
+    const { operatorStorePath } = await import("../herdr-tools/operator.mjs");
+    const { resolveAgentPrompts } = await import("./blocked-lane.mjs");
+    // Registered agents' due prompt defaults first; their messages then go out.
+    await resolveAgentPrompts({ herdr: api, storePath: operatorStorePath(), timestamp });
     operator = await deliverOperatorQueue({ herdr: api, timestamp });
   } catch {
     operator = [];
@@ -3986,6 +3990,23 @@ export async function handleHook({
       );
       if (activation) return activation;
       return recordRootActivity(config, event, stateDir);
+    }
+    // A standalone agent registered on the operator channel (an admin
+    // session, an external assistant): its blocked prompts are covered too.
+    if (event.data.agent_status === "blocked") {
+      try {
+        const { operatorStorePath, readOperatorStore } = await import("../herdr-tools/operator.mjs");
+        const storePath = operatorStorePath();
+        const store = await readOperatorStore(storePath);
+        const found = Object.entries(store.agents).find(([, agent]) => agent.paneId === event.data.pane_id && (!agent.workspaceId || agent.workspaceId === event.data.workspace_id));
+        if (found) {
+          const { handleBlockedAgent } = await import("./blocked-lane.mjs");
+          const blocked = await handleBlockedAgent({ herdr: herdr ?? new JsonLineHerdrClient(), name: found[0], agent: found[1], timestamp: now(), storePath, notify: herdrNotification });
+          return { accepted: true, operatorAgent: found[0], blocked };
+        }
+      } catch (error) {
+        return { accepted: true, ignored: true, reason: `unmapped_event (operator agent check failed: ${error instanceof Error ? error.message : String(error)})` };
+      }
     }
     return { accepted: true, ignored: true, reason: "unmapped_event" };
   }
@@ -4489,6 +4510,8 @@ export function hookResponse(result) {
   // a lane-event ledger record, so they have no record.identity or wake.
   if (result.rootActivity)
     return { accepted: true, rootActivity: result.rootActivity };
+  if (result.operatorAgent)
+    return { accepted: true, operatorAgent: result.operatorAgent, blocked: result.blocked };
   return {
     accepted: result.accepted,
     deduplicated: result.deduplicated,

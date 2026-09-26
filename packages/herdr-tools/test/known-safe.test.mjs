@@ -446,3 +446,16 @@ test("rm of a folder the same command recreates with mkdir, and of files created
   deferred("npm test 2>> err.log; rm -f err.log", scoped, /not a known-safe target/);
   deferred("npm test > log.txt 2>&1; rm -f other.txt", scoped, /not a known-safe target/);
 });
+
+test("git push to a repository inside a session scratchpad, by path or a scratch variable", () => {
+  allowed(`git push -q ${SCRATCH}/repro/origin.git HEAD:refs/heads/main`, {}, "git-push-scratchpad-repo");
+  // Scoped to the ask rule (auto and bypass mode), as the hook runs it.
+  const scoped = { askRules: ["Bash(git push *)"], scopeToAskRules: true };
+  allowed(`R=${SCRATCH}/repro; git init -q --bare $R/origin.git && git push -q $R/origin.git HEAD:refs/heads/main`, scoped, "git-push-scratchpad-repo");
+  deferred(`git push -q ${SCRATCH}/../elsewhere.git HEAD:main`, {}, /git push must be|\.\./);
+  deferred("git push -q /tmp/other.git HEAD:main", {}, /git push must be/);
+  deferred(`git push -q ${SCRATCH}/repro/origin.git +HEAD:main`, {}, /force|git push must be/);
+  deferred(`git push -f ${SCRATCH}/repro/origin.git HEAD:main`, {}, /force/);
+  deferred("git push -q https://example.test/repo.git HEAD:main", {}, /git push must be/);
+  deferred("R=/Users/dev; git push -q $R/origin.git HEAD:main", scoped, /git push must be/);
+});

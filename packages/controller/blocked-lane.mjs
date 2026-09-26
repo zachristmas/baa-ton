@@ -535,3 +535,100 @@ export async function resolveScreenPrompts({ herdr, manifest, workflow, timestam
   }
   return changed;
 }
+
+/**
+ * A registered standalone agent (baa-ton operator register) that turned
+ * blocked: it has no workflow, so its prompts live in the operator store.
+ * A known-safe permission is approved at once (after the re-check); anything
+ * else is recorded for the operator (baa-ton inbox, one notification) and
+ * gets the same bounded default as a lane's prompt.
+ */
+export async function handleBlockedAgent({ herdr, name, agent, timestamp, storePath, notify = async () => undefined }) {
+  const paneId = agent.paneId;
+  let text;
+  try {
+    text = await readScreen(herdr, paneId, paneId);
+  } catch (error) {
+    return { status: "skipped", reason: `screen read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const screen = classifyScreen(text);
+  if (screen.kind === "unknown") return { status: "none", reason: "no permission prompt or question dialog on the visible screen" };
+  let rules;
+  try {
+    rules = await loadKnownSafe();
+  } catch (error) {
+    return { status: "skipped", reason: `known-safe rules could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (screen.kind === "permission" && screen.toolName === "Bash" && !screen.truncated && screen.command) {
+    const verdict = rules.classifyCommand(screen.command, agent.cwd ? { cwd: agent.cwd } : {});
+    if (verdict.decision === "allow") {
+      const check = await recheck(herdr, { paneId, agentKind: agent.agentKind, fingerprint: screen.fingerprint });
+      if (!check.ok) return { status: "skipped", reason: check.reason };
+      try {
+        await sendKeys(herdr, paneId, screen.approveKeys);
+      } catch (error) {
+        return { status: "skipped", reason: `send-keys failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      return { status: "approved", rules: verdict.rules };
+    }
+  }
+  const { withOperatorStore } = await import("../herdr-tools/operator.mjs");
+  const fallback = agent.cwd ? defaultFor(screen, agent.cwd, rules) : { ...defaultFor(screen, "/nonexistent-agent-cwd", rules), ...(screen.kind === "permission" ? { decision: "denied", keys: screen.denyKeys, reason: "policy default: the agent registered no folder, so nothing counts as inside it", text: "That step was denied by the unattended policy: no folder is registered for you (baa-ton operator register --cwd). Find another way or ask the operator." } : {}) };
+  const summary = summaryFor(screen);
+  const created = await withOperatorStore(storePath, (store) => {
+    const prompts = (store.prompts ??= []);
+    if (prompts.some((item) => item.paneId === paneId && item.fingerprint === screen.fingerprint && !item.applied)) return false;
+    prompts.push({
+      id: `prompt-${screen.fingerprint.slice(0, 10)}`,
+      agent: name,
+      paneId,
+      ...(agent.agentKind ? { agentKind: agent.agentKind } : {}),
+      kind: screen.kind,
+      summary,
+      fingerprint: screen.fingerprint,
+      options: screen.options,
+      approveKeys: screen.approveKeys,
+      denyKeys: screen.denyKeys,
+      at: timestamp,
+      defaultAt: new Date(Date.parse(timestamp) + SCREEN_PROMPT_DEFAULT_MS).toISOString(),
+      default: fallback,
+    });
+    if (prompts.length > 200) prompts.splice(0, prompts.length - 200);
+    return true;
+  });
+  if (!created) return { status: "routed", reason: "already recorded for this prompt", kind: screen.kind };
+  await notify({ title: `Baa-ton: ${name} is blocked`, body: `${summary}. Default in ${Math.round(SCREEN_PROMPT_DEFAULT_MS / 60_000)} min: ${fallback.reason}` });
+  return { status: "routed", kind: screen.kind, to: "operator" };
+}
+
+/** Supervisor tick: apply the due default of each registered agent's open prompt. */
+export async function resolveAgentPrompts({ herdr, storePath, timestamp }) {
+  const { addOperatorMessage, withOperatorStore } = await import("../herdr-tools/operator.mjs");
+  const { existsSync } = await import("node:fs");
+  if (!existsSync(storePath)) return [];
+  return withOperatorStore(storePath, async (store) => {
+    const done = [];
+    for (const prompt of store.prompts ?? []) {
+      if (prompt.applied || Date.parse(timestamp) < Date.parse(prompt.defaultAt)) continue;
+      const check = await recheck(herdr, { paneId: prompt.paneId, agentKind: prompt.agentKind, fingerprint: prompt.fingerprint });
+      if (!check.ok) {
+        if (/no longer on screen|not blocked|no agent|now runs/.test(check.reason)) prompt.applied = { at: timestamp, skipped: check.reason };
+        continue;
+      }
+      try {
+        await sendKeys(herdr, prompt.paneId, prompt.default.keys);
+        prompt.applied = { at: timestamp, keys: prompt.default.keys, decision: prompt.default.decision, reason: prompt.default.reason };
+      } catch (error) {
+        prompt.applied = { at: timestamp, keys: prompt.default.keys, uncertain: error instanceof Error ? error.message : String(error) };
+      }
+      if (prompt.default.text) {
+        const agent = store.agents[prompt.agent];
+        if (agent) addOperatorMessage(store, { target: prompt.agent, resolved: { kind: "agent", label: `agent:${prompt.agent}`, paneId: agent.paneId, ...(agent.workspaceId ? { workspaceId: agent.workspaceId } : {}), ...(agent.agentKind ? { agentKind: agent.agentKind } : {}) }, text: prompt.default.text, from: "baa-ton unattended default", at: timestamp });
+      }
+      (store.decisions ??= []).push({ at: timestamp, kind: `agent-${prompt.kind}`, agent: prompt.agent, summary: prompt.summary, decision: prompt.default.decision, reason: prompt.default.reason, reviewed: false });
+      if (store.decisions.length > 200) store.decisions.splice(0, store.decisions.length - 200);
+      done.push(prompt.id);
+    }
+    return done;
+  });
+}

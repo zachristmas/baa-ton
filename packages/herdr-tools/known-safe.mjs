@@ -312,6 +312,18 @@ function gitVerdict(segment, options, context = {}) {
   const create = /^git (?:checkout|switch) (?:-q )?(?:-b|-c) (\S+) origin\/main$/.exec(segment);
   if (create) return branch.test(create[1]) ? { safe: true, rule: "git-create-branch" } : { safe: false, reason: `branch name ${create[1]}` };
   if (/^git (?:checkout|switch) (?:-q )?--detach origin\/main$/.test(segment)) return { safe: true, rule: "git-detach-origin-main" };
+  // A push to a local repository inside a session scratchpad (a bare repo a
+  // test or reproduction set up) never leaves the machine.
+  const localPush = /^git push(?: -q)?(?: -u)? ("?[^\s"]+"?) (?!\+)[\w./:-]+$/.exec(segment);
+  if (localPush) {
+    const target = unquote(localPush[1]);
+    const variable = /^\$\{?(\w+)\}?(\/[\w./-]*)?$/.exec(target);
+    const trusted = context.trusted;
+    const inScratch =
+      !target.includes("..") &&
+      (SESSION_SCRATCHPAD.test(target) || Boolean(variable && trusted && (trusted.scratchRoots?.has(variable[1]) || trusted.scratchSubs?.has(variable[1]))));
+    if (inScratch) return { safe: true, rule: "git-push-scratchpad-repo" };
+  }
   const push = /^git push(?: -q)?(?: -u)? origin (\S+)$/.exec(segment);
   if (/^git push\b/.test(segment)) {
     if (!push) return { safe: false, reason: "git push must be `git push [-q] [-u] origin <branch>`" };
