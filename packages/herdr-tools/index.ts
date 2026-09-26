@@ -2722,6 +2722,7 @@ function contract(workflow: Workflow, lane: Lane): string {
     ...(workflow.worktree ?? workflow.cwd
       ? [`Your working directory is ${workflow.worktree ?? workflow.cwd}, and you start in it. Run commands from it with relative paths; never retype its absolute path (one typo sends you outside it and stops you at a permission prompt).`]
       : []),
+    "Write every shell command on one line: no backslash line continuations and no line that is only a backslash. Claude asks about those, and nobody may be there to answer.",
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane. A command that outlasts the normal timeout runs with a longer timeout or in your harness's own tracked background mode (Claude: the Bash tool's run_in_background), never with &, disown, nohup or setsid.",
     "Never git stash drop, pop or clear: the stash is shared by every worktree of the repository and holds other sessions' work. Set temporary changes aside with a patch file outside the repository (git diff > <scratch>/x.patch; git checkout -- <files>; later git apply <scratch>/x.patch) or a throwaway commit on your own branch.",
@@ -5501,7 +5502,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             // lanes too) never started: once its agent is gone, retiring it
             // records that outcome. It needs no grace: the dispatch is over.
             const neverStarted = workflow.status === "dispatch-failed" && workflow.ownership?.createdBy === OWNER;
-            if (!lane.specStage && !neverStarted) continue;
+            // A completed workflow's lane with its receipt recorded is
+            // finished too, whether or not the receipt was ever delivered.
+            const completedWithReceipt = ["completed", "closed"].includes(workflow.status) && Boolean(lane.completionReceipt) && workflow.ownership?.createdBy === OWNER;
+            if (!lane.specStage && !neverStarted && !completedWithReceipt) continue;
+            if (completedWithReceipt && !lane.specStage && lane.paneId && (await agentPresent(lane.paneId).catch(() => true))) continue;
             if (lane.retirement && lane.retirement.status !== "partial") continue;
             if (current.has(`${workflow.id}/${lane.id}`)) continue;
             const orphan = !lane.completionReceipt;
@@ -5512,7 +5517,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             }
             const [candidate] = retireCandidates(ctx.cwd, latest, { auto: false, workflowId: workflow.id, laneId: lane.id, force: orphan });
             if (!candidate) continue;
-            const reason = !orphan ? "spec receipt consumed (auto-retire)" : neverStarted ? "dispatch failed; the lane never started (auto-retire)" : "spec lane no item maps any more (auto-retire)";
+            const reason = !orphan
+              ? lane.specStage
+                ? "spec receipt consumed (auto-retire)"
+                : "workflow completed with its receipt recorded (auto-retire)"
+              : neverStarted
+                ? "dispatch failed; the lane never started (auto-retire)"
+                : "spec lane no item maps any more (auto-retire)";
             try {
               await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, reason, signal)))(candidate);
               done.push(`retired ${workflow.id}/${lane.id}`);

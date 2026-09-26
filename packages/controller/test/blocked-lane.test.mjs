@@ -13,6 +13,7 @@ import {
   handleIdleLane,
   readTail,
   resolveScreenPrompts,
+  sweepLaneDialogs,
 } from "../blocked-lane.mjs";
 
 const PANE = "w-lane:p1";
@@ -408,4 +409,27 @@ test("a registered agent's command that starts by cd into another worktree of it
   assert.deepEqual(await agentCommandOptions("/repo", "cd /other && git rebase -q origin/main", { gitDir, facts }), { cwd: "/repo", ownBranch: "ink/admin" }, "another repository: the registered folder");
   assert.deepEqual(await agentCommandOptions("/repo", "git status", { gitDir, facts }), { cwd: "/repo", ownBranch: "ink/admin" });
   assert.deepEqual(await agentCommandOptions(undefined, "git status", { gitDir, facts }), {});
+});
+
+test("a dialog Herdr reports as working is found by the sweep and handled like a blocked lane (a live stall)", async () => {
+  // Claude's built-in check on a backslash-continued command raised a
+  // prompt, but the pane never turned blocked, so no hook ever ran.
+  const command = "node /home/u/.pi/agent/extensions/herdr-orchestrator/demo-report.mjs --steps a/steps.json --out a/demo.docx";
+  const herdr = fakeHerdr({ screens: permissionScreen(command, "Contains backslash-escaped whitespace"), status: "working" });
+  const workflow = { ...workflowFixture(), eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "working" } }] } };
+  workflow.lanes[0].status = "running";
+  const swept = new Map();
+  const manifest = { workflows: [workflow] };
+  const changed = await sweepLaneDialogs({ herdr, manifest, workflow, timestamp: "2026-09-24T12:00:00.000Z", now: 1_000_000, swept });
+  assert.equal(changed, true);
+  assert.deepEqual(herdr.calls.keys, [{ paneId: PANE, keys: ["1"] }], "the known-safe demo recorder is approved on screen");
+  assert.match(workflow.evidence.at(-1).text, /known-safe \(demo-report\)/);
+  // Checked at most once a minute.
+  herdr.calls.keys.length = 0;
+  await sweepLaneDialogs({ herdr, manifest, workflow, timestamp: "2026-09-24T12:00:30.000Z", now: 1_030_000, swept });
+  assert.equal(herdr.calls.keys.length, 0);
+  // A lane whose latest status is blocked is the hook's to handle.
+  const reads = herdr.calls.reads;
+  await sweepLaneDialogs({ herdr, manifest, workflow: { ...workflow, eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "blocked" } }] } }, timestamp: "t", now: 2_000_000, swept: new Map() });
+  assert.equal(herdr.calls.reads, reads);
 });

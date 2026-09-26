@@ -47,7 +47,7 @@ export {
 } from "./lane-services.mjs";
 import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
-import { handleBlockedLane, handleIdleLane, resolveScreenPrompts } from "./blocked-lane.mjs";
+import { handleBlockedLane, handleIdleLane, resolveScreenPrompts, sweepLaneDialogs } from "./blocked-lane.mjs";
 import { writeHeartbeat } from "./supervisor-keepalive.mjs";
 import {
   enqueueWakeHint,
@@ -3642,6 +3642,9 @@ export async function runSupervisorTick({
         if (await resolveScreenPrompts({ herdr: api, manifest, workflow: stored, timestamp })) laneQueueChanged = true;
       for (const stored of matchedWorkflows)
         if (await deliverLaneQueue({ workflow: stored, herdr: api, timestamp })) laneQueueChanged = true;
+      // Dialogs Herdr never reported as blocked are found by looking.
+      for (const stored of matchedWorkflows)
+        if (await sweepLaneDialogs({ herdr: api, manifest, workflow: stored, timestamp })) laneQueueChanged = true;
       if (laneQueueChanged) await atomicWriteJson(manifestPath, manifest);
       // Herdr's sidebar rows are selected by canonical agent kind, while
       // pane.report_metadata supplies the per-pane role/workflow breadcrumb.

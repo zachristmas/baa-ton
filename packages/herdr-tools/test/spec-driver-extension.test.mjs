@@ -1995,7 +1995,7 @@ test("spec lanes whose receipt the driver consumed are retired under the retire 
     const retired = [];
     f.ports.retire = async (candidate) => retired.push(`${candidate.workflowId}/${candidate.laneId}`);
     const result = await f.advance();
-    assert.deepEqual(retired, ["herdr-b1/lane-1"], "only the consumed spec lane: not the item's current lane, a non-spec lane or an already retired one");
+    assert.deepEqual(retired.sort(), ["herdr-b1/lane-1", "herdr-old/lane-1"], "the consumed spec lane, and a completed workflow's lane with its receipt; not the item's current lane or an already retired one");
     assert.match(result.content[0].text, /retired herdr-b1\/lane-1/);
   } finally {
     await f.cleanup();
@@ -2033,13 +2033,17 @@ test("spec lanes without a receipt that no item maps are retired once idle and p
       { id: "herdr-plain", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "done", paneId: "w:plain", tabId: "t:plain", agentStartedAt: old }], evidence: [] },
       // A root-dispatched (non-spec) lane whose dispatch failed and whose agent is gone: it never started.
       { id: "herdr-rootfail", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "gone", paneId: "w:gone", tabId: "t:gone" }], evidence: [] },
+      // A root-dispatched lane of a completed workflow, its receipt never delivered, its agent gone.
+      { id: "herdr-rootdone", status: "completed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "completion-reported", paneId: "w:done", tabId: "t:done", completionReceipt: { id: "r", summary: "done", delivery: "pending" } }], evidence: [] },
+      // The same, but its agent is still working: left alone.
+      { id: "herdr-rootbusy", status: "completed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "completion-reported", paneId: "w:busy", tabId: "t:rb", completionReceipt: { id: "r", summary: "done", delivery: "pending" } }], evidence: [] },
     );
     await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
     f.ports.agentPresent = async (paneId) => paneId === "w:busy";
     const retired = [];
     f.ports.retire = async (candidate) => retired.push(candidate.workflowId);
     const result = await f.advance();
-    assert.deepEqual(retired.sort(), ["herdr-closed", "herdr-planned", "herdr-rootfail"], "not the item's current lane, a lane in its grace, a working one, or a running non-spec lane; a non-spec lane whose dispatch failed is");
+    assert.deepEqual(retired.sort(), ["herdr-closed", "herdr-planned", "herdr-rootdone", "herdr-rootfail"], "not the item's current lane, a lane in its grace, a working one, or a running non-spec lane; a non-spec lane whose dispatch failed, or whose completed workflow recorded its receipt, is");
     assert.match(result.content[0].text, /retired herdr-planned\/lane-1/);
   } finally {
     await f.cleanup();
