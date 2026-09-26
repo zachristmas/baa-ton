@@ -46,3 +46,5 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | 2026-09-26 | Verify contended with integration for one worktree | #101: verify in its own detached worktree |
 | 2026-09-26 | Items exhausted by infrastructure errors | #103: infrastructure failures never count; re-armed on deploy |
 | 2026-09-26 | Root reload not taking effect; self-update never ran | #91, #97, #100 |
+| 2026-09-26 | Self-update refused a green commit: the suite timed out while starting a process took 15-55s | Self-update waits while spawns are slow and retries a red run up to 3 times |
+| 2026-09-26 | A root reload was never retried: the root stayed working for hours | A root busy 30 min past a due reload is reported as an anomaly |

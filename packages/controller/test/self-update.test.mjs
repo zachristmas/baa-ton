@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SELF_UPDATE_CHECK_MS, createSelfUpdater } from "../self-update.mjs";
+import { RELOAD_BUSY_MS, SELF_UPDATE_CHECK_MS, SPAWN_SLOW_MS, createSelfUpdater } from "../self-update.mjs";
 
 // Hermetic git: no global or system config (signing, hooks, aliases).
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" };
@@ -80,7 +80,7 @@ test("a new main is tested in a scratch worktree, then fast-forwarded into the i
   }
 });
 
-test("a commit that fails its tests is never applied and is reported once", async () => {
+test("a commit that fails its tests three times is never applied and is reported once", async () => {
   const r = await repos();
   try {
     const before = git(r.installed, "rev-parse", "HEAD");
@@ -102,7 +102,15 @@ test("a commit that fails its tests is never applied and is reported once", asyn
     await updater.tick();
     await settle();
     const result = await updater.tick();
-    assert.ok(result.events.some((event) => /failed npm test; not deployed/.test(event)));
+    assert.ok(result.events.some((event) => /failed npm test \(run 1 of 3\); retrying/.test(event)), "a red run may be the machine: it is retried");
+    assert.equal(notes.length, 0, "nothing reported before the last run");
+    for (const run of [2, 3]) {
+      time.advance(SELF_UPDATE_CHECK_MS + 1);
+      await updater.tick();
+      await settle();
+      const next = await updater.tick();
+      if (run === 3) assert.ok(next.events.some((event) => /failed npm test 3 times; not deployed/.test(event)));
+    }
     assert.equal(git(r.installed, "rev-parse", "HEAD"), before);
     assert.equal(notes.length, 1);
     assert.equal(notes[0].title, "Baa-ton update failed its tests");
@@ -110,7 +118,7 @@ test("a commit that fails its tests is never applied and is reported once", asyn
     await updater.tick();
     await settle();
     await updater.tick();
-    assert.equal(runs, 1, "the same red commit is not retested");
+    assert.equal(runs, 3, "a commit red three times is not retested");
     assert.equal(notes.length, 1, "nor reported again");
   } finally {
     await r.cleanup();
@@ -223,6 +231,81 @@ test("a reload that never shows up is tried 5 times, then the user is told once"
     }
     assert.equal(prompts.length, 5);
     assert.equal(notes.filter((note) => note.title === "Baa-ton: root did not reload").length, 1);
+  } finally {
+    await r.cleanup();
+  }
+});
+
+test("while starting a process is slow the test run waits, then runs once the machine recovers", async () => {
+  const r = await repos();
+  try {
+    await r.advance("two\n");
+    const time = clock();
+    let delay = SPAWN_SLOW_MS + 20_000;
+    let runs = 0;
+    const updater = createSelfUpdater({
+      configDir: r.configDir,
+      ownCheckout: r.installed,
+      env: {},
+      now: time.now,
+      spawnProbe: async () => delay,
+      startTests: async () => ((runs += 1), { ok: true, output: "" }),
+    });
+    const first = await updater.tick();
+    assert.ok(first.events.some((event) => /waits: starting a process takes 25s/.test(event)));
+    assert.equal(runs, 0);
+    time.advance(SELF_UPDATE_CHECK_MS + 1);
+    const second = await updater.tick();
+    assert.equal(second.events.length, 0, "the wait is logged once");
+    delay = 50;
+    time.advance(SELF_UPDATE_CHECK_MS + 1);
+    await updater.tick();
+    await settle();
+    await updater.tick();
+    assert.equal(runs, 1);
+    assert.equal(git(r.installed, "rev-parse", "HEAD"), git(r.installed, "rev-parse", "origin/main"));
+  } finally {
+    await r.cleanup();
+  }
+});
+
+test("a root that never goes idle for /reload is reported once, not waited on in silence", async () => {
+  const r = await repos();
+  try {
+    const old = git(r.installed, "rev-parse", "HEAD");
+    await r.advance("two\n");
+    git(r.installed, "pull", "-q", "--ff-only");
+    const time = clock();
+    const anomalies = [];
+    const prompts = [];
+    let status = "working";
+    const updater = createSelfUpdater({
+      configDir: r.configDir,
+      ownCheckout: r.installed,
+      env: {},
+      now: time.now,
+      startTests: async () => ({ ok: true, output: "" }),
+      runtime: () => [{ role: "extension", checkout: r.installed, commit: old, paneId: "w1:p1", agentKind: "pi" }],
+      rootPanes: async () => new Set(["w1:p1"]),
+      ready: async () => ({ ok: true, agent: { agent_status: status } }),
+      prompt: async (paneId, text) => prompts.push({ paneId, text }),
+      anomaly: async (anomaly) => anomalies.push(anomaly),
+    });
+    await updater.tick();
+    time.advance(RELOAD_BUSY_MS - 60_000);
+    await updater.tick();
+    assert.equal(anomalies.length, 0);
+    time.advance(60_000);
+    const due = await updater.tick();
+    assert.ok(due.events.some((event) => /still waiting: the root has been working for 30 min/.test(event)));
+    time.advance(60_000);
+    await updater.tick();
+    assert.equal(anomalies.length, 1, "reported once");
+    assert.equal(anomalies[0].kind, "reload-unconfirmed");
+    assert.equal(prompts.length, 0, "never typed into a working root");
+    status = "idle";
+    await updater.tick();
+    assert.equal(prompts.length, 1, "sent as soon as the root is idle");
   } finally {
     await r.cleanup();
   }

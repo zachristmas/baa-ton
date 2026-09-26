@@ -106,7 +106,7 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
         input: JSON.stringify({ session_id: "s-2", cwd: directory, hook_event_name: "PermissionRequest", tool_name: tool, tool_input: input }),
         encoding: "utf8",
         env: { ...process.env, FAKE_BRIDGE_LOG: bridgeLog, FAKE_BRIDGE_ANSWER: answer },
-        timeout: 20_000,
+        timeout: 120_000,
       },
     );
   try {
