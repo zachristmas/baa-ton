@@ -561,8 +561,13 @@ async function main(argv) {
   if (command === "status") process.stdout.write(`${specStatusTable(spec, state, verification)}\n`);
   else {
     process.stdout.write(`${verification.done}/${verification.total} done\n`);
-    for (const result of verification.results)
-      if (!result.done) process.stdout.write(`${result.id}: ${result.failing.name}: ${result.failing.detail}\n`);
+    for (const result of verification.results) {
+      if (result.done) continue;
+      // Deferred items are not counted and have no failing check.
+      if (result.deferred) process.stdout.write(`${result.id}: deferred (not counted)\n`);
+      else if (result.failing) process.stdout.write(`${result.id}: ${result.failing.name}: ${result.failing.detail}\n`);
+      else process.stdout.write(`${result.id}: not done\n`);
+    }
   }
   return command === "verify" && verification.done !== verification.total ? 1 : 0;
 }

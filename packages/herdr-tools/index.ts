@@ -11493,7 +11493,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               `${verification.done}/${verification.total} done`,
               ...verification.results
                 .filter((result) => !result.done)
-                .map((result) => `${result.id}: ${result.failing!.name}: ${result.failing!.detail}`),
+                // Deferred items are not counted and have no failing check.
+                .map((result) =>
+                  (result as { deferred?: boolean }).deferred
+                    ? `${result.id}: deferred (not counted)`
+                    : result.failing
+                      ? `${result.id}: ${result.failing.name}: ${result.failing.detail}`
+                      : `${result.id}: not done`,
+                ),
             ].join("\n");
       return { content: [{ type: "text", text }], details: { configured: true, verification } };
     },

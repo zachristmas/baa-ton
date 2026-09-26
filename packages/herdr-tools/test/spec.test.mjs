@@ -179,6 +179,30 @@ test("the verifier passes an item only when every check does, and names the firs
   }
 });
 
+test("the verify CLI lists deferred items instead of crashing on them", async () => {
+  const r = await repoFixture();
+  try {
+    const sha = await r.commit("a.txt", "a");
+    r.git("update-ref", "refs/remotes/origin/feature/release", sha);
+    await mkdir(join(r.directory, ".baa-ton", "herdr-orchestrator"), { recursive: true });
+    await writeFile(join(r.directory, ".baa-ton", "spec.json"), JSON.stringify(baseSpec([item("ONE"), item("LATER")])));
+    await writeFile(join(r.directory, ".baa-ton", "herdr-orchestrator", "spec-state.json"), JSON.stringify({ version: 1, items: { LATER: { state: "deferred" } } }));
+    const cli = fileURLToPath(new URL("../spec.mjs", import.meta.url));
+    const verify = spawnSync(process.execPath, [cli, "verify", r.directory], { encoding: "utf8" });
+    assert.equal(verify.stderr, "");
+    assert.equal(verify.status, 1);
+    assert.equal(verify.stdout, "0/1 done\nONE: integrated: no integrated commit recorded\nLATER: deferred (not counted)\n");
+    const require = createRequire(import.meta.url);
+    const { default: extension } = await require("jiti")(import.meta.url).import("../index.ts");
+    const tools = new Map();
+    extension({ on() {}, registerCommand() {}, registerTool: (definition) => tools.set(definition.name, definition), async exec() { throw new Error("unexpected"); } });
+    const result = await tools.get("herdr_spec").execute("spec", { action: "verify" }, undefined, undefined, { cwd: r.directory, mode: "json", hasUI: false, ui: { confirm: async () => false, notify() {} } });
+    assert.equal(result.content[0].text, "0/1 done\nONE: integrated: no integrated commit recorded\nLATER: deferred (not counted)", "the root's tool too");
+  } finally {
+    await rm(r.directory, { recursive: true, force: true });
+  }
+});
+
 test("the CLI and herdr_spec report the same verdict", async () => {
   const r = await repoFixture();
   try {
