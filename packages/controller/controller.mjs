@@ -2004,6 +2004,26 @@ async function paneProcessInfo(herdr, paneId) {
   return JSON.parse(stdout);
 }
 
+/**
+ * Whether a registered agent's pane is dead (agent-revive.mjs): the pane's
+ * only foreground process is its shell, or, when process info is
+ * unavailable, Herdr has no agent in it. Something else in the foreground
+ * (an agent starting, another program) is never dead. undefined when
+ * neither can be read.
+ */
+export async function revivePaneState(herdr, paneId) {
+  const shell = await paneProcessInfo(herdr, paneId).then(paneShowsShell, () => undefined);
+  if (shell === true) return { dead: true, reason: "pane_shows_shell_prompt" };
+  if (shell === false) return { dead: false, reason: "pane_busy" };
+  try {
+    const ready = liveAgentReady(await herdr.request("agent.get", { target: paneId }), { pane_id: paneId });
+    return { dead: ready.reason === "no_agent_in_pane", reason: ready.reason ?? "agent_present" };
+  } catch (error) {
+    if (error instanceof HerdrApiError && (error.code === "agent_not_found" || error.code === "agent_not_running")) return { dead: true, reason: error.code };
+    return undefined;
+  }
+}
+
 /** Fetch and check the agent right before a send; never throws. */
 export async function agentReadyForSend(herdr, target, expected) {
   let ready;
@@ -4481,6 +4501,9 @@ export async function runSupervisorLoop({
   // false turns one off.
   hosts,
   turnWatch,
+  // Dead-pane relaunch of registered agents (agent-revive.mjs); tests pass a
+  // fake, false turns it off.
+  revive,
 } = {}) {
   assert(
     Number.isSafeInteger(intervalMs) && intervalMs >= 5_000,
@@ -4577,6 +4600,30 @@ export async function runSupervisorLoop({
       supervisorLog(resolvedConfigDir, `spec hosts disabled: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  // Dead-pane fallback: relaunch a registered agent whose session ended.
+  let reviver = revive;
+  if (reviver === undefined && onCodeChange && code) {
+    try {
+      const { createAgentReviver } = await import("./agent-revive.mjs");
+      let client;
+      const api = {
+        request: (method, params) => (client ??= herdr ?? new JsonLineHerdrClient()).request(method, params),
+        ...(typeof herdr?.processInfo === "function" ? { processInfo: herdr.processInfo.bind(herdr) } : {}),
+      };
+      reviver = createAgentReviver({
+        paneState: (agent) => revivePaneState(api, agent.paneId),
+        run: (paneId, command) => execFileAsync("herdr", ["pane", "run", paneId, command], { timeout: 10_000 }),
+        anomaly: async (anomaly) => {
+          const { reportAnomaly } = await import("./anomalies.mjs");
+          return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+        },
+        notify: herdrNotification,
+      });
+    } catch (error) {
+      reviver = undefined;
+      supervisorLog(resolvedConfigDir, `agent relaunch disabled: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   let stopping = false;
   let ticking = false;
   let timer;
@@ -4628,6 +4675,13 @@ export async function runSupervisorLoop({
           const message = error instanceof Error ? error.message : String(error);
           if (message !== lastTickError) supervisorLog(resolvedConfigDir, `tick failed: ${message}`);
           lastTickError = message;
+        }
+        if (reviver && !stopping) {
+          try {
+            for (const event of (await reviver.tick())?.events ?? []) supervisorLog(resolvedConfigDir, `relaunch: ${event}`);
+          } catch (error) {
+            supervisorLog(resolvedConfigDir, `relaunch check failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
         for (const [label, part] of [["spec hosts", specHosts], ["root turn watch", rootTurns]]) {
           if (!part || stopping) continue;

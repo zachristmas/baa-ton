@@ -32,14 +32,14 @@ const USAGE = `Usage:
       target: root | root:<id> | <workflowId>/<laneId> | <registered agent>
   baa-ton reply <id> <text...> [--from <name>]
   baa-ton inbox [--all | --unread] [--json]
-  baa-ton operator register <name> [--pane <id>] [--workspace <id>] [--kind <agent>] [--cwd <folder>]
+  baa-ton operator register <name> [--pane <id>] [--workspace <id>] [--kind <agent>] [--cwd <folder>] [--resume | --resume-command "<command>"]
   baa-ton operator unregister <name>
   baa-ton operator agents
   baa-ton deliver
   baa-ton run status|pause|resume [--reason <text>] [--from <name>]`;
 
 /** Split argv into positionals and --flags (a flag takes the next word unless boolean). */
-export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread"])) {
+export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread", "resume"])) {
   const positional = [];
   const flags = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -102,8 +102,8 @@ export async function runOperatorCli(argv, { env = process.env, out = (text) => 
     case "operator": {
       const [sub, name] = positional;
       if (sub === "register" && name) {
-        const agent = await registerAgent({ name, paneId: flags.pane, workspaceId: flags.workspace, agentKind: flags.kind, cwd: flags.cwd, env });
-        out(`registered ${name} at pane ${agent.paneId}. Add this to the agent's own instructions:\n${agent.instructions}`);
+        const agent = await registerAgent({ name, paneId: flags.pane, workspaceId: flags.workspace, agentKind: flags.kind, cwd: flags.cwd, resume: flags["resume-command"] || flags.resume, env });
+        out(`registered ${name} at pane ${agent.paneId}${agent.resume ? ` (relaunched with "${agent.resume}" if its pane dies)` : ""}. Add this to the agent's own instructions:\n${agent.instructions}`);
         return agent;
       }
       if (sub === "unregister" && name) {

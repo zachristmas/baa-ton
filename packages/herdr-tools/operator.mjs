@@ -154,11 +154,11 @@ export function resolveOperatorTarget(target, { config, agents = {} } = {}) {
   throw new Error(`Unknown target ${text}. Registered agents: ${Object.keys(agents).join(", ") || "none"} (baa-ton operator register <name>).`);
 }
 
-export function registerOperatorAgent(store, { name, paneId, workspaceId, agentKind, cwd, at = nowIso() }) {
+export function registerOperatorAgent(store, { name, paneId, workspaceId, agentKind, cwd, sessionId, resume, at = nowIso() }) {
   if (!/^[A-Za-z0-9][\w.-]{0,63}$/.test(String(name ?? ""))) throw new Error("An agent name is letters, digits, dot, dash or underscore (up to 64).");
   if (name === "root" || name.includes(":") || name.includes("/")) throw new Error(`${name} is reserved.`);
   if (!paneId) throw new Error("A pane is required: run inside the agent's Herdr pane or pass --pane.");
-  store.agents[name] = { paneId, ...(workspaceId ? { workspaceId } : {}), ...(agentKind ? { agentKind } : {}), ...(cwd ? { cwd } : {}), registeredAt: at };
+  store.agents[name] = { paneId, ...(workspaceId ? { workspaceId } : {}), ...(agentKind ? { agentKind } : {}), ...(cwd ? { cwd } : {}), ...(sessionId ? { sessionId } : {}), ...(resume ? { resume } : {}), registeredAt: at };
   return store.agents[name];
 }
 

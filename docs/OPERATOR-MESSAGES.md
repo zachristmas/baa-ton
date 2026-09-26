@@ -71,7 +71,7 @@ Reply with: baa-ton reply op-1a2b3c4d "<answer>" (or the herdr_operator_reply to
 
 ### Surfaces
 
-- CLI: `baa-ton message <target> <text> [--from name] [--notify]`, `baa-ton reply <id> <text>`, `baa-ton inbox [--all|--unread] [--json]`, `baa-ton operator register <name> [--pane id]`, `baa-ton operator unregister <name>`, `baa-ton operator agents`, `baa-ton deliver`.
+- CLI: `baa-ton message <target> <text> [--from name] [--notify]`, `baa-ton reply <id> <text>`, `baa-ton inbox [--all|--unread] [--json]`, `baa-ton operator register <name> [--pane id] [--resume | --resume-command "<command>"]` (a resume command makes the supervisor relaunch the agent if its pane dies; see SELF-HEALING.md), `baa-ton operator unregister <name>`, `baa-ton operator agents`, `baa-ton deliver`.
 - MCP (the stdio bridge, also outside a Herdr session): `herdr_operator_message`, `herdr_operator_reply`, `herdr_operator_inbox`.
 - Pi root: the same three tools, registered by the extension.
 
