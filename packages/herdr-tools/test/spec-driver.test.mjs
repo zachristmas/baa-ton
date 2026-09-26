@@ -142,7 +142,7 @@ test("integration receipts are parsed from their INTEGRATED and SUITE lines", ()
   assert.deepEqual(integrationResult("INTEGRATED: abc\nSUITE: pass"), { sha: undefined, suite: "pass" }, "a short SHA is not accepted");
 });
 
-test("one serial integration queue in dependency order, then one push prompt per round", () => {
+test("one serial integration queue in dependency order; each newly ready head is pushed without waiting for the queue", () => {
   const s = spec([{ id: "A", acceptance: { text: "a", tests: ["npm test"] } }, { id: "B", dependsOn: ["A"] }, { id: "C" }]);
   const state = { version: 1, items: { A: { state: "integrating", attempts: 1 }, B: { state: "integrating", attempts: 1 }, C: { state: "integrating", attempts: 1 } } };
   let step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
@@ -150,14 +150,14 @@ test("one serial integration queue in dependency order, then one push prompt per
   assert.equal(step.waits.B, "integration queue: after A");
   assert.equal(step.waits.C, "integration queue: after A");
 
-  // A merges; B (which depends on A) is next, C after it; no push prompt while the queue runs.
+  // A merges; B (which depends on A) is next, C after it; A is ready to push now.
   step.state.items.A.lane = { workflowId: "wi1", laneId: "l1" };
   step = advanceSpec({ spec: s, state: step.state, lane: lanes({ "wi1/l1": { status: "completed", receipt: { summary: `INTEGRATED: ${SHA_A}\nSUITE: pass` } } }), now: at(1) });
   assert.equal(step.state.items.A.state, "awaiting-push");
   assert.deepEqual(step.state.items.A.integration, { sha: SHA_A, order: 1, at: at(1) });
   assert.deepEqual(step.state.items.A.tests, [{ command: "npm test", sha: SHA_A, result: "pass", at: at(1), by: "integrate" }]);
   assert.deepEqual(step.actions, [{ kind: "integrate", itemId: "B", attempt: 1 }]);
-  assert.equal(step.rootAsks.length, 0, "the round is still running");
+  assert.deepEqual(step.rootAsks, [{ itemId: "A", kind: "push", items: ["A"], sha: SHA_A, reason: "push round of 1" }], "ready items do not wait for the queue");
 
   step.state.items.B.lane = { workflowId: "wi2", laneId: "l1" };
   step.state.items.C.state = "failed";
@@ -386,4 +386,27 @@ test("a decline is an explicit DECLINED line, or decline language where the stag
     undefined,
   ]);
   assert.equal(profileAfterDeclines({ defaults: {}, stages: {} }, "review", 2), undefined, "no fallbacks: two declines, then the root");
+});
+
+test("the integration commit of an item is found in the branch history by its own spec(<id>) or merge commit", async () => {
+  const { integrationCommitFor } = await import("../spec-driver.mjs");
+  const [a, b, c, d] = ["a", "b", "c", "d"].map((char) => char.repeat(40));
+  const log = [`${a}\tspec(D12): renumber migrations`, `${b}\tMerge demo/store-create into spec-integration (D1)`, `${c}\tspec(D15): integrate`, `${d}\tfix(ticket): explicit inject`].join("\n");
+  assert.equal(integrationCommitFor(log, "D15"), c);
+  assert.equal(integrationCommitFor(log, "D12"), a, "the newest own commit");
+  assert.equal(integrationCommitFor(log, "D1"), b, "a merge naming it; D1 never matches D12 or D15");
+  assert.equal(integrationCommitFor(log, "D2"), undefined);
+  assert.equal(integrationCommitFor(`${d}\tdocs: mention D7 in the readme`, "D7"), undefined, "naming alone is not integrating");
+});
+
+test("a round push goes out for the ready items while others still integrate", () => {
+  const s = spec([{ id: "A" }, { id: "B" }, { id: "C" }]);
+  const step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1 } }, B: { state: "awaiting-push", integration: { sha: SHA_B, order: 2 } }, C: { state: "integrating", attempts: 1 } } },
+    lane: lanes({}),
+    now: at(0),
+  });
+  const push = step.rootAsks.find((ask) => ask.kind === "push");
+  assert.deepEqual([push.items, push.sha], [["A", "B"], SHA_B], "the last ready item's commit, not the branch head");
 });

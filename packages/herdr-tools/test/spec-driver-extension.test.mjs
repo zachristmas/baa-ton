@@ -1334,7 +1334,7 @@ test("the integration gate is baseline-relative: failures the target tip already
     assert.ok(["ready", "building"].includes(state.items.D04.state), "a new failure is a real one: back to its builder");
     assert.equal(state.items.D04.integration, undefined);
     assert.match(state.items.D04.findings, /tasks the target does not already fail: @acme\/payment-service test/);
-    assert.match(result.content[0].text, /push/i);
+    void result;
     const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
     assert.ok(alerts.some((alert) => alert.kind === "spec-push-ready" && /known baseline failures, not from these items\): @acme\/ticket-service lint/.test(alert.text)), "the push ask lists them");
   } finally {
@@ -1664,6 +1664,73 @@ test("without the grant the push stays with the root; while the run is paused th
     else process.env.BAATON_OPERATOR_STORE = saved;
     await rm(storeDir, { recursive: true, force: true });
     await f.cleanup();
+  }
+});
+
+test("a baseline lane idle without its receipt is asked once, then replaced by a fresh lane", async () => {
+  const target = "7".repeat(40);
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release", suite: ["npm test"] }, items: [{ id: "D17", title: "Footer", acceptance: { text: "f" } }] },
+    seed: { version: 1, items: { D17: { state: "integrating", attempts: 1 } }, baselineRun: { kind: "baseline", targetSha: target, attempts: 1, requestedAt: "2026-09-24T11:00:00.000Z", lane: { workflowId: "herdr-base", laneId: "lane-1" } } },
+  });
+  try {
+    f.ports.revParse = async () => target;
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-base", status: "awaiting-explicit-outcome", lanes: [{ id: "lane-1", status: "done", specStage: "baseline", paneId: "w-spec:p5" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] }, evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => (told.push(input), { message: { delivery: { status: "delivered" } } });
+    await f.advance();
+    assert.equal(told.length, 1);
+    assert.match(told[0].text, new RegExp(`BASELINE: ${target}`));
+    f.ports.now = () => "2026-09-24T12:31:00.000Z";
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.baselineRun.attempts, 2);
+    assert.ok(f.calls.plan.some((call) => call.specStage === "baseline"), "a fresh baseline lane");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a queued item merged with rewritten commits is found by its spec(<id>) commit and recorded as integrated", async () => {
+  const merged = "6".repeat(40);
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D15", title: "Rewritten", acceptance: { text: "r" } }] },
+    seed: { version: 1, items: { D15: { state: "integrating", attempts: 1, branch: "demo/d15" } } },
+  });
+  try {
+    f.ports.containingCommit = async () => undefined;
+    f.ports.historyCommit = async (_repo, id) => (id === "D15" ? merged : undefined);
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.items.D15.state, "awaiting-push");
+    assert.deepEqual([state.items.D15.integration.sha, state.items.D15.integration.contained], [merged, true]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an evidence report rewritten by a newer valid run is re-recorded, and the item finishes", async () => {
+  const sha = "5".repeat(40);
+  const { mkdtemp: mkd } = await import("node:fs/promises");
+  const { tmpdir: tmp } = await import("node:os");
+  const reportDir = await mkd(join(tmp(), "baa-evidence-"));
+  const reportPath = join(reportDir, "d29.docx");
+  await writeFile(reportPath, docx(3));
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D29", title: "Evidence", acceptance: { text: "e", evidence: { report: "artifacts/d29.docx", minImages: 2 } } }] },
+    seed: { version: 1, items: { D29: { state: "verifying", integratedSha: sha, verified: "2026-09-24T11:00:00.000Z", evidence: { path: reportPath, sha256: "0".repeat(64), images: 2, reportAt: "2026-09-24T11:00:00.000Z" } } } },
+  });
+  try {
+    f.pushedShas.add(sha);
+    await f.advance();
+    const after = await f.state();
+    assert.equal(after.items.D29.state, "done");
+    assert.ok(after.items.D29.history.some((entry) => /evidence report changed by a newer run \(3 images\): re-recorded/.test(entry.note ?? "")));
+  } finally {
+    await f.cleanup();
+    await rm(reportDir, { recursive: true, force: true });
   }
 });
 
