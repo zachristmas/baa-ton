@@ -410,3 +410,17 @@ test("a round push goes out for the ready items while others still integrate", (
   const push = step.rootAsks.find((ask) => ask.kind === "push");
   assert.deepEqual([push.items, push.sha], [["A", "B"], SHA_B], "the last ready item's commit, not the branch head");
 });
+
+test("a lane whose workflow failed to dispatch (lane still planned) climbs the ladder", () => {
+  const s = spec([{ id: "D05" }]);
+  const step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { D05: { state: "reviewing", attempts: 1, lane: { workflowId: "herdr-fdc", laneId: "lane-1" } } } },
+    lane: lanes({ "herdr-fdc/lane-1": { status: "planned", workflowStatus: "dispatch-failed" } }),
+    now: at(0),
+  });
+  assert.equal(step.state.items.D05.state, "reviewing", "not parked");
+  assert.equal(step.state.items.D05.declined.kind, "never started");
+  assert.equal(step.state.items.D05.lane, undefined);
+  assert.ok(step.actions.some((action) => action.kind === "review" && action.itemId === "D05"), "a fresh review lane");
+});

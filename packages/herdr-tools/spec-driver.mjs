@@ -395,6 +395,12 @@ export function advanceSpec({
     const stage = current ? STAGE_OF[current.state] : undefined;
     if (!stage || !current.lane) continue;
     const view = lane(current.lane);
+    // A lane whose workflow never started (a failed startup attestation, a
+    // shell that never came up) climbs the ladder, whatever its lane status.
+    if (view && !view.receipt && (view.workflowStatus === "dispatch-failed" || view.status === "dispatch-failed")) {
+      retryStage(item, current, stage, "never started", `lane ${current.lane.workflowId} dispatch-failed`);
+      continue;
+    }
     if (!view?.receipt) continue;
     const reason = declineReason(view.receipt.summary, stage);
     if (!reason) {

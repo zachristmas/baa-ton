@@ -176,3 +176,33 @@ test("no startup intent produces no task context", () => {
   assert.equal(result.status, 0);
   assert.equal(result.stdout, "");
 });
+
+test("a lane in its worktree's own workspace (laneWorkspaceId) attests; another workspace is still refused", async () => {
+  // The live failure: the lane joined workspace w2G, where its worktree was
+  // already open, while the task binding stays with the root's w22. The hook
+  // checked only the root's workspace, refused, and wrote no identity.
+  await fixture(async ({ invoke, intentPath }) => {
+    const result = invoke({ HERDR_PANE_ID: "w2G:p2", HERDR_WORKSPACE_ID: "w2G" });
+    assert.equal(result.status, 0, result.stderr);
+    const ready = JSON.parse(await readFile(`${intentPath}.ready`, "utf8"));
+    assert.equal(ready.sessionId, "session-test", "identity written: the attestation is complete");
+    assert.equal(ready.workspaceId, "w2G");
+  }, ({ intent, lane, manifest }) => {
+    intent.workspaceId = "w2G";
+    intent.paneId = "w2G:p2";
+    lane.paneId = "w2G:p2";
+    lane.workspaceId = "w2G";
+    manifest.workflows[0].laneWorkspaceId = "w2G";
+  });
+  await fixture(async ({ invoke, intentPath }) => {
+    const result = invoke({ HERDR_PANE_ID: "w9:p2", HERDR_WORKSPACE_ID: "w9" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /differs from the recorded manifest lane/);
+    await assert.rejects(readFile(`${intentPath}.ready`, "utf8"));
+  }, ({ intent, lane, manifest }) => {
+    intent.workspaceId = "w9";
+    intent.paneId = "w9:p2";
+    lane.paneId = "w9:p2";
+    manifest.workflows[0].laneWorkspaceId = "w2G";
+  });
+});
