@@ -1256,6 +1256,69 @@ test("a lane idle while its own background work runs is not asked for a receipt,
   }
 });
 
+test("background work running an hour with the agent idle stops holding the slot: the receipt is asked for (a live stall)", async () => {
+  // As it stood live: an integrate lane done without a receipt for hours,
+  // its hung test run still in the process tree, the item's history only
+  // "idle while its background work runs" notes since the run began.
+  const hung = "node /opt/homebrew/bin/pnpm turbo run test --force --continue=always --concurrency=4 (+8 more)";
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D18", title: "Hung", acceptance: { text: "h" } }, { id: "D19", title: "Next", acceptance: { text: "n" } }] },
+    seed: {
+      version: 1,
+      items: {
+        D18: {
+          state: "integrating",
+          attempts: 1,
+          lane: { workflowId: "herdr-922", laneId: "lane-1" },
+          laneStage: "integrate",
+          backgroundWork: hung,
+          history: [
+            { at: "2026-09-24T10:00:00.000Z", from: "queued", to: "integrating", note: "integrate lane" },
+            { at: "2026-09-24T10:43:33.000Z", from: "integrating", to: "integrating", note: `idle while its background work runs: ${hung}` },
+            { at: "2026-09-24T10:44:20.000Z", from: "integrating", to: "integrating", note: "idle while its background work runs: node /opt/homebrew/bin/pnpm turbo run test (+7 more)" },
+          ],
+        },
+        D19: { state: "integrating", attempts: 1 },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({
+      id: "herdr-922",
+      status: "awaiting-explicit-outcome",
+      lanes: [{ id: "lane-1", status: "done", specStage: "integrate", paneId: "w-spec:p58", sessionLog: { status: "done" } }],
+      eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] },
+      evidence: [],
+    });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => {
+      told.push(input);
+      return { message: { delivery: { status: "delivered" } } };
+    };
+    f.ports.agentPresent = async () => false;
+    f.ports.backgroundWork = async () => hung;
+    // 50 minutes into the run: still waiting on it, the worktree stays reserved.
+    f.ports.now = () => "2026-09-24T11:33:00.000Z";
+    const early = await f.advance();
+    let state = await f.state();
+    assert.equal(told.length, 0);
+    assert.equal(state.items.D18.backgroundSince, "2026-09-24T10:43:33.000Z", "the clock starts at the first note of the current run");
+    assert.match(early.content[0].text, /D19 waits: integration worktree busy/);
+    // Past an hour: the driver stops waiting and asks for the receipt.
+    f.ports.now = () => "2026-09-24T11:45:00.000Z";
+    await f.advance();
+    state = await f.state();
+    assert.equal(told.length, 1, "the receipt is asked for although the run is still in the tree");
+    assert.ok(state.items.D18.backgroundStaleAt);
+    assert.ok(state.items.D18.history.some((entry) => /^background work ran 61 min with the agent idle/.test(entry.note)), "logged once, with the run's age");
+    assert.ok(state.items.D18.receiptAskedAt, "the receipt flow (ask, pointed ask, inference) now runs");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("queued items already on spec-integration are recorded at the containing commit, not integrated again", async () => {
   const merged = "e".repeat(40);
   const f = await fixture({

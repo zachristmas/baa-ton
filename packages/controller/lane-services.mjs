@@ -104,13 +104,19 @@ export function paneServiceProcesses(paneInfo) {
 }
 
 /** Long-lived helpers an agent keeps running that are not its own work. */
-const AGENT_HELPER = /mcp-server\.mjs|known-safe-hook\.mjs|claude-startup-attest|typescript-language-server|tsserver|language-server|caffeinate|(^|\/)(zsh|bash|sh|fish)$/;
+const AGENT_HELPER = /mcp-server\.mjs|known-safe-hook\.mjs|claude-startup-attest|typescript-language-server|tsserver|typingsInstaller|language-server|lsp-proxy|caffeinate/;
+/** Shells the agent runs its commands through: not work themselves, but their children are. */
+const SHELL = /(^|\/)-?(zsh|bash|sh|fish)$/;
 
 /**
  * Background work a lane's agent is still running: descendants of the
  * pane's shell, below the agent process itself, that are not long-lived
- * helpers. `processes` is `ps -axo pid=,ppid=,command=` parsed into
- * { pid, ppid, command }. Returns a short description, or undefined.
+ * helpers. Everything below a helper belongs to the helper (a language
+ * server's tsserver and typings installer, an MCP bridge's worker), so a
+ * helper's subtree is never work; a shell is looked through (its children
+ * are the agent's commands). `processes` is `ps -axo pid=,ppid=,command=`
+ * parsed into { pid, ppid, command }. Returns a short description, or
+ * undefined.
  */
 export function laneBackgroundWork(shellPid, processes) {
   const children = new Map();
@@ -123,8 +129,9 @@ export function laneBackgroundWork(shellPid, processes) {
   const work = [];
   const walk = (pid, depth) => {
     for (const child of children.get(pid) ?? []) {
-      const helper = AGENT_HELPER.test(child.command.split(/\s+/)[0]) || AGENT_HELPER.test(child.command);
-      if (!helper) work.push(child.command);
+      const program = child.command.split(/\s+/)[0];
+      if (AGENT_HELPER.test(program) || AGENT_HELPER.test(child.command)) continue;
+      if (!SHELL.test(program)) work.push(child.command);
       if (depth < 6) walk(child.pid, depth + 1);
     }
   };

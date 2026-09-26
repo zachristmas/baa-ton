@@ -218,6 +218,34 @@ export function integrationResult(summary) {
 }
 
 /**
+ * How long a done lane's background work may run before the driver stops
+ * waiting on it and asks for the receipt: a hung test run (near-zero CPU for
+ * hours) must not hold a slot forever.
+ */
+export const BACKGROUND_STALE_MS = 60 * 60_000;
+
+/** Whether the item's lane has had background work for BACKGROUND_STALE_MS; notes it once. */
+function staleBackground(current, now) {
+  // Records from before the clock existed: the start of the trailing run of
+  // "idle while its background work runs" notes.
+  if (!current.backgroundSince) {
+    let since;
+    for (const entry of [...(current.history ?? [])].reverse()) {
+      if (!String(entry?.note ?? "").startsWith("idle while its background work runs")) break;
+      since = entry.at;
+    }
+    current.backgroundSince = since ?? now;
+  }
+  const minutes = Math.round((Date.parse(now) - Date.parse(current.backgroundSince)) / 60_000);
+  if (Date.parse(now) - Date.parse(current.backgroundSince) < BACKGROUND_STALE_MS) return false;
+  if (!current.backgroundStaleAt) {
+    current.backgroundStaleAt = now;
+    (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `background work ran ${minutes} min with the agent idle (${current.backgroundWork ?? "unknown"}); asking for its receipt` });
+  }
+  return true;
+}
+
+/**
  * @param {object} input
  * @param {object} input.spec       validated spec
  * @param {object} input.state      spec-state (not mutated)
@@ -406,7 +434,7 @@ export function advanceSpec({
           rootAsks.push({ itemId: item.id, reason: `${item.id}: its build lane is gone without a receipt after ${attempts} attempt(s)` });
         } else current.attempts = attempts + 1;
       }
-    } else if ((view.agentStatus === "done" || view.agentStatus === "idle") && background.has(`${current.lane.workflowId}/${current.lane.laneId}`)) {
+    } else if ((view.agentStatus === "done" || view.agentStatus === "idle") && background.has(`${current.lane.workflowId}/${current.lane.laneId}`) && !staleBackground(current, now)) {
       // Idle only on the surface: its tracked background shell or monitor is
       // still running. Not stuck: no receipt ask, no block.
       const work = background.get(`${current.lane.workflowId}/${current.lane.laneId}`);
@@ -419,6 +447,11 @@ export function advanceSpec({
     } else if (view.agentStatus === "done" || view.agentStatus === "idle") {
       // Herdr shows a finished turn as done, or idle once the pane was seen.
       delete current.backgroundWork;
+      // Stale background work keeps its clock; gone background work resets it.
+      if (!background.has(`${current.lane.workflowId}/${current.lane.laneId}`)) {
+        delete current.backgroundSince;
+        delete current.backgroundStaleAt;
+      }
       // An integration whose commits are already on the integration branch
       // needs no receipt: it is recorded as integrated there (1c0 below).
       if (stage === "integrate" && contained.has(item.id)) {
@@ -644,7 +677,7 @@ export function advanceSpec({
     if (view && CLOSED_WORKFLOW.has(view.workflowStatus ?? "")) return false;
     const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone" || LANE_ENDED.has(view.status ?? ""));
     const waitingOnIt = STAGE_OF[current.state] === stage && !current.receiptEscalatedAt;
-    const working = background.has(`${current.lane.workflowId}/${current.lane.laneId}`);
+    const working = background.has(`${current.lane.workflowId}/${current.lane.laneId}`) && !current.backgroundStaleAt;
     if (idle && !waitingOnIt && !working) {
       if (!current.lockReclaimedAt) {
         current.lockReclaimedAt = now;
