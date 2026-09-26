@@ -4657,6 +4657,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await git(["commit", "-m", input.message], 300_000);
     return (await git(["rev-parse", "HEAD"])).stdout.trim();
   }
+  /** The driver logs that it is alive at least this often. */
+  const SPEC_ALIVE_MS = 10 * 60_000;
   /** How long the driver starts no new lanes after a shell failed to start. */
   const SPEC_SHELL_BACKOFF_MS = 10 * 60_000;
 
@@ -5514,30 +5516,58 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
    * spec-driver.log. Started for a root whose project has a spec; every
    * lifecycle event refreshes the context the passes use.
    */
-  function ensureSpecTimer(ctx: ExtensionContext) {
+  function ensureSpecTimer(ctx: ExtensionContext, { restart = false }: { restart?: boolean } = {}) {
     if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
     specTimerCtx = ctx;
+    // After a /reload the timer starts again on the fresh context.
+    if (restart && specTimer) {
+      specTimer.stop();
+      specTimer = undefined;
+    }
     if (specTimer?.active || !existsSync(join(ctx.cwd, SPEC_PATH))) return;
     const stateDir = dirname(manifestPath(ctx.cwd));
     const logPath = join(stateDir, "spec-driver.log");
     const write = (entry: Record<string, unknown>) =>
       appendFile(logPath, `${JSON.stringify({ at: now(), ...entry })}\n`, { mode: 0o600 }).catch(() => undefined);
     let lastSkip: string | undefined;
+    // A driver that is alive but has nothing to do still says so every
+    // SPEC_ALIVE_MS, so silence in the log means a dead driver.
+    let lastWrite = Date.now();
+    const alive = (reason: string) => {
+      if (Date.now() - lastWrite < SPEC_ALIVE_MS) return;
+      lastWrite = Date.now();
+      void write({ trigger: reason, alive: true, passes: timer.passes });
+    };
     // Tests replace the clock and the manifest watcher through the context.
     const overrides = (ctx as { specTimerOptions?: Partial<Parameters<typeof specDriverTimer>[0]> }).specTimerOptions ?? {};
-    specTimer = specDriverTimer({
+    const timer = specDriverTimer({
       run: () => runSpecDriver(specTimerCtx!, (specTimerCtx as { specDriverPorts?: Partial<SpecDriverPorts> }).specDriverPorts),
       log: (result, reason) => {
         const outcome = result as { skipped?: string; actions?: string[]; rootAsks?: unknown[] };
+        alive(reason);
         if (outcome.skipped !== undefined) {
           if (outcome.skipped !== lastSkip) void write({ trigger: reason, skipped: outcome.skipped });
           lastSkip = outcome.skipped;
           return;
         }
         lastSkip = undefined;
-        if (outcome.actions?.length || outcome.rootAsks?.length) void write({ trigger: reason, actions: outcome.actions, rootAsks: outcome.rootAsks });
+        if (outcome.actions?.length || outcome.rootAsks?.length) {
+          lastWrite = Date.now();
+          void write({ trigger: reason, actions: outcome.actions, rootAsks: outcome.rootAsks });
+        }
       },
-      onError: (error) => void write({ error: clip((error as Error)?.message ?? String(error), 500) }),
+      onError: (error) => {
+        const message = (error as Error)?.message ?? String(error);
+        lastWrite = Date.now();
+        void write({ error: clip(message, 500) });
+        // This instance's context died with a /reload: stop for good. The
+        // reloaded extension starts its own timer on a fresh context.
+        if (/ctx is stale/i.test(message)) {
+          timer.stop();
+          if (specTimer === timer) specTimer = undefined;
+          void write({ stopped: "this extension instance's context went stale after a reload; the reloaded instance drives" });
+        }
+      },
       watch: (onChange) => {
         try {
           const watcher = watchPath(stateDir, (_event, file) => {
@@ -5551,7 +5581,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       },
       ...overrides,
     });
-    specTimer.start();
+    specTimer = timer;
+    timer.start();
   }
 
   /** Runs when the root's turn settles: retire lanes whose completion the
@@ -10562,6 +10593,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // The driver records its own failures in spec-state; never throw into Pi.
     }
   });
+  // A reloaded instance mid-turn gets no session or agent event until the
+  // turn ends; every turn boundary hands it a fresh context and starts its
+  // driver if none runs.
+  for (const boundary of ["turn_start", "turn_end"] as const)
+    pi.on(boundary, async (_event, ctx) => {
+      try {
+        ensureSpecTimer(ctx);
+      } catch {
+        // Best effort, as on every lifecycle event.
+      }
+    });
   pi.on("session_shutdown", async (_event, ctx) => {
     specTimer?.stop();
     specTimer = undefined;
@@ -10599,7 +10641,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const reloadedIdle = (event as { reason?: string })?.reason === "reload" && typeof ctx.isIdle === "function" && ctx.isIdle();
     await persistRootTurn(ctx, reloadedIdle ? "idle" : "unknown", { afterReload: reloadedIdle });
     try {
-      ensureSpecTimer(ctx);
+      ensureSpecTimer(ctx, { restart: (event as { reason?: string })?.reason === "reload" });
     } catch {
       // Best effort; agent_start and agent_settled try again.
     }
