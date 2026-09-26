@@ -17,6 +17,7 @@
  *   maxBuildAttempts, then the item fails and the root is asked.
  * - A lane that ends without a receipt counts as a failed attempt.
  */
+import { fileURLToPath } from "node:url";
 import { BASELINES_KEPT, baselineNote, baselineResult, compareToBaseline, formatFailures, knownFailures, suiteFailures } from "./spec-baseline.mjs";
 
 /** How build and integration lanes run a suite that outlasts a normal command timeout. */
@@ -110,6 +111,17 @@ export function verifyResult(summary) {
     .map((match) => ({ spec: match[1], result: match[2].toLowerCase() }));
   const report = lines.map((line) => /^\s*REPORT\s*:\s*(\S+)\s*$/i.exec(line)?.[1]).find(Boolean);
   return { previews, ...(report ? { report } : {}) };
+}
+
+/** The demo generator lanes use (absolute path, for their Playwright runs). */
+export const DEMO_TOOL = fileURLToPath(new URL("./demo-report.mjs", import.meta.url));
+
+/** The feature demo rule for build and verify lanes. */
+export function demoRule(report, minImages) {
+  return [
+    `Required output: the feature demo ${report}, a Word document with a screenshot for every navigation or action (page visit, click, fill, submit, and the resulting state), each captioned with its step number, the action and what it shows; at least ${minImages} screenshots.`,
+    `Record it from your Playwright run with the demo recorder: import { createDemoRecorder } from ${JSON.stringify(DEMO_TOOL)}; call demo.step(page, "<action>", "<what it shows>") after each navigation or action, then demo.finish({ out: ${JSON.stringify(report)}, title: "<item>: <feature>" }). It writes the .docx and ${report}.steps.json, which the verifier checks (every screenshot captioned, one per recorded step). From saved screenshots: node ${JSON.stringify(DEMO_TOOL)} --steps <steps.json> --out ${report}.`,
+  ].join(" ");
 }
 
 /** Every spec lane's last instruction: the work ends with the receipt tool call, not a plain-text report. */
@@ -872,7 +884,7 @@ export function buildObjective(spec, item, { branch, findings, decided, answers 
     item.migrations ? `It needs ${item.migrations} migration(s); ask for the slot with herdr_request instead of picking a number.` : "",
     item.acceptance.tests.length ? `Run until green: ${item.acceptance.tests.join("; ")}.` : "",
     LONG_COMMANDS,
-    item.acceptance.evidence ? `Write the evidence report ${item.acceptance.evidence.report} with at least ${item.acceptance.evidence.minImages} screenshots.` : "",
+    item.acceptance.evidence ? demoRule(item.acceptance.evidence.report, item.acceptance.evidence.minImages) : "",
     `Commit your work on ${branch} in this worktree (local commits only).`,
     findings ? `The previous attempt failed review. Findings to address:\n${findings}` : "",
     "Finish with herdr_complete: the commit SHA, the checks you ran and their results, and the evidence report path.",
@@ -901,7 +913,7 @@ export function verifyObjective(spec, item, { releaseSha, reportPath }) {
       : "",
     `Acceptance: ${item.acceptance.text}`,
     item.acceptance.evidence
-      ? `Write the final evidence report at ${reportPath} in this worktree, with at least ${item.acceptance.evidence.minImages} screenshots from the preview run.`
+      ? `${demoRule(reportPath, item.acceptance.evidence.minImages)} Run it against the preview.`
       : "",
     "Do not change code or Git state; this stage only verifies.",
     "Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, and REPORT: <path of the report you wrote>.",
@@ -942,7 +954,7 @@ export function reviewObjective(spec, item, { branch, buildSummary }) {
     `Diff: git diff ${spec.target.remote}/${spec.target.branch}...${branch}`,
     `Acceptance: ${item.acceptance.text}`,
     item.acceptance.tests.length ? `Its tests: ${item.acceptance.tests.join("; ")}.` : "",
-    item.acceptance.evidence ? `Check the evidence report ${item.acceptance.evidence.report} (at least ${item.acceptance.evidence.minImages} images).` : "",
+    item.acceptance.evidence ? `Check the evidence report ${item.acceptance.evidence.report}: at least ${item.acceptance.evidence.minImages} screenshots, one per navigation or action, each with a caption.` : "",
     buildSummary ? `The builder reported:\n${buildSummary}` : "",
     "Finish with herdr_complete. The summary's first line must be exactly VERDICT: PASS or VERDICT: FAIL, followed by the findings (file:line and what is wrong) for a FAIL.",
   ].filter(Boolean).join("\n");

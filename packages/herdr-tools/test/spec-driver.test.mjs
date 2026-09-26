@@ -125,7 +125,7 @@ test("a stage whose dispatch left no lane is retried; objectives carry the spec'
   const step = advanceSpec({ spec: s, state: { version: 1, items: { A: { state: "reviewing", attempts: 1 } } }, lane: lanes({}), now: at(1) });
   assert.deepEqual(step.actions, [{ kind: "review", itemId: "A", attempt: 1 }]);
   const build = buildObjective(s, s.items[0], { branch: "spec/A" });
-  for (const fragment of ["Implement spec item A", "Totals exclude tax.", "board:A", "src/a/**", "herdr_request", "npm test", "artifacts/a.docx with at least 3", "on spec/A", "herdr_complete"])
+  for (const fragment of ["Implement spec item A", "Totals exclude tax.", "board:A", "src/a/**", "herdr_request", "npm test", "feature demo artifacts/a.docx", "every navigation or action", "at least 3 screenshots", "createDemoRecorder", "on spec/A", "herdr_complete"])
     assert.ok(build.includes(fragment), fragment);
   const review = reviewObjective(s, s.items[0], { branch: "spec/A", buildSummary: "Committed abc." });
   assert.match(review, /Read-only/);

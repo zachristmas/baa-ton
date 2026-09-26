@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 import { promisify } from "node:util";
+import { inflateRawSync } from "node:zlib";
 
 const execFile = promisify(execFileCallback);
 
@@ -117,7 +118,20 @@ export function validateSpec(input) {
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines", "evidence"], "spec.defaults");
+    // Evidence every item needs unless it names its own: a Word demo with
+    // captioned screenshots. The report path may use {id}.
+    if (input.defaults.evidence !== undefined) {
+      const evidence = input.defaults.evidence;
+      if (!isRecord(evidence)) throw new Error("spec.defaults.evidence must be an object.");
+      onlyKeys(evidence, ["report", "minImages"], "spec.defaults.evidence");
+      if (typeof evidence.report !== "string" || !evidence.report.includes("{id}"))
+        throw new Error('spec.defaults.evidence.report must be a path containing {id}, for example "artifacts/{id}.docx".');
+      defaults.evidence = {
+        report: evidence.report,
+        minImages: positiveInteger(evidence.minImages, "spec.defaults.evidence.minImages", { min: 0 }) ?? 1,
+      };
+    }
     if (input.defaults.maxDeclines !== undefined) defaults.maxDeclines = positiveInteger(input.defaults.maxDeclines, "spec.defaults.maxDeclines", { max: 10 });
     if (input.defaults.fixBaseline !== undefined) {
       if (typeof input.defaults.fixBaseline !== "boolean") throw new Error("spec.defaults.fixBaseline must be true or false.");
@@ -257,6 +271,13 @@ export function validateSpec(input) {
     visited.add(id);
   };
   for (const item of items) visit(item.id, []);
+  if (defaults.evidence)
+    for (const item of items)
+      if (!item.acceptance.evidence)
+        item.acceptance.evidence = {
+          report: relativePath(defaults.evidence.report.replaceAll("{id}", item.id), `spec.items.${item.id}.acceptance.evidence.report`),
+          minImages: defaults.evidence.minImages,
+        };
   return { version: 1, target, defaults, stages, items };
 }
 
@@ -335,6 +356,72 @@ export function docxImageCount(buffer) {
   return images;
 }
 
+/** One entry of a .docx (a zip), stored or deflated; undefined when absent or unreadable. */
+export function docxEntry(buffer, wanted) {
+  const minimum = 22;
+  if (buffer.length < minimum) return undefined;
+  let end = -1;
+  for (let at = buffer.length - minimum; at >= Math.max(0, buffer.length - minimum - 65_535); at -= 1)
+    if (buffer.readUInt32LE(at) === 0x06054b50) {
+      end = at;
+      break;
+    }
+  if (end < 0) return undefined;
+  const entries = buffer.readUInt16LE(end + 10);
+  let offset = buffer.readUInt32LE(end + 16);
+  for (let index = 0; index < entries; index += 1) {
+    if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) return undefined;
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressed = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const local = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+    if (name === wanted) {
+      if (buffer.readUInt32LE(local) !== 0x04034b50) return undefined;
+      const start = local + 30 + buffer.readUInt16LE(local + 26) + buffer.readUInt16LE(local + 28);
+      const data = buffer.subarray(start, start + compressed);
+      try {
+        return method === 0 ? data : method === 8 ? inflateRawSync(data) : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return undefined;
+}
+
+/**
+ * The images in a .docx and how many lack a caption: an image counts as
+ * captioned when its own paragraph has text, or the nearest paragraph with
+ * text before or after it (not another image) is right beside it.
+ */
+export function docxCaptions(buffer) {
+  const xml = docxEntry(buffer, "word/document.xml")?.toString("utf8");
+  if (xml === undefined) return undefined;
+  const paragraphs = [...xml.matchAll(/<w:p\b[^>]*\/>|<w:p\b[\s\S]*?<\/w:p>/g)].map((match) => ({
+    image: /<w:drawing\b|<w:pict\b/.test(match[0]),
+    text: [...match[0].matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g)].map((part) => part[1]).join("").trim(),
+  }));
+  const neighbour = (from, step) => {
+    for (let index = from + step; index >= 0 && index < paragraphs.length; index += step) {
+      if (paragraphs[index].image) return undefined;
+      if (paragraphs[index].text) return paragraphs[index].text;
+    }
+    return undefined;
+  };
+  let images = 0;
+  let uncaptioned = 0;
+  for (const [index, entry] of paragraphs.entries()) {
+    if (!entry.image) continue;
+    images += 1;
+    if (!entry.text && !neighbour(index, -1) && !neighbour(index, 1)) uncaptioned += 1;
+  }
+  return { images, uncaptioned };
+}
+
 /** Images in a report: a .docx by its media entries; Markdown/HTML by references. */
 export function reportImageCount(path, buffer) {
   if (/\.docx$/i.test(path)) return docxImageCount(buffer);
@@ -353,6 +440,27 @@ export async function gitAncestor(repo, ancestor, descendant) {
 }
 
 /**
+ * A feature demo's rule: a screenshot for every navigation or action, each
+ * with a caption, and at least as many images as the steps the demo recorded
+ * (<report>.steps.json, written by demo-report.mjs). Undefined when it holds.
+ */
+async function demoReportProblem(buffer, reportPath, images) {
+  const captions = docxCaptions(buffer);
+  if (!captions) return "report is not a readable .docx (no word/document.xml)";
+  if (captions.uncaptioned) return `${captions.uncaptioned} of ${captions.images} screenshots have no caption (a step number, the action, what it shows)`;
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(`${reportPath}.steps.json`, "utf8"));
+  } catch {
+    return "no steps manifest beside the report (write it with demo-report.mjs, one screenshot per navigation or action)";
+  }
+  const steps = Array.isArray(manifest?.steps) ? manifest.steps.length : 0;
+  if (!steps) return "the steps manifest records no steps";
+  if (images < steps) return `report has ${images} screenshots for ${steps} recorded steps`;
+  return undefined;
+}
+
+/**
  * Check one item. Returns { done, checks: [{ name, ok, detail }], failing? }
  * with the checks in order; `failing` is the first that did not pass.
  */
@@ -366,6 +474,7 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
     // The verify stage records where it wrote the final report; before that
     // the report is looked up in the target repository.
     const reportPath = typeof record.evidence?.path === "string" ? record.evidence.path : join(repo, evidence.report);
+    let demoProblem;
     try {
       buffer = await readFile(reportPath);
     } catch {
@@ -377,6 +486,7 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
       const sha256 = createHash("sha256").update(buffer).digest("hex");
       if (images === undefined) check("evidence", false, `report ${evidence.report} is not a readable .docx`);
       else if (images < evidence.minImages) check("evidence", false, `report has ${images} of ${evidence.minImages} images`);
+      else if (/\.docx$/i.test(evidence.report) && (demoProblem = await demoReportProblem(buffer, reportPath, images))) check("evidence", false, demoProblem);
       else if (!record.evidence?.sha256) check("evidence", false, "report hash is not recorded");
       else if (record.evidence.sha256 !== sha256) check("evidence", false, "report changed since it was recorded");
       else check("evidence", true, `${images} images, hash matches`);

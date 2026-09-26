@@ -116,8 +116,11 @@ test("the verifier passes an item only when every check does, and names the firs
     r.git("checkout", "-q", "-b", "side", first);
     const offBranch = await r.commit("c.txt", "c");
     await mkdir(join(r.directory, "artifacts"), { recursive: true });
-    const report = zip(["word/document.xml", "word/media/image1.png", "word/media/image2.png"]);
+    const { assembleDemo, TINY_PNG } = await import("../demo-report.mjs");
+    const demo = assembleDemo({ steps: [{ action: "Open the page", shows: "the list", data: TINY_PNG }, { action: "Click Save", shows: "the saved row", data: TINY_PNG }] });
+    const report = demo.docx;
     await writeFile(join(r.directory, "artifacts", "done.docx"), report);
+    await writeFile(join(r.directory, "artifacts", "done.docx.steps.json"), JSON.stringify(demo.manifest));
     await writeFile(join(r.directory, "artifacts", "thin.docx"), zip(["word/media/image1.png"]));
     const sha256 = createHash("sha256").update(report).digest("hex");
     const spec = validateSpec(baseSpec([
@@ -257,4 +260,53 @@ test("spec.defaults.generatedArtifacts defaults to the known generated files and
   assert.deepEqual(validateSpec({ ...base, defaults: { generatedArtifacts: ["gen/**"] } }).defaults.generatedArtifacts, ["gen/**"]);
   assert.deepEqual(validateSpec({ ...base, defaults: { generatedArtifacts: [] } }).defaults.generatedArtifacts, []);
   for (const bad of [["/abs/**"], ["../x"], [""], "gen/**"]) assert.throws(() => validateSpec({ ...base, defaults: { generatedArtifacts: bad } }), /generatedArtifacts/);
+});
+
+test("a feature demo passes only with a caption beside every screenshot and one screenshot per recorded step", async () => {
+  const { assembleDemo, TINY_PNG, writeDemoReport } = await import("../demo-report.mjs");
+  const { docxCaptions } = await import("../spec.mjs");
+  const step = (n) => ({ action: `Click control ${n}`, shows: `state ${n}`, data: TINY_PNG });
+  const captioned = assembleDemo({ steps: [step(1), step(2), step(3)] });
+  assert.deepEqual(docxCaptions(captioned.docx), { images: 3, uncaptioned: 0 });
+  assert.deepEqual(docxCaptions(assembleDemo({ steps: [step(1), { ...step(2), captions: false }], compress: true }).docx), { images: 2, uncaptioned: 1 }, "Word-style deflated XML is read too");
+
+  const r = await repoFixture();
+  try {
+    const sha = await r.commit("a.txt", "a");
+    r.git("update-ref", "refs/remotes/origin/feature/release", sha);
+    const artifacts = join(r.directory, "artifacts");
+    await mkdir(artifacts, { recursive: true });
+    const { writeFile: write } = await import("node:fs/promises");
+    await write(join(artifacts, "good.docx"), captioned.docx);
+    await write(join(artifacts, "good.docx.steps.json"), JSON.stringify(captioned.manifest));
+    const bare = assembleDemo({ steps: [step(1), { ...step(2), captions: false }] });
+    await write(join(artifacts, "bare.docx"), bare.docx);
+    await write(join(artifacts, "bare.docx.steps.json"), JSON.stringify(bare.manifest));
+    await write(join(artifacts, "short.docx"), captioned.docx);
+    await write(join(artifacts, "short.docx.steps.json"), JSON.stringify({ version: 1, steps: [1, 2, 3, 4, 5].map((n) => ({ n, action: `step ${n}` })) }));
+    await write(join(artifacts, "nosteps.docx"), captioned.docx);
+    const hash = (buffer) => createHash("sha256").update(buffer).digest("hex");
+    const spec = validateSpec(baseSpec([
+      item("GOOD", { acceptance: { evidence: { report: "artifacts/good.docx", minImages: 3 } } }),
+      item("BARE", { acceptance: { evidence: { report: "artifacts/bare.docx", minImages: 1 } } }),
+      item("SHORT", { acceptance: { evidence: { report: "artifacts/short.docx", minImages: 1 } } }),
+      item("NOSTEPS", { acceptance: { evidence: { report: "artifacts/nosteps.docx", minImages: 1 } } }),
+    ]));
+    const state = { version: 1, items: Object.fromEntries(["GOOD", "BARE", "SHORT", "NOSTEPS"].map((id) => [id, { integratedSha: sha, evidence: { sha256: hash(id === "BARE" ? bare.docx : captioned.docx) } }])) };
+    const verdicts = Object.fromEntries((await verifySpec(spec, state, { repo: r.directory })).results.map((result) => [result.id, result]));
+    assert.equal(verdicts.GOOD.done, true, JSON.stringify(verdicts.GOOD.failing));
+    assert.match(verdicts.BARE.failing.detail, /1 of 2 screenshots have no caption/);
+    assert.match(verdicts.SHORT.failing.detail, /3 screenshots for 5 recorded steps/);
+    assert.match(verdicts.NOSTEPS.failing.detail, /no steps manifest beside the report/);
+    void writeDemoReport;
+  } finally {
+    await rm(r.directory, { recursive: true, force: true });
+  }
+});
+
+test("spec.defaults.evidence gives every item without its own a demo report", () => {
+  const spec = validateSpec({ ...baseSpec([item("A"), item("B", { acceptance: { evidence: { report: "docs/b.docx", minImages: 4 } } })]), defaults: { evidence: { report: "artifacts/{id}-demo.docx", minImages: 3 } } });
+  assert.deepEqual(spec.items[0].acceptance.evidence, { report: "artifacts/A-demo.docx", minImages: 3 });
+  assert.deepEqual(spec.items[1].acceptance.evidence, { report: "docs/b.docx", minImages: 4 }, "an item's own evidence wins");
+  assert.throws(() => validateSpec({ ...baseSpec([item("A")]), defaults: { evidence: { report: "artifacts/demo.docx" } } }), /must be a path containing \{id\}/);
 });

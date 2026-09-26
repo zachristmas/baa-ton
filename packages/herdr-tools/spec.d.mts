@@ -35,6 +35,8 @@ export type Spec = {
     fixBaseline?: boolean;
     /** Declines per profile before the stage's next fallback profile (default 2). */
     maxDeclines?: number;
+    /** Evidence for every item without its own (report path with {id}). */
+    evidence?: { report: string; minImages: number };
   };
   stages: Record<string, { profile: string; differentFrom?: string; fallbackProfiles?: string[] }>;
   items: SpecItem[];
@@ -82,3 +84,5 @@ export function finalReportPath(spec: Spec, report: string): string;
 /** The deployed SHA from a release-check response body (JSON or text). */
 export function releaseShaFrom(body: string): string | undefined;
 export const DEFAULT_GENERATED_ARTIFACTS: string[];
+export function docxEntry(buffer: Buffer, name: string): Buffer | undefined;
+export function docxCaptions(buffer: Buffer): { images: number; uncaptioned: number } | undefined;

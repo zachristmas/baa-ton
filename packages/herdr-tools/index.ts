@@ -5347,6 +5347,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           if (buffer) {
             await mkdir(dirname(path), { recursive: true });
             await writeFile(path, buffer);
+            // The demo's steps manifest travels with it (the verifier reads it).
+            const steps = await readFile(`${written}.steps.json`).catch(() => undefined);
+            if (steps) await writeFile(`${path}.steps.json`, steps);
           }
           if (buffer)
             record.evidence = {
