@@ -148,6 +148,7 @@ export function advanceSpec({
   next.items ??= {};
   const actions = [];
   const rootAsks = [];
+  const reclaimed = [];
   const waits = {};
   const record = (id) => (next.items[id] ??= { state: "pending" });
   const move = (id, to, extra = {}, note) => {
@@ -396,13 +397,30 @@ export function advanceSpec({
   // worktree stays reserved by any integrate or verify lane whose workflow
   // is still open, even when its item was blocked or the lane went idle
   // without a receipt: a second lane there would collide.
+  // A lock is held only by a live owner. A lane whose agent is done or gone
+  // holds it only while its item still waits on it in that stage (the
+  // receipt ask runs, or its own background work does); once the item has
+  // moved on (blocked, failed, re-queued) or the ask escalated, nothing will
+  // ever release it, so it is reclaimed and the queue moves on.
   const reservedItem = spec.items.find((item) => {
     const current = next.items[item.id];
     if (!current?.lane) return false;
     const view = lane(current.lane);
     const stage = current.laneStage ?? view?.specStage ?? STAGE_OF[current.state];
     if (stage !== "integrate" && stage !== "verify") return false;
-    return !view || !CLOSED_WORKFLOW.has(view.workflowStatus ?? "");
+    if (view && CLOSED_WORKFLOW.has(view.workflowStatus ?? "")) return false;
+    const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone" || LANE_ENDED.has(view.status ?? ""));
+    const waitingOnIt = STAGE_OF[current.state] === stage && !current.receiptEscalatedAt;
+    const working = background.has(`${current.lane.workflowId}/${current.lane.laneId}`);
+    if (idle && !waitingOnIt && !working) {
+      if (!current.lockReclaimedAt) {
+        current.lockReclaimedAt = now;
+        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `released the integration worktree: its ${stage} lane ${current.lane.workflowId} is ${view.agentStatus ?? view.status} and the item is ${current.state}` });
+        reclaimed.push(`${item.id}'s ${stage} lane ${current.lane.workflowId} (${view.agentStatus ?? view.status}, item ${current.state})`);
+      }
+      return false;
+    }
+    return true;
   });
   const reservedBy = reservedItem
     ? `${reservedItem.id}'s lane ${next.items[reservedItem.id].lane.workflowId} is still open`
@@ -432,6 +450,11 @@ export function advanceSpec({
       `already on the integration branch at ${sha.slice(0, 12)}`,
     );
   }
+  if (reclaimed.length)
+    rootAsks.push({
+      itemId: "integration-lock",
+      reason: `Reclaimed the spec-integration lock from ${reclaimed.join("; ")}: no live agent held it. The next integration is dispatched by the driver; nothing to wait for. Resolve the blocked item separately (read its lane, set its outcome).`,
+    });
   // B2. Record the baseline once per target SHA when an item is queued for
   // integration; with defaults.fixBaseline, one lane fixes its failures on
   // the integration branch before any item is merged there.

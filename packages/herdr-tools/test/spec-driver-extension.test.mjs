@@ -1381,6 +1381,80 @@ test("with defaults.fixBaseline one lane fixes the baseline first; integrations 
   }
 });
 
+test("a lock whose owner is no live working agent is reclaimed: the next integration starts and the root is told", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "D04", title: "Declined", acceptance: { text: "a" } }, { id: "D12", title: "Next", acceptance: { text: "b" } }],
+    },
+    // D04's integrate lane went idle without a receipt; the ask escalated and blocked the item, but it still points at the lane.
+    seed: {
+      version: 1,
+      items: {
+        D04: { state: "blocked", blockedReason: "human-gate", attempts: 1, lane: { workflowId: "herdr-9d", laneId: "lane-1" }, laneStage: "integrate", receiptEscalatedAt: "2026-09-24T10:00:00.000Z" },
+        D12: { state: "integrating", attempts: 1 },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({
+      id: "herdr-9d",
+      status: "running",
+      lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p9" }],
+      eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] },
+      evidence: [],
+    });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    // Herdr still has the (idle) agent in that pane: it is not working.
+    f.ports.agentPresent = async () => false;
+    const result = await f.advance();
+    assert.deepEqual(f.calls.plan.filter((call) => call.specStage === "integrate").map((call) => call.objective), ["spec D12 integrate: Next"], "the queue moves on");
+    const state = await f.state();
+    assert.ok(state.items.D04.lockReclaimedAt);
+    assert.equal(state.items.D04.state, "blocked", "the blocked item is left for the root to resolve");
+    assert.match(state.items.D04.history.at(-1).note, /released the integration worktree: its integrate lane herdr-9d is done and the item is blocked/);
+    const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
+    assert.ok(alerts.some((alert) => /Reclaimed the spec-integration lock from D04's integrate lane herdr-9d/.test(alert.text)), "the root is told once");
+    assert.doesNotMatch(result.content[0].text, /integration worktree busy/);
+    await f.advance();
+    const again = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []).filter((alert) => /Reclaimed/.test(alert.text));
+    assert.equal(again.length, 1, "reported once, not every pass");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a done lane still waited on in its stage keeps the lock (the receipt ask is running)", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "D04", title: "Integrating", acceptance: { text: "a" } }, { id: "D12", title: "Next", acceptance: { text: "b" } }],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D04: { state: "integrating", attempts: 1, lane: { workflowId: "herdr-9d", laneId: "lane-1" }, laneStage: "integrate" },
+        D12: { state: "integrating", attempts: 1 },
+      },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-9d", status: "running", lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p9" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] }, evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    f.ports.agentPresent = async () => false;
+    f.ports.tell = async () => ({ message: { delivery: { status: "delivered" } } });
+    await f.advance();
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0);
+    assert.equal((await f.state()).items.D04.lockReclaimedAt, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("spec lanes whose receipt the driver consumed are retired under the retire grant", async () => {
   const receipt = { id: "r", summary: "Done.", delivery: "delivered" };
   const seedManifest = async (f) => {
