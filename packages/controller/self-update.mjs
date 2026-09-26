@@ -29,7 +29,7 @@ export const SELF_UPDATE_TEST_TIMEOUT_MS = 30 * 60_000;
 export const RELOAD_CONFIRM_MS = 60_000;
 export const RELOAD_ATTEMPTS = 5;
 export const SELF_UPDATE_TEST_ATTEMPTS = 3;
-export const SPAWN_SLOW_MS = 5_000;
+export const SPAWN_SLOW_MS = 15_000;
 /** A root busy this long past a due reload is reported: it never goes idle for /reload. */
 export const RELOAD_BUSY_MS = 30 * 60_000;
 const execFileAsync = promisify(execFile);
