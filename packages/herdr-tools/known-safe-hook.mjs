@@ -28,6 +28,9 @@ import { fileURLToPath } from "node:url";
 import { classifyCommand, laneConfinedVerdict } from "./known-safe.mjs";
 import { bridgeClient, DEFAULT_WAIT_MS, routePermission } from "./permission-route.mjs";
 
+/** Permission modes in which only ask-rule segments can force a prompt. */
+export const SCOPED_MODES = new Set(["bypassPermissions", "auto"]);
+
 export function decide(input, options = {}) {
   if (input?.hook_event_name && input.hook_event_name !== "PermissionRequest") return undefined;
   if (input?.tool_name !== "Bash") return undefined;
@@ -137,10 +140,12 @@ async function main() {
   if (input?.hook_event_name && input.hook_event_name !== "PermissionRequest") return;
   // Explicit options win over what the worktree says.
   if (input?.tool_name === "Bash") options = { ...worktreeFacts(input.cwd, input.tool_input?.command), ...options };
-  // In bypassPermissions only ask-rule segments can have caused this prompt,
-  // so only they must be known-safe; other segments run without a prompt in
-  // that mode anyway. Other modes classify the whole command.
-  if (input?.tool_name === "Bash" && input.permission_mode === "bypassPermissions" && options.scopeToAskRules !== false) {
+  // In bypassPermissions and auto mode, a command matching an ask rule is
+  // what forces this prompt, so only its ask-rule segments must be
+  // known-safe; the rest would run without a prompt in that mode (a command
+  // with no ask-rule segment defers: the prompt has another cause). Other
+  // modes classify the whole command.
+  if (input?.tool_name === "Bash" && SCOPED_MODES.has(input.permission_mode) && options.scopeToAskRules !== false) {
     const askRules = options.askRules ?? loadAskRules(input.cwd);
     if (askRules.length) options = { ...options, askRules, scopeToAskRules: true };
   }

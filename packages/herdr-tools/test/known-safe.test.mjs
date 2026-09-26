@@ -401,7 +401,7 @@ test("scoped to ask rules, only the segments that prompted must be known-safe", 
   deferred("git status", { scopeToAskRules: true, askRules: [] }, /no known-safe rule applies/, "without ask rules scoping is off");
 });
 
-test("the hook scopes to the session's ask rules only in bypassPermissions mode", async () => {
+test("the hook scopes to the session's ask rules in bypassPermissions and auto mode only", async () => {
   const { spawnSync } = await import("node:child_process");
   const { mkdtemp, mkdir: makeDir, rm: remove, writeFile: write } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
@@ -420,9 +420,29 @@ test("the hook scopes to the session's ask rules only in bypassPermissions mode"
       });
     const command = "node scripts/check.mjs && git checkout -q -b ink/x origin/main";
     assert.deepEqual(JSON.parse(run("bypassPermissions", command).stdout).hookSpecificOutput.decision, { behavior: "allow" });
+    assert.deepEqual(JSON.parse(run("auto", command).stdout).hookSpecificOutput.decision, { behavior: "allow" }, "lanes run in auto mode");
+    assert.deepEqual(JSON.parse(run("auto", "node gen.mjs > out.json && jq . out.json; rm -f out.json").stdout).hookSpecificOutput.decision, { behavior: "allow" });
+    assert.deepEqual(JSON.parse(run("auto", "rm -rf dist && mkdir dist && node build.mjs").stdout).hookSpecificOutput.decision, { behavior: "allow" });
+    assert.equal(run("auto", "node x.mjs && git push origin main").stdout, "", "an unsafe ask-rule segment still prompts in auto mode");
     assert.equal(run("default", command).stdout, "", "default mode still classifies the whole command");
+    assert.equal(run("acceptEdits", command).stdout, "", "so does acceptEdits");
     assert.equal(run("bypassPermissions", "node x.mjs && git push origin main").stdout, "", "an unsafe ask-rule segment still prompts");
   } finally {
     await remove(home, { recursive: true, force: true });
   }
+});
+
+test("rm of a folder the same command recreates with mkdir, and of files created by >, 2> or &>", () => {
+  const scoped = { askRules: ["Bash(rm *)"], scopeToAskRules: true };
+  allowed("rm -rf dist && mkdir dist", scoped, "rm-recreated-dir");
+  allowed("rm -rf build/out; mkdir build/out && node gen.mjs", scoped, "rm-recreated-dir");
+  allowed("rm -rf dist && mkdir dist", {}, "rm-recreated-dir");
+  deferred("rm -rf dist && mkdir other", scoped, /not a known-safe target/);
+  deferred("rm -rf ../dist && mkdir ../dist", scoped, /not a known-safe target|\.\./);
+  allowed("npm test 2> err.log; tail err.log; rm -f err.log", scoped, "rm-created-file");
+  allowed("npm test &> all.log; rm all.log", scoped, "rm-created-file");
+  allowed("node gen.mjs > ./out.json; rm -f ./out.json", scoped, "rm-created-file");
+  deferred("npm test >> run.log; rm -f run.log", scoped, /not a known-safe target/, "an append does not create the file");
+  deferred("npm test 2>> err.log; rm -f err.log", scoped, /not a known-safe target/);
+  deferred("npm test > log.txt 2>&1; rm -f other.txt", scoped, /not a known-safe target/);
 });
