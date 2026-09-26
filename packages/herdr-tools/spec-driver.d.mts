@@ -4,7 +4,10 @@ export const ACTIVE_STATES: Set<string>;
 export function globsOverlap(left: string, right: string): boolean;
 export function reviewVerdict(summary: unknown): "pass" | "fail" | undefined;
 export type SpecAction = {
-  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt";
+  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt" | "infer-receipt";
+  /** ask-receipt: the pointed second ask. infer-receipt: when the first ask went out. */
+  pointed?: boolean;
+  since?: string;
   itemId: string;
   attempt: number;
   findings?: string;
@@ -18,6 +21,7 @@ export type SpecAction = {
 };
 export const RECEIPT_ASK_TIMEOUT_MS: number;
 export const RECEIPT_REASK_BASE_MS: number;
+export const RECEIPT_ASK_INTERVAL_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
   state: SpecState | undefined;
@@ -63,6 +67,7 @@ export function verifyResult(summary: unknown): { previews: Array<{ spec: string
 export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;
 export function specCommitMessage(itemId: string, subject: string): string;
 export const DECLINE_RULE: string;
+export const RECEIPT_RULE: string;
 export const INFRA_KINDS: Set<string>;
 export const INFRA_BACKOFF_MAX_MS: number;
 export function infraBackoffMs(failures: number): number;

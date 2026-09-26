@@ -4547,3 +4547,27 @@ test("an operator's running run state lifts a pause the root put on its own goal
     await rm(storeDir, { recursive: true, force: true });
   }
 });
+
+test("a stall is judged by the spec's own lanes: a stale working event in an old workflow does not cancel it", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("waiting-for-event"), laneRequests: [] });
+  const specDir = dirname(dirname(fixture.manifestPath));
+  await writeFile(join(specDir, "spec.json"), JSON.stringify({ version: 1, items: [{ id: "D05" }, { id: "D15" }] }));
+  await writeFile(join(dirname(fixture.manifestPath), "spec-state.json"), JSON.stringify({ version: 1, items: { D05: { state: "building", lane: { workflowId: "herdr-b5", laneId: "lane-1" } }, D15: { state: "ready" } } }));
+  const manifest = await fixture.manifest();
+  // The routed workflow's lane last reported "working" long ago; the spec lane finished without a receipt.
+  manifest.workflows[0].eventController = { version: 1, events: [{ identity: "old", received_at: "2026-09-20T00:00:00.000Z", workflow_id: "herdr-bb029", lane_id: CHILD.lane_id, pane_id: CHILD.pane_id, classification: "unclassified", source: { agent_status: "working" }, wake: { status: "not-required", attempts: 0, updated_at: "t" } }] };
+  manifest.workflows.push({ id: "herdr-b5", status: "running", lanes: [{ id: "lane-1", status: "running" }], eventController: { version: 1, events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] }, taskBinding: { workspaceId: ROOT.workspace_id, rootPaneId: ROOT.pane_id } });
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const texts = [];
+  const api = recoveryApi();
+  const capture = { async request(method, params) { if (method === "agent.prompt") texts.push(params.text); return api.request(method, params); } };
+  try {
+    for (let step = 0; step < 3; step += 1)
+      await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: new Date(Date.parse("2026-09-26T14:00:00.000Z") + step * 6 * 60_000).toISOString() });
+    const nudge = texts.find((text) => text.startsWith("[Baa-ton supervisor]"));
+    assert.ok(nudge, "nudged");
+    assert.match(nudge, /spec: 2 item\(s\) are waiting \((?=.*ready: 1)(?=.*in flight without a receipt: 1)/);
+  } finally {
+    await fixture.cleanup();
+  }
+});

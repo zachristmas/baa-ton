@@ -137,7 +137,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, INFRA_KINDS, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -4617,6 +4617,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     removeWorktree?(input: { repo: string; path: string }): Promise<void>;
     /** Save and abort a half-done merge or staged changes left in the integration worktree; undefined when clean. */
     cleanIntegration?(input: { worktree: string; patchPath: string }): Promise<{ merging: boolean; files: number } | undefined>;
+    /** A lane pane's visible screen (to infer a receipt from its final report). */
+    readScreen?(paneId: string): Promise<string>;
     /** Push `sha` to `remote`'s `branch` from the integration worktree (spec-push grant). */
     push?(input: { worktree: string; remote: string; sha: string; branch: string }): Promise<void>;
     /** Send a root-to-lane message (herdr_tell). */
@@ -5086,8 +5088,57 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         // After a shell failed to start, start nothing else this pass; the
         // items keep their state and are retried after the backoff.
         if (shellTimeout && action.kind !== "decide" && action.kind !== "ask-receipt") continue;
+        if (action.kind === "infer-receipt") {
+          // The lane's own final report: its last message after the ask, or
+          // else its visible screen. Recorded as its receipt, marked inferred.
+          const ref = action.lane!;
+          const latest = await loadManifest(ctx.cwd);
+          const workflow = latest.workflows.find((candidate) => candidate.id === ref.workflowId) as WorkflowWithRequests | undefined;
+          const laneRecord = workflow?.lanes.find((candidate) => candidate.id === ref.laneId);
+          const message = [...((workflow as { messageRequests?: Array<{ laneId?: string; requestedAt?: string; summary?: string; details?: string }> } | undefined)?.messageRequests ?? [])]
+            .filter((entry) => entry.laneId === ref.laneId && (!action.since || (entry.requestedAt ?? "") >= action.since))
+            .at(-1);
+          let report = message ? [message.summary, message.details].filter(Boolean).join("\n") : "";
+          let source = message ? "its last message" : "";
+          if (report.trim().length < 40 && laneRecord?.paneId) {
+            const read = await (ports?.readScreen ??
+              (async (paneId: string) => {
+                const raw = await runHerdr(["agent", "read", paneId, "--source", "visible", "--lines", "60"], signal);
+                const result = isRecord(raw) && isRecord(raw.result) ? raw.result : raw;
+                const text = isRecord(result) && isRecord(result.read) ? result.read.text : isRecord(result) ? result.text : undefined;
+                return typeof text === "string" ? text : "";
+              }))(laneRecord.paneId).catch(() => "");
+            report = read
+              .split("\n")
+              .filter((line: string) => !/^\s*(?:[>❯]\s*$|⏵⏵|\? for shortcuts|─{5,})/.test(line))
+              .join("\n")
+              .trim()
+              .slice(-4000);
+            source = "its visible screen";
+          }
+          if (report.trim().length < 40) {
+            record.receiptInferFailedAt = "no report found in its messages or on its screen";
+            done.push(`${item.id}: no report to infer a receipt from; a fresh lane follows`);
+            continue;
+          }
+          const blockers = report.split("\n").map((line) => line.trim()).filter((line) => /\b(block(?:ed|er|ers)?|fail(?:ed|s|ing)?|cannot|can't|missing|error|needs? (?:a )?decision)\b/i.test(line)).slice(0, 5);
+          const reportPath = /(\S+\.(?:docx|md|pdf|html|json|txt))\b/.exec(report)?.[1];
+          const summary = `INFERRED receipt: the lane finished without calling herdr_complete; recorded from ${source}.\n${report.trim().slice(0, 6000)}`;
+          await withManifestTransaction(ctx.cwd, (stored) => {
+            const lane = stored.workflows.find((candidate) => candidate.id === ref.workflowId)?.lanes.find((candidate) => candidate.id === ref.laneId);
+            if (lane && !lane.completionReceipt) (lane as { completionReceipt?: unknown }).completionReceipt = { id: `inferred-${randomUUID().slice(0, 8)}`, summary, inferred: true, delivery: "inferred" };
+          });
+          record.receiptInferred = { at: use.now(), source, ...(reportPath ? { reportPath } : {}) };
+          record.history = [...(record.history ?? []), { at: use.now(), from: record.state, to: record.state, note: `receipt inferred from ${source}${reportPath ? ` (report ${reportPath})` : ""}; the slot is free` }];
+          if (blockers.length)
+            step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${action.stage} lane finished without a receipt; its report (recorded as an inferred receipt) names blockers:\n${blockers.map((line) => `- ${line}`).join("\n")}${reportPath ? `\nReport: ${reportPath}` : ""}` });
+          done.push(`inferred ${item.id}'s ${action.stage} receipt from ${source}`);
+          continue;
+        }
         if (action.kind === "ask-receipt") {
-          const text = `Your spec ${action.stage} lane for ${item.id} is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must contain ${action.format}.`;
+          const text = action.pointed
+            ? `Your spec ${action.stage} lane for ${item.id} finished without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now, as your only action: put the outcome and any blockers from your last message in the summary, with ${action.format}. A plain-text report is not a receipt; if herdr_complete returns an error, send that error with herdr_message.`
+            : `Your spec ${action.stage} lane for ${item.id} is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must contain ${action.format}.`;
           try {
             const told = await (ports?.tell ?? ((input: { workflowId: string; laneId: string; text: string }) => tellLane(ctx.cwd, input, signal)))({ ...action.lane!, text });
             done.push(`asked ${item.id} for its receipt (${told.message.delivery.status})`);
@@ -5233,6 +5284,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 : "",
             objective,
             DECLINE_RULE,
+            RECEIPT_RULE,
           ]
             .filter(Boolean)
             .join("\n");

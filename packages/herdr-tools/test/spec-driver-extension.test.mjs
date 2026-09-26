@@ -568,7 +568,7 @@ test("an adopted branch with uncommitted changes outside its files, or with no o
   }
 });
 
-test("a lane idle without its receipt is asked once, then replaced by a fresh lane; a gone lane is retried in place", async () => {
+test("a lane idle without its receipt is asked, asked pointedly, then (with no report to infer from) replaced by a fresh lane; a gone lane is retried in place", async () => {
   const f = await fixture({
     specDocument: {
       version: 1,
@@ -613,7 +613,15 @@ test("a lane idle without its receipt is asked once, then replaced by a fresh la
 
     await f.advance();
     assert.equal(told.length, 1, "asked once");
-    f.ports.now = () => "2026-09-24T12:31:00.000Z";
+    f.ports.now = () => "2026-09-24T12:11:00.000Z";
+    await f.advance();
+    assert.equal(told.length, 2, "one pointed ask after an interval");
+    assert.match(told[1].text, /Call herdr_complete for workflow herdr-idle now, as your only action/);
+    // Nothing to infer from: no message, an empty screen.
+    f.ports.readScreen = async () => "";
+    f.ports.now = () => "2026-09-24T12:22:00.000Z";
+    await f.advance();
+    f.ports.now = () => "2026-09-24T12:23:00.000Z";
     await f.advance();
     state = await f.state();
     assert.equal(state.items.IDLE.state, "reviewing", "not held at the human gate");
@@ -1058,7 +1066,8 @@ test("a live integrate lane in Herdr keeps spec-integration reserved, whatever i
   }
 });
 
-test("a lane that answers the receipt ask with a status message is still working: asked again later, not blocked", async () => {
+test("a lane that replies with its report instead of a receipt gets one pointed ask, then its receipt is inferred from that report", async () => {
+  const merged = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const f = await fixture({
     specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D12", title: "Batch", acceptance: { text: "b" } }] },
     seed: {
@@ -1073,30 +1082,47 @@ test("a lane that answers the receipt ask with a status message is still working
       status: "running",
       lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p8" }],
       eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] },
-      messageRequests: [{ id: "m1", laneId: "lane-1", summary: "Full suite still running in the background (about 40%).", requestedAt: "2026-09-24T11:25:00.000Z" }],
+      // The live shape: herdr_complete failed, so the lane sent its receipt text as a message.
+      messageRequests: [{ id: "m1", laneId: "lane-1", summary: "herdr_complete FAILED to deliver; receipt text follows", details: `INTEGRATED: ${merged}\nSUITE: pass\nReport: artifacts/d12.docx`, requestedAt: "2026-09-24T11:25:00.000Z" }],
       evidence: [],
     });
     await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
     const told = [];
-    f.ports.tell = async (input) => {
-      told.push(input);
-      return { message: { delivery: { status: "delivered" } } };
-    };
-    f.ports.agentPresent = async () => true;
-    // 40 minutes after the ask: past the 30-minute escalation, but the lane replied.
+    f.ports.tell = async (input) => (told.push(input), { message: { delivery: { status: "delivered" } } });
+    f.ports.agentPresent = async () => false;
     await f.advance();
-    let state = await f.state();
-    assert.equal(state.items.D12.state, "integrating", "not blocked");
-    assert.equal(state.items.D12.receiptAskAfter, "2026-09-24T13:00:00.000Z", "asked again after an hour");
-    assert.equal(told.length, 0);
-    f.ports.now = () => "2026-09-24T12:30:00.000Z";
+    assert.equal(told.length, 1, "its reply is not 'still working': one pointed ask");
+    assert.match(told[0].text, /as your only action/);
+    f.ports.now = () => "2026-09-24T12:11:00.000Z";
+    const inferred = await f.advance();
+    assert.match(inferred.content[0].text, /inferred D12's integrate receipt from its last message/);
+    const lane = (await f.manifest()).workflows.find((workflow) => workflow.id === "herdr-338").lanes[0];
+    assert.equal(lane.completionReceipt.inferred, true);
+    assert.match(lane.completionReceipt.summary, /^INFERRED receipt/);
+    const alerts = ((await f.manifest()).rootSupervision ?? []).flatMap((entry) => entry.alerts ?? []);
+    assert.ok(alerts.some((alert) => /names blockers:\n- herdr_complete FAILED to deliver/.test(alert.text)), "blockers go to the root");
+    f.ports.now = () => "2026-09-24T12:12:00.000Z";
     await f.advance();
-    assert.equal(told.length, 0, "not before the longer interval");
-    f.ports.now = () => "2026-09-24T13:01:00.000Z";
+    const state = await f.state();
+    assert.equal(state.items.D12.state, "awaiting-push", "the inferred receipt's lines are processed like a real receipt");
+    assert.equal(state.items.D12.integration.sha, merged);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a finished lane without a receipt holds its maxParallel slot for at most one ask interval", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, defaults: { maxParallel: 1 }, items: [{ id: "D05", title: "Done lane", acceptance: { text: "a" } }, { id: "D15", title: "Waiting", acceptance: { text: "b" } }] },
+    seed: { version: 1, items: { D05: { state: "building", attempts: 1, lane: { workflowId: "herdr-b5", laneId: "lane-1" }, receiptAskedAt: "2026-09-24T11:45:00.000Z" }, D15: { state: "ready", attempts: 0 } } },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-b5", status: "running", lanes: [{ id: "lane-1", status: "running", paneId: "w-spec:p5" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "idle" } }] }, evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    f.ports.tell = async () => ({ message: { delivery: { status: "delivered" } } });
     await f.advance();
-    assert.equal(told.length, 1, "then asked again");
-    state = await f.state();
-    assert.equal(state.items.D12.state, "integrating");
+    assert.ok(f.calls.plan.some((call) => call.specStage === "build" && /D15/.test(call.objective)), "15 minutes after the ask, D15 gets the slot");
   } finally {
     await f.cleanup();
   }

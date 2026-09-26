@@ -88,6 +88,16 @@ function identity(value, label) {
   };
 }
 
+/**
+ * Whether a message between these endpoints can use the inbox: herdr-link/1
+ * stays within one Herdr workspace. Cross-workspace routes (a lane in its
+ * worktree's own workspace reporting to the root) go through the manifest
+ * and the controller's hooks instead; callers skip the inbox for them.
+ */
+export function inboxRoutable(from, to) {
+  return isRecord(from) && isRecord(to) && typeof from.workspace_id === "string" && from.workspace_id === to.workspace_id;
+}
+
 export function makeEnvelope({
   logicalKey,
   occurrenceId = randomUUID(),
