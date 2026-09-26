@@ -20,10 +20,14 @@ async function delegatedContext(intent, intentPath) {
   );
   const workflow = manifest.workflows?.find((entry) => entry.id === intent.workflowId);
   const lane = workflow?.lanes?.find((entry) => entry.id === intent.laneId);
+  // A lane runs in its workflow's lane workspace (where its worktree is
+  // already open) or, by default, the root's task workspace.
+  const laneWorkspace = workflow?.laneWorkspaceId ?? workflow?.taskBinding?.workspaceId;
   if (
     !lane || lane.agentKind !== "claude" ||
     lane.paneId !== intent.paneId ||
-    workflow.taskBinding?.workspaceId !== intent.workspaceId ||
+    laneWorkspace !== intent.workspaceId ||
+    (typeof lane.workspaceId === "string" && lane.workspaceId !== intent.workspaceId) ||
     typeof lane.startupIntentPath !== "string" ||
     resolve(lane.startupIntentPath) !== resolve(intentPath) ||
     lane.startupNonce !== intent.nonce ||
