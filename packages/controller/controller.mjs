@@ -776,6 +776,20 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath }) {
   }
   for (const directive of openDirectives(manifest, orchestrator))
     reasons.push(`directive ${directive.id} from ${directive.from} is open: ${clipText(directive.text, 160)}`);
+  // A wait on an event only holds while someone can send it: with no lane
+  // working or blocked (and nobody owing an answer), the wait is a stall.
+  if (goal.status === "waiting-for-event" && !awaitingUser.length && !reasons.length) {
+    const live = owned.flatMap((workflow) =>
+      (Array.isArray(workflow.lanes) ? workflow.lanes : [])
+        .filter((lane) => isRecord(lane) && !lane.completionReceipt && !["completed", "closed", "operator-closed", "superseded", "retired"].includes(workflow.status))
+        .map((lane) => latestLaneStatus(workflow, lane.id))
+        .filter((status) => status === "working" || status === "blocked"),
+    );
+    if (!live.length)
+      reasons.push(
+        `parent goal ${goal.id} is waiting-for-event, but no lane is working or blocked, so no event is coming: this is no progress, not a wait. Take the next action (herdr_spec status names it), reclaim or retire what is stale, or record a truthful state (action-required only while the user owes an answer)`,
+      );
+  }
   if (!reasons.length) return { quiet: "no-actionable-work", awaitingUser };
   return { reasons, awaitingUser };
 }

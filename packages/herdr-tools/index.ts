@@ -4598,7 +4598,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     status?(worktree: string): Promise<string>;
     /** Retire one finished lane (close its tab, release its leases). */
     retire?(candidate: RetireCandidate): Promise<unknown>;
-    /** Whether Herdr still finds an agent in this pane. */
+    /** Whether Herdr finds a live working (or blocked) agent in this pane; an idle or done agent holds no lock. */
     agentPresent?(paneId: string): Promise<boolean>;
     /** Background work (a suite, build or monitor) the idle agent in this pane still runs, if any. */
     backgroundWork?(paneId: string): Promise<string | undefined>;
@@ -4804,13 +4804,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         if (work) background.set(`${record.lane.workflowId}/${record.lane.laneId}`, work);
       }
       // The integration worktree stays reserved while any integrate or verify
-      // lane still has a live agent in its pane, whatever its item's state.
+      // lane still has a working agent in its pane, whatever its item's
+      // state; an idle or done agent there holds nothing.
       const agentPresent =
         ports?.agentPresent ??
         (async (paneId: string) => {
           const result = await runHerdr(["agent", "get", paneId], signal).catch(() => undefined);
           const info = isRecord(result) && isRecord(result.result) ? result.result : result;
-          return isRecord(info) && isRecord(info.agent) && typeof info.agent.agent === "string" && Boolean(info.agent.agent);
+          if (!isRecord(info) || !isRecord(info.agent) || typeof info.agent.agent !== "string" || !info.agent.agent) return false;
+          // Only a working or blocked agent (or one whose status Herdr does not know yet) holds the lock.
+          return !["done", "idle"].includes(String(info.agent.agent_status ?? ""));
         });
       let integrationLive: string | undefined;
       const closedWorkflow = new Set(["closed", "completed", "operator-closed", "superseded", "retired"]);

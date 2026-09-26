@@ -2370,7 +2370,8 @@ for (const [label, status, options, expected] of [
   ["blocked even with a pending question when work waits", "blocked", { questionRequests: pendingQuestion }, "delivered"],
   ["completed", "completed", {}, "quiet:goal-completed"],
   ["paused", "paused", {}, "not-running"],
-  ["waiting-for-event with no actionable work", "waiting-for-event", { laneRequests: [] }, "quiet:no-actionable-work"],
+  // Nothing working and nobody owing an answer: no event can come, so the wait is a stall.
+  ["waiting-for-event with no lane working", "waiting-for-event", { laneRequests: [] }, "delivered"],
 ]) {
   test(`supervisor nudge rule: ${label} -> ${expected}`, async () => {
     const fixture = await createFixture({ parentGoal: statusGoal(status), ...options });
@@ -2426,6 +2427,34 @@ test("a nudge names each waiting item: lane requests, lease asks, unread message
     assert.match(nudge, /workflow herdr-next is planned but not dispatched/);
     assert.match(nudge, /directive directive-sweep from zach is open: Sweep finished lanes\./);
     assert.doesNotMatch(nudge, /observational only/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("waiting-for-event is a real wait while a lane works, and a stall (named in the nudge) once none does", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("waiting-for-event"), laneRequests: [] });
+  const setStatus = async (status) => {
+    const manifest = await fixture.manifest();
+    manifest.workflows[0].eventController = { version: 1, events: [{ identity: `e-${status}`, received_at: "2026-09-14T00:00:00.000Z", workflow_id: "herdr-bb029", lane_id: CHILD.lane_id, pane_id: CHILD.pane_id, classification: "unclassified", source: { agent_status: status }, wake: { status: "not-required", attempts: 0, updated_at: "t" } }] };
+    await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  };
+  const texts = [];
+  const api = recoveryApi();
+  const capture = {
+    async request(method, params) {
+      if (method === "agent.prompt") texts.push(params.text);
+      return api.request(method, params);
+    },
+  };
+  try {
+    await setStatus("working");
+    let result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:00:00.000Z" });
+    assert.deepEqual([result.results[0].status, result.results[0].reason], ["quiet", "no-actionable-work"], "a working lane will send the event");
+    await setStatus("done");
+    result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:10:00.000Z" });
+    assert.equal(result.results[0].status, "delivered");
+    assert.match(texts.find((text) => text.startsWith("[Baa-ton supervisor]")), /is waiting-for-event, but no lane is working or blocked, so no event is coming: this is no progress, not a wait/);
   } finally {
     await fixture.cleanup();
   }
