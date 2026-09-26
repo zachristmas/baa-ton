@@ -282,8 +282,25 @@ function rmVerdict(segment, context) {
 /** Build outputs a lane may put back to HEAD after a build rewrote them. */
 const GENERATED_ARTIFACTS = [/(^|\/)openapi(-spec)?\.(json|ya?ml)$/, /\.generated\.[\w]+$/, /(^|\/)(__generated__|generated)\//, /\.gen\.[jt]sx?$/];
 
+/** A quoted -m message: double- or single-quoted, over any number of lines. */
+const COMMIT_MESSAGE = String.raw`(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*')`;
+
 function gitVerdict(segment, options, context = {}) {
   if (!/^git\s/.test(segment)) return undefined;
+  // Local, reversible steps in the lane's own worktree: stage named paths,
+  // read the status, commit with a message (any length, any lines). Parsed
+  // before the force check: a message may mention -f or --force.
+  if (/^git status(\s+(-s|--short|-b|--branch|--porcelain(=v\d)?|-uno|--untracked-files(=\w+)?))*$/.test(segment)) return { safe: true, rule: "git-status" };
+  const add = /^git add((?:\s+(?:-q|-u|-A|--all|--|"?[\w.][\w./-]*"?))+)$/.exec(segment);
+  if (add) {
+    return add[1].split(/\s+/).some((part) => part.includes(".."))
+      ? { safe: false, reason: "git add of a path outside the worktree" }
+      : { safe: true, rule: "git-stage" };
+  }
+  const commit = new RegExp(`^git commit((?:\\s+-(?:q|a|s))*)((?:\\s+-m\\s+${COMMIT_MESSAGE})+)$`).exec(segment);
+  if (commit) return { safe: true, rule: "git-commit-local" };
+  if (/^git commit\b/.test(segment.replace(new RegExp(COMMIT_MESSAGE, "g"), '""')) && /--amend|--no-verify|(^|\s)-n(\s|$)/.test(segment.replace(new RegExp(COMMIT_MESSAGE, "g"), '""')))
+    return { safe: false, reason: "git commit --amend or --no-verify" };
   const branch = options.branchPattern ?? DEFAULT_BRANCH;
   // Recreate the lane's own branch at origin/main: only in a clean worktree,
   // and only when that branch does not exist yet or is already merged, so no
