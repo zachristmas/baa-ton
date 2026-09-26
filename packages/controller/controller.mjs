@@ -3576,6 +3576,23 @@ export async function runSupervisorTick({
             queueStore(manifest),
           );
       }
+      // The root's own question dialog, when nothing else will answer it.
+      try {
+        const { superviseRootDialog } = await import("./root-dialog.mjs");
+        const dialog = await superviseRootDialog({
+          orchestrator,
+          manifest,
+          manifestPath,
+          entry: supervisionFor(manifest, orchestrator, true),
+          herdr: api,
+          notify,
+          timestamp,
+        });
+        if (dialog.changed) await atomicWriteJson(manifestPath, manifest);
+        if (dialog.action === "answered") pendingWakes.push({ manifestPath, kind: "root-dialog-answered" });
+      } catch {
+        // Best effort: a missing helper or a Herdr hiccup never blocks the tick.
+      }
       const escalatedDirectives = await escalateDirectives({
         orchestrator,
         manifestPath,

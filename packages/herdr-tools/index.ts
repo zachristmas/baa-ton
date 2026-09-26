@@ -132,7 +132,7 @@ import {
 } from "./live-identity.mjs";
 import { legacyStateStatus } from "./state-migration.mjs";
 import { classifyLocalValidation } from "./known-safe.mjs";
-import { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers } from "./root-question.mjs";
+import { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } from "./root-question.mjs";
 import { OPERATOR_AUTHORITY } from "./operator.mjs";
 import { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage } from "./operator-api.mjs";
 import {
@@ -10386,6 +10386,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       isRootOrchestrator() &&
       isRootForManifest(ctx.cwd)
     ) {
+      // Herdr sees a dialog-bound Pi root as working; say it is blocked, so
+      // the controller and the digest treat it as waiting on an answer.
+      await reportRootDialog((event as { toolCallId?: string }).toolCallId, call.input);
       await armRootQuestionDefault(event as { toolCallId?: string }, call.input, ctx);
       return;
     }
@@ -10474,9 +10477,36 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       })();
     });
   }
+  // The root's open question dialogs, reported to Herdr as blocked until
+  // they close (Herdr's own detection resumes on release).
+  const ROOT_DIALOG_SOURCE = "baa-ton-root-dialog";
+  const openRootDialogs = new Set<string>();
+  async function reportRootDialog(toolCallId: string | undefined, input: unknown): Promise<void> {
+    const paneId = process.env[HERDR_PANE_ID_ENV];
+    if (!paneId) return;
+    const question = parseQuestions(input ?? {})[0]?.question ?? "question dialog";
+    try {
+      await runHerdr(["pane", "report-agent", "--source", ROOT_DIALOG_SOURCE, "--agent", "pi", "--state", "blocked", "--message", clip(`question dialog open: ${question}`, 200), paneId], undefined);
+      openRootDialogs.add(toolCallId ?? "dialog");
+    } catch {
+      // Older Herdr without report-agent: the controller's stall check still sees the dialog.
+    }
+  }
+  async function releaseRootDialog(toolCallId?: string): Promise<void> {
+    const paneId = process.env[HERDR_PANE_ID_ENV];
+    if (toolCallId) openRootDialogs.delete(toolCallId);
+    else openRootDialogs.clear();
+    if (!paneId || openRootDialogs.size) return;
+    await runHerdr(["pane", "release-agent", "--source", ROOT_DIALOG_SOURCE, "--agent", "pi", paneId], undefined).catch(() => undefined);
+  }
+  pi.on("agent_end", async () => {
+    // A turn that ended (aborted, answered) holds no dialog.
+    if (openRootDialogs.size) await releaseRootDialog();
+  });
   pi.on("tool_result", async (event) => {
     const result = event as unknown as { toolName?: string; toolCallId?: string };
     if (result.toolName !== "ask_user_question" || !result.toolCallId) return;
+    if (openRootDialogs.has(result.toolCallId)) await releaseRootDialog(result.toolCallId);
     const fired = rootQuestions.settle(result.toolCallId);
     const text = rootQuestionAnswers.get(result.toolCallId);
     rootQuestionAnswers.delete(result.toolCallId);

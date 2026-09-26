@@ -149,6 +149,43 @@ export function classifyScreen(text) {
       fingerprint: sha(block),
     };
   }
+  // An unnumbered option list (some dialogs mark only the cursor): a block
+  // of short sibling lines around a cursor line. Too ambiguous to act on
+  // unless exactly one option is marked Recommended.
+  const cursorAt = lines.findLastIndex((line) => /^\s*[❯›▶]\s+\S/.test(line));
+  if (cursorAt >= 0) {
+    const indent = /^(\s*)/.exec(lines[cursorAt].replace(/[❯›▶]/, " "))[1].length;
+    const sibling = (line) => line.trim() && !FOOTER.test(line) && (/^\s*[❯›▶]\s+\S/.test(line) || /^(\s*)/.exec(line)[1].length === indent);
+    let first = cursorAt;
+    while (first > 0 && sibling(lines[first - 1])) first -= 1;
+    let last = cursorAt;
+    while (last < lines.length - 1 && sibling(lines[last + 1])) last += 1;
+    const labels = lines.slice(first, last + 1).map((line) => line.replace(/^\s*[❯›▶]?\s*/, "").trim());
+    const options = labels.map((label, index) => ({
+      number: index + 1,
+      label,
+      selected: first + index === cursorAt,
+      ...(/\(recommended\)/i.test(label) ? { recommended: true } : {}),
+      ...(FREE_TEXT.test(label) ? { freeText: true } : {}),
+    }));
+    let end = first - 1;
+    while (end >= 0 && !lines[end].trim()) end -= 1;
+    let start = end;
+    while (start > 0 && end - start < 3 && lines[start - 1].trim()) start -= 1;
+    const question = lines.slice(Math.max(0, start), end + 1).map((line) => line.trim()).filter((line) => line && !/[←→]|✔ Submit/.test(line)).join(" ");
+    if (question && options.length >= 2 && options.filter((option) => option.recommended).length === 1 && labels.every((label) => label.length <= 120)) {
+      const recommended = options.find((option) => option.recommended);
+      return {
+        kind: "question",
+        unnumbered: true,
+        question,
+        options,
+        recommended: recommended.number,
+        denyKeys: ["esc"],
+        fingerprint: sha([question, ...labels].join("\n")),
+      };
+    }
+  }
   return { kind: "unknown", fingerprint: sha(lines.join("\n")) };
 }
 
@@ -273,7 +310,7 @@ function laneWorktree(workflow, lane) {
   return lane?.sessionLog?.worktree ?? lane?.worktree ?? workflow?.worktree ?? workflow?.cwd;
 }
 
-async function readScreen(herdr, target, paneId) {
+export async function readScreen(herdr, target, paneId) {
   const result = await herdr.request("agent.read", { target, source: "visible", lines: SCREEN_LINES, strip_ansi: true });
   const read = result?.read;
   if (result?.type !== "pane_read" || !read || read.pane_id !== paneId || typeof read.text !== "string")
@@ -284,7 +321,7 @@ async function readScreen(herdr, target, paneId) {
 const execFileAsync = promisify(execFile);
 
 /** `herdr agent send-keys <pane> <key>...`; tests pass herdr.sendKeys. */
-async function sendKeys(herdr, paneId, keys) {
+export async function sendKeys(herdr, paneId, keys) {
   if (typeof herdr.sendKeys === "function") return herdr.sendKeys(paneId, keys);
   return execFileAsync("herdr", ["agent", "send-keys", paneId, ...keys], { timeout: 5_000 });
 }
