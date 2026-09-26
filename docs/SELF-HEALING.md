@@ -33,10 +33,14 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 
 ## lane-admin's contract
 
-- Register once with `baa-ton operator register lane-admin` from its pane.
+- Register once from its pane with `baa-ton operator register lane-admin --resume`. That records its Claude Code session and the command that resumes it (`--resume-command "<command>"` sets the command explicitly, for example to keep a permission mode).
 - Never idle while its operator inbox holds an unhandled anomaly. Each one gets a fix, tests, a merge by branch name, and an entry below.
-- **Continuity:** when its context passes about 80%, write a handoff file (open anomalies, branch, what's next) in its scratchpad. Then it must be started fresh, re-register, and resume from the handoff and `baa-ton inbox`.
-- The fresh start needs something outside the session to relaunch it (an operator or a supervisor action). That relaunch is not automated yet.
+- **Continuity:** Claude Code compacts its own session, so nothing is relaunched for context size. lane-admin keeps a handoff file in its scratchpad (role, open anomalies, branch, what's next) and updates it after each merge, so a compaction or a restart loses nothing.
+- **Dead-pane fallback** (`packages/controller/agent-revive.mjs`): when a pane registered with a resume command has no agent left, the supervisor types `cd <folder> && <resume command>` into it. "No agent left" means the shell is the only foreground process there, or, when process info is unavailable, Herdr reports no agent. Safeguards:
+  - the pane must look dead on two checks at least 30 seconds apart;
+  - relaunches are at least 10 minutes apart, at most 3 an hour, and the count survives supervisor restarts;
+  - each relaunch is reported as an `agent-relaunched` anomaly (so the resumed session sees it and looks for the cause);
+  - when the hour's budget runs out, the user gets one notice.
 
 ## Fixed anomalies
 
@@ -53,3 +57,4 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | 2026-09-26 | Every root /reload killed the spec driver: the timer kept the old instance's context, which went stale | The timer restarts on session_start(reload) and on turn boundaries, stops on a stale context, and logs that it is alive every 10 min |
 | 2026-09-26 | The spec driver went silent for hours while the root sat in one multi-hour turn and never reloaded | The driver runs in a supervisor-owned spec host; root turns over 30 min are interrupted; the root contract forbids lane work |
 | 2026-09-26 | Four done lanes held every slot for hours: their language server's tsserver typings installer counted as background work, and one lane's hung test run counted forever | A helper's whole process subtree is tooling, not work; background work over 60 min with the agent idle no longer defers the receipt ask |
+| 2026-09-26 | A dead lane-admin session needed a person to restart it | Dead-pane fallback: the supervisor resumes a registered agent in its pane |

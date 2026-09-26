@@ -71,11 +71,24 @@ export async function readOperatorInbox({ all = false, unread = false, limit = 2
   return operatorInbox(await readOperatorStore(path), { all, limit });
 }
 
-export async function registerAgent({ name, paneId, workspaceId, agentKind, cwd, env = process.env } = {}) {
+export async function registerAgent({ name, paneId, workspaceId, agentKind, cwd, sessionId, resume, env = process.env } = {}) {
   const path = operatorStorePath(env);
   // The agent's working folder bounds the unattended policy for its prompts.
+  // A Claude Code session id makes the agent resumable: with `resume` set, the
+  // supervisor relaunches it in its pane if that pane dies (agent-revive.mjs).
+  const session = sessionId ?? env.CLAUDE_CODE_SESSION_ID;
+  const resumeCommand = resume === true ? (session ? `claude --resume ${session}` : undefined) : resume || undefined;
+  if (resume && !resumeCommand) throw new Error("--resume needs a Claude Code session (CLAUDE_CODE_SESSION_ID) or an explicit --resume-command.");
   const agent = await withOperatorStore(path, (store) =>
-    registerOperatorAgent(store, { name, paneId: paneId ?? env.HERDR_PANE_ID, workspaceId: workspaceId ?? env.HERDR_WORKSPACE_ID, agentKind, cwd: cwd ?? process.cwd() }),
+    registerOperatorAgent(store, {
+      name,
+      paneId: paneId ?? env.HERDR_PANE_ID,
+      workspaceId: workspaceId ?? env.HERDR_WORKSPACE_ID,
+      agentKind,
+      cwd: cwd ?? process.cwd(),
+      sessionId: session,
+      resume: resumeCommand,
+    }),
   );
   return { name, ...agent, instructions: OPERATOR_AUTHORITY };
 }
