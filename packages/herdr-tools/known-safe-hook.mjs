@@ -157,7 +157,13 @@ async function main() {
   }
   const bridge = argument("--bridge");
   const intent = argument("--intent");
-  if (!bridge || !intent || typeof input?.tool_name !== "string") return;
+  if (!bridge || !intent || typeof input?.tool_name !== "string") {
+    // No route: the prompt goes to a person. Log why (with the mode), so it
+    // can be explained afterwards.
+    if (known?.result && input?.tool_name === "Bash")
+      audit({ sessionId: input.session_id, decision: "defer", mode: input.permission_mode, scoped: Boolean(options.scopeToAskRules), reason: known.result.reason, command: String(input.tool_input?.command ?? "").slice(0, 2000) });
+    return;
+  }
   // Tools that need the person's own answer are never routed.
   if (INTERACTIVE_TOOLS.has(input.tool_name)) return;
   const seconds = Number(argument("--wait-seconds"));
