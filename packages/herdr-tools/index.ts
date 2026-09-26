@@ -137,7 +137,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, INFRA_KINDS, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -4766,6 +4766,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // Items held for a cause a deploy may fix (commit rules, hooks, the
       // untracked-files rule) retry once on the first pass under new code.
       // Holds recorded before causes were stamped are recognized by note.
+      // Items a stage exhausted only through infrastructure errors (a dirty
+      // worktree, a failed attestation, never started) go back to that stage
+      // once per driver version: those failures were never the lane's work.
+      for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, Record<string, any>]>) {
+        if (record.state !== "blocked" || record.blockedReason !== "exhausted" || record.rearmedByCode === codeVersion) continue;
+        const declines = Array.isArray(record.declines) ? record.declines : [];
+        const stage = declines.at(-1)?.stage as string | undefined;
+        const stateOf: Record<string, string> = { decide: "deciding", build: "building", review: "reviewing", integrate: "integrating", verify: "verifying" };
+        if (!stage || !stateOf[stage]) continue;
+        const ofStage = declines.filter((entry: { stage?: string }) => entry.stage === stage);
+        const infraOnly = ofStage.length > 0 && ofStage.every((entry: { kind?: string }) => INFRA_KINDS.has(entry.kind ?? ""));
+        if (!infraOnly) continue;
+        record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: stateOf[stage], note: `re-armed: ${stage} was exhausted only by infrastructure errors` }];
+        Object.assign(record, { state: stateOf[stage], since: use.now(), rearmedByCode: codeVersion });
+        for (const key of ["blockedReason", "note", "declined", "infraFailures", "infraRetryAfter", "infraAlertedAt", "lane"]) delete record[key];
+        void id;
+      }
       for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, Record<string, any>]>) {
         if (record.state !== "blocked" || record.blockedReason !== "human-gate") continue;
         const retryable =
@@ -5061,6 +5078,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         }
         const item = spec.items.find((candidate) => candidate.id === action.itemId)!;
         const record = next.items[item.id];
+        // Backing off after an infrastructure error: not yet.
+        if (action.kind !== "ask-receipt" && typeof record?.infraRetryAfter === "string" && Date.parse(use.now()) < Date.parse(record.infraRetryAfter)) {
+          step.waits[item.id] = `retrying after an infrastructure error at ${record.infraRetryAfter}`;
+          continue;
+        }
         // After a shell failed to start, start nothing else this pass; the
         // items keep their state and are retried after the backoff.
         if (shellTimeout && action.kind !== "decide" && action.kind !== "ask-receipt") continue;
@@ -5236,16 +5258,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           done.push(`${action.kind} ${item.id} -> ${workflow.id}`);
         } catch (error) {
           record.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
-          // A lane that could not start (startup attestation, shell) climbs
-          // the same retry ladder as one that declined: fresh, then fallback.
+          // A lane that could not start (startup attestation, shell, a dirty
+          // worktree, the bridge) is an infrastructure error, not the lane's
+          // work: never counted toward exhaustion, retried after a growing wait.
           const declines = ((record.declines as Array<Record<string, unknown>> | undefined) ??= []);
-          declines.push({ at: use.now(), stage: action.kind, kind: "never started", reason: clip((error as Error).message, 300) });
-          const count = declines.filter((entry) => entry.stage === action.kind).length;
-          const choice = profileAfterDeclines(spec, action.kind, count);
-          if (choice) record.declined = { stage: action.kind, kind: "never started", reason: clip((error as Error).message, 300), count, ...(choice.profile ? { profile: choice.profile } : {}) };
-          else {
-            Object.assign(record, { state: "blocked", blockedReason: "exhausted", since: use.now() });
-            step.rootAsks.push({ itemId: item.id, reason: `${item.id}: ${count} ${action.kind} lane(s) could not start with every configured profile: ${clip((error as Error).message, 200)}` });
+          declines.push({ at: use.now(), stage: action.kind, kind: "infrastructure", reason: clip((error as Error).message, 300) });
+          if (declines.length > 20) declines.splice(0, declines.length - 20);
+          record.infraFailures = ((record.infraFailures as number | undefined) ?? 0) + 1;
+          record.infraRetryAfter = new Date(Date.parse(use.now()) + infraBackoffMs(record.infraFailures as number)).toISOString();
+          record.history = [...(record.history ?? []), { at: use.now(), from: record.state, to: record.state, note: `${action.kind} lane could not start (${clip((error as Error).message, 160)}): an infrastructure error, not counted; retrying after ${record.infraRetryAfter}` }];
+          if ((record.infraFailures as number) >= 5 && !record.infraAlertedAt) {
+            record.infraAlertedAt = use.now();
+            step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${action.kind} lanes failed to start ${record.infraFailures} times in a row (${clip((error as Error).message, 200)}); the driver keeps retrying, check the harness` });
           }
           if (/shell did not become ready/i.test((error as Error).message)) {
             shellTimeout = true;

@@ -1580,7 +1580,7 @@ test("a hold caused only by a regenerated artifact resumes without a deploy and 
   }
 });
 
-test("a lane that cannot start climbs the ladder: a fresh try, then the fallback profile", async () => {
+test("a lane that cannot start is an infrastructure error: never counted, retried after a growing wait on the same profile", async () => {
   const f = await fixture({
     specDocument: {
       version: 1,
@@ -1597,20 +1597,60 @@ test("a lane that cannot start climbs the ladder: a fresh try, then the fallback
     f.ports.plan = async (input) => {
       if (failing) {
         f.calls.plan.push(input);
-        throw new Error("Startup attestation incomplete: bridge did not report herdr_complete");
+        throw new Error("worktreeCwd must be clean before Herdr dispatch");
       }
       return plan(input);
     };
+    let clock = Date.parse("2026-09-24T12:00:00.000Z");
+    f.ports.now = () => new Date(clock).toISOString();
     await f.advance();
     let state = await f.state();
-    assert.equal(state.items.D05.state, "reviewing");
-    assert.equal(state.items.D05.declined.kind, "never started");
-    assert.equal(state.items.D05.declined.profile, "review-alt");
-    failing = false;
+    assert.equal(state.items.D05.state, "reviewing", "never exhausted");
+    assert.equal(state.items.D05.infraFailures, 1);
+    assert.equal(state.items.D05.infraRetryAfter, "2026-09-24T12:01:00.000Z", "one minute, then doubling");
+    const tries = () => f.calls.plan.filter((call) => call.specStage === "review").length;
+    assert.equal(tries(), 1);
     await f.advance();
-    const reviews = f.calls.plan.filter((call) => call.specStage === "review");
-    assert.equal(reviews.at(-1).taskProfile, "review-alt", "the next lane uses the fallback profile");
-    assert.match(reviews.at(-1).laneObjective, /did not finish \(never started: Startup attestation incomplete/);
+    assert.equal(tries(), 1, "no retry before the wait is over");
+    // Keep failing: five in a row alert the root once; still never exhausted.
+    for (let failures = 1; failures < 6; failures += 1) {
+      clock += 31 * 60_000;
+      await f.advance();
+    }
+    state = await f.state();
+    assert.equal(state.items.D05.state, "reviewing");
+    assert.equal(state.items.D05.blockedReason, undefined);
+    const alerts = ((await f.manifest()).rootSupervision ?? []).flatMap((entry) => entry.alerts ?? []).filter((alert) => /failed to start/.test(alert.text));
+    assert.equal(alerts.length, 1);
+    failing = false;
+    clock += 31 * 60_000;
+    await f.advance();
+    const last = f.calls.plan.filter((call) => call.specStage === "review").at(-1);
+    assert.equal(last.taskProfile, "review", "no fallback: the lane never ran, so its profile was never the problem");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an item exhausted only by infrastructure errors is re-armed once per driver version", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D03", title: "Pushed", acceptance: { text: "p" } }, { id: "D11", title: "Real", acceptance: { text: "r" } }] },
+    seed: {
+      version: 1,
+      items: {
+        D03: { state: "blocked", blockedReason: "exhausted", integratedSha: "3".repeat(40), declines: [{ at: "t", stage: "verify", kind: "never started", reason: "worktreeCwd must be clean" }, { at: "t", stage: "verify", kind: "never started", reason: "worktreeCwd must be clean" }] },
+        D11: { state: "blocked", blockedReason: "exhausted", declines: [{ at: "t", stage: "review", kind: "declined", reason: "out of scope" }, { at: "t", stage: "review", kind: "declined", reason: "out of scope" }] },
+      },
+    },
+  });
+  try {
+    f.ports.codeVersion = "code-a";
+    await f.advance();
+    let state = await f.state();
+    assert.equal(state.items.D03.state, "verifying", "back to verification");
+    assert.equal(state.items.D03.rearmedByCode, "code-a");
+    assert.ok(state.items.D03.history.some((entry) => /re-armed: verify was exhausted only by infrastructure errors/.test(entry.note ?? "")));
+    assert.equal(state.items.D11.state, "blocked", "real declines stay exhausted");
   } finally {
     await f.cleanup();
   }
