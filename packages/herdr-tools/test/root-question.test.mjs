@@ -21,14 +21,14 @@ test("eligible only with one Recommended option per question and nothing a perso
   assert.match(autoAnswerText(plan), /One file per item/);
   assert.match(autoAnswerText(plan), /logged for the user's review/);
 
-  assert.match(autoAnswerPlan(round("Which layout?", ["A", "B"])).reason, /no Recommended option/);
+  const firstByDefault = autoAnswerPlan(round("Which layout?", ["A", "B"]));
+  assert.deepEqual(firstByDefault.answers, [{ question: "Which layout?", answer: "A", byDefault: true }], "no Recommended option: the first option is the policy default");
   assert.match(autoAnswerPlan(round("Which layout?", ["A (Recommended)", "B (Recommended)"])).reason, /more than one/);
   for (const [question, options] of [
-    ["Push the integration branch now?", ["Yes (Recommended)", "Wait"]],
+    ["Which of these fits? [unclear-requirements]", ["A (Recommended)", "B"]],
     ["Deploy the preview?", ["Yes (Recommended)", "No"]],
     ["Run the migration against production?", ["Yes (Recommended)", "No"]],
     ["Add bulk export while we are here?", ["Yes, new scope (Recommended)", "No"]],
-    ["Next step?", ["Merge to main (Recommended)", "Hold"]],
   ])
     assert.equal(autoAnswerPlan(round(question, options)).eligible, false, question);
   assert.equal(autoAnswerPlan(round("Name the product module?", ["core (Recommended)", "base"])).eligible, true, "product is not prod");

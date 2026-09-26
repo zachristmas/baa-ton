@@ -95,10 +95,10 @@ test("a root dialog still open after the wait gets its Recommended option, re-ch
   }
 });
 
-test("no keys for push/deploy/production questions, a changed dialog, or a run that is not autonomous", async () => {
+test("no keys for production or unclear-requirements questions, a changed dialog, or a run that is not autonomous", async () => {
   const p = await project();
   try {
-    const push = fakeHerdr(piDialog.replace("How should the root proceed?", "Push the integration branch now?"));
+    const push = fakeHerdr(piDialog.replace("How should the root proceed?", "Run the migration against production now?"));
     const entry = {};
     const notes = [];
     for (const ms of [0, ROOT_DIALOG_DEFAULT_MS]) await superviseRootDialog({ orchestrator: ORCHESTRATOR, manifest: p.manifest, manifestPath: p.manifestPath, entry, herdr: push, notify: async (note) => notes.push(note), timestamp: at(ms) });

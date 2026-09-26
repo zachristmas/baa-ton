@@ -3777,6 +3777,28 @@ export async function runSupervisorTick({
         continue;
       }
       const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath, run });
+      // Self-healing: anomalies with evidence go to lane-admin (and decisions
+      // to the root), once per signature (anomalies.mjs).
+      try {
+        const { detectAnomalies, reportAnomaly } = await import("./anomalies.mjs");
+        let specState = {};
+        try {
+          specState = JSON.parse(readFileSync(join(dirname(manifestPath), "spec-state.json"), "utf8"));
+        } catch {
+          specState = {};
+        }
+        const anomalyEntry = supervisionFor(manifest, orchestrator, true);
+        const found = detectAnomalies({ entry: anomalyEntry, specStall: Boolean(decision.specStall), specReason: decision.reasons?.find((reason) => reason.startsWith("spec: ")), specState, timestamp });
+        for (const anomaly of found)
+          await reportAnomaly(anomaly, {
+            timestamp,
+            notify,
+            rootTarget: { kind: "root", label: `root:${orchestrator.id}`, paneId: orchestrator.root.pane_id, workspaceId: orchestrator.root.workspace_id, ...(orchestrator.root.agent_kind ? { agentKind: orchestrator.root.agent_kind } : {}) },
+          });
+        await persist();
+      } catch {
+        // Best effort: anomaly reporting never blocks the tick.
+      }
       // A stall episode ends as soon as the spec no longer stalls.
       if (!decision.specStall && supervisionFor(manifest, orchestrator)?.stall) {
         delete supervisionFor(manifest, orchestrator).stall;
@@ -3922,8 +3944,8 @@ export async function runSupervisorTick({
             entry.stall.notifiedAt = timestamp;
             const specReason = decision.reasons.find((reason) => reason.startsWith("spec: ")) ?? "spec items are waiting";
             entry.stall.notification = await notify({
-              title: "Baa-ton: the root is not moving",
-              body: clipText(`${orchestrator.id}: ${entry.stall.nudges} nudges unanswered since ${entry.stall.since}; ${specReason.replace(/ The run state is.*$/, "")}`, 300),
+              title: "Baa-ton bug report: the root is not moving",
+              body: clipText(`${orchestrator.id}: ${entry.stall.nudges} nudges unanswered since ${entry.stall.since}; ${specReason.replace(/ The run state is.*$/, "")}. No action needed: lane-admin gets it as an anomaly.`, 300),
             });
           }
         }
@@ -4283,6 +4305,23 @@ export async function handleHook({
         timestamp: record.received_at ?? now(),
       });
       if (blocked.status === "approved" || (blocked.status === "routed" && !blocked.reason)) await atomicWriteJson(mapping.workflow.manifest_path, manifest);
+      // Nothing the handler could act on: that is a gap to fix.
+      if (blocked.status === "none" || blocked.status === "skipped") {
+        try {
+          const { reportAnomaly } = await import("./anomalies.mjs");
+          await reportAnomaly(
+            {
+              kind: "unhandled-blocked",
+              signature: `blocked:${workflow.id}/${mapping.lane.lane_id}:${blocked.status}:${String(blocked.reason ?? "").slice(0, 60)}`,
+              summary: `lane ${workflow.id}/${mapping.lane.lane_id} (pane ${event.data.pane_id}) is blocked and the handler did nothing: ${blocked.status} (${blocked.reason ?? "no reason"})`,
+              evidence: [`pane ${event.data.pane_id}`, ...(blocked.excerpt ? ["screen (last 30 lines):", ...String(blocked.excerpt).split("\n").slice(-30)] : [])],
+            },
+            { timestamp: record.received_at ?? now(), notify: herdrNotification },
+          );
+        } catch {
+          // Best effort.
+        }
+      }
     } else if (event.data.agent_status === "done" && !postCompletionObservation) {
       // Idle without a receipt, asking for direction in plain text.
       blocked = await handleIdleLane({
@@ -4478,6 +4517,10 @@ export async function runSupervisorLoop({
         ownCheckout: code.checkout,
         runtime: () => listRuntime(resolvedConfigDir),
         prune: () => pruneRuntime(resolvedConfigDir),
+        anomaly: async (anomaly) => {
+          const { reportAnomaly } = await import("./anomalies.mjs");
+          return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+        },
         dialogOpen: async (paneId) => {
           const { classifyScreen, readScreen } = await import("./blocked-lane.mjs");
           return classifyScreen(await readScreen(api, paneId, paneId)).kind !== "unknown";

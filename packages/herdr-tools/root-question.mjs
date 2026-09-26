@@ -11,8 +11,14 @@
 export const ROOT_QUESTION_AUTO_ANSWER_MS = 5 * 60_000;
 
 /** Decisions that stay with a person, whatever the root recommends. */
+/**
+ * The escalation policy: the user is asked only about unclear requirements
+ * (tagged [unclear-requirements], or a question about scope or what the
+ * feature should do) and about production or deploys. Everything else has a
+ * policy default and is decided and logged. Pushes are pre-approved.
+ */
 const HUMAN_ONLY =
-  /\b(push(?:es|ed|ing)?|force[- ]push|deploy\w*|production|prod|go[- ]live|publish\w*|release to|ship to|merge (?:it )?(?:in)?to main|new (?:product )?scope|scope (?:change|expansion|increase)|out of scope|expand(?:ing)? (?:the )?scope|new feature)\b/i;
+  /\[unclear-requirements\]|\bunclear requirements?\b|\b(deploy\w*|production|prod|go[- ]live|new (?:product )?scope|scope (?:change|expansion|increase)|out of scope|expand(?:ing)? (?:the )?scope|new feature)\b/i;
 
 const RECOMMENDED = /\s*\((?:recommended)\)\s*/i;
 
@@ -61,9 +67,11 @@ export function autoAnswerPlan(input) {
   const answers = [];
   for (const item of questions) {
     const recommended = item.options.filter((option) => option.recommended);
-    if (recommended.length !== 1)
-      return { eligible: false, reason: `${recommended.length ? "more than one" : "no"} Recommended option for "${item.question.slice(0, 80)}"` };
-    answers.push({ question: item.question, answer: recommended[0].label });
+    if (recommended.length > 1) return { eligible: false, reason: `more than one Recommended option for "${item.question.slice(0, 80)}"` };
+    // No Recommended option: the policy default is the first real option.
+    const choice = recommended[0] ?? item.options.find((option) => !/^(type something|chat about this|other)\b/i.test(option.label));
+    if (!choice) return { eligible: false, reason: `no option to choose for "${item.question.slice(0, 80)}"` };
+    answers.push({ question: item.question, answer: choice.label, ...(recommended[0] ? {} : { byDefault: true }) });
   }
   return { eligible: true, answers };
 }
