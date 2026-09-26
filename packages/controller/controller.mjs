@@ -22,6 +22,7 @@ import { appendFileSync, realpathSync, renameSync, statSync } from "node:fs";
 import {
   codeChangeWatcher,
   listRuntime,
+  pruneRuntime,
   loadedCode,
   recordRuntime,
 } from "./code-version.mjs";
@@ -4359,6 +4360,9 @@ export async function runSupervisorLoop({
         configDir: resolvedConfigDir,
         ownCheckout: code.checkout,
         runtime: () => listRuntime(resolvedConfigDir),
+        prune: () => pruneRuntime(resolvedConfigDir),
+        // Fail closed: an unreadable config means no root is known, so no reload.
+        rootPanes: async () => new Set((await loadConfig(resolvedConfigDir).catch(() => ({ orchestrators: [] }))).orchestrators.map((orchestrator) => orchestrator.root.pane_id)),
         notify: herdrNotification,
         ready: (paneId, expected) => agentReadyForSend(api, paneId, expected),
         prompt: async (paneId, text) => {
