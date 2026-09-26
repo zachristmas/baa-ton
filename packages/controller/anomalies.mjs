@@ -9,6 +9,8 @@
 export const ANOMALY_AGENT = "lane-admin";
 export const STALL_ANOMALY_MS = 20 * 60_000;
 export const RECEIPT_ANOMALY_MS = 30 * 60_000;
+/** Only alerts this recent count toward a repeat; older ones are history. */
+export const REPEAT_WINDOW_MS = 6 * 60 * 60_000;
 const FIXES_BEFORE_USER = 2;
 
 function operator() {
@@ -78,7 +80,7 @@ export async function reportAnomaly(anomaly, { timestamp, notify = async () => u
 /**
  * Anomalies visible in one root's manifest and spec state on a supervisor
  * tick: a stall of STALL_ANOMALY_MS or more, a root alert repeated three or
- * more times, and a lane still without a receipt RECEIPT_ANOMALY_MS after
+ * more times within REPEAT_WINDOW_MS (while its item is still blocked), and a lane still without a receipt RECEIPT_ANOMALY_MS after
  * the driver's pointed ask. `entry` is the root's rootSupervision record
  * (stallSince is kept there).
  */
@@ -90,10 +92,19 @@ export function detectAnomalies({ entry, specStall, specReason, specState, times
     if (now - Date.parse(entry.stallSince) >= STALL_ANOMALY_MS)
       found.push({ kind: "stall", signature: `stall:${entry.stallSince}`, summary: `no lane has worked for ${Math.round((now - Date.parse(entry.stallSince)) / 60_000)} min while spec items remain`, evidence: [specReason] });
   } else delete entry.stallSince;
+  // A repeat is current: raised within REPEAT_WINDOW_MS, and, for an alert
+  // about a spec item ("D02: ..."), only while that item is still blocked.
+  // The alert list is kept as history, so older ones would fire forever.
   const counts = new Map();
   for (const alert of Array.isArray(entry.alerts) ? entry.alerts : []) {
     const text = String(alert?.text ?? "").slice(0, 300);
-    if (text) counts.set(text, (counts.get(text) ?? 0) + 1);
+    if (!text) continue;
+    const created = Date.parse(alert?.createdAt ?? "");
+    if (!Number.isFinite(created) || now - created > REPEAT_WINDOW_MS) continue;
+    const itemId = /^([A-Za-z][\w.-]{0,31}):\s/.exec(text)?.[1];
+    const item = itemId ? specState?.items?.[itemId] : undefined;
+    if (item && item.state !== "blocked") continue;
+    counts.set(text, (counts.get(text) ?? 0) + 1);
   }
   for (const [text, count] of counts)
     if (count >= 3) found.push({ kind: "repeated-alert", decision: true, signature: `alert:${text.slice(0, 120)}`, summary: `the same root alert was raised ${count} times`, evidence: [text] });

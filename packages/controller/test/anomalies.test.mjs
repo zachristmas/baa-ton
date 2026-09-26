@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { STALL_ANOMALY_MS, detectAnomalies, reportAnomaly } from "../anomalies.mjs";
+import { REPEAT_WINDOW_MS, STALL_ANOMALY_MS, detectAnomalies, reportAnomaly } from "../anomalies.mjs";
 
 async function store(agents = { "lane-admin": { paneId: "w2F:p2", agentKind: "claude" } }) {
   const directory = await mkdtemp(join(tmpdir(), "baa-anomaly-"));
@@ -15,13 +15,24 @@ async function store(agents = { "lane-admin": { paneId: "w2F:p2", agentKind: "cl
 const at = (ms) => new Date(Date.parse("2026-09-26T15:00:00.000Z") + ms).toISOString();
 
 test("anomalies are detected with evidence: a 20-minute stall, a repeated alert, a receipt still missing after the pointed ask", () => {
-  const entry = { alerts: [1, 2, 3].map(() => ({ text: "D11: its review lanes declined 2 time(s)" })) };
+  const entry = { alerts: [1, 2, 3].map(() => ({ text: "D11: its review lanes declined 2 time(s)", createdAt: at(-60_000) })) };
   assert.deepEqual(detectAnomalies({ entry, specStall: true, specReason: "spec: 1 item(s) are waiting", specState: {}, timestamp: at(0) }).map((a) => a.kind), ["repeated-alert"]);
   const later = detectAnomalies({ entry, specStall: true, specReason: "spec: 1 item(s) are waiting", specState: { items: { D05: { state: "building", lane: { workflowId: "herdr-1" }, receiptPointedAt: at(-40 * 60_000) } } }, timestamp: at(STALL_ANOMALY_MS) });
   assert.deepEqual(later.map((a) => a.kind).sort(), ["receipt-missing", "repeated-alert", "stall"]);
   assert.equal(later.find((a) => a.kind === "repeated-alert").decision, true, "a repeated root alert is a decision: the root gets it too");
   detectAnomalies({ entry, specStall: false, specState: {}, timestamp: at(STALL_ANOMALY_MS + 1) });
   assert.equal(entry.stallSince, undefined, "the stall episode ends when work moves");
+});
+
+test("a repeated alert counts only while current: recent, and its item still blocked", () => {
+  const text = "D02: a worktree has modified tracked files that belong to no spec item (x.json).";
+  const alerts = (createdAt) => [1, 2, 3].map(() => ({ text, createdAt }));
+  const kinds = (entry, specState) => detectAnomalies({ entry, specStall: false, specState, timestamp: at(0) }).map((a) => a.kind);
+  assert.deepEqual(kinds({ alerts: alerts(at(-60_000)) }, { items: { D02: { state: "blocked" } } }), ["repeated-alert"]);
+  assert.deepEqual(kinds({ alerts: alerts(at(-60_000)) }, { items: { D02: { state: "failed" } } }), [], "the item moved on: history, not a repeat");
+  assert.deepEqual(kinds({ alerts: alerts(at(-REPEAT_WINDOW_MS - 1)) }, { items: { D02: { state: "blocked" } } }), [], "older than the window");
+  assert.deepEqual(kinds({ alerts: [1, 2, 3].map(() => ({ text })) }, {}), [], "no timestamp: history");
+  assert.deepEqual(kinds({ alerts: [1, 2, 3].map(() => ({ text: "memory pressure: free 1 GB", createdAt: at(-60_000) })) }, {}), ["repeated-alert"], "an alert about no item counts by time alone");
 });
 
 test("each anomaly reaches lane-admin once per signature; after two fixes it recurs, the user gets one bug report", async () => {

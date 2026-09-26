@@ -7,11 +7,11 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | Anomaly | Detected by | Evidence sent |
 | --- | --- | --- |
 | No lane working for 20 minutes while spec items remain | The supervisor tick, from the spec items' own lanes | The spec's waiting counts |
-| The same root alert raised 3 or more times | The supervisor tick, from the root's alerts | The alert text (this is a decision, so the root gets it too) |
+| The same root alert raised 3 or more times in 6 hours, while its item (if any) is still blocked | The supervisor tick, from the root's alerts | The alert text (this is a decision, so the root gets it too) |
 | A blocked lane the handler did nothing about (`none` or `skipped`) | The `pane.agent_status_changed` hook | Pane id, reason, the last 30 screen lines |
 | A lane still without a receipt 30 minutes after the driver's pointed ask | The supervisor tick, from `spec-state.json` | Item state, whether inference was requested |
-| A self-update commit that failed `npm test` | The self-updater | The last 30 lines of the test output |
-| A root reload not confirmed after 5 attempts | The self-updater | The runtime record's commit and the checkout's |
+| A self-update commit that failed `npm test` 3 times | The self-updater | The last 30 lines of the test output |
+| A root reload not confirmed after 5 attempts, or a root busy 30 minutes past a due reload | The self-updater | The runtime record's commit and the checkout's |
 
 ## Routing
 
@@ -48,3 +48,4 @@ The loop reports its own bugs. The supervisor turns what it sees going wrong int
 | 2026-09-26 | Root reload not taking effect; self-update never ran | #91, #97, #100 |
 | 2026-09-26 | Self-update refused a green commit: the suite timed out while starting a process took 15-55s | Self-update waits while spawns are slow and retries a red run up to 3 times |
 | 2026-09-26 | A root reload was never retried: the root stayed working for hours | A root busy 30 min past a due reload is reported as an anomaly |
+| 2026-09-26 | A repeated-alert anomaly fired for an item that had moved on (the alert list is history) | Repeats count only alerts from the last 6 h whose item is still blocked |
