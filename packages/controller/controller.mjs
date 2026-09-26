@@ -1965,7 +1965,7 @@ async function paneProcessInfo(herdr, paneId) {
 }
 
 /** Fetch and check the agent right before a send; never throws. */
-async function agentReadyForSend(herdr, target, expected) {
+export async function agentReadyForSend(herdr, target, expected) {
   let ready;
   try {
     ready = liveAgentReady(await herdr.request("agent.get", { target }), expected);
@@ -3408,6 +3408,31 @@ export async function deliverLaneQueue({ workflow, herdr, timestamp = now() }) {
   return changed;
 }
 
+/**
+ * Operator messages (docs/OPERATOR-MESSAGES.md) waiting for their target:
+ * the same live, idle, never-retype rules as root-to-lane delivery.
+ */
+export async function deliverOperatorQueue({ herdr, storePath, timestamp = now() } = {}) {
+  // Loaded on use: the supervisor starts and runs without it.
+  const { deliverOperatorMessages, operatorStorePath, withOperatorStore } = await import("../herdr-tools/operator.mjs");
+  storePath ??= operatorStorePath();
+  const { existsSync: exists } = await import("node:fs");
+  if (!exists(storePath)) return [];
+  return withOperatorStore(storePath, (store) =>
+    deliverOperatorMessages(store, {
+      at: timestamp,
+      ready: (paneId, expected) => agentReadyForSend(herdr, paneId, expected),
+      prompt: async (paneId, text) => {
+        try {
+          await herdr.request("agent.prompt", { target: paneId, text });
+        } catch (error) {
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { sent: Boolean(error?.sent) || !unavailable(error) });
+        }
+      },
+    }),
+  );
+}
+
 export async function runSupervisorTick({
   stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
@@ -3786,7 +3811,14 @@ export async function runSupervisorTick({
           });
     }
   }
-  return { accepted: true, results, pendingWakes };
+  // Operator messages ride the same tick (best effort, never blocks it).
+  let operator = [];
+  try {
+    operator = await deliverOperatorQueue({ herdr: api, timestamp });
+  } catch {
+    operator = [];
+  }
+  return { accepted: true, results, pendingWakes, ...(operator.length ? { operator } : {}) };
 }
 
 function newRecord(event, mapping, classification, identity) {

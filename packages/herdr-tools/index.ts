@@ -133,6 +133,8 @@ import {
 import { legacyStateStatus } from "./state-migration.mjs";
 import { classifyLocalValidation } from "./known-safe.mjs";
 import { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers } from "./root-question.mjs";
+import { OPERATOR_AUTHORITY } from "./operator.mjs";
+import { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage } from "./operator-api.mjs";
 import {
   SPEC_PATH,
   SPEC_STATE_PATH,
@@ -2720,6 +2722,7 @@ function contract(workflow: Workflow, lane: Lane): string {
     "A recorded local authorization policy applies only to the designated root's dispatch, retry, and Pi paused-goal recovery; it grants this child no approval authority.",
     "Use herdr_message for durable informational facts the parent should review, including after herdr_complete; use the question flow for Zach's decisions and herdr_complete for the one lane receipt.",
     "Ask for ports, database names, runtime launches and approvals with herdr_request (lease, runtime-launch, approval), never in chat; policy-matching requests are answered at once and the rest stay open until the root answers.",
+    OPERATOR_AUTHORITY,
     lane.specStage === "integrate"
       ? "Spec integration lane: you may merge spec/* branches and commit on this worktree's integration branch (local only). Never push, deploy, create a PR, mutate production or external services, or close Herdr resources."
       : "Never push, merge, deploy, create a PR, mutate production or external services, or close Herdr resources.",
@@ -10475,7 +10478,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "active");
     return {
-      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only.${await rootBootstrapPrompt(ctx.cwd)}`,
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY}${await rootBootstrapPrompt(ctx.cwd)}`,
     };
   });
 
@@ -11767,6 +11770,51 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
     },
   });
+  // The operator channel (docs/OPERATOR-MESSAGES.md): durable messages from
+  // the user's operator to a root, a lane or a registered agent, and replies.
+  pi.registerTool({
+    name: "herdr_operator_message",
+    label: "Operator Message",
+    description:
+      "Send a durable operator message to the root (root or root:<id>), a lane (<workflowId>/<laneId>) or a registered agent. It is delivered when the target is live and idle, never typed twice, and gets an id to read replies by.",
+    promptSnippet: "Send a durable operator message to a Baa-ton root, lane or registered agent.",
+    parameters: Type.Object({
+      target: Type.String({ description: "root, root:<id>, <workflowId>/<laneId> or a registered agent name" }),
+      text: Type.String(),
+      from: Type.Optional(Type.String({ description: "who the message is from (default: operator)" })),
+      notify: Type.Optional(Type.Boolean({ description: "raise a Herdr notification when the reply arrives" })),
+    }),
+    async execute(_id, params) {
+      const message = await sendOperatorMessage(params);
+      return {
+        content: [{ type: "text", text: `${message.id} -> ${message.resolved.label}: ${message.delivery.status}${message.delivery.reason ? ` (${message.delivery.reason})` : ""}` }],
+        details: message,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_operator_reply",
+    label: "Operator Reply",
+    description: "Reply to an operator message by its id (op-…); the operator reads it in their inbox.",
+    promptSnippet: "Answer a [Baa-ton operator message op-…] by its id.",
+    parameters: Type.Object({ id: Type.String(), text: Type.String(), from: Type.Optional(Type.String()) }),
+    async execute(_id, params) {
+      const result = await replyToOperator(params);
+      return { content: [{ type: "text", text: `reply stored on ${result.id}` }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_operator_inbox",
+    label: "Operator Inbox",
+    description: "Operator messages with their delivery state and replies; unread=true returns only unread replies and marks them read.",
+    promptSnippet: "Read operator messages and their replies.",
+    parameters: Type.Object({ all: Type.Optional(Type.Boolean()), unread: Type.Optional(Type.Boolean()) }),
+    async execute(_id, params) {
+      const messages = await readOperatorInbox(params);
+      return { content: [{ type: "text", text: formatInbox(messages) }], details: { messages } };
+    },
+  });
+
   pi.registerTool({
     name: "herdr_doctor",
     label: "Herdr Doctor",

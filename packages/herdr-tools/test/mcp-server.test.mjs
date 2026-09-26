@@ -678,9 +678,17 @@ test("MCP identity failures include the live server PID diagnostics", async () =
 });
 
 test("tools/call outside a Herdr session and unknown tools still fail predictably", async () => {
-  await withMcpServer({ HERDR_ENV: "0" }, async (rpc) => {
+  const storeDir = await mkdtemp(join(tmpdir(), "baa-operator-mcp-"));
+  await withMcpServer({ HERDR_ENV: "0", BAATON_OPERATOR_STORE: join(storeDir, "operator.json"), HERDR_SOCKET_PATH: undefined }, async (rpc) => {
     const listed = await rpc("tools/list");
-    assert.deepEqual(listed.result.tools, []);
+    // Only the operator channel is open to callers outside Herdr.
+    assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ["herdr_operator_inbox", "herdr_operator_message", "herdr_operator_reply"]);
+    const unknownTarget = await rpc("tools/call", { name: "herdr_operator_message", arguments: { target: "nobody", text: "hi" } });
+    assert.equal(unknownTarget.result.isError, true);
+    assert.match(unknownTarget.result.content[0].text, /Unknown target nobody/);
+    const inbox = await rpc("tools/call", { name: "herdr_operator_inbox", arguments: {} });
+    assert.equal(inbox.result.isError, undefined);
+    assert.match(inbox.result.content[0].text, /No operator messages/);
     const outside = await rpc("tools/call", {
       name: "herdr_permission_prompt",
       arguments: { tool_name: "Bash", input: { command: "pwd" } },
@@ -691,6 +699,7 @@ test("tools/call outside a Herdr session and unknown tools still fail predictabl
       /only inside a HERDR_ENV=1 session/,
     );
   });
+  await rm(storeDir, { recursive: true, force: true });
   await withMcpServer({ HERDR_ENV: "1" }, async (rpc) => {
     const unknown = await rpc("tools/call", {
       name: "herdr_not_a_real_tool",

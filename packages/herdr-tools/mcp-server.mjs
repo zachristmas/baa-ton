@@ -799,7 +799,31 @@ function requestKey(id) {
   return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
 }
 
+/**
+ * The operator channel (docs/OPERATOR-MESSAGES.md) is for callers outside
+ * Baa-ton too (an external assistant, a standalone agent): listed and
+ * callable without a Herdr session, and with no root or lane identity.
+ */
+const OPERATOR_TOOLS = new Set(["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox"]);
+
+async function callOperatorTool(definition, args) {
+  if (!Value.Check(definition.parameters, args)) {
+    const issues = [...Value.Errors(definition.parameters, args)]
+      .slice(0, 5)
+      .map((issue) => `${issue.path || "(root)"} ${issue.message}`)
+      .join("; ");
+    return toolError(`Invalid arguments for ${definition.name}: ${issues || "schema validation failed"}`);
+  }
+  try {
+    return outputResult(await definition.execute(randomUUID(), args, undefined, undefined, { cwd: process.cwd() }));
+  } catch (caught) {
+    return toolError(caught instanceof Error ? caught.message : String(caught));
+  }
+}
+
 async function callTool(id, params) {
+  if (isRecord(params) && OPERATOR_TOOLS.has(params.name) && tools.has(params.name))
+    return callOperatorTool(tools.get(params.name), isRecord(params.arguments) ? params.arguments : {});
   if (!isHerdrSession())
     return toolError(
       "Herdr Orchestrator tools are available only inside a HERDR_ENV=1 session.",
@@ -953,7 +977,7 @@ async function handleRequest(request) {
   }
   if (method === "tools/list") {
     result(id, {
-      tools: isHerdrSession() ? [...tools.values()].map(toolDefinition) : [],
+      tools: (isHerdrSession() ? [...tools.values()] : [...tools.values()].filter((definition) => OPERATOR_TOOLS.has(definition.name))).map(toolDefinition),
     });
     return;
   }

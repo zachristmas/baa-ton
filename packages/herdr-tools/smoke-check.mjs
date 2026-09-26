@@ -389,7 +389,9 @@ extension.default({
     throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
   },
 });
-assert.equal(tools.size, 28, "extension registered its workflow tools");
+assert.equal(tools.size, 31, "extension registered its workflow tools");
+for (const name of ["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox"])
+  assert.ok(tools.has(name), `extension registers the operator channel (${name})`);
 assert.ok(tools.has("herdr_recover_root"), "extension registers audited stale-root recovery");
 assert.ok(
   tools.has("herdr_bootstrap_root"),
