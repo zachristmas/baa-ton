@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "bin": { "baa-ton": "packages/herdr-tools/operator-cli.mjs" },
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./packages/herdr-tools/index.ts"]
