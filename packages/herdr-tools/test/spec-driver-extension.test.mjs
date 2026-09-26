@@ -2031,13 +2031,15 @@ test("spec lanes without a receipt that no item maps are retired once idle and p
       { id: "herdr-busy", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("busy", { agentStartedAt: old })], evidence: [] },
       { id: "herdr-cur", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("cur", { agentStartedAt: old })], evidence: [] },
       { id: "herdr-plain", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "done", paneId: "w:plain", tabId: "t:plain", agentStartedAt: old }], evidence: [] },
+      // A root-dispatched (non-spec) lane whose dispatch failed and whose agent is gone: it never started.
+      { id: "herdr-rootfail", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "gone", paneId: "w:gone", tabId: "t:gone" }], evidence: [] },
     );
     await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
     f.ports.agentPresent = async (paneId) => paneId === "w:busy";
     const retired = [];
     f.ports.retire = async (candidate) => retired.push(candidate.workflowId);
     const result = await f.advance();
-    assert.deepEqual(retired.sort(), ["herdr-closed", "herdr-planned"], "not the item's current lane, a lane in its grace, a working one, or a non-spec lane");
+    assert.deepEqual(retired.sort(), ["herdr-closed", "herdr-planned", "herdr-rootfail"], "not the item's current lane, a lane in its grace, a working one, or a running non-spec lane; a non-spec lane whose dispatch failed is");
     assert.match(result.content[0].text, /retired herdr-planned\/lane-1/);
   } finally {
     await f.cleanup();
