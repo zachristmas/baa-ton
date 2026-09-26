@@ -28,9 +28,10 @@ async function defaultRun(command, args, options = {}) {
 
 /** `npm ci` when the lockfile changed, then `npm test`; resolves { ok, output }. Tracked, never detached. */
 function defaultStartTests({ dir, install, env = process.env }) {
-  const runOne = (args) =>
+  const runOne = (args) => runCommand("npm", args);
+  const runCommand = (command, args) =>
     new Promise((resolve) => {
-      const child = spawn("npm", args, { cwd: dir, env: { ...env, BAATON_SELF_UPDATE: "0" }, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(command, args, { cwd: dir, env: { ...env, BAATON_SELF_UPDATE: "0" }, stdio: ["ignore", "pipe", "pipe"] });
       let output = "";
       const keep = (chunk) => {
         output = (output + chunk).slice(-8000);
@@ -47,7 +48,10 @@ function defaultStartTests({ dir, install, env = process.env }) {
         resolve({ ok: false, output: String(error?.message ?? error) });
       });
     });
+  // For tests of the supervisor itself: a JSON command array instead of npm test.
+  const override = env.BAATON_SELF_UPDATE_TEST_COMMAND ? JSON.parse(env.BAATON_SELF_UPDATE_TEST_COMMAND) : undefined;
   return (async () => {
+    if (override) return runCommand(override[0], override.slice(1));
     if (install) {
       const installed = await runOne(["ci", "--no-audit", "--no-fund"]);
       if (!installed.ok) return installed;
