@@ -339,6 +339,50 @@ function readVerdict(segment, options) {
   return { safe: true, rule: "read-local" };
 }
 
+/**
+ * The demo recorder writing a lane's own demo: the installed Baa-ton tool
+ * (never a file of that name in the lane's worktree), with --steps and --out
+ * inside the worktree or scratch and nothing but --title besides.
+ */
+/**
+ * A lane's own helper script in a session scratchpad: `node <scratch>/x.mjs
+ * [args]`, where every path-like argument stays in the worktree, /tmp or
+ * scratch. The lane wrote it and could run the same code in its tests; the
+ * rule only spares the prompt for running it from scratch.
+ */
+function scratchScriptVerdict(segment, options) {
+  const words = segment.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+  if (words[0] !== "node" || !/\.(?:mjs|js|cjs)$/.test(unquote(words[1] ?? ""))) return undefined;
+  const script = unquote(words[1]);
+  if (!SESSION_SCRATCHPAD.test(script) || script.includes("..")) return undefined;
+  const outside = words.slice(2).map(unquote).find((word) => /^[/~.]/.test(word) && !readablePath(word, options.cwd));
+  if (outside) return { safe: false, reason: `a scratch script argument outside the worktree and scratch: ${outside}` };
+  return { safe: true, rule: "node-scratch-script" };
+}
+
+function demoReportVerdict(segment, options) {
+  const words = segment.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+  if (!/^node$/.test(words[0] ?? "") || !/(?:^|\/)demo-report\.mjs$/.test(unquote(words[1] ?? ""))) return undefined;
+  const script = unquote(words[1]);
+  const root = options.cwd?.replace(/\/+$/, "");
+  const installed = script.startsWith("/") && /\/(?:packages\/herdr-tools|herdr-orchestrator)\/demo-report\.mjs$/.test(script) && !script.includes("..") && !(root && script.startsWith(`${root}/`));
+  if (!installed) return { safe: false, reason: `demo-report.mjs must be the installed Baa-ton tool, not ${script}` };
+  const flags = new Map();
+  for (let index = 2; index < words.length; index += 2) {
+    const flag = words[index];
+    if (!/^--(steps|out|title)$/.test(flag) || words[index + 1] === undefined) return { safe: false, reason: `demo-report.mjs takes only --steps, --out and --title (got ${flag})` };
+    flags.set(flag, words[index + 1]);
+  }
+  for (const flag of ["--steps", "--out"]) {
+    const path = flags.get(flag);
+    if (path === undefined) continue;
+    if (!readablePath(path, options.cwd)) return { safe: false, reason: `demo-report.mjs ${flag} ${unquote(path)} is outside the worktree and scratch` };
+    if (/^\/(?:private\/)?tmp\//.test(unquote(path)) && !SESSION_SCRATCHPAD.test(unquote(path)) && !(root && unquote(path).startsWith(`${root}/`)) && flag === "--out") return { safe: false, reason: "demo-report.mjs --out must be in the worktree or a session scratchpad" };
+  }
+  if (!flags.has("--out")) return { safe: false, reason: "demo-report.mjs without --out" };
+  return { safe: true, rule: "demo-report" };
+}
+
 /** A quoted -m message: double- or single-quoted, over any number of lines. */
 const COMMIT_MESSAGE = String.raw`(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*')`;
 
@@ -486,6 +530,9 @@ function stripRedirects(segment) {
  */
 export function classifyCommand(command, options = {}) {
   if (typeof command !== "string" || !command.trim()) return { decision: "defer", reason: "empty command" };
+  // A backslash line continuation is one line to the shell; read it so.
+  // A line that is only `\` (a command starting with one) joins the same way.
+  command = command.replace(/(^|[ \t])\\\r?\n[ \t]*/gm, "$1").trim();
   const { segments, heredocTargets, body, expandingBody } = commandSegments(command);
   if (expandingBody) return { decision: "defer", reason: "command substitution inside an unquoted heredoc" };
   let scrubbed = body;
@@ -513,7 +560,7 @@ export function classifyCommand(command, options = {}) {
     let normalized = stripRedirects(segment);
     for (const pattern of KNOWN_SUBSTITUTIONS) normalized = normalized.replace(pattern, "SUBST");
     const plain = normalized.replace(/^(?:(?!GH_TOKEN=)\w+=[\w./:@-]*\s+)+(?=\S)/, "");
-    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options, context) ?? ghVerdict(plain, options) ?? readVerdict(plain, options);
+    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options, context) ?? ghVerdict(plain, options) ?? demoReportVerdict(plain, options) ?? scratchScriptVerdict(plain, options) ?? readVerdict(plain, options);
     if (verdict) {
       if (!verdict.safe) return { decision: "defer", reason: verdict.reason };
       rules.add(verdict.rule);

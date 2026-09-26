@@ -339,7 +339,7 @@ export async function sendKeys(herdr, paneId, keys) {
  * Right before any keys: the same agent is live in the pane, still blocked,
  * and the same prompt is still on screen.
  */
-async function recheck(herdr, { paneId, agentKind, fingerprint }) {
+async function recheck(herdr, { paneId, agentKind, fingerprint, screenProves = false }) {
   let agent;
   try {
     const result = await herdr.request("agent.get", { target: paneId });
@@ -352,7 +352,9 @@ async function recheck(herdr, { paneId, agentKind, fingerprint }) {
   if (agentKind && agent.agent !== agentKind) return { ok: false, reason: `the pane now runs ${agent.agent}` };
   // Herdr may show a dialog-bound agent as blocked, done or idle; only a
   // working agent has moved on. The screen fingerprint below is the proof.
-  if (agent.agent_status === "working") return { ok: false, reason: "the agent is working, not blocked" };
+  // The dialog sweep found a prompt Herdr reports as working: the screen
+  // fingerprint below is then the only proof, and enough.
+  if (agent.agent_status === "working" && !screenProves) return { ok: false, reason: "the agent is working, not blocked" };
   let screen;
   try {
     screen = classifyScreen(await readScreen(herdr, paneId, paneId));
@@ -404,7 +406,44 @@ function defaultFor(screen, worktree, { laneConfinedVerdict }) {
  * On `blocked` for a mapped lane. Returns what it did; never throws for
  * a read or send failure (the event is still recorded as blocked).
  */
-export async function handleBlockedLane({ herdr, manifest, workflow, laneId, paneId, target = paneId, agentKind, timestamp, readTranscriptTail = readTail, home }) {
+/** How often a working lane's screen is checked for a dialog Herdr did not report. */
+export const DIALOG_SWEEP_MS = 60_000;
+const lastSwept = new Map();
+
+/**
+ * Some dialogs never flip a pane to blocked: Claude's built-in command
+ * checks (backslash-escaped whitespace, for one) fire no notification, so no
+ * pane.agent_status_changed event reaches the hook and the lane waits
+ * forever. The supervisor looks instead: a running lane whose latest status
+ * is working has its screen read at most every DIALOG_SWEEP_MS, and a
+ * permission prompt or question on it goes through handleBlockedLane, the
+ * same path a blocked event takes. Returns true when the manifest changed.
+ */
+export async function sweepLaneDialogs({ herdr, manifest, workflow, timestamp, now = Date.now(), swept = lastSwept }) {
+  let changed = false;
+  const events = workflow?.eventController?.events ?? [];
+  for (const lane of workflow?.lanes ?? []) {
+    if (!lane.paneId || lane.retirement || lane.status !== "running") continue;
+    const latest = [...events].reverse().find((event) => event.lane_id === lane.id)?.source?.agent_status;
+    if (latest !== "working") continue;
+    const key = `${workflow.id}/${lane.id}`;
+    if (now - (swept.get(key) ?? 0) < DIALOG_SWEEP_MS) continue;
+    swept.set(key, now);
+    let text;
+    try {
+      text = await readScreen(herdr, lane.paneId, lane.paneId);
+    } catch {
+      continue;
+    }
+    const screen = classifyScreen(text);
+    if (screen.kind !== "permission" && screen.kind !== "question") continue;
+    const result = await handleBlockedLane({ herdr, manifest, workflow, laneId: lane.id, paneId: lane.paneId, agentKind: lane.agentKind ?? workflow.agentKind, timestamp, screenProves: true });
+    if (result.status === "approved" || result.status === "routed") changed = true;
+  }
+  return changed;
+}
+
+export async function handleBlockedLane({ herdr, manifest, workflow, laneId, paneId, target = paneId, agentKind, timestamp, readTranscriptTail = readTail, home, screenProves = false }) {
   let text;
   try {
     text = await readScreen(herdr, target, paneId);
@@ -437,7 +476,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   if (screen.kind === "permission" && screen.toolName === "Bash" && !screen.truncated && screen.command) {
     const verdict = rules.classifyCommand(screen.command, { cwd: worktree });
     if (verdict.decision === "allow") {
-      const check = await recheck(herdr, { paneId, agentKind, fingerprint: screen.fingerprint });
+      const check = await recheck(herdr, { paneId, agentKind, fingerprint: screen.fingerprint, screenProves });
       if (!check.ok) return { status: "skipped", reason: check.reason };
       try {
         await sendKeys(herdr, paneId, screen.approveKeys);
@@ -451,7 +490,7 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   // Reading the worktree, /tmp or scratch (never a credential file) is
   // known-safe too: approved at once, not routed.
   if (screen.kind === "permission" && ["Read", "Grep", "Glob"].includes(screen.toolName) && screen.target && rules.laneConfinedVerdict(screen.toolName, { file_path: screen.target }, { cwd: worktree }).allow) {
-    const check = await recheck(herdr, { paneId, agentKind, fingerprint: screen.fingerprint });
+    const check = await recheck(herdr, { paneId, agentKind, fingerprint: screen.fingerprint, screenProves });
     if (!check.ok) return { status: "skipped", reason: check.reason };
     try {
       await sendKeys(herdr, paneId, screen.approveKeys);
@@ -489,6 +528,9 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
       denyKeys: screen.denyKeys,
       defaultAt: new Date(Date.parse(timestamp) + SCREEN_PROMPT_DEFAULT_MS).toISOString(),
       default: fallback,
+      // Found by the dialog sweep: Herdr shows the agent as working, so the
+      // screen fingerprint alone proves the prompt when it is answered.
+      ...(screenProves ? { screenProves: true } : {}),
     },
   };
   requests.push(request);
@@ -540,7 +582,7 @@ export async function resolveScreenPrompts({ herdr, manifest, workflow, timestam
       } else prompt.keys = prompt.denyKeys;
       changed = true;
     }
-    const check = await recheck(herdr, { paneId: prompt.paneId, agentKind: prompt.agentKind, fingerprint: prompt.fingerprint });
+    const check = await recheck(herdr, { paneId: prompt.paneId, agentKind: prompt.agentKind, fingerprint: prompt.fingerprint, screenProves: Boolean(prompt.screenProves) });
     if (!check.ok) {
       // Only a prompt that is gone ends this; a transient check failure retries next tick.
       if (/no longer on screen|not blocked|no agent|now runs/.test(check.reason)) {

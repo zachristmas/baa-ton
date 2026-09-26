@@ -540,3 +540,32 @@ test("a rebase of the worktree's own feature branch is known-safe; --skip, inter
   assert.equal(classifyCommand("git rebase -q origin/main", { cwd: "/w" }).decision, "defer", "branch unknown");
   assert.equal(classifyCommand("git rebase -q origin/main", { cwd: "/w", ownBranch: "HEAD" }).decision, "defer");
 });
+
+test("the installed demo recorder writing inside the worktree is known-safe, even over backslash continuations (a live lane block)", () => {
+  const cwd = "/work/spec-verify-D03";
+  const tool = "/home/u/.pi/agent/extensions/herdr-orchestrator/demo-report.mjs";
+  const allow = (command) => assert.equal(classifyCommand(command, { cwd }).decision, "allow", command);
+  const defer = (command, why) => {
+    const verdict = classifyCommand(command, { cwd });
+    assert.equal(verdict.decision, "defer", command);
+    if (why) assert.match(verdict.reason, why);
+  };
+  allow(`node "${tool}" --steps .claude-artifacts/d03/steps.json --out .claude-artifacts/d03/regression-proof.final.docx --title "D03: regression proof"`);
+  allow(`node ${tool} \\\n  --steps .claude-artifacts/d03/steps.json \\\n  --out .claude-artifacts/d03/regression-proof.final.docx \\\n  --title "D03: regression proof"`);
+  allow(`node /home/u/baa-ton/packages/herdr-tools/demo-report.mjs --steps ${cwd}/a/steps.json --out ${cwd}/a/demo.docx`);
+  defer(`node ${cwd}/demo-report.mjs --steps s.json --out d.docx`, /installed Baa-ton tool/);
+  defer(`node ${tool} --steps s.json --out /Users/someone/d.docx`, /outside the worktree/);
+  defer(`node ${tool} --steps s.json --out ../d.docx`, /outside the worktree/);
+  defer(`node ${tool} --steps s.json --out d.docx --exec x`, /takes only --steps, --out and --title/);
+  defer(`node ${tool} --steps s.json`, /without --out/);
+});
+
+test("a command that starts with a lone backslash line, and a lane's own scratch script, are read and judged (a live lane block)", () => {
+  const cwd = "/work/spec-verify-D03";
+  const tool = "/home/u/baa-ton/packages/herdr-tools/demo-report.mjs";
+  assert.equal(classifyCommand(`\\\n  node ${tool} --steps a/steps.json --out a/demo.docx --title "D03: proof"`, { cwd }).decision, "allow");
+  const scratch = "/tmp/claude-501/p/s/scratchpad";
+  assert.equal(classifyCommand(`node ${scratch}/capture.mjs --out .claude-artifacts/d03 /tmp/backend.log`, { cwd }).decision, "allow");
+  assert.equal(classifyCommand(`node ${scratch}/capture.mjs /Users/someone/secret-notes`, { cwd }).decision, "defer");
+  assert.equal(classifyCommand("node ./capture.mjs", { cwd }).decision, "defer", "a script outside scratch is not this rule");
+});
