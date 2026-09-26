@@ -50,6 +50,7 @@ import { handleActivation } from "./activation.mjs";
 import { handleBlockedLane, handleIdleLane, resolveScreenPrompts } from "./blocked-lane.mjs";
 import {
   enqueueWakeHint,
+  inboxRoutable,
   makeEnvelope,
   markDelivery,
   putMessage,
@@ -788,8 +789,11 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run 
       .filter((status) => status === "working" || status === "blocked"),
   );
   let specStall = false;
-  if (!liveLanes.length && !awaitingUser.length) {
-    const waiting = specWaiting(manifestPath);
+  const spec = specWaiting(manifestPath, manifest);
+  // With a spec, its own lanes decide liveness; otherwise every owned lane.
+  const anyLive = spec.hasSpec ? spec.live : liveLanes.length > 0;
+  if (!anyLive && !awaitingUser.length) {
+    const waiting = spec.counts;
     if (waiting.size) {
       specStall = true;
       const total = [...waiting.values()].reduce((sum, count) => sum + count, 0);
@@ -3341,7 +3345,7 @@ async function persistControllerMessage(stateDir, {
   // cross-workspace child. They remain supported by the controller's legacy
   // ledger, but are not eligible for herdr-link/1 delivery until a
   // workspace-scoped mapping is registered.
-  if (from.workspace_id !== to.workspace_id) return undefined;
+  if (!inboxRoutable(from, to)) return undefined;
   const path = storePath({ stateDir });
   const stored = await putMessage(path, {
     envelope: makeEnvelope({
@@ -3465,8 +3469,14 @@ async function runStateDigestLine() {
   }
 }
 
-/** Spec items waiting for the root's loop to move them (read-only), by state. */
-function specWaiting(manifestPath) {
+/**
+ * Spec items waiting for the root's loop to move them (read-only), by state,
+ * and whether any spec item's own lane is working. Liveness comes from the
+ * spec's lanes only: one stale "working" event in an old workflow must not
+ * cancel a stall. An in-flight item whose lane finished without a receipt
+ * counts as waiting ("in flight without a receipt").
+ */
+function specWaiting(manifestPath, manifest) {
   try {
     const spec = JSON.parse(readFileSync(join(dirname(dirname(manifestPath)), "spec.json"), "utf8"));
     let state = {};
@@ -3476,15 +3486,24 @@ function specWaiting(manifestPath) {
       state = {};
     }
     const counts = new Map();
+    let live = false;
+    const workflows = Array.isArray(manifest?.workflows) ? manifest.workflows : [];
     for (const item of Array.isArray(spec?.items) ? spec.items : []) {
       const record = isRecord(state[item?.id]) ? state[item.id] : {};
       const stage = typeof record.state === "string" ? record.state : "pending";
+      const laneRef = isRecord(record.lane) ? record.lane : undefined;
+      const workflow = laneRef ? workflows.find((candidate) => isRecord(candidate) && candidate.id === laneRef.workflowId) : undefined;
+      const laneRecord = workflow?.lanes?.find?.((candidate) => candidate?.id === laneRef?.laneId);
+      const status = workflow && laneRef ? latestLaneStatus(workflow, laneRef.laneId) : undefined;
+      if (laneRef && (status === "working" || status === "blocked")) live = true;
+      const finishedWithoutReceipt = laneRef && (status === "done" || status === "idle") && !laneRecord?.completionReceipt;
       const waiting = ["awaiting-push", "pending", "ready", "failed"].includes(stage) || (stage === "blocked" && record.blockedReason === "exhausted") || (stage === "integrating" && !record.lane);
       if (waiting) counts.set(stage, (counts.get(stage) ?? 0) + 1);
+      else if (finishedWithoutReceipt) counts.set("in flight without a receipt", (counts.get("in flight without a receipt") ?? 0) + 1);
     }
-    return counts;
+    return { counts, live, hasSpec: true };
   } catch {
-    return new Map();
+    return { counts: new Map(), live: false, hasSpec: false };
   }
 }
 

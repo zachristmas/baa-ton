@@ -163,6 +163,19 @@ test("permission answers stay pending across uncertainty and release exactly onc
   }
 });
 
+test("a lane in another workspace is not inbox-routable: its receipt goes through the manifest instead", async () => {
+  const { inboxRoutable } = await import("../inbox/index.mjs");
+  assert.equal(inboxRoutable(endpoint("w-root:p2"), endpoint("w-root:p1")), true);
+  // The live failure: a lane in its worktree's workspace (w2G) reporting to the
+  // root in w22. The bridge built an envelope anyway, and herdr_complete failed.
+  assert.equal(inboxRoutable({ ...endpoint("w2G:p2"), workspace_id: "w2G" }, { ...endpoint("w22:p1"), workspace_id: "w22" }), false);
+  assert.equal(inboxRoutable(undefined, endpoint("w-root:p1")), false);
+  const { readFile: read } = await import("node:fs/promises");
+  const bridge = await read(new URL("../mcp-server.mjs", import.meta.url), "utf8");
+  const persist = bridge.slice(bridge.indexOf("async function persistBridgeMessage"), bridge.indexOf("async function finishBridgeMessage"));
+  assert.ok(persist.indexOf("inboxRoutable(") > 0 && persist.indexOf("inboxRoutable(") < persist.indexOf("makeEnvelope("), "the bridge skips the inbox for cross-workspace routes before building an envelope");
+});
+
 test("herdr-link/1 envelope rejects cross-workspace routes", () => {
   assert.throws(
     () =>

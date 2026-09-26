@@ -33,6 +33,7 @@ import {
   digest,
   enqueueWakeHint,
   findMessage,
+  inboxRoutable,
   makeEnvelope,
   markDelivery,
   markState,
@@ -529,6 +530,13 @@ async function persistBridgeMessage(name, args, requestId) {
   const endpoints = bridgeMessageEndpoints(route);
   const path = bridgeStorePath(route);
   if (!route || !endpoints || !path) return undefined;
+  // herdr-link/1 envelopes stay within one Herdr workspace. A lane that runs
+  // in its worktree's own workspace (laneWorkspaceId) reports to a root in
+  // another one: its receipt and messages go through the manifest (the tool
+  // below) and the controller's hooks, not the inbox, exactly as the
+  // controller already skips cross-workspace routes. Throwing here failed
+  // every herdr_complete from such lanes.
+  if (!inboxRoutable(endpoints.from, endpoints.to)) return undefined;
   const logicalKey = `${kind}:${route.workflowId ?? "root"}:${route.laneId ?? route.root.pane_id}:${name}:${digest(args)}`;
   // JSON-RPC request IDs are only unique enough for an in-flight request. A
   // harness may reuse one across turns, so the durable occurrence must also

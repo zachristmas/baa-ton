@@ -32,6 +32,12 @@ export const RECEIPT_ASK_TIMEOUT_MS = 30 * 60_000;
 /** A lane that answers the ask with a status message is still working: ask
  * again after this long (doubling each time it answers with a status). */
 export const RECEIPT_REASK_BASE_MS = 60 * 60_000;
+/**
+ * A lane that finished its turn without a receipt: asked, then one pointed
+ * ask after this interval, then its receipt is inferred from its final
+ * report after another. Past the first interval it holds no maxParallel slot.
+ */
+export const RECEIPT_ASK_INTERVAL_MS = 10 * 60_000;
 const RECEIPT_FORMAT = {
   decide: "QUESTION: lines for anything still open (none when settled), OWNS: and MIGRATIONS: if they differ",
   build: "the commit SHA, the checks you ran and their results, and the evidence report path",
@@ -105,6 +111,10 @@ export function verifyResult(summary) {
   const report = lines.map((line) => /^\s*REPORT\s*:\s*(\S+)\s*$/i.exec(line)?.[1]).find(Boolean);
   return { previews, ...(report ? { report } : {}) };
 }
+
+/** Every spec lane's last instruction: the work ends with the receipt tool call, not a plain-text report. */
+export const RECEIPT_RULE =
+  "Your last action when the work is done (or blocked) is the herdr_complete call with the receipt lines this task asks for, plus the outcome, blockers and report path. A plain-text final report is not a receipt. If herdr_complete returns an error, send the error and your receipt text with herdr_message.";
 
 /** Every spec lane's instruction for declining, so a decline is a receipt, never a stall in chat. */
 export const DECLINE_RULE =
@@ -384,7 +394,7 @@ export function advanceSpec({
           rootAsks.push({ itemId: item.id, reason: `${item.id}: its build lane is gone without a receipt after ${attempts} attempt(s)` });
         } else current.attempts = attempts + 1;
       }
-    } else if (view.agentStatus === "done" && background.has(`${current.lane.workflowId}/${current.lane.laneId}`)) {
+    } else if ((view.agentStatus === "done" || view.agentStatus === "idle") && background.has(`${current.lane.workflowId}/${current.lane.laneId}`)) {
       // Idle only on the surface: its tracked background shell or monitor is
       // still running. Not stuck: no receipt ask, no block.
       const work = background.get(`${current.lane.workflowId}/${current.lane.laneId}`);
@@ -394,25 +404,43 @@ export function advanceSpec({
       }
       delete current.receiptAskedAt;
       continue;
-    } else if (view.agentStatus === "done") {
+    } else if (view.agentStatus === "done" || view.agentStatus === "idle") {
+      // Herdr shows a finished turn as done, or idle once the pane was seen.
       delete current.backgroundWork;
-      // It answered the ask with a status message (herdr_message): still
-      // working, e.g. waiting on a long suite in a tracked background shell.
-      if (current.receiptAskedAt && view.lastMessageAt && Date.parse(view.lastMessageAt) > Date.parse(current.receiptAskedAt)) {
-        current.receiptStatusReplies = (current.receiptStatusReplies ?? 0) + 1;
-        current.receiptAskAfter = new Date(Date.parse(now) + RECEIPT_REASK_BASE_MS * 2 ** (current.receiptStatusReplies - 1)).toISOString();
-        delete current.receiptAskedAt;
-        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `lane replied with a status; asking again after ${current.receiptAskAfter}` });
+      // An integration whose commits are already on the integration branch
+      // needs no receipt: it is recorded as integrated there (1c0 below).
+      if (stage === "integrate" && contained.has(item.id)) {
+        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `integrate lane ${current.lane.workflowId} finished without a receipt, but its commits are on the integration branch` });
+        for (const key of ["lane", "receiptAskedAt", "receiptPointedAt", "receiptInferRequestedAt"]) delete current[key];
         continue;
       }
-      if (current.receiptAskAfter && Date.parse(now) < Date.parse(current.receiptAskAfter)) continue;
+      // The driver found no report to infer a receipt from: a fresh lane.
+      if (current.receiptInferFailedAt) {
+        const why = current.receiptInferFailedAt;
+        for (const key of ["receiptInferFailedAt", "receiptInferRequestedAt", "receiptPointedAt"]) delete current[key];
+        retryStage(item, current, stage, "idle without a receipt", `lane ${current.lane.workflowId}/${current.lane.laneId} finished without a receipt or a readable report (${why})`);
+        continue;
+      }
       if (!current.receiptAskedAt) {
         current.receiptAskedAt = now;
         actions.push({ kind: "ask-receipt", itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, format: RECEIPT_FORMAT[stage] });
-      } else if (Date.parse(now) - Date.parse(current.receiptAskedAt) > RECEIPT_ASK_TIMEOUT_MS && !current.receiptEscalatedAt) {
-        // Its commits may already be on the integration branch (1c0 records
-        // that below); otherwise a fresh lane takes over.
-        retryStage(item, current, stage, "idle without a receipt", `lane ${current.lane.workflowId}/${current.lane.laneId} went idle and did not answer the receipt ask`);
+        continue;
+      }
+      // A reply (its report, or a failure it hit) or one interval after the
+      // ask: one pointed ask for the receipt tool call.
+      if (!current.receiptPointedAt) {
+        const replied = view.lastMessageAt && Date.parse(view.lastMessageAt) > Date.parse(current.receiptAskedAt);
+        if (replied || Date.parse(now) - Date.parse(current.receiptAskedAt) > RECEIPT_ASK_INTERVAL_MS) {
+          current.receiptPointedAt = now;
+          actions.push({ kind: "ask-receipt", pointed: true, itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, format: RECEIPT_FORMAT[stage] });
+        }
+        continue;
+      }
+      // Still none an interval after the pointed ask: the driver records a
+      // receipt from the lane's final report, marked inferred.
+      if (!current.receiptInferRequestedAt && Date.parse(now) - Date.parse(current.receiptPointedAt) > RECEIPT_ASK_INTERVAL_MS) {
+        current.receiptInferRequestedAt = now;
+        actions.push({ kind: "infer-receipt", itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, since: current.receiptAskedAt });
       }
     }
   }
@@ -799,6 +827,9 @@ export function advanceSpec({
     spec.items.filter((item) => {
       const current = next.items[item.id];
       if (!ACTIVE_STATES.has(current?.state)) return false;
+      // A lane that finished its turn without a receipt holds its slot for
+      // at most one ask interval.
+      if (current.lane && current.receiptAskedAt && Date.parse(now) - Date.parse(current.receiptAskedAt) > RECEIPT_ASK_INTERVAL_MS) return false;
       return Boolean(current.lane) || current.state === "building" || current.state === "reviewing";
     });
   // A review reuses its item's slot; only new builds need one.
