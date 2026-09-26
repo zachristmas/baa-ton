@@ -170,6 +170,23 @@ export function integrationCommitFor(log, id) {
   return merged;
 }
 
+/**
+ * Retry kinds caused by the infrastructure or harness, not the lane's work:
+ * a lane that never started (startup attestation, shell, bridge, a dirty
+ * worktree at dispatch). They never count toward exhausting a stage; they
+ * retry with backoff instead.
+ */
+export const INFRA_KINDS = new Set(["never started", "infrastructure"]);
+export const INFRA_BACKOFF_MAX_MS = 30 * 60_000;
+/** The wait before retry number `failures` (1, 2, ...) after an infrastructure error. */
+export function infraBackoffMs(failures) {
+  return Math.min(60_000 * 2 ** Math.max(0, failures - 1), INFRA_BACKOFF_MAX_MS);
+}
+/** Declines that count toward a stage's ladder (real lane outcomes only). */
+export function countedDeclines(declines, stage) {
+  return (Array.isArray(declines) ? declines : []).filter((entry) => entry.stage === stage && !INFRA_KINDS.has(entry.kind)).length;
+}
+
 /** Parse an integration lane's receipt: INTEGRATED: <sha> and SUITE: pass|fail lines. */
 export function integrationResult(summary) {
   const text = String(summary ?? "");
@@ -237,13 +254,27 @@ export function advanceSpec({
     const declines = (current.declines ??= []);
     declines.push({ at: now, stage, kind, reason: String(reason).slice(0, 500), ...(current.lane ? { lane: current.lane } : {}), ...(current.declined?.profile ? { profile: current.declined.profile } : {}) });
     if (declines.length > 20) declines.splice(0, declines.length - 20);
-    const count = declines.filter((entry) => entry.stage === stage).length;
+    const infra = INFRA_KINDS.has(kind);
+    const count = countedDeclines(declines, stage);
     const choice = profileAfterDeclines(spec, stage, count);
     const from = current.lane?.workflowId;
     delete current.lane;
     delete current.receiptAskedAt;
     delete current.receiptEscalatedAt;
     delete current.receiptAskAfter;
+    if (infra) {
+      // Not the lane's fault: never exhausts, retries after a growing wait.
+      current.infraFailures = (current.infraFailures ?? 0) + 1;
+      current.infraRetryAfter = new Date(Date.parse(now) + infraBackoffMs(current.infraFailures)).toISOString();
+      if (current.infraFailures >= 5 && !current.infraAlertedAt) {
+        current.infraAlertedAt = now;
+        rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lanes failed to start ${current.infraFailures} times in a row (${String(reason).slice(0, 200)}); the driver keeps retrying every ${Math.round(INFRA_BACKOFF_MAX_MS / 60_000)} min, check the harness` });
+      }
+      if (current.state !== STATE_OF[stage]) move(item.id, STATE_OF[stage], {}, `recovered for a fresh ${stage} lane`);
+      current.declined = { stage, kind, reason: String(reason).slice(0, 500), count, ...(current.declined?.stage === stage && current.declined.profile ? { profile: current.declined.profile } : choice?.profile ? { profile: choice.profile } : {}) };
+      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `${stage} lane${from ? ` ${from}` : ""} never started (${String(reason).slice(0, 160)}): an infrastructure error, not counted; retrying after ${current.infraRetryAfter}` });
+      return true;
+    }
     if (!choice) {
       move(item.id, "blocked", { blockedReason: "exhausted", note: `${stage}: ${count} lane(s) did not finish (${kind}) with every configured profile: ${String(reason).slice(0, 200)}` }, `${stage} retries exhausted`);
       rootAsks.push({ itemId: item.id, reason: `${item.id}: ${count} ${stage} lane(s) did not finish, with every profile in spec.stages.${stage} (profile, fallbackProfiles). Last: ${kind}: ${String(reason).slice(0, 300)}. Add a fallback profile or decide how to proceed.` });
@@ -402,6 +433,10 @@ export function advanceSpec({
       continue;
     }
     if (!view?.receipt) continue;
+    // A lane that delivered a receipt started fine: the infrastructure is back.
+    delete current.infraFailures;
+    delete current.infraRetryAfter;
+    delete current.infraAlertedAt;
     const reason = declineReason(view.receipt.summary, stage);
     if (!reason) {
       if (current.declined?.stage === stage) delete current.declined;
