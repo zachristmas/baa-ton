@@ -219,7 +219,7 @@ test("herdr_doctor reports version skew and a split install after an update", as
   }
 });
 
-test("a pulled update restarts the real supervisor from the new code", { timeout: 90_000 }, async () => {
+test("a pulled update restarts the real supervisor from the new code", { timeout: 300_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-supervisor-restart-"));
   const copy = join(directory, "checkout");
   const configDir = join(directory, "config");
@@ -255,14 +255,14 @@ test("a pulled update restarts the real supervisor from the new code", { timeout
   };
   try {
     // Generous: the suite runs several heavy files in parallel.
-    const first = await waitFor(supervisorRecord, 30_000);
+    const first = await waitFor(supervisorRecord, 120_000);
     assert.ok(first, `the runner starts and records itself: ${stderr}`);
     assert.notEqual(first.pid, launcher.pid, "the runner is the launcher's child");
     await appendFile(join(copy, "packages", "controller", "activation.mjs"), "\n// updated by git pull\n");
     const second = await waitFor(async () => {
       const record = await supervisorRecord();
       return record && record.pid !== first.pid ? record : undefined;
-    }, 30_000);
+    }, 120_000);
     assert.ok(second, `a new runner took over after the code changed: ${stderr}`);
     assert.notEqual(second.fingerprint, first.fingerprint, "and it loaded the new code");
     assert.match(stderr, /code changed on disk .* restarting/);

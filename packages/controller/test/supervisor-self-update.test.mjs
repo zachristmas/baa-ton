@@ -15,7 +15,7 @@ const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encodi
 // regular tick failing (here: a config with no orchestrators), the updater
 // must check origin/main, test the new commit and fast-forward the checkout,
 // and the log file must show all of it.
-test("the supervisor started like Herdr starts it deploys a new main, and logs to its config dir", { timeout: 90_000 }, async () => {
+test("the supervisor started like Herdr starts it deploys a new main, and logs to its config dir", { timeout: 240_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-supervisor-deploy-"));
   const source = join(directory, "source");
   const origin = join(directory, "origin.git");
@@ -56,7 +56,7 @@ test("the supervisor started like Herdr starts it deploys a new main, and logs t
     return false;
   };
   try {
-    assert.ok(await waitFor(() => git(installed, "rev-parse", "HEAD") === target, 60_000), `the checkout was fast-forwarded to the new main.\nlog:\n${await log()}\nstderr:\n${stderr}`);
+    assert.ok(await waitFor(() => git(installed, "rev-parse", "HEAD") === target, 180_000), `the checkout was fast-forwarded to the new main.\nlog:\n${await log()}\nstderr:\n${stderr}`);
     const text = await log();
     assert.match(text, /started on [0-9a-f]{12}/);
     assert.match(text, /tick failed: config\.orchestrators must be a non-empty array/, "the tick failure is in the log");

@@ -71,7 +71,7 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
   // Generous: the bridge compiles the whole extension on start, which can take
   // well over 15 s while the full suite runs in parallel on a loaded machine.
-  const timeout = setTimeout(() => child.kill(), 60_000);
+  const timeout = setTimeout(() => child.kill(), 180_000);
   try {
     return await run(rpc, rpcWithId);
   } finally {

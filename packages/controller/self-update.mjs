@@ -10,6 +10,12 @@
  * run at a time, tracked by the supervisor (never detached); a red commit
  * is never applied and is reported once; disabled by BAATON_SELF_UPDATE=0 or
  * {"enabled": false} in <configDir>/self-update.json.
+ *
+ * The suite spawns many processes, so a machine that takes seconds to start
+ * one (heavy load, OS exec checks) fails it for reasons unrelated to the
+ * commit. A test run waits while starting Node takes over SPAWN_SLOW_MS, and
+ * a red run is retried at the next checks, SELF_UPDATE_TEST_ATTEMPTS runs in
+ * all, before the commit counts as failed.
  */
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -22,7 +28,18 @@ export const SELF_UPDATE_TEST_TIMEOUT_MS = 30 * 60_000;
 /** How long a /reload has to show up in the root's runtime record. */
 export const RELOAD_CONFIRM_MS = 60_000;
 export const RELOAD_ATTEMPTS = 5;
+export const SELF_UPDATE_TEST_ATTEMPTS = 3;
+export const SPAWN_SLOW_MS = 5_000;
+/** A root busy this long past a due reload is reported: it never goes idle for /reload. */
+export const RELOAD_BUSY_MS = 30 * 60_000;
 const execFileAsync = promisify(execFile);
+
+/** Milliseconds to start and end a bare Node process. */
+async function defaultSpawnProbe() {
+  const started = Date.now();
+  await execFileAsync(process.execPath, ["-e", "0"], { timeout: 120_000 }).catch(() => undefined);
+  return Date.now() - started;
+}
 
 async function defaultRun(command, args, options = {}) {
   const { stdout } = await execFileAsync(command, args, { timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...options });
@@ -91,6 +108,8 @@ export function createSelfUpdater({
   // Self-healing: a failed update test or an unconfirmed reload is an anomaly.
   anomaly = async () => undefined,
   prune = () => 0,
+  // Wall time to start a process; a test run waits while it is slow.
+  spawnProbe = defaultSpawnProbe,
   now = () => new Date().toISOString(),
   env = process.env,
 } = {}) {
@@ -165,7 +184,18 @@ export function createSelfUpdater({
       if (!(await clean(record.checkout).catch(() => false))) continue;
       const check = await ready(record.paneId, { pane_id: record.paneId, agent_kind: record.agentKind ?? "pi" });
       // Herdr reports a Pi root that finished its turn as done, or as idle.
-      if (!check?.ok || !["idle", "done"].includes(check.agent?.agent_status)) continue;
+      if (!check?.ok || !["idle", "done"].includes(check.agent?.agent_status)) {
+        // A root that never goes idle never gets /reload: say so rather than wait in silence.
+        const due = entry?.busySince ?? now();
+        reloads[record.paneId] = { ...(entry ?? { commit: disk, attempts: 0 }), busySince: due };
+        if (!entry?.busyReportedAt && Date.parse(now()) - Date.parse(due) >= RELOAD_BUSY_MS) {
+          reloads[record.paneId].busyReportedAt = now();
+          const status = check?.agent?.agent_status ?? check?.reason ?? "unknown";
+          events.push(`root reload in ${record.paneId} still waiting: the root has been ${status} for ${Math.round((Date.parse(now()) - Date.parse(due)) / 60_000)} min`);
+          await Promise.resolve(anomaly({ kind: "reload-unconfirmed", signature: `reload-busy:${record.paneId}:${disk}`, summary: `the root in ${record.paneId} has not been idle for ${Math.round(RELOAD_BUSY_MS / 60_000)}+ min, so it cannot be sent /reload onto ${disk.slice(0, 12)}; it still runs ${String(record.commit).slice(0, 12)}`, evidence: [`status: ${status}`, `attempts so far: ${entry?.attempts ?? 0}`] })).catch(() => undefined);
+        }
+        continue;
+      }
       // Typed into a dialog, /reload would answer it instead of reloading.
       if (await Promise.resolve(dialogOpen(record.paneId)).catch(() => true)) {
         if (!entry?.waitingOnDialogAt) events.push(`root reload in ${record.paneId} waits: a dialog is on screen`);
@@ -214,12 +244,15 @@ export function createSelfUpdater({
       if (active?.done) {
         const { sha, result, dir, checkout } = active;
         active = undefined;
-        (state.tested ??= {})[sha] = { result: result.ok ? "pass" : "fail", at: now(), ...(result.ok ? {} : { tail: result.output.slice(-1500) }) };
+        const attempts = (state.tested?.[sha]?.attempts ?? 0) + 1;
+        const final = result.ok || attempts >= SELF_UPDATE_TEST_ATTEMPTS;
+        (state.tested ??= {})[sha] = { result: result.ok ? "pass" : final ? "fail" : "retry", at: now(), attempts, ...(result.ok ? {} : { tail: result.output.slice(-1500) }) };
         delete state.testing;
         await git(checkout, "worktree", "remove", "--force", dir).catch(() => rm(dir, { recursive: true, force: true }));
         if (result.ok) events.push(...(await apply(state, sha)));
+        else if (!final) events.push(`${sha.slice(0, 12)} failed npm test (run ${attempts} of ${SELF_UPDATE_TEST_ATTEMPTS}); retrying at the next check`);
         else {
-          events.push(`${sha.slice(0, 12)} failed npm test; not deployed`);
+          events.push(`${sha.slice(0, 12)} failed npm test ${attempts} times; not deployed`);
           await Promise.resolve(anomaly({ kind: "self-update-test-failed", signature: `update-test:${sha}`, summary: `${sha.slice(0, 12)} failed npm test and was not deployed`, evidence: result.output.split("\n").slice(-30) })).catch(() => undefined);
           await notify({ title: "Baa-ton update failed its tests", body: `${sha.slice(0, 12)} is not deployed. ${result.output.slice(-300)}` });
         }
@@ -239,8 +272,15 @@ export function createSelfUpdater({
             else if (reason !== "current") events.push(`${checkout}: ${reason}`);
           }
           const tested = target ? state.tested?.[target]?.result : undefined;
+          // Only the real suite is probed; an override (tests of the supervisor) is not.
+          const probed = spawnProbe !== defaultSpawnProbe || (startTests === defaultStartTests && !env.BAATON_SELF_UPDATE_TEST_COMMAND);
+          const slow = probed && target && behind.length && (!tested || tested === "retry") ? await Promise.resolve(spawnProbe()).catch(() => 0) : 0;
           if (target && behind.length && tested === "pass") events.push(...(await apply(state, target)));
-          else if (target && behind.length && !tested) {
+          else if (slow > SPAWN_SLOW_MS) {
+            if (!state.deferredSlowAt) events.push(`testing ${target.slice(0, 12)} waits: starting a process takes ${Math.round(slow / 1000)}s, so the suite would time out`);
+            state.deferredSlowAt ??= now();
+          } else if (target && behind.length && (!tested || tested === "retry")) {
+            delete state.deferredSlowAt;
             const dir = join(configDir, "self-update", target.slice(0, 12));
             await git(base, "worktree", "remove", "--force", dir).catch(() => undefined);
             await rm(dir, { recursive: true, force: true });
