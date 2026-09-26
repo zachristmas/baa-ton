@@ -9980,7 +9980,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         };
       const results: string[] = [];
       const warnings: string[] = [];
+      const failures: string[] = [];
+      let skipped = 0;
       for (const { workflow, lane } of lanes) {
+        try {
         // Load the stored manifest lane first: a gone pane is only tolerable
         // when the lane already holds a durable completion receipt.
         let attestation: unknown = null;
@@ -10001,6 +10004,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             );
         } catch {
           attestation = null;
+        }
+        // Retired lanes and lanes of closed or failed workflows hold no
+        // bridge: nothing to check, and no Herdr call for them.
+        if (storedLane?.retirement?.status === "retired") {
+          skipped += 1;
+          continue;
         }
         let response: Record<string, unknown>;
         try {
@@ -10041,8 +10050,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             );
             continue;
           }
+          // A lane that never started had no bridge to lose.
+          if (["dispatch-failed", "planned"].includes(String(storedLane?.status))) {
+            warnings.push(`${lane.lane_id} (${lane.pane_id}) never started (${storedLane?.status}); its mapping can be retired`);
+            continue;
+          }
           throw new Error(
-            `Lane ${lane.lane_id} pane ${lane.pane_id} is gone without a durable completion receipt.`,
+            `Lane ${lane.lane_id} pane ${lane.pane_id} is gone without a durable completion receipt (${storedLane?.status ?? "no stored lane"}); record its outcome with herdr_close or herdr_supersede.`,
           );
         }
         const agent = response.agent;
@@ -10095,13 +10109,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           continue;
         }
         results.push(`${lane.lane_id} (${lane.pane_id}) native/bridge evidence present`);
+        } catch (error) {
+          // One lane's failure is reported with the rest, not instead of them.
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
       }
       return {
-        status: warnings.length ? "warn" : "ok",
+        status: failures.length ? "fail" : warnings.length ? "warn" : "ok",
         detail: [
           results.length
             ? `Checked ${results.length}/${lanes.length} mapped lane bridge(s): ${results.join("; ")}.`
-            : `Checked ${lanes.length} mapped lane bridge(s).`,
+            : `Checked ${lanes.length - skipped} mapped lane bridge(s).`,
+          ...(skipped ? [`Skipped ${skipped} retired lane(s).`] : []),
+          ...(failures.length ? [`Failures: ${failures.join("; ")}.`] : []),
           ...(warnings.length ? [`Warnings: ${warnings.join("; ")}.`] : []),
         ].join(" "),
       };
@@ -10263,8 +10283,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         { triggerTurn: true, deliverAs: "followUp" },
       );
   }
+  // /reload can keep the session's earlier active tool set; make sure the
+  // operator channel's tools are active, so a root can always reply.
+  const ensureOperatorTools = () => {
+    try {
+      const active = pi.getActiveTools() as unknown[];
+      const names = active.map((tool) => (typeof tool === "string" ? tool : (tool as { name?: string })?.name)).filter(Boolean) as string[];
+      const missing = ["herdr_operator_message", "herdr_operator_reply", "herdr_operator_inbox"].filter((name) => !names.includes(name));
+      if (missing.length && names.length) pi.setActiveTools([...names, ...missing]);
+    } catch {
+      // Older Pi without tool control: the tools are active by default.
+    }
+  };
   pi.on("agent_start", async (_event, ctx) => {
     recordExtensionRuntime(ctx);
+    ensureOperatorTools();
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "active");
     await attemptActivationAck(ctx);
