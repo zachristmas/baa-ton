@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assembleDemo, TINY_PNG } from "../demo-report.mjs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -343,31 +344,16 @@ test("decide lanes read the project; answers recorded by the root unblock the bu
 
 /** A minimal stored zip with the given entry names (a .docx for the report check). */
 function docx(images) {
-  const names = ["word/document.xml", ...Array.from({ length: images }, (_, index) => `word/media/image${index + 1}.png`)];
-  const locals = [];
-  const centrals = [];
-  let offset = 0;
-  for (const name of names) {
-    const bytes = Buffer.from(name);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(bytes.length, 26);
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(bytes.length, 28);
-    central.writeUInt32LE(offset, 42);
-    locals.push(local, bytes);
-    centrals.push(central, bytes);
-    offset += 30 + bytes.length;
-  }
-  const directory = Buffer.concat(centrals);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(names.length, 8);
-  end.writeUInt16LE(names.length, 10);
-  end.writeUInt32LE(directory.length, 12);
-  end.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, directory, end]);
+  // A real feature demo: captioned steps (demo-report.mjs), as lanes write it.
+  return assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG })) }).docx;
+}
+
+/** Write a demo report and its steps manifest. */
+async function writeDemo(path, images) {
+  const { docx: buffer, manifest } = assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG })) });
+  await writeFile(path, buffer);
+  await writeFile(`${path}.steps.json`, JSON.stringify(manifest));
+  return buffer;
 }
 
 test("verification: waits for the deploy, runs the preview specs, records the final report, and the verifier marks done", async () => {
@@ -404,7 +390,7 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
 
     await mkdir(join(f.worktreeRoot, "spec-verify-A", "artifacts"), { recursive: true });
-    await writeFile(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), docx(2));
+    await writeDemo(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), 2);
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
     result = await f.advance();
@@ -1794,7 +1780,7 @@ test("an evidence report rewritten by a newer valid run is re-recorded, and the 
   const { tmpdir: tmp } = await import("node:os");
   const reportDir = await mkd(join(tmp(), "baa-evidence-"));
   const reportPath = join(reportDir, "d29.docx");
-  await writeFile(reportPath, docx(3));
+  await writeDemo(reportPath, 3);
   const f = await fixture({
     specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D29", title: "Evidence", acceptance: { text: "e", evidence: { report: "artifacts/d29.docx", minImages: 2 } } }] },
     seed: { version: 1, items: { D29: { state: "verifying", integratedSha: sha, verified: "2026-09-24T11:00:00.000Z", evidence: { path: reportPath, sha256: "0".repeat(64), images: 2, reportAt: "2026-09-24T11:00:00.000Z" } } } },

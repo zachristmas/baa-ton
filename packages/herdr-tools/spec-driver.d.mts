@@ -67,6 +67,8 @@ export function verifyResult(summary: unknown): { previews: Array<{ spec: string
 export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;
 export function specCommitMessage(itemId: string, subject: string): string;
 export const DECLINE_RULE: string;
+export const DEMO_TOOL: string;
+export function demoRule(report: string, minImages: number): string;
 export const RECEIPT_RULE: string;
 export const INFRA_KINDS: Set<string>;
 export const INFRA_BACKOFF_MAX_MS: number;

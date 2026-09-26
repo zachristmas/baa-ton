@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assembleDemo, TINY_PNG } from "../demo-report.mjs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -10,31 +11,16 @@ import { adoptSpec, adoptionTable, globToRegExp, isSecretPath, itemOwnedChanges,
 import { specSummaryLine, validateSpec, verifySpec } from "../spec.mjs";
 
 function docx(images) {
-  const names = ["word/document.xml", ...Array.from({ length: images }, (_, index) => `word/media/image${index + 1}.png`)];
-  const locals = [];
-  const centrals = [];
-  let offset = 0;
-  for (const name of names) {
-    const bytes = Buffer.from(name);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(bytes.length, 26);
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(bytes.length, 28);
-    central.writeUInt32LE(offset, 42);
-    locals.push(local, bytes);
-    centrals.push(central, bytes);
-    offset += 30 + bytes.length;
-  }
-  const directory = Buffer.concat(centrals);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(names.length, 8);
-  end.writeUInt16LE(names.length, 10);
-  end.writeUInt32LE(directory.length, 12);
-  end.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, directory, end]);
+  // A real feature demo: captioned steps (demo-report.mjs), as lanes write it.
+  return assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG })) }).docx;
+}
+
+/** Write a demo report and its steps manifest. */
+async function writeDemo(path, images) {
+  const { docx: buffer, manifest } = assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG })) });
+  await writeFile(path, buffer);
+  await writeFile(`${path}.steps.json`, JSON.stringify(manifest));
+  return buffer;
 }
 
 test("secret-looking files are never staged, tracked or not", () => {
@@ -83,9 +69,8 @@ async function projectFixture() {
   const artifacts = join(directory, "artifacts");
   await mkdir(join(project, ".baa-ton", "herdr-orchestrator"), { recursive: true });
   await mkdir(artifacts, { recursive: true });
-  const report = docx(3);
-  await writeFile(join(artifacts, "r-report.docx"), report);
-  await writeFile(join(artifacts, "i-report.docx"), docx(2));
+  const report = await writeDemo(join(artifacts, "r-report.docx"), 3);
+  await writeDemo(join(artifacts, "i-report.docx"), 2);
   const receipt = (summary) => ({ id: "r", summary, delivery: "delivered" });
   const spec = {
     version: 1,
