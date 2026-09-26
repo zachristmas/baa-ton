@@ -282,6 +282,63 @@ function rmVerdict(segment, context) {
 /** Build outputs a lane may put back to HEAD after a build rewrote them. */
 const GENERATED_ARTIFACTS = [/(^|\/)openapi(-spec)?\.(json|ya?ml)$/, /\.generated\.[\w]+$/, /(^|\/)(__generated__|generated)\//, /\.gen\.[jt]sx?$/];
 
+/** Programs that only read (and print) files. */
+const READ_ONLY = /^(cat|head|tail|ls|wc|grep|egrep|rg|stat|du|jq|uniq|cut|diff|cmp|file|sort)$/;
+/** Files that may hold credentials: never read unattended. */
+const CREDENTIAL_FILE = /(^|\/)(\.env(\.[\w.-]*)?|\.npmrc|\.netrc|\.pgpass|id_[a-z0-9]+(\.pub)?|[^/]*\.(pem|key|p12|pfx|keystore|jks)|[^/]*(credential|secret)[^/]*)$/i;
+
+/**
+ * Whether a path may be read unattended: relative without `..` (cd
+ * confinement keeps it in the worktree), or absolute under the worktree,
+ * /tmp, /private/tmp or a session scratchpad; never a credential file.
+ */
+export function readablePath(path, cwd) {
+  const target = unquote(path);
+  if (!target || target.includes("..") || /[$`~]/.test(target)) return false;
+  if (CREDENTIAL_FILE.test(target)) return false;
+  if (!target.startsWith("/")) return true;
+  const root = cwd?.replace(/\/+$/, "");
+  if (root && (target === root || target.startsWith(`${root}/`))) return true;
+  return /^\/(?:private\/)?tmp\//.test(target);
+}
+
+/**
+ * A read-only command on readable paths: `tail -100 /tmp/backend.log`,
+ * `grep -n x src/a.ts`, `ls /tmp`. grep and rg take their first operand as
+ * the pattern, not a path.
+ */
+function readVerdict(segment, options) {
+  const words = segment.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+  const program = words[0];
+  if (!READ_ONLY.test(program ?? "")) return undefined;
+  if (program === "sort" && words.some((word) => /^-o/.test(word))) return undefined;
+  const operands = [];
+  let patternTaken = !/^(grep|egrep|rg)$/.test(program);
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (/^-[eEf]$/.test(word) && /^(grep|egrep|rg)$/.test(program)) {
+      patternTaken = true;
+      index += 1;
+      continue;
+    }
+    if (word.startsWith("-")) continue;
+    if (!patternTaken) {
+      patternTaken = true;
+      continue;
+    }
+    operands.push(word);
+  }
+  // Only reads of named paths: a bare `ls` or `cat` prompts for some other reason.
+  if (!operands.length) return undefined;
+  // A credential file is never read unattended, whatever else the command
+  // does. Any other path the rule cannot place just gets no read rule (the
+  // segment stays inert, as before).
+  const credential = operands.find((operand) => CREDENTIAL_FILE.test(unquote(operand)));
+  if (credential) return { safe: false, reason: `reads a credential file: ${unquote(credential)}` };
+  if (operands.some((operand) => !readablePath(operand, options.cwd))) return undefined;
+  return { safe: true, rule: "read-local" };
+}
+
 /** A quoted -m message: double- or single-quoted, over any number of lines. */
 const COMMIT_MESSAGE = String.raw`(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*')`;
 
@@ -302,6 +359,15 @@ function gitVerdict(segment, options, context = {}) {
   if (/^git commit\b/.test(segment.replace(new RegExp(COMMIT_MESSAGE, "g"), '""')) && /--amend|--no-verify|(^|\s)-n(\s|$)/.test(segment.replace(new RegExp(COMMIT_MESSAGE, "g"), '""')))
     return { safe: false, reason: "git commit --amend or --no-verify" };
   const branch = options.branchPattern ?? DEFAULT_BRANCH;
+  // Rebase the worktree's own feature branch onto origin/main, and continue
+  // or abort that rebase: local and recoverable from the reflog. Only when
+  // the current branch is known and is a feature branch; never --skip
+  // (which drops a commit) and never an interactive rebase.
+  if (/^git rebase\b/.test(segment)) {
+    if (!/^git rebase(?: -q)? origin\/main$|^git rebase --(?:continue|abort)$/.test(segment)) return { safe: false, reason: "git rebase must be `git rebase [-q] origin/main`, --continue or --abort" };
+    if (!options.ownBranch || !branch.test(options.ownBranch)) return { safe: false, reason: "rebase only on the worktree's own feature branch" };
+    return { safe: true, rule: "git-rebase-own-branch" };
+  }
   // Recreate the lane's own branch at origin/main: only in a clean worktree,
   // and only when that branch does not exist yet or is already merged, so no
   // unmerged commit can be lost.
@@ -447,7 +513,7 @@ export function classifyCommand(command, options = {}) {
     let normalized = stripRedirects(segment);
     for (const pattern of KNOWN_SUBSTITUTIONS) normalized = normalized.replace(pattern, "SUBST");
     const plain = normalized.replace(/^(?:(?!GH_TOKEN=)\w+=[\w./:@-]*\s+)+(?=\S)/, "");
-    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options, context) ?? ghVerdict(plain, options);
+    const verdict = rmVerdict(plain, context) ?? gitVerdict(plain, options, context) ?? ghVerdict(plain, options) ?? readVerdict(plain, options);
     if (verdict) {
       if (!verdict.safe) return { decision: "defer", reason: verdict.reason };
       rules.add(verdict.rule);
@@ -637,6 +703,13 @@ export function laneConfinedVerdict(toolName, toolInput, { cwd } = {}) {
     const path = String(toolInput?.file_path ?? toolInput?.notebook_path ?? "");
     if (path && pathInside(path, cwd) && !path.split("/").includes("..")) return { allow: true, reason: "the edit is inside the lane's worktree or scratch" };
     return { allow: false, reason: `${path || "the file"} is outside the lane's worktree and scratch` };
+  }
+  // Reading: the worktree, /tmp and scratch, never a credential file.
+  if (["Read", "Grep", "Glob"].includes(toolName)) {
+    const path = String(toolInput?.file_path ?? toolInput?.path ?? cwd ?? "");
+    if (CREDENTIAL_FILE.test(path)) return { allow: false, reason: `${path} may hold credentials` };
+    if (path && (pathInside(path, cwd) || readablePath(path, cwd))) return { allow: true, reason: "it reads inside the lane's worktree, /tmp or scratch" };
+    return { allow: false, reason: `${path || "the file"} is outside the lane's worktree, /tmp and scratch` };
   }
   return { allow: false, reason: `${toolName} is not covered by the unattended policy` };
 }

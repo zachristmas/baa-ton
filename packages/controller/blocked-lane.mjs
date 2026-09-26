@@ -448,6 +448,19 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
       return { status: "approved", rules: verdict.rules };
     }
   }
+  // Reading the worktree, /tmp or scratch (never a credential file) is
+  // known-safe too: approved at once, not routed.
+  if (screen.kind === "permission" && ["Read", "Grep", "Glob"].includes(screen.toolName) && screen.target && rules.laneConfinedVerdict(screen.toolName, { file_path: screen.target }, { cwd: worktree }).allow) {
+    const check = await recheck(herdr, { paneId, agentKind, fingerprint: screen.fingerprint });
+    if (!check.ok) return { status: "skipped", reason: check.reason };
+    try {
+      await sendKeys(herdr, paneId, screen.approveKeys);
+    } catch (error) {
+      return { status: "skipped", reason: `send-keys failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    (workflow.evidence ??= []).push({ at: timestamp, kind: "screen-prompt-approved", text: `${laneId}: known-safe (read-local): ${screen.toolName} ${screen.target.slice(0, 200)}` });
+    return { status: "approved", rules: ["read-local"] };
+  }
   const id = `req-screen-${screen.fingerprint.slice(0, 10)}`;
   const fallback = defaultFor(screen, worktree, rules);
   const request = {
@@ -554,6 +567,42 @@ export async function resolveScreenPrompts({ herdr, manifest, workflow, timestam
  * else is recorded for the operator (baa-ton inbox, one notification) and
  * gets the same bounded default as a lane's prompt.
  */
+/**
+ * The classifier's options for a registered agent's command: its registered
+ * folder, or, when the command starts with `cd <dir> &&` into another
+ * worktree of the same repository (an agent's own feature worktree), that
+ * worktree. Plus the worktree's facts (its branch, clean or not), so a
+ * commit or rebase of its own feature branch can be recognized.
+ */
+export async function agentCommandOptions(cwd, command, { gitDir = defaultGitCommonDir, facts } = {}) {
+  if (!cwd) return {};
+  let effective = cwd;
+  const lead = /^\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)\s*&&/.exec(String(command));
+  if (lead) {
+    const target = lead[1].replace(/^["']|["']$/g, "");
+    if (target.startsWith("/") && !target.includes("..")) {
+      const [mine, theirs] = await Promise.all([gitDir(cwd), gitDir(target)]);
+      if (mine && theirs && mine === theirs) effective = target;
+    }
+  }
+  let worktreeFacts = facts;
+  try {
+    worktreeFacts ??= (await import("../herdr-tools/known-safe-hook.mjs")).worktreeFacts;
+  } catch {
+    return { cwd: effective };
+  }
+  return { cwd: effective, ...worktreeFacts(effective, command) };
+}
+
+async function defaultGitCommonDir(dir) {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], { timeout: 5_000 });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function handleBlockedAgent({ herdr, name, agent, timestamp, storePath, notify = async () => undefined }) {
   const paneId = agent.paneId;
   let text;
@@ -571,7 +620,8 @@ export async function handleBlockedAgent({ herdr, name, agent, timestamp, storeP
     return { status: "skipped", reason: `known-safe rules could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (screen.kind === "permission" && screen.toolName === "Bash" && !screen.truncated && screen.command) {
-    const verdict = rules.classifyCommand(screen.command, agent.cwd ? { cwd: agent.cwd } : {});
+    const options = await agentCommandOptions(agent.cwd, screen.command);
+    const verdict = rules.classifyCommand(screen.command, options);
     if (verdict.decision === "allow") {
       const check = await recheck(herdr, { paneId, agentKind: agent.agentKind, fingerprint: screen.fingerprint });
       if (!check.ok) return { status: "skipped", reason: check.reason };

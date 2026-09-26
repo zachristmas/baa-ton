@@ -23,7 +23,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyCommand, laneConfinedVerdict } from "./known-safe.mjs";
 import { bridgeClient, DEFAULT_WAIT_MS, routePermission } from "./permission-route.mjs";
@@ -58,7 +58,17 @@ export function worktreeFacts(cwd, command, git = (args) => execFileSync("git", 
       return undefined;
     }
   };
-  const branch = quiet(["branch", "--show-current"]);
+  // Mid-rebase HEAD is detached: the branch being rebased is in Git's state.
+  const rebasing = () => {
+    const path = quiet(["rev-parse", "--git-path", "rebase-merge/head-name"]);
+    if (!path) return undefined;
+    try {
+      return readFileSync(isAbsolute(path) ? path : join(cwd, path), "utf8").trim().replace(/^refs\/heads\//, "") || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const branch = quiet(["branch", "--show-current"]) || rebasing();
   if (branch && !["main", "master"].includes(branch)) facts.ownBranch = branch;
   const url = quiet(["remote", "get-url", "origin"]);
   const repo = url && /[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(url)?.[1];
