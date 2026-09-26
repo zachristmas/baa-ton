@@ -62,3 +62,6 @@ export function integrateObjective(
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; report?: string };
 export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;
 export function specCommitMessage(itemId: string, subject: string): string;
+export const DECLINE_RULE: string;
+export function declineReason(summary: unknown, stage: string): string | undefined;
+export function profileAfterDeclines(spec: Spec, stage: string, count: number): { index: number; profile?: string } | undefined;

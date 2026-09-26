@@ -355,3 +355,23 @@ test("an open verify lane also reserves the integration worktree", () => {
   assert.equal(step.actions.some((action) => action.kind === "integrate"), false);
   assert.match(step.waits.I, /integration worktree busy: V's lane wv is still open/);
 });
+
+test("a decline is an explicit DECLINED line, or decline language where the stage's required lines are missing", async () => {
+  const { declineReason, profileAfterDeclines } = await import("../spec-driver.mjs");
+  assert.equal(declineReason("DECLINED: the lint fix would need a rule suppression\nNo changes.", "integrate"), "the lint fix would need a rule suppression");
+  assert.equal(declineReason("I must decline this task. Changing another team's service is out of my scope.", "integrate"), "I must decline this task.");
+  assert.equal(declineReason("INTEGRATED: " + "a".repeat(40) + "\nSUITE: fail\nI can't proceed further.", "integrate"), undefined, "a real receipt is not a decline");
+  assert.equal(declineReason("I won't do that without approval.", "build"), undefined, "a build receipt needs the explicit line");
+  assert.equal(declineReason("DECLINED: out of scope", "build"), "out of scope");
+  assert.equal(declineReason("Looks good overall.", "review"), undefined);
+  const spec = { defaults: { maxDeclines: 2 }, stages: { integrate: { profile: "balanced", fallbackProfiles: ["deep", "careful"] } } };
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map((count) => profileAfterDeclines(spec, "integrate", count)), [
+    { index: 0 },
+    { index: 1, profile: "deep" },
+    { index: 1, profile: "deep" },
+    { index: 2, profile: "careful" },
+    { index: 2, profile: "careful" },
+    undefined,
+  ]);
+  assert.equal(profileAfterDeclines({ defaults: {}, stages: {} }, "review", 2), undefined, "no fallbacks: two declines, then the root");
+});

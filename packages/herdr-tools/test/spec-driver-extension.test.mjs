@@ -1455,6 +1455,47 @@ test("a done lane still waited on in its stage keeps the lock (the receipt ask i
   }
 });
 
+test("a declined lane is retried with its reason, then with a fallback profile, and only then goes to the root", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      defaults: { maxDeclines: 1 },
+      stages: { integrate: { profile: "balanced", fallbackProfiles: ["deep"] } },
+      items: [{ id: "D12", title: "Lint repair", acceptance: { text: "b" } }],
+    },
+    seed: { version: 1, items: { D12: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    const decline = async (summary) => {
+      const ref = (await f.state()).items.D12.lane;
+      await receive(f, ref, summary);
+      return f.advance();
+    };
+    await f.advance();
+    const integrates = () => f.calls.plan.filter((call) => call.specStage === "integrate");
+    assert.equal(integrates().length, 1);
+    assert.match(integrates()[0].laneObjective, /finish with herdr_complete whose summary starts with DECLINED:/, "every lane is told how to decline");
+    await decline("DECLINED: fixing the lint errors needs a rule suppression I should not add");
+    let state = await f.state();
+    assert.equal(state.items.D12.state, "integrating", "not blocked, not asked");
+    assert.equal(integrates().length, 2, "retried at once");
+    assert.equal(integrates()[1].taskProfile, "deep", "after maxDeclines, the fallback profile");
+    assert.match(integrates()[1].laneObjective, /An earlier lane for this integrate declined it \(1 time\(s\)\), saying: "fixing the lint errors needs a rule suppression I should not add"/);
+    assert.match(integrates()[1].objective, /after 1 decline/);
+    assert.match(state.items.D12.history.at(-1).note, /declined \(1\).*retrying with profile deep/);
+    const result = await decline("I must decline this task: it touches a service outside my scope.");
+    state = await f.state();
+    assert.equal(state.items.D12.state, "blocked", "every configured profile declined");
+    assert.equal(integrates().length, 2);
+    const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
+    assert.ok(alerts.some((alert) => /its integrate lanes declined 2 time\(s\), with every profile/.test(alert.text)));
+    assert.match(result.content[0].text, /D12/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("spec lanes whose receipt the driver consumed are retired under the retire grant", async () => {
   const receipt = { id: "r", summary: "Done.", delivery: "delivered" };
   const seedManifest = async (f) => {

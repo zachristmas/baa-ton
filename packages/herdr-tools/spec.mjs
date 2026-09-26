@@ -116,7 +116,8 @@ export function validateSpec(input) {
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines"], "spec.defaults");
+    if (input.defaults.maxDeclines !== undefined) defaults.maxDeclines = positiveInteger(input.defaults.maxDeclines, "spec.defaults.maxDeclines", { max: 10 });
     if (input.defaults.fixBaseline !== undefined) {
       if (typeof input.defaults.fixBaseline !== "boolean") throw new Error("spec.defaults.fixBaseline must be true or false.");
       if (input.defaults.fixBaseline) defaults.fixBaseline = true;
@@ -152,8 +153,13 @@ export function validateSpec(input) {
     onlyKeys(input.stages, STAGES, "spec.stages");
     for (const [name, stage] of Object.entries(input.stages)) {
       if (!isRecord(stage)) throw new Error(`spec.stages.${name} must be an object.`);
-      onlyKeys(stage, ["profile", "differentFrom"], `spec.stages.${name}`);
+      onlyKeys(stage, ["profile", "differentFrom", "fallbackProfiles"], `spec.stages.${name}`);
       stages[name] = { profile: text(stage.profile, `spec.stages.${name}.profile`, { max: 100 }) };
+      if (stage.fallbackProfiles !== undefined) {
+        if (!Array.isArray(stage.fallbackProfiles) || stage.fallbackProfiles.length > 5)
+          throw new Error(`spec.stages.${name}.fallbackProfiles must be a list of up to 5 profile names.`);
+        stages[name].fallbackProfiles = stage.fallbackProfiles.map((profile, index) => text(profile, `spec.stages.${name}.fallbackProfiles[${index}]`, { max: 100 }));
+      }
       if (stage.differentFrom !== undefined) {
         if (!STAGES.includes(stage.differentFrom) || stage.differentFrom === name)
           throw new Error(`spec.stages.${name}.differentFrom must name another stage.`);

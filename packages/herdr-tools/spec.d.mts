@@ -33,8 +33,10 @@ export type Spec = {
     generatedArtifacts: string[];
     /** Dispatch one lane to fix the target's own suite failures before integrating. */
     fixBaseline?: boolean;
+    /** Declines per profile before the stage's next fallback profile (default 2). */
+    maxDeclines?: number;
   };
-  stages: Record<string, { profile: string; differentFrom?: string }>;
+  stages: Record<string, { profile: string; differentFrom?: string; fallbackProfiles?: string[] }>;
   items: SpecItem[];
 };
 export type SpecAdopt = { worktree?: string; branch?: string; report?: string; workflow?: string; review?: string; accepted?: boolean };

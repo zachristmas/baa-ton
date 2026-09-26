@@ -150,7 +150,7 @@ import {
   validateSpecState,
   verifySpec,
 } from "./spec.mjs";
-import { advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
+import { DECLINE_RULE, advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
 import { baselineObjective, fixBaselineObjective, knownFailures } from "./spec-baseline.mjs";
 import { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
@@ -4971,7 +4971,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const action of step.actions) {
         if (action.kind === "baseline" || action.kind === "fix-baseline") {
           if (shellTimeout) continue;
-          const run = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string }; note?: string } }).baselineRun;
+          const run = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string }; note?: string; declined?: { reason: string; count: number } } }).baselineRun;
           if (!run) continue;
           try {
             const fix = action.kind === "fix-baseline";
@@ -4979,9 +4979,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             await use.worktree({ repo, path: worktree, branch: fix ? "spec-integration" : "spec-baseline", base: targetRef }, signal);
             const workflow = await use.plan({
               objective: fix ? `spec fix-baseline at ${action.targetSha!.slice(0, 12)}` : `spec baseline suite at ${action.targetSha!.slice(0, 12)}`,
-              laneObjective: fix
-                ? fixBaselineObjective(spec, { sha: action.targetSha!, failures: action.failures ?? [], integrationBranch: "spec-integration" })
-                : baselineObjective(spec, { sha: action.targetSha! }),
+              laneObjective: [
+                run.declined
+                  ? `An earlier lane declined this (${run.declined.count} time(s)), saying: "${clip(run.declined.reason, 400)}". The task is unchanged and stays within your contract. Address that concern in how you work (or name the one step you cannot do) rather than declining the whole task.`
+                  : "",
+                fix
+                  ? fixBaselineObjective(spec, { sha: action.targetSha!, failures: action.failures ?? [], integrationBranch: "spec-integration" })
+                  : baselineObjective(spec, { sha: action.targetSha! }),
+                DECLINE_RULE,
+              ]
+                .filter(Boolean)
+                .join("\n"),
               readOnly: false,
               taskProfile: spec.stages.integrate?.profile ?? "balanced",
               worktree,
@@ -5110,9 +5118,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             }
             objective = reviewObjective(spec, item, { branch, buildSummary: record.buildSummary });
           }
+          // A stage an earlier lane declined: its reason up front, and the
+          // fallback profile the driver chose after repeated declines.
+          const declined = record.declined?.stage === action.kind ? (record.declined as { reason: string; count: number; profile?: string }) : undefined;
+          if (declined?.profile) profile = declined.profile;
+          const laneObjective = [
+            declined
+              ? `An earlier lane for this ${action.kind} declined it (${declined.count} time(s)), saying: "${clip(declined.reason, 400)}". The task is unchanged and stays within your contract. Address that concern in how you work (or name the one step you cannot do) rather than declining the whole task.`
+              : "",
+            objective,
+            DECLINE_RULE,
+          ]
+            .filter(Boolean)
+            .join("\n");
           const workflow = await use.plan({
-            objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}: ${item.title}`,
-            laneObjective: objective,
+            objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}${declined ? ` (after ${declined.count} decline(s))` : ""}: ${item.title}`,
+            laneObjective,
             readOnly: action.kind === "review" || action.kind === "decide",
             taskProfile: profile,
             // The decide stage reads the project, not an item worktree.
