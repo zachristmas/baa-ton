@@ -45,6 +45,30 @@ test("a fresh heartbeat is alive; a stale one with no lease holder is relaunched
   }
 });
 
+test("a runner that just took the lease after a restart is starting, not hung (a live false alarm)", async () => {
+  const d = await dir();
+  try {
+    // The old runner (41) wrote the last heartbeat, then exited to restart on
+    // new code; the new runner (42) took the lease 39 s later.
+    writeHeartbeat(d.path, { pid: 41, at: new Date(T0).toISOString() });
+    await mkdir(join(d.path, "supervisor.lock"), { recursive: true });
+    await writeFile(join(d.path, "supervisor.lock", "owner.json"), JSON.stringify({ pid: 42, created_at: new Date(T0 + 39_000).toISOString() }));
+    const anomalies = [];
+    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, now, alive: (pid) => pid === 42, launch: () => 1, anomaly: async (anomaly) => anomalies.push(anomaly) });
+    assert.deepEqual(await run(T0 + 60_000), { status: "starting", pid: 42 });
+    assert.equal(anomalies.length, 0, "no report during a restart");
+    // In the gap before anyone holds the lease, a recent heartbeat means a restart too.
+    const gap = await ensureSupervisor({ configDir: d.path, env: {}, now: T0 + 20_000, alive: () => false, launch: () => { throw new Error("no relaunch in a restart gap"); }, anomaly: async (anomaly) => anomalies.push(anomaly) });
+    assert.deepEqual(gap, { status: "restarting" });
+    assert.equal(anomalies.length, 0);
+    // Still no heartbeat of its own 2 min after taking the lease: now it is hung.
+    assert.equal((await run(T0 + 39_000 + HEARTBEAT_STALE_MS + 1)).status, "hung");
+    assert.equal(anomalies.length, 1);
+  } finally {
+    await d.cleanup();
+  }
+});
+
 test("a stale heartbeat while a live process holds the lease is reported as hung, never duplicated; tests and a missing config dir skip", async () => {
   const d = await dir();
   try {
