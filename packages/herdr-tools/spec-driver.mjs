@@ -858,6 +858,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,
+    `Never leave ${integrationBranch} half-merged or staged: if you stop before committing (a conflict you cannot resolve, a failing hook, a decline), run git merge --abort (or git reset --merge) so the worktree is clean for the next lane.`,
     "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
     "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then the FAILED lines, what you changed and the suite output for a failure.",
   ].filter(Boolean).join("\n");
