@@ -17,7 +17,7 @@
  *   - a loop variable bound only by `for V in <session scratchpad glob>; do
  *     break; done`, never reassigned, removed with -rf;
  *   - one named file (no glob) inside a session scratchpad, removed with -f;
- *   - a relative directory the same command recreates with `mkdir -p`;
+ *   - a relative directory the same command recreates with `mkdir` or `mkdir -p`;
  *   - a `selftest-XXXXXXXX` directory (optionally under runtime/).
  *   `find . -maxdepth 1 -type d -name 'selftest-*' -exec rm -rf {} +` counts
  *   as the selftest rule. Any `..` anywhere in a target is unsafe.
@@ -40,7 +40,7 @@ const KNOWN_SUBSTITUTIONS = [/\$\(mktemp -d(?: [\w./-]+)*\)/g, /\$\(gh auth toke
 const INERT = [
   /^(pwd|ls|cat|head|tail|wc|grep|rg|echo|printf|true|false|test|date|which|stat|du|sort|uniq|cut|tr|diff|cmp|basename|dirname|realpath|jq)(\s|$)/,
   /^\[ .* \]$/,
-  /^(mkdir -p|touch)(\s+"?[\w./$-]+"?)+$/,
+  /^(mkdir(?: -p)?|touch)(\s+"?[\w./$-]+"?)+$/,
   // A copy whose destination is a relative path in the worktree.
   /^cp(?:\s+-[a-z]+)*\s+"?[^\s;&|"]+"?\s+"?[\w.][\w./-]*"?$/,
   /^(?:export )?\w+="?SUBST"?$/,
@@ -83,7 +83,8 @@ function createdFiles(body, heredocTargets) {
   const found = [
     ...heredocTargets,
     ...[...body.matchAll(/git show HEAD:\S+(?:\s*\|\s*sed\s+[^>\n]*?)?\s>\s*("?[\w./$-]+"?)/g)].map((match) => unquote(match[1])),
-    ...[...body.matchAll(/(?<![>&\d])>\s*("?[\w.][\w./-]*"?)/g)].map((match) => unquote(match[1])),
+    // `>`, `2>` and `&>` create (truncate) the file; `>>` appends and does not.
+    ...[...body.matchAll(/(?<![>\w])(?:[12&])?>(?!>)\s*("?[\w.][\w./-]*"?)/g)].map((match) => unquote(match[1])),
     ...[...body.matchAll(/(?:^|[\s;&|(])touch((?:\s+"?[\w.][\w./-]*"?)+)/g)].flatMap((match) => match[1].trim().split(/\s+/).map(unquote)),
     ...[...body.matchAll(/(?:^|[\s;&|(])cp(?:\s+-\w+)*\s+\S+\s+("?[\w.][\w./-]*"?)(?=[\s;&|]|$)/g)].map((match) => unquote(match[1])),
   ];
@@ -269,7 +270,7 @@ function rmVerdict(segment, context) {
     else if (
       flags === "-rf" &&
       /^(?![/~])[\w.-]+(\/[\w.-]+)*$/.test(target) &&
-      new RegExp(`mkdir -p "?${escapeRegExp(target)}"?(\\s|$|&|;)`).test(context.body)
+      new RegExp(`mkdir(?: -p)? "?${escapeRegExp(target)}"?(\\s|$|&|;)`).test(context.body)
     )
       rule = "rm-recreated-dir";
     else if ((flags === "-f" || flags === "") && created.has(target)) rule = "rm-created-file";
