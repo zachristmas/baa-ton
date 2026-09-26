@@ -164,6 +164,18 @@ export function approvalPolicyHash(policy: ApprovalPolicy): string {
   return createHash("sha256").update(canonical(policy)).digest("hex");
 }
 
+/**
+ * Whether the root's acknowledgement covers this policy. Adding the
+ * spec-push grant (approved by the user in the config file) keeps an
+ * existing acknowledgement valid: the acknowledged hash may be that of the
+ * same policy without spec-push. Any other change needs a new one.
+ */
+export function approvalAckMatches(ack: { hash?: string } | undefined, policy: ApprovalPolicy): boolean {
+  if (!ack?.hash) return false;
+  if (ack.hash === approvalPolicyHash(policy)) return true;
+  return policy.grants.includes("spec-push") && ack.hash === approvalPolicyHash({ ...policy, grants: policy.grants.filter((grant) => grant !== "spec-push") });
+}
+
 /** Why an operation falls outside the standing policy, or undefined when it
  * is inside. Worktree cleanliness is checked by the caller (it needs git). */
 export function outsidePolicyReason(
@@ -208,7 +220,7 @@ export function standingDecision(
   const hash = approvalPolicyHash(policy);
   const outside = outsidePolicyReason(policy, workflow, operation);
   if (outside) return { kind: "outside", reason: outside, policy, hash };
-  if (ack?.hash !== hash) return { kind: "needs-ack", policy, hash };
+  if (!approvalAckMatches(ack, policy)) return { kind: "needs-ack", policy, hash };
   return { kind: "granted", policy, hash };
 }
 

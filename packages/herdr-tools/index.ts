@@ -103,6 +103,7 @@ import {
   approvalPolicySummary,
   validateApprovalPolicy,
   approvalPolicyHash,
+  approvalAckMatches,
   type ApprovalPolicyAck,
   type StandingOperation,
   type StandingResult,
@@ -3729,7 +3730,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     try {
       const policy = validateApprovalPolicy(raw);
       const hash = approvalPolicyHash(policy);
-      return { configured: true as const, valid: true as const, policy, hash, acknowledged: ack?.hash === hash, ack };
+      return { configured: true as const, valid: true as const, policy, hash, acknowledged: approvalAckMatches(ack, policy), ack };
     } catch (error) {
       return { configured: true as const, valid: false as const, error: (error as Error).message, ack };
     }
@@ -3842,7 +3843,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     try {
       const policy = validateApprovalPolicy(raw);
       if (!policy.grants.includes(grant)) return `approvalPolicy does not grant ${grant}`;
-      if (ack?.hash !== approvalPolicyHash(policy))
+      if (!approvalAckMatches(ack, policy))
         return "approvalPolicy is not acknowledged by the root";
       return undefined;
     } catch (error) {
@@ -4424,7 +4425,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function acknowledgedPolicy(cwd: string, ack: ApprovalPolicyAck | undefined) {
     try {
       const policy = validateApprovalPolicy(loadTaskProfileConfig(cwd)?.approvalPolicy);
-      return ack?.hash === approvalPolicyHash(policy) ? policy : undefined;
+      return approvalAckMatches(ack, policy) ? policy : undefined;
     } catch {
       return undefined;
     }
