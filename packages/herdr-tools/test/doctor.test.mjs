@@ -416,6 +416,22 @@ test("lane-bridge-liveness tolerates gone panes only with durable completion rec
 
     goneResult = { code: 1, stderr: "agent_not_found (unstructured)", stdout: "" };
     assert.equal((await check({ id: "lane-gone", completionReceipt: { id: "receipt-b", summary: "Done" } })).status, "fail");
+
+    // A lane that never started had no bridge; a retired lane is not even queried.
+    goneResult = { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "agent_not_found", message: "agent target w1:p3 not found" }, id: "cli:agent:get" }) };
+    const neverStarted = await check({ id: "lane-gone", status: "dispatch-failed" });
+    assert.equal(neverStarted.status, "warn");
+    assert.match(neverStarted.detail, /lane-gone \(w1:p3\) never started \(dispatch-failed\)/);
+    goneResult = { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "internal_error", message: "must not be asked" } }) };
+    const retired = await check({ id: "lane-gone", status: "done", retirement: { status: "retired" } });
+    assert.equal(retired.status, "ok");
+    assert.match(retired.detail, /Skipped 1 retired lane/);
+    // Every lane is reported: a failure no longer hides the live lane's evidence.
+    goneResult = { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "agent_not_found", message: "gone" }, id: "cli:agent:get" }) };
+    const both = await check({ id: "lane-gone", status: "done" });
+    assert.equal(both.status, "fail");
+    assert.match(both.detail, /lane-live \(w1:p2\) native\/bridge evidence present/);
+    assert.match(both.detail, /record its outcome with herdr_close or herdr_supersede/);
   } finally {
     for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
     await rm(directory, { recursive: true, force: true });
