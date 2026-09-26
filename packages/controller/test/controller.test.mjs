@@ -4435,3 +4435,35 @@ test("every blocked event runs the blocked-lane handler and reports its outcome 
     await fixture.cleanup();
   }
 });
+
+test("a blocked event from a registered operator agent's pane is handled, not ignored", async () => {
+  const fixture = await createFixture({ piGoalPauseDetection: false });
+  const storeDir = await mkdtemp(join(tmpdir(), "baa-operator-hook-"));
+  const saved = process.env.BAATON_OPERATOR_STORE;
+  process.env.BAATON_OPERATOR_STORE = join(storeDir, "operator.json");
+  const pane = { pane_id: "w-admin:p2", workspace_id: "w-admin" };
+  await writeFile(process.env.BAATON_OPERATOR_STORE, JSON.stringify({ version: 1, agents: { "lane-admin": { paneId: pane.pane_id, workspaceId: pane.workspace_id, agentKind: "claude" } }, messages: [] }));
+  const mock = await startHerdrMock((request) => {
+    if (request.method === "agent.read" && request.params.source === "visible")
+      return { result: { type: "pane_read", read: { pane_id: pane.pane_id, text: "Which base should I use?\n\n❯ 1. main (Recommended)\n  2. release\n\nEnter to select · Esc to cancel" } } };
+    throw new Error(`Unexpected method: ${request.method}`);
+  });
+  try {
+    const event = { event: "pane_agent_status_changed", data: { type: "pane_agent_status_changed", pane_id: pane.pane_id, workspace_id: pane.workspace_id, agent_status: "blocked", agent: "claude" } };
+    const result = await handleHook({ eventName: "pane.agent_status_changed", eventJson: event, stateDir: fixture.stateDir, herdr: client(mock) });
+    const output = hookResponse(result);
+    assert.equal(output.operatorAgent, "lane-admin");
+    assert.deepEqual([output.blocked.status, output.blocked.kind, output.blocked.to], ["routed", "question", "operator"]);
+    const store = JSON.parse(await readFile(process.env.BAATON_OPERATOR_STORE, "utf8"));
+    assert.equal(store.prompts[0].agent, "lane-admin");
+    assert.deepEqual(store.prompts[0].default.keys, ["1"], "the Recommended option once the wait is over");
+    const other = { ...event, data: { ...event.data, pane_id: "w-admin:p9" } };
+    assert.equal(hookResponse(await handleHook({ eventName: "pane.agent_status_changed", eventJson: other, stateDir: fixture.stateDir, herdr: client(mock) })).reason, "unmapped_event");
+  } finally {
+    if (saved === undefined) delete process.env.BAATON_OPERATOR_STORE;
+    else process.env.BAATON_OPERATOR_STORE = saved;
+    await mock.close();
+    await fixture.cleanup();
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});

@@ -64,10 +64,11 @@ export async function readOperatorInbox({ all = false, unread = false, limit = 2
   return operatorInbox(await readOperatorStore(path), { all, limit });
 }
 
-export async function registerAgent({ name, paneId, workspaceId, agentKind, env = process.env } = {}) {
+export async function registerAgent({ name, paneId, workspaceId, agentKind, cwd, env = process.env } = {}) {
   const path = operatorStorePath(env);
+  // The agent's working folder bounds the unattended policy for its prompts.
   const agent = await withOperatorStore(path, (store) =>
-    registerOperatorAgent(store, { name, paneId: paneId ?? env.HERDR_PANE_ID, workspaceId: workspaceId ?? env.HERDR_WORKSPACE_ID, agentKind }),
+    registerOperatorAgent(store, { name, paneId: paneId ?? env.HERDR_PANE_ID, workspaceId: workspaceId ?? env.HERDR_WORKSPACE_ID, agentKind, cwd: cwd ?? process.cwd() }),
   );
   return { name, ...agent, instructions: OPERATOR_AUTHORITY };
 }
