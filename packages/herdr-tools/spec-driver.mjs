@@ -49,6 +49,43 @@ const RECEIPT_FORMAT = {
 const STAGE_OF = { deciding: "decide", building: "build", reviewing: "review", integrating: "integrate", verifying: "verify" };
 /** Workflow statuses after which a lane no longer occupies its worktree. */
 const CLOSED_WORKFLOW = new Set(["closed", "completed", "operator-closed", "superseded", "retired"]);
+/** Per-lane receipt and background bookkeeping on an item record. */
+const LANE_BOOKKEEPING = [
+  "receiptAskedAt",
+  "receiptPointedAt",
+  "receiptInferRequestedAt",
+  "receiptInferred",
+  "receiptInferFailedAt",
+  "receiptEscalatedAt",
+  "receiptAskAfter",
+  "receiptStatusReplies",
+  "backgroundWork",
+  "backgroundSince",
+  "backgroundStaleAt",
+];
+
+/**
+ * Bookkeeping from before the item's current stage (records written before
+ * move() cleared it): any timestamp older than `since` belongs to an earlier
+ * lane. Cleared once; the counters go with them.
+ */
+function dropStaleBookkeeping(item) {
+  const since = Date.parse(item?.since ?? "");
+  if (!Number.isFinite(since)) return;
+  const stamp = (value) => Date.parse(typeof value === "string" ? value : value?.at ?? "");
+  let dropped = false;
+  for (const key of LANE_BOOKKEEPING) {
+    const at = stamp(item[key]);
+    if (Number.isFinite(at) && at < since) {
+      delete item[key];
+      dropped = true;
+    }
+  }
+  if (dropped && !LANE_BOOKKEEPING.some((key) => key !== "receiptStatusReplies" && key !== "backgroundWork" && item[key] !== undefined)) {
+    delete item.receiptStatusReplies;
+    delete item.backgroundWork;
+  }
+}
 const LANE_ENDED = new Set(["operator-closed", "superseded", "dispatch-failed", "failed", "closed"]);
 
 /** Static prefix of a glob (everything before the first wildcard). */
@@ -277,6 +314,7 @@ export function advanceSpec({
 }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
   next.items ??= {};
+  for (const item of Object.values(next.items)) dropStaleBookkeeping(item);
   const actions = [];
   const rootAsks = [];
   const reclaimed = [];
@@ -285,6 +323,9 @@ export function advanceSpec({
   const move = (id, to, extra = {}, note) => {
     const item = record(id);
     const from = item.state ?? "pending";
+    // A new stage gets a new lane: the last lane's receipt and background
+    // bookkeeping does not carry over.
+    if (from !== to) for (const key of LANE_BOOKKEEPING) delete item[key];
     Object.assign(item, extra, { state: to, since: now });
     if (to !== "blocked") delete item.blockedReason;
     (item.history ??= []).push({ at: now, from, to, ...(note ? { note } : {}) });
@@ -397,6 +438,12 @@ export function advanceSpec({
           delete next.baselineRun;
         }
       }
+    } else if (view && (view.status === "dispatch-failed" || view.workflowStatus === "dispatch-failed")) {
+      // It never started (a shell or session that was not ready): an
+      // infrastructure error, not an attempt. A fresh lane after a backoff.
+      run.infraFailures = (run.infraFailures ?? 0) + 1;
+      run.retryAfter = new Date(Date.parse(now) + infraBackoffMs(run.infraFailures)).toISOString();
+      delete run.lane;
     } else if (!view || LANE_ENDED.has(view.status)) {
       run.attempts = (run.attempts ?? 1) + 1;
       delete run.lane;
@@ -731,7 +778,8 @@ export function advanceSpec({
       next.baselineRun = { kind: "fix-baseline", targetSha, attempts: 1, requestedAt: now };
   }
   if (next.baselineRun && next.baselineRun.targetSha !== targetSha && !next.baselineRun.lane) delete next.baselineRun;
-  if (useBaseline && next.baselineRun && !next.baselineRun.lane && !capacityWaiting)
+  const baselineBackoff = typeof next.baselineRun?.retryAfter === "string" && Date.parse(now) < Date.parse(next.baselineRun.retryAfter);
+  if (useBaseline && next.baselineRun && !next.baselineRun.lane && !capacityWaiting && !baselineBackoff)
     actions.push({
       kind: next.baselineRun.kind,
       itemId: "",
@@ -796,6 +844,11 @@ export function advanceSpec({
   // 1d2. Verification: once the preview reports a release containing the
   // item's commit, a verify lane runs its preview specs and writes the final
   // report. Items with nothing to verify on the preview skip the lane.
+  // A verify lane that records an evidence report runs the app locally (a
+  // dev stack: ports, a database); two at once collide, so they take turns.
+  const devStacks = spec.defaults.maxDevStacks ?? 1;
+  const runsDevStack = (item) => Boolean(item.acceptance.evidence);
+  const onDevStack = spec.items.filter((item) => runsDevStack(item) && next.items[item.id]?.state === "verifying" && next.items[item.id]?.lane).map((item) => item.id);
   for (const item of spec.items) {
     const current = next.items[item.id];
     if (current?.state !== "verifying" || current.lane || current.verified) continue;
@@ -816,6 +869,11 @@ export function advanceSpec({
       }
       current.releaseSha = releaseSha;
     }
+    if (runsDevStack(item) && onDevStack.length >= devStacks) {
+      waits[item.id] = `dev stack busy: ${onDevStack.join(", ")} verifying on it (at most ${devStacks} at a time)`;
+      continue;
+    }
+    if (runsDevStack(item)) onDevStack.push(item.id);
     actions.push({ kind: "verify", itemId: item.id, attempt: 1 });
   }
 
@@ -938,9 +996,15 @@ export function decideObjective(spec, item) {
 }
 
 /** The verify lane's objective: preview specs against the deployed release, then the final report. */
-export function verifyObjective(spec, item, { releaseSha, reportPath }) {
+export function verifyObjective(spec, item, { worktree, releaseSha, reportPath }) {
   return [
     `Verify spec item ${item.id}: ${item.title}, now pushed to ${spec.target.remote}/${spec.target.branch}${releaseSha ? ` and deployed (release ${releaseSha})` : ""}.`,
+    worktree
+      ? `Your worktree is ${worktree} (a detached checkout of the pushed commit), and you start in it: run every command from it with relative paths, never cd into a retyped absolute path.`
+      : "",
+    item.acceptance.evidence
+      ? "If you start the app locally, you are the only lane running a dev stack now (the driver serializes them); stop it before you finish."
+      : "",
     item.acceptance.preview.length && spec.target.preview
       ? `Run these browser specs against the preview at ${spec.target.preview.url}: ${item.acceptance.preview.join(", ")}.`
       : "",

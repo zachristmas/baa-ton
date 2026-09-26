@@ -118,7 +118,7 @@ export function validateSpec(input) {
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines", "evidence"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines", "evidence", "maxDevStacks"], "spec.defaults");
     // Evidence every item needs unless it names its own: a Word demo with
     // captioned screenshots. The report path may use {id}.
     if (input.defaults.evidence !== undefined) {
@@ -133,6 +133,8 @@ export function validateSpec(input) {
       };
     }
     if (input.defaults.maxDeclines !== undefined) defaults.maxDeclines = positiveInteger(input.defaults.maxDeclines, "spec.defaults.maxDeclines", { max: 10 });
+    // Verify lanes that run the app locally at once (1: they take turns).
+    if (input.defaults.maxDevStacks !== undefined) defaults.maxDevStacks = positiveInteger(input.defaults.maxDevStacks, "spec.defaults.maxDevStacks", { max: 8 });
     if (input.defaults.fixBaseline !== undefined) {
       if (typeof input.defaults.fixBaseline !== "boolean") throw new Error("spec.defaults.fixBaseline must be true or false.");
       if (input.defaults.fixBaseline) defaults.fixBaseline = true;

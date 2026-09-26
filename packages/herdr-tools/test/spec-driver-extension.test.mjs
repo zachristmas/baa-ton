@@ -2011,3 +2011,35 @@ test("spec lanes whose receipt the driver consumed are retired under the retire 
     await noGrant.cleanup();
   }
 });
+
+test("spec lanes without a receipt that no item maps are retired once idle and past the grace (a live cleanup)", async () => {
+  // As it stood live: lanes whose dispatch "failed" though an agent started,
+  // lanes of operator-closed workflows still holding an agent, an integrate
+  // lane whose item moved on. None has a receipt.
+  const spec = { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "A", title: "A", acceptance: { text: "a" } }] };
+  const seed = { version: 1, items: { A: { state: "building", attempts: 1, lane: { workflowId: "herdr-cur", laneId: "lane-1" } } } };
+  const f = await fixture({ grants: ["dispatch", "integrate", "retire"], specDocument: spec, seed });
+  try {
+    const old = "2026-09-24T11:00:00.000Z";
+    const recent = "2026-09-24T11:55:00.000Z";
+    const lane = (id, extra) => ({ id: "lane-1", status: "done", specStage: "build", paneId: `w:${id}`, tabId: `t:${id}`, ...extra });
+    const manifest = await f.manifest();
+    manifest.workflows.push(
+      { id: "herdr-planned", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("planned", { status: "planned", specStage: "review", tabCreateAttemptedAt: old })], evidence: [] },
+      { id: "herdr-closed", status: "operator-closed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("closed", { status: "operator-closed", agentStartedAt: old })], evidence: [] },
+      { id: "herdr-young", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("young", { agentStartedAt: recent })], evidence: [] },
+      { id: "herdr-busy", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("busy", { agentStartedAt: old })], evidence: [] },
+      { id: "herdr-cur", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [lane("cur", { agentStartedAt: old })], evidence: [] },
+      { id: "herdr-plain", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "done", paneId: "w:plain", tabId: "t:plain", agentStartedAt: old }], evidence: [] },
+    );
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    f.ports.agentPresent = async (paneId) => paneId === "w:busy";
+    const retired = [];
+    f.ports.retire = async (candidate) => retired.push(candidate.workflowId);
+    const result = await f.advance();
+    assert.deepEqual(retired.sort(), ["herdr-closed", "herdr-planned"], "not the item's current lane, a lane in its grace, a working one, or a non-spec lane");
+    assert.match(result.content[0].text, /retired herdr-planned\/lane-1/);
+  } finally {
+    await f.cleanup();
+  }
+});
