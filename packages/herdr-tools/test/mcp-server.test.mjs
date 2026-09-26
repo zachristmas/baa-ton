@@ -312,7 +312,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
         name: "herdr_bootstrap_root",
         arguments: {},
       });
-      assert.equal(bootstrap.result.isError, undefined);
+      assert.equal(bootstrap.result.isError, undefined, `bootstrap failed: ${bootstrap.result.content?.map((item) => item.text).join("\n")}`);
       assert.match(bootstrap.result.content.map((item) => item.text).join("\n"), /ROOT BRIEFING/);
       assert.match(bootstrap.result.structuredContent.rootBriefing, /sole Baa-ton parent executor/);
       assert.equal(bootstrap.result.structuredContent.root.agent_kind, "claude");
@@ -405,7 +405,7 @@ test("MCP message occurrences remain distinct when a harness reuses a request id
         name: "herdr_bootstrap_root",
         arguments: {},
       });
-      assert.equal(bootstrap.result.isError, undefined);
+      assert.equal(bootstrap.result.isError, undefined, `bootstrap failed: ${bootstrap.result.content?.map((item) => item.text).join("\n")}`);
 
       const first = await rpc("tools/call", {
         name: "herdr_plan",

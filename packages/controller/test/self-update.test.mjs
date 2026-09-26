@@ -329,3 +329,16 @@ test("runtime records of ended processes are pruned", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("every failing test is collected from the stream, not only the tail", async () => {
+  const { createFailureCollector } = await import("../self-update.mjs");
+  const collector = createFailureCollector();
+  const noise = "ok 1 - fine\n  ---\n  duration_ms: 1\n  ...\n".repeat(200);
+  collector.add("# Subtest: first\nnot ok 7 - mapped root bridge exposes root-role parity\n  ---\n  error: 'bootstrap failed: timed out'\n  location: 'a.test.mjs:276:1'\n");
+  collector.add(`  ...\n${noise}`);
+  collector.add("not ok 9 - another one\n  ---\n  error: boom\n  ...\nok 10 - after");
+  const text = collector.text();
+  assert.match(text, /^not ok 7 - mapped root bridge exposes root-role parity\n {2}---\n {2}error: 'bootstrap failed: timed out'/);
+  assert.match(text, /not ok 9 - another one\n {2}---\n {2}error: boom/);
+  assert.doesNotMatch(text, /ok 1 - fine|ok 10 - after/);
+});

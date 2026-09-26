@@ -110,6 +110,8 @@ export function detectAnomalies({ entry, specStall, specReason, specState, times
     if (count >= 3) found.push({ kind: "repeated-alert", decision: true, signature: `alert:${text.slice(0, 120)}`, summary: `the same root alert was raised ${count} times`, evidence: [text] });
   for (const [id, record] of Object.entries(specState?.items ?? {})) {
     if (!record?.lane || !record.receiptPointedAt) continue;
+    // A failed, done or held item waits on no receipt.
+    if (["failed", "done", "blocked"].includes(record.state)) continue;
     if (now - Date.parse(record.receiptPointedAt) >= RECEIPT_ANOMALY_MS)
       found.push({ kind: "receipt-missing", signature: `receipt:${id}:${record.lane.workflowId}`, summary: `${id}'s lane ${record.lane.workflowId} is still without a receipt ${Math.round((now - Date.parse(record.receiptPointedAt)) / 60_000)} min after the pointed ask`, evidence: [`state: ${record.state}`, record.receiptInferRequestedAt ? `inference requested at ${record.receiptInferRequestedAt}` : "no inference yet"] });
   }

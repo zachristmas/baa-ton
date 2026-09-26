@@ -491,3 +491,10 @@ test("a new stage does not inherit the last lane's receipt bookkeeping (a live f
   assert.deepEqual(record.lane, { workflowId: "herdr-rev", laneId: "lane-1" }, "the current lane stays");
   assert.equal(record.state, "reviewing");
 });
+
+test("a review never judges the demo evidence: the verify stage produces it", () => {
+  const s = spec([{ id: "R" }], { evidence: { report: "artifacts/{id}.docx", minImages: 2 } });
+  const objective = reviewObjective(s, s.items[0], { branch: "spec/R", buildSummary: "built" });
+  assert.match(objective, /Do not judge the demo evidence or runtime proof/);
+  assert.doesNotMatch(objective, /Check the evidence report/);
+});

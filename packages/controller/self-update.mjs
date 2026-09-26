@@ -46,22 +46,60 @@ async function defaultRun(command, args, options = {}) {
   return stdout.trim();
 }
 
-/** `npm ci` when the lockfile changed, then `npm test`; resolves { ok, output }. Tracked, never detached. */
+/**
+ * Every failing test in a TAP stream: each `not ok` line with the lines of
+ * its diagnostic block (error, location), wherever it fell in the output.
+ * A tail alone loses a failure that scrolled past.
+ */
+export function createFailureCollector({ blockLines = 14, maxBlocks = 20 } = {}) {
+  const blocks = [];
+  let partial = "";
+  let open;
+  return {
+    add(chunk) {
+      const lines = (partial + chunk).split("\n");
+      partial = lines.pop() ?? "";
+      for (const line of lines) {
+        if (/^not ok \d+ /.test(line)) {
+          if (blocks.length >= maxBlocks) {
+            open = undefined;
+            continue;
+          }
+          open = { lines: [line], left: blockLines };
+          blocks.push(open);
+        } else if (open && open.left > 0) {
+          if (/^(ok|not ok) \d+ |^# Subtest/.test(line)) open = undefined;
+          else {
+            open.lines.push(line);
+            open.left -= 1;
+          }
+        }
+      }
+    },
+    text() {
+      return blocks.map((block) => block.lines.join("\n")).join("\n");
+    },
+  };
+}
+
+/** `npm ci` when the lockfile changed, then `npm test`; resolves { ok, output, failures }. Tracked, never detached. */
 function defaultStartTests({ dir, install, env = process.env }) {
   const runOne = (args) => runCommand("npm", args);
   const runCommand = (command, args) =>
     new Promise((resolve) => {
       const child = spawn(command, args, { cwd: dir, env: { ...env, BAATON_SELF_UPDATE: "0" }, stdio: ["ignore", "pipe", "pipe"] });
       let output = "";
+      const failures = createFailureCollector();
       const keep = (chunk) => {
         output = (output + chunk).slice(-8000);
+        failures.add(String(chunk));
       };
       child.stdout.on("data", keep);
       child.stderr.on("data", keep);
       const timer = setTimeout(() => child.kill("SIGTERM"), SELF_UPDATE_TEST_TIMEOUT_MS);
       child.on("close", (code) => {
         clearTimeout(timer);
-        resolve({ ok: code === 0, output });
+        resolve({ ok: code === 0, output, failures: failures.text() });
       });
       child.on("error", (error) => {
         clearTimeout(timer);
@@ -246,14 +284,16 @@ export function createSelfUpdater({
         active = undefined;
         const attempts = (state.tested?.[sha]?.attempts ?? 0) + 1;
         const final = result.ok || attempts >= SELF_UPDATE_TEST_ATTEMPTS;
-        (state.tested ??= {})[sha] = { result: result.ok ? "pass" : final ? "fail" : "retry", at: now(), attempts, ...(result.ok ? {} : { tail: result.output.slice(-1500) }) };
+        (state.tested ??= {})[sha] = { result: result.ok ? "pass" : final ? "fail" : "retry", at: now(), attempts, ...(result.ok ? {} : { tail: result.output.slice(-1500), ...(result.failures ? { failures: String(result.failures).slice(0, 6000) } : {}) }) };
         delete state.testing;
         await git(checkout, "worktree", "remove", "--force", dir).catch(() => rm(dir, { recursive: true, force: true }));
+        const failing = String(result.failures ?? "").split("\n").filter((line) => /^not ok /.test(line)).map((line) => line.replace(/^not ok \d+ - /, "")).slice(0, 5);
+        const named = failing.length ? `: ${failing.join("; ")}` : "";
         if (result.ok) events.push(...(await apply(state, sha)));
-        else if (!final) events.push(`${sha.slice(0, 12)} failed npm test (run ${attempts} of ${SELF_UPDATE_TEST_ATTEMPTS}); retrying at the next check`);
+        else if (!final) events.push(`${sha.slice(0, 12)} failed npm test (run ${attempts} of ${SELF_UPDATE_TEST_ATTEMPTS}); retrying at the next check${named}`);
         else {
-          events.push(`${sha.slice(0, 12)} failed npm test ${attempts} times; not deployed`);
-          await Promise.resolve(anomaly({ kind: "self-update-test-failed", signature: `update-test:${sha}`, summary: `${sha.slice(0, 12)} failed npm test and was not deployed`, evidence: result.output.split("\n").slice(-30) })).catch(() => undefined);
+          events.push(`${sha.slice(0, 12)} failed npm test ${attempts} times; not deployed${named}`);
+          await Promise.resolve(anomaly({ kind: "self-update-test-failed", signature: `update-test:${sha}`, summary: `${sha.slice(0, 12)} failed npm test and was not deployed`, evidence: (result.failures ? String(result.failures) : result.output).split("\n").slice(0, 60) })).catch(() => undefined);
           await notify({ title: "Baa-ton update failed its tests", body: `${sha.slice(0, 12)} is not deployed. ${result.output.slice(-300)}` });
         }
       } else if (!active && (!state.lastCheckAt || Date.parse(now()) - Date.parse(state.lastCheckAt) >= SELF_UPDATE_CHECK_MS)) {

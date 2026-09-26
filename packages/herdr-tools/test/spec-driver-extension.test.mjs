@@ -2043,3 +2043,85 @@ test("spec lanes without a receipt that no item maps are retired once idle and p
     await f.cleanup();
   }
 });
+
+test("changes outside an item's owns are set aside as a patch and the item carries on, not held for a human (a live hold)", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "A", title: "Stray", owns: ["src/a/**"], acceptance: { text: "a" } }] },
+    seed: { version: 1, items: { A: { state: "reviewing", attempts: 1, worktree: "/work/wt-a", branch: "demo/a", adopted: { worktree: "/work/wt-a" } } } },
+  });
+  try {
+    f.ports.status = async () => " M src/a/x.ts\n M apps/storefront/src/features/other.ts";
+    const setAside = [];
+    f.ports.setAside = async (input) => setAside.push(input);
+    const commits = [];
+    f.ports.commit = async (input) => (commits.push(input), "c".repeat(40));
+    const result = await f.advance();
+    assert.equal(setAside.length, 1);
+    assert.deepEqual(setAside[0].paths, ["apps/storefront/src/features/other.ts"]);
+    assert.match(setAside[0].patch, /patches\/A-.*-outside-owns\.patch$/);
+    assert.deepEqual(commits.map((commit) => commit.paths), [["src/a/x.ts"]], "the item's own work is still committed");
+    const state = await f.state();
+    assert.notEqual(state.items.A.state, "blocked", "not held");
+    assert.match(result.content[0].text, /set aside 1 path\(s\) outside A's owns/);
+    assert.ok(state.items.A.history.some((entry) => /set aside changes outside its owns as .*outside-owns\.patch/.test(entry.note)));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("missing or invalid demo evidence is never terminal: a demo lane is dispatched, told what was wrong, after a backoff (a live stall)", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      defaults: { evidence: { report: "artifacts/{id}.docx", minImages: 3 } },
+      items: [{ id: "D04", title: "Demo", acceptance: { text: "d" } }],
+    },
+    seed: { version: 1, items: { D04: { state: "verifying", attempts: 1, integratedSha: "a".repeat(40), verified: "2026-09-24T11:00:00.000Z" } } },
+  });
+  try {
+    f.ports.ancestor = async () => true;
+    f.ports.now = () => "2026-09-24T12:00:00.000Z";
+    const first = await f.advance();
+    let state = await f.state();
+    assert.equal(state.items.D04.state, "verifying", "never failed");
+    assert.equal(state.items.D04.verified, undefined, "the verify step runs again");
+    assert.equal(state.items.D04.evidenceRetries, 1);
+    assert.equal(state.items.D04.evidenceRetryAfter, "2026-09-24T12:10:00.000Z");
+    assert.match(first.content[0].text, /evidence for D04 failed the check; a demo lane follows/);
+    const planned = f.calls.plan.length;
+    await f.advance();
+    assert.equal(f.calls.plan.length, planned, "waits out the backoff");
+    f.ports.now = () => "2026-09-24T12:11:00.000Z";
+    await f.advance();
+    const demo = f.calls.plan.at(-1);
+    assert.equal(demo.specStage, "verify");
+    assert.match(demo.laneObjective, /The last run's demo evidence failed the check: .*Producing that evidence is this lane's main job/);
+    state = await f.state();
+    assert.ok(state.items.D04.lane, "a demo lane runs");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an item whose review failed on demo evidence gets one fresh review; one that failed on code does not", async () => {
+  const failed = (findings) => ({ state: "failed", attempts: 3, worktree: "/work/wt", branch: "spec/x", findings, history: [{ at: "2026-09-24T10:00:00.000Z", from: "reviewing", to: "failed", note: "review failed" }] });
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "E", title: "Evidence", acceptance: { text: "e" } }, { id: "K", title: "Code", acceptance: { text: "k" } }] },
+    seed: { version: 1, items: { E: failed("VERDICT: FAIL\nFAIL reason: acceptance requires observed runtime proof; the only evidence artifact is pre-fix."), K: failed("VERDICT: FAIL\n1. src/k.ts: the new function has zero callers.") } },
+  });
+  try {
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.items.E.state, "reviewing");
+    assert.ok(state.items.E.reviewRearmedForEvidence);
+    assert.equal(state.items.K.state, "failed", "a code failure stays failed");
+    const again = await f.state();
+    again.items.E = { ...again.items.E, state: "failed", history: [...again.items.E.history, { at: "2026-09-24T12:30:00.000Z", from: "reviewing", to: "failed", note: "review failed" }], findings: "runtime proof missing" };
+    await writeFile(join(f.stateDir, "spec-state.json"), JSON.stringify(again));
+    await f.advance();
+    assert.equal((await f.state()).items.E.state, "failed", "only once");
+  } finally {
+    await f.cleanup();
+  }
+});

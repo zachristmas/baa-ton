@@ -199,7 +199,9 @@ const MANIFEST_DIR = ".baa-ton/herdr-orchestrator";
 const MANIFEST_NAME = "manifest.json";
 const OWNER = "herdr-orchestrator";
 const BB029_AUTHORIZATION_SCOPE = "BB-029";
-const HERDR_COMMAND_TIMEOUT_MS = 35_000;
+// A loaded machine can take tens of seconds to start a process; the test
+// runner raises this so a slow fake herdr is not a failure.
+const HERDR_COMMAND_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 35_000;
 const execFile = promisify(execFileCallback);
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
@@ -4646,6 +4648,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     aheadOf?(repo: string, branch: string, base: string): Promise<number>;
     /** Put `paths` in `worktree` back to HEAD (generated build artifacts). */
     restore?(input: { worktree: string; paths: string[] }): Promise<void>;
+    /** Save `paths`' changes as a patch file, then restore them to HEAD. */
+    setAside?(input: { worktree: string; paths: string[]; patch: string }): Promise<void>;
     /** The loaded code's fingerprint (holds retry once it changes). */
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
@@ -4830,6 +4834,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: stateOf[stage], note: `re-armed: ${stage} was exhausted only by infrastructure errors` }];
         Object.assign(record, { state: stateOf[stage], since: use.now(), rearmedByCode: codeVersion });
         for (const key of ["blockedReason", "note", "declined", "infraFailures", "infraRetryAfter", "infraAlertedAt", "lane"]) delete record[key];
+        void id;
+      }
+      // Reviews once failed items for missing demo evidence or runtime proof,
+      // which only the verify stage can produce. Evidence is never terminal:
+      // an item whose review failed with evidence in its findings gets one
+      // fresh review under the current contract (which judges the code, not
+      // the demo). A real code defect fails it again, for that reason.
+      for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, Record<string, any>]>) {
+        if (record.state !== "failed" || record.reviewRearmedForEvidence) continue;
+        if (!/review failed/.test(String([...(record.history ?? [])].reverse().find((entry: { to?: string }) => entry.to === "failed")?.note ?? ""))) continue;
+        if (!/evidence|runtime proof|demo|screenshot|\.docx|playwright|not (?:been )?demonstrated/i.test(String(record.findings ?? ""))) continue;
+        record.history = [...(record.history ?? []), { at: use.now(), from: "failed", to: "reviewing", note: "re-armed: its review failed with demo evidence in the findings; evidence comes from the verify stage, so it gets one fresh review of the code" }];
+        Object.assign(record, { state: "reviewing", since: use.now(), reviewRearmedForEvidence: use.now(), laneStage: "review" });
+        for (const key of ["lane", "note", "findings", "declined"]) delete record[key];
         void id;
       }
       for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, Record<string, any>]>) {
@@ -5047,11 +5065,29 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         };
         if (outside.length) {
           const files = outside.slice(0, 20).join(", ") + (outside.length > 20 ? `, and ${outside.length - 20} more` : "");
-          return hold(
-            `uncommitted changes outside the item's owns and sharedTouch: ${files}`,
-            `${item.id}: ${worktree} has modified tracked files that belong to no spec item (${files}). Commit them where they belong, add them to the spec, or discard them; then set the item back to ${stage}.`,
-            "tracked-outside",
-          );
+          // Mechanical, not a human decision: the changes are saved as a
+          // patch in the state folder (nothing is lost), the files go back to
+          // HEAD, and the item carries on. The root is told where the patch
+          // is. Only a failure to save or restore holds the item.
+          const patchPath = join(dirname(manifestPath(ctx.cwd)), "patches", `${item.id}-${use.now().replace(/[:.]/g, "-")}-outside-owns.patch`);
+          try {
+            await (ports?.setAside ??
+              (async ({ worktree: path, paths, patch }: { worktree: string; paths: string[]; patch: string }) => {
+                const { stdout } = await execFile("git", ["-C", path, "diff", "HEAD", "--", ...paths], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+                await mkdir(dirname(patch), { recursive: true, mode: 0o700 });
+                await writeFile(patch, stdout, { mode: 0o600 });
+                await execFile("git", ["-C", path, "checkout", "HEAD", "--", ...paths], { timeout: 60_000 });
+              }))({ worktree, paths: outside, patch: patchPath });
+          } catch (error) {
+            return hold(
+              `uncommitted changes outside the item's owns and sharedTouch: ${files} (setting them aside failed: ${clip((error as Error).message, 200)})`,
+              `${item.id}: ${worktree} has modified tracked files that belong to no spec item (${files}), and saving them as a patch failed. Commit them where they belong, add them to the spec, or discard them; then set the item back to ${stage}.`,
+              "tracked-outside",
+            );
+          }
+          record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: stage, note: `set aside changes outside its owns as ${patchPath}: ${files}` }];
+          step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its worktree had changes outside the item's files (${files}). They are saved as ${patchPath} and restored to HEAD, and the item carries on. No action needed unless they belonged to the item (then add them to its owns).` });
+          done.push(`set aside ${outside.length} path(s) outside ${item.id}'s owns`);
         }
         if (untracked.length)
           record.history = [
@@ -5229,6 +5265,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             record.verifyWorktree = worktree;
             objective = verifyObjective(spec, item, {
               worktree,
+              evidenceProblem: record.evidenceProblem,
               releaseSha: record.releaseSha,
               reportPath: item.acceptance.evidence ? finalReportPath(spec, item.acceptance.evidence.report) : "",
             });
@@ -5430,6 +5467,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "done", note: "verifier passed" }];
           Object.assign(record, { state: "done", since: use.now() });
           done.push(`done ${item.id}`);
+        } else if (verdict.failing!.name === "evidence") {
+          // Missing or invalid evidence is never terminal: a fresh demo lane
+          // produces it, told what was wrong, after a backoff. The root hears
+          // about it (information, not a question) from the third retry on.
+          const retries = (record.evidenceRetries ?? 0) + 1;
+          const retryAfter = new Date(Date.parse(use.now()) + Math.min(10 * 60_000 * 2 ** (retries - 1), 2 * 60 * 60_000)).toISOString();
+          record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "verifying", note: `evidence check failed (${clip(verdict.failing!.detail, 160)}); a demo lane produces it after ${retryAfter}` }];
+          Object.assign(record, { evidenceRetries: retries, evidenceProblem: verdict.failing!.detail, evidenceRetryAfter: retryAfter });
+          for (const key of ["verified", "lane", "evidence", "note"]) delete record[key];
+          if (retries === 3) step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its demo evidence failed the check 3 times (${clip(verdict.failing!.detail, 200)}); the driver keeps dispatching demo lanes. No action needed unless the requirement is unclear.` });
+          done.push(`evidence for ${item.id} failed the check; a demo lane follows`);
         } else record.note = `verifier: ${verdict.failing!.name}: ${verdict.failing!.detail}`;
       }
       // Retire spec lanes no item points at any more, under the retire grant:
