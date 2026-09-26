@@ -135,8 +135,14 @@ export function classifyScreen(text) {
     while (end >= 0 && !lines[end].trim()) end -= 1;
     let start = end;
     while (start > 0 && end - start < 3 && lines[start - 1].trim() && !OPTION.test(lines[start - 1])) start -= 1;
-    const questionLines = lines.slice(Math.max(0, start), end + 1).map((line) => line.trim()).filter((line) => line && !/[←→]|✔ Submit/.test(line));
-    const question = questionLines.join(" ");
+    const questionLines = lines
+      .slice(Math.max(0, start), end + 1)
+      .map((line) => line.trim().replace(/^[☐☒]\s+/, ""))
+      .filter((line) => line && !/[←→]|✔ Submit/.test(line));
+    // The dialog's header (☐ <topic>) stands in when the question itself is
+    // above the visible screen.
+    const header = lines.slice(0, first).reverse().find((line) => /^\s*[☐☒]\s+\S/.test(line))?.trim().replace(/^[☐☒]\s+/, "");
+    const question = questionLines.join(" ") || (footer && header ? header : "");
     if (!question || !(footer || options.some((option) => option.selected) || /\?/.test(question))) continue;
     const recommended = options.find((option) => option.recommended && !option.freeText);
     const block = [question, ...options.map((option) => `${option.number}. ${option.label}`)].join("\n");
@@ -218,7 +224,7 @@ export function classifyIdleScreen(text) {
  * direction becomes a lane request for the root, with a default message
  * after the bounded wait.
  */
-export async function handleIdleLane({ herdr, workflow, laneId, paneId, target = paneId, timestamp }) {
+export async function handleIdleLane({ herdr, manifest = {}, workflow, laneId, paneId, target = paneId, agentKind, timestamp }) {
   const lane = (workflow.lanes ?? []).find((item) => item.id === laneId);
   if (lane?.completionReceipt) return { status: "has-receipt" };
   let text;
@@ -227,6 +233,9 @@ export async function handleIdleLane({ herdr, workflow, laneId, paneId, target =
   } catch (error) {
     return { status: "unread", reason: error instanceof Error ? error.message : String(error) };
   }
+  // Herdr can report a lane waiting in a dialog as done or idle: a dialog on
+  // screen is handled like a blocked lane's.
+  if (classifyScreen(text).kind !== "unknown") return handleBlockedLane({ herdr, manifest, workflow, laneId, paneId, target, agentKind, timestamp });
   const screen = classifyIdleScreen(text);
   if (!screen) return { status: "no-question" };
   const requests = (workflow.laneRequests ??= []);
@@ -341,7 +350,9 @@ async function recheck(herdr, { paneId, agentKind, fingerprint }) {
   }
   if (!agent?.agent || agent.pane_id !== paneId) return { ok: false, reason: "no agent in the pane" };
   if (agentKind && agent.agent !== agentKind) return { ok: false, reason: `the pane now runs ${agent.agent}` };
-  if (agent.agent_status !== "blocked") return { ok: false, reason: `the agent is ${agent.agent_status ?? "in an unknown state"}, not blocked` };
+  // Herdr may show a dialog-bound agent as blocked, done or idle; only a
+  // working agent has moved on. The screen fingerprint below is the proof.
+  if (agent.agent_status === "working") return { ok: false, reason: "the agent is working, not blocked" };
   let screen;
   try {
     screen = classifyScreen(await readScreen(herdr, paneId, paneId));

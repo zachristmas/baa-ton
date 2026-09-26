@@ -1,3 +1,7 @@
+// Native .mjs modules stay cached across Pi's /reload; load them fresh at the
+// version of the code on disk (fresh-modules.mjs), so a deploy takes effect.
+import { freshImport, modulesVersion } from "./fresh-modules.mjs";
+const MODULES_VERSION = modulesVersion();
 import {
   access,
   appendFile,
@@ -26,7 +30,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
-import { resolvePiSessionIdentity, registerPiIdentityBridge } from "./pi-session-identity.mjs";
+const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
   SUPPORTED_AGENT_KINDS,
@@ -92,8 +96,8 @@ import {
   STARTUP_PROOF_REQUIRED_OPERATIONS,
 } from "./harness-adapter.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { acknowledgeActivation } from "./activation-ack.mjs";
-import { loadTaskProfileConfig, resolveTaskProfile } from "./profile-config.mjs";
+const { acknowledgeActivation } = (await freshImport("./activation-ack.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./activation-ack.mjs");
+const { loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
 import {
   authorizeStanding,
   approvalPolicySummary,
@@ -124,36 +128,18 @@ import {
   type LaneRequest,
   type LaneRequestKind,
 } from "./lane-requests.js";
-import { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } from "./root-recovery.mjs";
-import {
-  applyHerdrIdentity,
-  currentAppliedHerdrIdentity,
-  resolveHerdrIdentity,
-} from "./live-identity.mjs";
-import { legacyStateStatus } from "./state-migration.mjs";
-import { classifyLocalValidation } from "./known-safe.mjs";
-import { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } from "./root-question.mjs";
-import { OPERATOR_AUTHORITY } from "./operator.mjs";
-import { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage } from "./operator-api.mjs";
-import {
-  SPEC_PATH,
-  SPEC_STATE_PATH,
-  finalReportPath,
-  gitAncestor,
-  loadSpec,
-  releaseShaFrom,
-  reportImageCount,
-  verifyItem,
-  loadSpecState,
-  specStatusTable,
-  targetRepo,
-  validateSpecState,
-  verifySpec,
-} from "./spec.mjs";
-import { DECLINE_RULE, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
-import { baselineObjective, fixBaselineObjective, knownFailures } from "./spec-baseline.mjs";
-import { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
-import { specDriverTimer } from "./spec-timer.mjs";
+const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } = (await freshImport("./root-recovery.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-recovery.mjs");
+const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
+const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
+const { classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
+const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
+const { OPERATOR_AUTHORITY } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
+const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
+const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
+const { DECLINE_RULE, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
+const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
+const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -169,7 +155,7 @@ async function importRouteChildMessage() {
   const fromSpecifier = new URL("../controller/controller.mjs", import.meta.url);
   for (const candidate of [fromRealPath, fromSpecifier]) {
     try {
-      return (await import(fileURLToPath(candidate))) as typeof import("../controller/controller.mjs");
+      return (await freshImport(candidate.href, import.meta.url, MODULES_VERSION)) as typeof import("../controller/controller.mjs");
     } catch {
       continue;
     }
@@ -1491,6 +1477,14 @@ async function parentGoal(
         const control = supervisor();
         control.state = "stopped";
         control.nextNudgeAt = null;
+        control.updatedAt = timestamp;
+      } else if (goal.supervisor?.state === "paused") {
+        // Leaving a pause ends it: a goal set back to active, blocked or
+        // waiting is supervised again (a paused supervisor under a live goal
+        // sent nothing, however long the root sat idle).
+        const control = supervisor();
+        control.state = "running";
+        delete control.pauseReason;
         control.updatedAt = timestamp;
       }
     } else if (action === "start") {
@@ -10210,6 +10204,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function persistRootTurn(
     ctx: ExtensionContext,
     state: RootTurn["state"],
+    // After /reload: Pi reports idle and no run exists yet, so there is no
+    // active run to settle; idle may be recorded directly.
+    { afterReload = false }: { afterReload?: boolean } = {},
   ): Promise<void> {
     if (process.env.HERDR_ENV !== "1") return;
     await refreshHerdrIdentity(ctx.signal);
@@ -10243,6 +10240,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const control = goal?.supervisor;
       if (
         state === "idle" &&
+        !afterReload &&
         control &&
         (control.rootTurn?.runId !== turn.runId ||
           control.rootTurn.state !== "active")
@@ -10377,17 +10375,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         checkout: LOADED_CODE.checkout,
         fingerprint: LOADED_CODE.fingerprint,
         commit: LOADED_CODE.commit,
+        // The version every .mjs module of this instance was loaded at; it
+        // changes on each /reload after a deploy (fresh-modules.mjs).
+        modulesVersion: MODULES_VERSION,
         paneId: process.env[HERDR_PANE_ID_ENV],
         workspaceId: process.env.HERDR_WORKSPACE_ID,
         sessionPath: ctx.sessionManager?.getSessionFile?.(),
         agentKind: "pi",
       });
   };
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     recordExtensionRuntime(ctx);
     rootRunId = randomUUID();
     await refreshHerdrIdentity(ctx.signal);
-    await persistRootTurn(ctx, "unknown");
+    // A /reload runs between turns: with Pi idle, the root is idle, and the
+    // supervisor may nudge it. Anything else starts unknown until a turn settles.
+    const reloadedIdle = (event as { reason?: string })?.reason === "reload" && typeof ctx.isIdle === "function" && ctx.isIdle();
+    await persistRootTurn(ctx, reloadedIdle ? "idle" : "unknown", { afterReload: reloadedIdle });
     try {
       ensureSpecTimer(ctx);
     } catch {

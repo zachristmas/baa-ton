@@ -4165,10 +4165,12 @@ export async function handleHook({
         timestamp: record.received_at ?? now(),
       });
       if (blocked.status === "approved" || (blocked.status === "routed" && !blocked.reason)) await atomicWriteJson(mapping.workflow.manifest_path, manifest);
-    } else if (created && event.data.agent_status === "done" && !postCompletionObservation) {
+    } else if (event.data.agent_status === "done" && !postCompletionObservation) {
       // Idle without a receipt, asking for direction in plain text.
       blocked = await handleIdleLane({
         herdr: api,
+        manifest,
+        agentKind: (workflow.lanes ?? []).find((item) => item.id === mapping.lane.lane_id)?.agentKind ?? workflow.agentKind,
         workflow,
         laneId: mapping.lane.lane_id,
         paneId: event.data.pane_id,

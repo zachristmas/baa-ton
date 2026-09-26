@@ -14,11 +14,12 @@
  * CI. Tests that need a variable or a binary set or inject it themselves.
  */
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SESSION_VARIABLE =
-  /^(HERDR_|CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PID$|CLAUDE_EFFORT$|PI_|BAA_|CODEX_|OPENCODE_)/;
+  /^(HERDR_|CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PID$|CLAUDE_EFFORT$|PI_|BAA_|BAATON_|CODEX_|OPENCODE_)/;
 
 export function hermeticEnvironment(env = process.env) {
   const stubs = join(dirname(fileURLToPath(import.meta.url)), "bin");
@@ -33,6 +34,9 @@ export function hermeticEnvironment(env = process.env) {
   // which falls back to the user's real Herdr directory. Tests of the
   // recorder pass an explicit directory instead.
   isolated.BAA_TON_NO_RUNTIME_RECORDS = "1";
+  // The operator channel's store defaults to the user's real one; a
+  // supervisor tick in a test would otherwise deliver its live messages.
+  isolated.BAATON_OPERATOR_STORE = join(tmpdir(), `baa-hermetic-operator-${process.pid}-${Date.now()}.json`);
   return isolated;
 }
 
