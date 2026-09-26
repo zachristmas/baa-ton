@@ -96,7 +96,7 @@ test("review FAIL rebuilds with findings until maxBuildAttempts, then the root i
   assert.equal(step.actions.length, 0);
 });
 
-test("a lane that ends without a receipt is a failed attempt; an unclear verdict goes to the root", () => {
+test("a lane that ends without a receipt is a failed attempt; an unclear verdict gets a fresh review lane", () => {
   const s = spec([{ id: "A" }, { id: "B" }]);
   const state = {
     version: 1,
@@ -113,9 +113,10 @@ test("a lane that ends without a receipt is a failed attempt; an unclear verdict
   });
   assert.equal(step.state.items.A.state, "building", "rebuilt as attempt 2");
   assert.equal(step.state.items.A.attempts, 2);
-  assert.equal(step.state.items.B.state, "blocked");
-  assert.equal(step.state.items.B.blockedReason, "human-gate");
-  assert.match(step.rootAsks[0].reason, /no verdict/);
+  assert.equal(step.state.items.B.state, "reviewing", "not held at the human gate");
+  assert.equal(step.state.items.B.declined.kind, "unclear receipt");
+  assert.ok(step.actions.some((action) => action.kind === "review" && action.itemId === "B"), "a fresh review lane");
+  assert.equal(step.rootAsks.length, 0);
   assert.equal(state.items.A.state, "building", "the input state is not mutated");
 });
 
@@ -172,7 +173,7 @@ test("one serial integration queue in dependency order, then one push prompt per
   assert.equal(pushed.state.items.B.integratedSha, SHA_B);
 });
 
-test("per-item push gate, suite failures rebuild, unclear receipts go to the root", () => {
+test("per-item push gate, suite failures rebuild, unclear receipts get a fresh lane, then exhaust", () => {
   const s = spec([{ id: "A" }, { id: "B" }], { pushGate: "item", maxBuildAttempts: 2 });
   let step = advanceSpec({
     spec: s,
@@ -190,8 +191,19 @@ test("per-item push gate, suite failures rebuild, unclear receipts go to the roo
     lane: lanes({ "w/l": { status: "completed", receipt: { summary: "Merged it, looks good." } } }),
     now: at(1),
   });
+  assert.equal(step.state.items.B.state, "integrating", "a fresh integration lane, not the human gate");
+  assert.equal(step.state.items.B.declined.kind, "unclear receipt");
+  assert.equal(step.rootAsks.length, 0);
+  // With no fallback profiles, the second unclear receipt exhausts the ladder.
+  step = advanceSpec({
+    spec: s,
+    state: { version: 1, items: { B: { ...step.state.items.B, lane: { workflowId: "w2", laneId: "l" } } } },
+    lane: lanes({ "w2/l": { status: "completed", receipt: { summary: "Done, I think." } } }),
+    now: at(1),
+  });
   assert.equal(step.state.items.B.state, "blocked");
-  assert.match(step.rootAsks[0].reason, /integration receipt is unclear/);
+  assert.equal(step.state.items.B.blockedReason, "exhausted");
+  assert.match(step.rootAsks[0].reason, /2 integrate lane\(s\) did not finish/);
 
   step = advanceSpec({
     spec: s,

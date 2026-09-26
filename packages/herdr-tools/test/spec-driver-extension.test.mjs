@@ -557,7 +557,7 @@ test("an adopted branch with uncommitted changes outside its files, or with no o
   }
 });
 
-test("a lane idle without its receipt is asked once, then handed to the root; a gone lane is retried in place", async () => {
+test("a lane idle without its receipt is asked once, then replaced by a fresh lane; a gone lane is retried in place", async () => {
   const f = await fixture({
     specDocument: {
       version: 1,
@@ -605,9 +605,11 @@ test("a lane idle without its receipt is asked once, then handed to the root; a 
     f.ports.now = () => "2026-09-24T12:31:00.000Z";
     await f.advance();
     state = await f.state();
-    assert.equal(state.items.IDLE.state, "blocked");
-    const asks = (await f.manifest()).rootSupervision[0].alerts.map((alert) => alert.text);
-    assert.ok(asks.some((text) => /IDLE: its review lane herdr-idle\/lane-1 went idle without a receipt and did not answer the ask/.test(text)));
+    assert.equal(state.items.IDLE.state, "reviewing", "not held at the human gate");
+    assert.equal(state.items.IDLE.declined.kind, "idle without a receipt");
+    const fresh = f.calls.plan.filter((call) => call.specStage === "review").at(-1);
+    assert.match(fresh.objective, /retry 1: idle without a receipt/);
+    assert.match(fresh.laneObjective, /An earlier lane for this review did not finish \(idle without a receipt/);
   } finally {
     await f.cleanup();
   }
@@ -868,7 +870,8 @@ test("holds a deploy may fix retry once on the first pass under new code", async
     assert.equal(state.items.OLD.state, "reviewing", "held under older code: retried");
     assert.equal(state.items.LEGACY.state, "integrating", "an unstamped hold from before this change is retried too");
     assert.equal(state.items.SAME.state, "blocked", "held under the current code: stays for the root");
-    assert.equal(state.items.OTHER.state, "blocked", "other human-gate causes are never retried automatically");
+    assert.equal(state.items.OTHER.state, "reviewing", "an old hold for an unclear receipt goes back on the retry ladder");
+    assert.equal(state.items.OTHER.declined.kind, "unclear receipt");
     assert.equal(state.items.OLD.history.at(-1).note, "retried after a deploy");
     assert.equal(state.items.OLD.blockedCause, undefined);
   } finally {
@@ -983,7 +986,7 @@ test("a build into an adopted worktree commits the adopted work first; a refusal
   }
 });
 
-test("an open integrate lane keeps spec-integration reserved, even idle without a receipt on a blocked item", async () => {
+test("an item an older driver held for an idle integrate lane gets a fresh lane instead of holding spec-integration forever", async () => {
   const f = await fixture({
     specDocument: {
       version: 1,
@@ -1003,14 +1006,12 @@ test("an open integrate lane keeps spec-integration reserved, even idle without 
     manifest.workflows.push({ id: "herdr-int1", status: "running", lanes: [{ id: "lane-1", status: "awaiting-explicit-outcome" }], evidence: [] });
     await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
     const first = await f.advance();
-    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0, "no second integrate lane in spec-integration");
-    assert.match(first.content[0].text, /D12 waits: integration worktree busy: D11's lane herdr-int1 is still open/);
-
-    const closed = await f.manifest();
-    closed.workflows.find((item) => item.id === "herdr-int1").status = "closed";
-    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(closed));
-    await f.advance();
-    assert.deepEqual(f.calls.plan.filter((call) => call.specStage === "integrate").map((call) => call.objective), ["spec D12 integrate: Next"], "once that workflow is closed, the next integration starts");
+    const integrates = f.calls.plan.filter((call) => call.specStage === "integrate");
+    assert.deepEqual(integrates.map((call) => call.objective), ["spec D11 integrate (retry 1: idle without a receipt): Earlier"], "one fresh lane, for the held item first");
+    assert.match(first.content[0].text, /D12 waits: integration queue: after D11|D12 waits: integration queue: one merge at a time/);
+    const state = await f.state();
+    assert.equal(state.items.D11.state, "integrating");
+    assert.equal(state.items.D11.blockedReason, undefined);
   } finally {
     await f.cleanup();
   }
@@ -1482,15 +1483,123 @@ test("a declined lane is retried with its reason, then with a fallback profile, 
     assert.equal(integrates().length, 2, "retried at once");
     assert.equal(integrates()[1].taskProfile, "deep", "after maxDeclines, the fallback profile");
     assert.match(integrates()[1].laneObjective, /An earlier lane for this integrate declined it \(1 time\(s\)\), saying: "fixing the lint errors needs a rule suppression I should not add"/);
-    assert.match(integrates()[1].objective, /after 1 decline/);
-    assert.match(state.items.D12.history.at(-1).note, /declined \(1\).*retrying with profile deep/);
+    assert.match(integrates()[1].objective, /retry 1: declined/);
+    assert.match(state.items.D12.history.at(-1).note, /did not finish \(declined, 1\).*retrying with profile deep/);
     const result = await decline("I must decline this task: it touches a service outside my scope.");
     state = await f.state();
     assert.equal(state.items.D12.state, "blocked", "every configured profile declined");
     assert.equal(integrates().length, 2);
     const alerts = (await f.manifest()).rootSupervision.flatMap((entry) => entry.alerts ?? []);
-    assert.ok(alerts.some((alert) => /its integrate lanes declined 2 time\(s\), with every profile/.test(alert.text)));
+    assert.ok(alerts.some((alert) => /2 integrate lane\(s\) did not finish, with every profile/.test(alert.text)));
+    assert.equal(state.items.D12.blockedReason, "exhausted", "human-gate is for push, deploy, production and scope");
     assert.match(result.content[0].text, /D12/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an integrate lane idle without a receipt: already merged is integrated, otherwise a fresh lane", async () => {
+  const merged = "d".repeat(40);
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D03", title: "Merged", acceptance: { text: "a" } }] },
+    seed: { version: 1, items: { D03: { state: "integrating", attempts: 1, branch: "demo/d03", lane: { workflowId: "herdr-i3", laneId: "lane-1" }, laneStage: "integrate", receiptAskedAt: "2026-09-24T11:00:00.000Z" } } },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-i3", status: "running", lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p3" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] }, evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    f.ports.agentPresent = async () => false;
+    f.ports.containingCommit = async (_repo, tip) => (tip === "demo/d03" ? merged : undefined);
+    await f.advance();
+    const state = await f.state();
+    assert.equal(state.items.D03.state, "awaiting-push", "its commits were already on spec-integration");
+    assert.deepEqual([state.items.D03.integration.sha, state.items.D03.integration.contained], [merged, true]);
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "integrate").length, 0, "no fresh lane needed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a hold caused only by a regenerated artifact resumes without a deploy and is restored from HEAD, staged or not", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtemp: mkd } = await import("node:fs/promises");
+  const { tmpdir: tmp } = await import("node:os");
+  const repo = await mkd(join(tmp(), "baa-generated-"));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" };
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env }).trim();
+  git("init", "-q", "-b", "demo/d02");
+  await mkdir(join(repo, "apps", "pay"), { recursive: true });
+  await writeFile(join(repo, "apps", "pay", "openapi-spec.json"), "{\"v\":1}\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "base");
+  await writeFile(join(repo, "apps", "pay", "openapi-spec.json"), "{\"v\":2}\n");
+  git("add", "apps/pay/openapi-spec.json");
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D02", title: "Payments", owns: ["src/d02/**"], acceptance: { text: "d" } }] },
+    seed: {
+      version: 1,
+      items: {
+        D02: {
+          state: "blocked",
+          blockedReason: "human-gate",
+          blockedCause: "tracked-outside",
+          blockedByCode: "code-now",
+          note: "uncommitted changes outside the item's owns and sharedTouch: apps/pay/openapi-spec.json",
+          worktree: repo,
+          branch: "demo/d02",
+          adopted: { worktree: repo, branch: "demo/d02" },
+          history: [{ at: "t", from: "building", to: "blocked" }],
+        },
+      },
+    },
+  });
+  try {
+    f.ports.codeVersion = "code-now";
+    delete f.ports.restore;
+    delete f.ports.status;
+    await f.advance();
+    const state = await f.state();
+    assert.equal(git("status", "--porcelain"), "", "restored from HEAD, index included");
+    assert.ok(state.items.D02.history.some((entry) => entry.note === "resumed: only generated artifacts were outside its files"), "resumed under the same code");
+    assert.ok(state.items.D02.history.some((entry) => /restored generated artifacts to HEAD/.test(entry.note ?? "")));
+    assert.equal(state.items.D02.state, "building");
+    assert.equal(f.calls.plan.filter((call) => call.specStage === "build").length, 1, "and its build runs");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane that cannot start climbs the ladder: a fresh try, then the fallback profile", async () => {
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      defaults: { maxDeclines: 1 },
+      stages: { review: { profile: "review", fallbackProfiles: ["review-alt"] } },
+      items: [{ id: "D05", title: "Review me", acceptance: { text: "r" } }],
+    },
+    seed: { version: 1, items: { D05: { state: "reviewing", attempts: 1 } } },
+  });
+  try {
+    let failing = true;
+    const plan = f.ports.plan;
+    f.ports.plan = async (input) => {
+      if (failing) {
+        f.calls.plan.push(input);
+        throw new Error("Startup attestation incomplete: bridge did not report herdr_complete");
+      }
+      return plan(input);
+    };
+    await f.advance();
+    let state = await f.state();
+    assert.equal(state.items.D05.state, "reviewing");
+    assert.equal(state.items.D05.declined.kind, "never started");
+    assert.equal(state.items.D05.declined.profile, "review-alt");
+    failing = false;
+    await f.advance();
+    const reviews = f.calls.plan.filter((call) => call.specStage === "review");
+    assert.equal(reviews.at(-1).taskProfile, "review-alt", "the next lane uses the fallback profile");
+    assert.match(reviews.at(-1).laneObjective, /did not finish \(never started: Startup attestation incomplete/);
   } finally {
     await f.cleanup();
   }

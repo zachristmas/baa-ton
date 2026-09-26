@@ -2454,7 +2454,24 @@ test("waiting-for-event is a real wait while a lane works, and a stall (named in
     await setStatus("done");
     result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:10:00.000Z" });
     assert.equal(result.results[0].status, "delivered");
-    assert.match(texts.find((text) => text.startsWith("[Baa-ton supervisor]")), /is waiting-for-event, but no lane is working or blocked, so no event is coming: this is no progress, not a wait/);
+    assert.match(texts.find((text) => text.startsWith("[Baa-ton supervisor]")), /is waiting-for-event, but no lane is working or blocked, so nothing will change on its own: this is no progress, not a wait/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a blocked goal with no lane working is a stall too", async () => {
+  const fixture = await createFixture({ parentGoal: statusGoal("blocked"), laneRequests: [] });
+  const manifest = await fixture.manifest();
+  manifest.workflows[0].eventController = { version: 1, events: [{ identity: "e-done", received_at: "2026-09-14T00:00:00.000Z", workflow_id: "herdr-bb029", lane_id: CHILD.lane_id, pane_id: CHILD.pane_id, classification: "unclassified", source: { agent_status: "done" }, wake: { status: "not-required", attempts: 0, updated_at: "t" } }] };
+  await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+  const texts = [];
+  const api = recoveryApi();
+  const capture = { async request(method, params) { if (method === "agent.prompt") texts.push(params.text); return api.request(method, params); } };
+  try {
+    const result = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:00:00.000Z" });
+    assert.equal(result.results[0].status, "delivered");
+    assert.match(texts.find((text) => text.startsWith("[Baa-ton supervisor]")), /is blocked, but no lane is working or blocked, so nothing will change on its own/);
   } finally {
     await fixture.cleanup();
   }

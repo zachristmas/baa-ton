@@ -203,6 +203,51 @@ export function advanceSpec({
     if (item.history.length > 50) item.history.splice(0, item.history.length - 50);
   };
 
+  /**
+   * A stage whose lane did not finish for a mechanical reason (it declined,
+   * went idle without a receipt, sent an unclear receipt, or never started)
+   * is retried with a fresh lane, then with the stage's fallback profiles.
+   * Only an exhausted ladder is held, as "exhausted" (human-gate is for
+   * push, deploy, production and scope), and the root is told once.
+   * Returns false when the ladder is exhausted.
+   */
+  const STATE_OF = { decide: "deciding", build: "building", review: "reviewing", integrate: "integrating", verify: "verifying" };
+  const retryStage = (item, current, stage, kind, reason) => {
+    const declines = (current.declines ??= []);
+    declines.push({ at: now, stage, kind, reason: String(reason).slice(0, 500), ...(current.lane ? { lane: current.lane } : {}), ...(current.declined?.profile ? { profile: current.declined.profile } : {}) });
+    if (declines.length > 20) declines.splice(0, declines.length - 20);
+    const count = declines.filter((entry) => entry.stage === stage).length;
+    const choice = profileAfterDeclines(spec, stage, count);
+    const from = current.lane?.workflowId;
+    delete current.lane;
+    delete current.receiptAskedAt;
+    delete current.receiptEscalatedAt;
+    delete current.receiptAskAfter;
+    if (!choice) {
+      move(item.id, "blocked", { blockedReason: "exhausted", note: `${stage}: ${count} lane(s) did not finish (${kind}) with every configured profile: ${String(reason).slice(0, 200)}` }, `${stage} retries exhausted`);
+      rootAsks.push({ itemId: item.id, reason: `${item.id}: ${count} ${stage} lane(s) did not finish, with every profile in spec.stages.${stage} (profile, fallbackProfiles). Last: ${kind}: ${String(reason).slice(0, 300)}. Add a fallback profile or decide how to proceed.` });
+      return false;
+    }
+    if (current.state !== STATE_OF[stage]) move(item.id, STATE_OF[stage], {}, `recovered for a fresh ${stage} lane`);
+    current.declined = { stage, kind, reason: String(reason).slice(0, 500), count, ...(choice.profile ? { profile: choice.profile } : {}) };
+    (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `${stage} lane${from ? ` ${from}` : ""} did not finish (${kind}, ${count}): ${String(reason).slice(0, 160)}; retrying${choice.profile ? ` with profile ${choice.profile}` : " with a fresh lane"}` });
+    return true;
+  };
+
+  // A. Items an older driver held at the human gate for a mechanical reason
+  // (an idle lane, an unclear receipt) go back on the retry ladder.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    if (current?.state !== "blocked" || current.blockedReason !== "human-gate" || current.blockedCause) continue;
+    const idle = /^(decide|build|review|integrate|verify) lane is idle without a receipt, even after being asked$/.exec(current.note ?? "")?.[1];
+    const unclear = /^integration receipt has no INTEGRATED/.test(current.note ?? "") ? "integrate" : /^review receipt has no VERDICT/.test(current.note ?? "") ? "review" : undefined;
+    const stage = idle ?? unclear;
+    if (!stage) continue;
+    delete current.blockedReason;
+    retryStage(item, current, stage, idle ? "idle without a receipt" : "unclear receipt", current.note);
+    delete current.note;
+  }
+
   // B. The suite baseline at the target tip: a baseline lane's receipt
   // records it once per target SHA; a fix-baseline lane's receipt records
   // what is still failing after its fixes.
@@ -297,9 +342,9 @@ export function advanceSpec({
         current.receiptAskedAt = now;
         actions.push({ kind: "ask-receipt", itemId: item.id, attempt: current.attempts ?? 1, stage, lane: current.lane, format: RECEIPT_FORMAT[stage] });
       } else if (Date.parse(now) - Date.parse(current.receiptAskedAt) > RECEIPT_ASK_TIMEOUT_MS && !current.receiptEscalatedAt) {
-        current.receiptEscalatedAt = now;
-        move(item.id, "blocked", { blockedReason: "human-gate", note: `${stage} lane is idle without a receipt, even after being asked` });
-        rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lane ${current.lane.workflowId}/${current.lane.laneId} went idle without a receipt and did not answer the ask; read its pane and set the outcome` });
+        // Its commits may already be on the integration branch (1c0 records
+        // that below); otherwise a fresh lane takes over.
+        retryStage(item, current, stage, "idle without a receipt", `lane ${current.lane.workflowId}/${current.lane.laneId} went idle and did not answer the receipt ask`);
       }
     }
   }
@@ -319,26 +364,7 @@ export function advanceSpec({
       if (current.declined?.stage === stage) delete current.declined;
       continue;
     }
-    const declines = (current.declines ??= []);
-    declines.push({ at: now, stage, reason, lane: current.lane, ...(current.declined?.profile ? { profile: current.declined.profile } : {}) });
-    if (declines.length > 20) declines.splice(0, declines.length - 20);
-    const count = declines.filter((entry) => entry.stage === stage).length;
-    const choice = profileAfterDeclines(spec, stage, count);
-    const declinedLane = current.lane;
-    delete current.lane;
-    delete current.receiptAskedAt;
-    if (!choice) {
-      move(item.id, "blocked", { blockedReason: "human-gate", note: `${stage} lanes declined ${count} time(s) with every configured profile: ${reason}` }, `${stage} declined`);
-      rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${stage} lanes declined ${count} time(s), with every profile in spec.stages.${stage} (profile, fallbackProfiles). Last reason: ${reason}. Decide how to proceed or add a fallback profile.` });
-      continue;
-    }
-    current.declined = { stage, reason, count, ...(choice.profile ? { profile: choice.profile } : {}) };
-    (current.history ??= []).push({
-      at: now,
-      from: current.state,
-      to: current.state,
-      note: `${stage} lane ${declinedLane.workflowId} declined (${count}): ${reason.slice(0, 200)}; retrying${choice.profile ? ` with profile ${choice.profile}` : ""}`,
-    });
+    retryStage(item, current, stage, "declined", reason);
   }
 
   // 1. Receipts and lane endings advance in-flight items.
@@ -430,12 +456,13 @@ export function advanceSpec({
             rootAsks.push({ itemId: item.id, reason: `${item.id} failed integration after ${attempts} build attempt(s)` });
           } else move(item.id, "ready", { findings, lane: undefined }, "integration suite failed");
         } else {
-          move(item.id, "blocked", { blockedReason: "human-gate", lane: undefined, note: "integration receipt has no INTEGRATED: <sha> and SUITE: pass|fail lines" });
-          rootAsks.push({ itemId: item.id, reason: `${item.id}: the integration receipt is unclear; check spec-integration and set the outcome` });
+          retryStage(item, current, "integrate", "unclear receipt", "the integration receipt has no INTEGRATED: <sha> and SUITE: pass|fail lines");
         }
       } else if (LANE_ENDED.has(view.status)) {
-        // The merge is retried by a fresh integration lane; it is not a build attempt.
-        delete current.lane;
+        // The merge is retried by a fresh integration lane; it is not a build
+        // attempt. One that never started climbs the retry ladder.
+        if (view.status === "dispatch-failed") retryStage(item, current, "integrate", "never started", `lane ${current.lane.workflowId} ${view.status}`);
+        else delete current.lane;
       }
       continue;
     }
@@ -458,10 +485,13 @@ export function advanceSpec({
       if (verdict === "pass") move(item.id, "integrating", { reviewLane: current.lane, lane: undefined, findings: undefined }, "review passed");
       else if (verdict === "fail") failAttempt("review failed", view.receipt.summary);
       else {
-        move(item.id, "blocked", { blockedReason: "human-gate", note: "review receipt has no VERDICT: PASS or VERDICT: FAIL line" });
-        rootAsks.push({ itemId: item.id, reason: `${item.id}: the review receipt has no verdict; read it and set the outcome` });
+        if (retryStage(item, current, "review", "unclear receipt", "the review receipt has no VERDICT: PASS or VERDICT: FAIL line") && !capacityWaiting)
+          actions.push({ kind: "review", itemId: item.id, attempt: attempts });
       }
-    } else if (view && LANE_ENDED.has(view.status))
+    } else if (view && view.status === "dispatch-failed")
+      // It never started (startup attestation, shell): not a build attempt.
+      retryStage(item, current, STAGE_OF[current.state], "never started", `lane ${current.lane.workflowId} ${view.status}`);
+    else if (view && LANE_ENDED.has(view.status))
       failAttempt(`${current.state === "building" ? "build" : "review"} lane ended (${view.status}) without a receipt`);
     // A stage whose dispatch never produced a lane is retried, under the
     // same capacity hold as a new build.

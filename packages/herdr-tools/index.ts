@@ -150,7 +150,7 @@ import {
   validateSpecState,
   verifySpec,
 } from "./spec.mjs";
-import { DECLINE_RULE, advanceSpec, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
+import { DECLINE_RULE, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } from "./spec-driver.mjs";
 import { baselineObjective, fixBaselineObjective, knownFailures } from "./spec-baseline.mjs";
 import { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } from "./spec-adopt.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
@@ -4763,10 +4763,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const retryable =
           SPEC_DEPLOY_RETRY_CAUSES.has(record.blockedCause) ||
           (!record.blockedCause && /^(committing the adopted work failed|uncommitted changes outside the item's owns)/.test(record.note ?? ""));
-        if (!retryable || record.blockedByCode === codeVersion) continue;
+        // Held only by generated artifacts outside owns: resume on any pass
+        // (the resumed stage restores them), not only after a deploy.
+        let onlyGenerated = false;
+        if (retryable && record.worktree && (record.blockedCause === "tracked-outside" || record.blockedCause === "integrate-outside" || !record.blockedCause)) {
+          const specItem = spec.items.find((candidate) => candidate.id === id);
+          const porcelain = specItem ? await (ports?.status ?? (async (path: string) => (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], { timeout: 30_000 })).stdout))(record.worktree).catch(() => "") : "";
+          if (specItem && porcelain.trim()) {
+            const patterns = (spec.defaults.generatedArtifacts ?? []).map(globToRegExp);
+            const outside = itemOwnedChanges(porcelain, record.decided?.owns ?? specItem.owns, specItem.sharedTouch).outside;
+            // At most 3 such resumes per code version: a restore that keeps
+            // failing waits for a deploy instead of looping every pass.
+            onlyGenerated =
+              outside.length > 0 &&
+              outside.every((path: string) => patterns.some((pattern: RegExp) => pattern.test(path))) &&
+              ((record.generatedResumes?.code === codeVersion ? record.generatedResumes.count : 0) < 3);
+          }
+        }
+        if (!retryable || (record.blockedByCode === codeVersion && !onlyGenerated)) continue;
         const resume = [...(record.history ?? [])].reverse().find((entry: { to?: string; from?: string }) => entry.to === "blocked")?.from;
         if (resume !== "reviewing" && resume !== "integrating" && resume !== "building") continue;
-        record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: resume, note: "retried after a deploy" }];
+        if (onlyGenerated) record.generatedResumes = { code: codeVersion, count: (record.generatedResumes?.code === codeVersion ? record.generatedResumes.count : 0) + 1 };
+        record.history = [...(record.history ?? []), { at: use.now(), from: "blocked", to: resume, note: onlyGenerated ? "resumed: only generated artifacts were outside its files" : "retried after a deploy" }];
         Object.assign(record, { state: resume, since: use.now() });
         for (const key of ["blockedReason", "blockedCause", "blockedByCode", "note", "lane"]) delete record[key];
         void id;
@@ -4845,8 +4863,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         (async (repoPath: string, branch: string, base: string) =>
           Number((await execFile("git", ["-C", repoPath, "rev-list", "--count", `${base}..${branch}`], { timeout: 30_000 })).stdout.trim()) || 0);
       for (const item of spec.items) {
-        const record = state.items?.[item.id] as { state?: string; lane?: unknown; branch?: string; worktree?: string; decided?: { owns?: string[] } } | undefined;
-        if (record?.state !== "integrating" || record.lane) continue;
+        const record = state.items?.[item.id] as { state?: string; lane?: { workflowId: string; laneId: string }; branch?: string; worktree?: string; decided?: { owns?: string[] }; note?: string; blockedReason?: string } | undefined;
+        // Queued integrations, integrations whose lane went idle, and items an
+        // older driver held for an idle or unclear integration.
+        const heldIntegration = record?.state === "blocked" && record.blockedReason === "human-gate" && /^(integrate lane is idle without a receipt|integration receipt has no INTEGRATED)/.test(record.note ?? "");
+        const idleLane = record?.state === "integrating" && record.lane && ["done", "gone"].includes(laneView(record.lane)?.agentStatus ?? "");
+        if (!(record?.state === "integrating" && !record.lane) && !idleLane && !heldIntegration) continue;
         const branch = record.branch ?? `spec/${item.id}`;
         if (!((await aheadOf(repo, branch, targetRef).catch(() => 0)) > 0)) continue;
         if (record.worktree) {
@@ -4907,9 +4929,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         try {
           await (ports?.restore ??
             (async ({ worktree, paths }: { worktree: string; paths: string[] }) => {
-              await execFile("git", ["-C", worktree, "checkout", "--", ...paths], { timeout: 30_000 });
+              // From HEAD, so a staged regeneration is put back too.
+              await execFile("git", ["-C", worktree, "checkout", "HEAD", "--", ...paths], { timeout: 30_000 });
             }))({ worktree: record.worktree, paths: generated });
-        } catch {
+        } catch (error) {
+          record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: stage, note: `restoring generated artifacts failed: ${clip((error as Error).message, 200)}` }];
           return porcelain;
         }
         const listed = generated.slice(0, 10).join(", ") + (generated.length > 10 ? `, and ${generated.length - 10} more` : "");
@@ -5120,19 +5144,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           }
           // A stage an earlier lane declined: its reason up front, and the
           // fallback profile the driver chose after repeated declines.
-          const declined = record.declined?.stage === action.kind ? (record.declined as { reason: string; count: number; profile?: string }) : undefined;
+          const declined = record.declined?.stage === action.kind ? (record.declined as { reason: string; count: number; profile?: string; kind?: string }) : undefined;
           if (declined?.profile) profile = declined.profile;
           const laneObjective = [
-            declined
+            declined && (declined.kind ?? "declined") === "declined"
               ? `An earlier lane for this ${action.kind} declined it (${declined.count} time(s)), saying: "${clip(declined.reason, 400)}". The task is unchanged and stays within your contract. Address that concern in how you work (or name the one step you cannot do) rather than declining the whole task.`
-              : "",
+              : declined
+                ? `An earlier lane for this ${action.kind} did not finish (${declined.kind}: ${clip(declined.reason, 300)}). Start from the current state of the worktree, finish the work, and end with herdr_complete and the receipt lines this task asks for.`
+                : "",
             objective,
             DECLINE_RULE,
           ]
             .filter(Boolean)
             .join("\n");
           const workflow = await use.plan({
-            objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}${declined ? ` (after ${declined.count} decline(s))` : ""}: ${item.title}`,
+            objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}${declined ? ` (retry ${declined.count}: ${declined.kind ?? "declined"})` : ""}: ${item.title}`,
             laneObjective,
             readOnly: action.kind === "review" || action.kind === "decide",
             taskProfile: profile,
@@ -5153,6 +5179,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           done.push(`${action.kind} ${item.id} -> ${workflow.id}`);
         } catch (error) {
           record.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
+          // A lane that could not start (startup attestation, shell) climbs
+          // the same retry ladder as one that declined: fresh, then fallback.
+          const declines = ((record.declines as Array<Record<string, unknown>> | undefined) ??= []);
+          declines.push({ at: use.now(), stage: action.kind, kind: "never started", reason: clip((error as Error).message, 300) });
+          const count = declines.filter((entry) => entry.stage === action.kind).length;
+          const choice = profileAfterDeclines(spec, action.kind, count);
+          if (choice) record.declined = { stage: action.kind, kind: "never started", reason: clip((error as Error).message, 300), count, ...(choice.profile ? { profile: choice.profile } : {}) };
+          else {
+            Object.assign(record, { state: "blocked", blockedReason: "exhausted", since: use.now() });
+            step.rootAsks.push({ itemId: item.id, reason: `${item.id}: ${count} ${action.kind} lane(s) could not start with every configured profile: ${clip((error as Error).message, 200)}` });
+          }
           if (/shell did not become ready/i.test((error as Error).message)) {
             shellTimeout = true;
             (next as { dispatchBackoff?: unknown }).dispatchBackoff = {

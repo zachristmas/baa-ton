@@ -39,7 +39,8 @@ export const ITEM_STATES = [
   // absent): counted as done by decision.
   "resolved",
 ];
-const BLOCK_REASONS = ["decision", "dependency", "capacity", "human-gate"];
+// human-gate: push, deploy, production, scope; exhausted: every retry of a stage failed.
+const BLOCK_REASONS = ["decision", "dependency", "capacity", "human-gate", "exhausted"];
 const ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/;
 
 function isRecord(value) {
