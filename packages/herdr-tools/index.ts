@@ -5,6 +5,9 @@ const MODULES_VERSION = modulesVersion();
 /** The user is asked only about unclear requirements; everything else is decided and logged. */
 const ESCALATION_POLICY =
   "Escalation policy: ask the user only about unclear requirements, and tag such a question [unclear-requirements]. Decide everything else yourself with the driver's recommendation or the policy default, log the decision, and keep going; never park work waiting for the user. Pushes of green work are pre-approved.";
+/** The root decides and dispatches; lanes do the work (docs/SPEC-LOOP.md, "Who drives"). */
+const ROOT_CONTRACT =
+  "Root contract: you decide and dispatch; you never do lane work yourself. Debugging a lane's failure, reading its logs or manifest at length, or running its builds and tests belongs in a lane: dispatch one (or a fix lane) or decide, then end your turn. The spec driver runs in the supervisor on its own timer and sends you rootAsks and decisions through your digest. A root turn that runs 30 minutes or longer is interrupted.";
 import {
   access,
   appendFile,
@@ -144,6 +147,7 @@ const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, infraBackoffMs, integrationComm
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
+const { specHandover } = (await freshImport("./spec-handover.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-handover.mjs");
 
 // routeChildMessage lives in the controller package, which is a sibling of
 // this package inside the baa-ton checkout. Pi may load this extension
@@ -2928,6 +2932,24 @@ function liveClaudeAgentAtIdentity(
   });
 }
 
+/**
+ * The supervisor's spec host (spec-host.mjs) runs this extension headless as
+ * a root. It has no Pi session and must not depend on the root's being alive
+ * or idle, so root identity comes from the controller config and the root
+ * session the host last recorded (ctx.sessionManager), not a live Pi agent.
+ */
+function specHostMode(): boolean {
+  return process.env.BAATON_SPEC_HOST === "1" && process.env.HERDR_ENV === "1";
+}
+
+function specHostRootMapping(): ControllerRootMapping | undefined {
+  const paneId = process.env[HERDR_PANE_ID_ENV];
+  const record = readControllerConfigForCurrentPane()?.orchestrators.find(
+    (item) => item.root.pane_id === paneId && item.root.workspace_id === process.env.HERDR_WORKSPACE_ID,
+  );
+  return record?.root;
+}
+
 function isRootOrchestrator(): boolean {
   return isRegisteredRootIdentity({
     paneId: process.env[HERDR_PANE_ID_ENV],
@@ -3529,6 +3551,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   }
 
   async function rootSessionMatches(native: unknown, stored: string | undefined, ctx: ExtensionContext, signal?: AbortSignal) {
+    // The spec host checks the binding against the root session it recorded.
+    if (specHostMode()) {
+      const file = ctx?.sessionManager?.getSessionFile?.();
+      const id = ctx?.sessionManager?.getSessionId?.();
+      return Boolean(stored) && (stored === file || stored === id);
+    }
     if (!isRecord(native) || !isRecord(native.agent_session)) return false;
     if (native.agent !== "pi") return native.agent_session.value === stored;
     const proof = await inspectPiRootIdentity(ctx, signal);
@@ -4671,6 +4699,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
    */
   async function runSpecDriver(ctx: ExtensionContext, ports?: Partial<SpecDriverPorts>, signal?: AbortSignal) {
     if (specDriverRunning) return { skipped: "already running" };
+    // The supervisor's spec host drives when it holds the lease; checked
+    // between passes, so a pass in flight always finishes first.
+    const handover = specHandover(dirname(manifestPath(ctx.cwd)));
+    if (handover) return { skipped: handover };
     const spec = await loadSpec(ctx.cwd);
     if (!spec) return { skipped: `no ${SPEC_PATH}` };
     const manifest = await loadManifest(ctx.cwd);
@@ -6148,6 +6180,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   async function currentPaneRoot(
     signal?: AbortSignal,
   ): Promise<ControllerRootMapping> {
+    if (specHostMode()) {
+      const mapped = specHostRootMapping();
+      if (!mapped) throw new Error("The spec host's root is not in the controller config.");
+      return mapped;
+    }
     const identity = await refreshHerdrIdentity(signal);
     const paneId = identity.paneId;
     if (!paneId)
@@ -7546,10 +7583,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     rootScope ??= currentRootScope(cwd);
     if (!rootScope)
       throw new Error("The verified controller-mapped root does not own this workflow manifest.");
-    const rootAgent = responseRecord(
-      await runHerdr(["agent", "get", root.pane_id]),
-      "task root",
-    ).agent;
+    const hostSession = specHostMode() ? ctx?.sessionManager?.getSessionFile?.() : undefined;
+    if (specHostMode() && !hostSession)
+      throw new Error("The spec host has not recorded the root's session yet; it plans once it has seen the root live.");
+    const rootAgent = specHostMode()
+      ? { agent: root.agent_kind ?? "pi", agent_session: { kind: "path", value: hostSession } }
+      : responseRecord(
+          await runHerdr(["agent", "get", root.pane_id]),
+          "task root",
+        ).agent;
     if (
       !isRecord(rootAgent) ||
       !isRecord(rootAgent.agent_session) ||
@@ -7561,7 +7603,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         "Task planning requires a verified native root session path or id.",
       );
     if (rootAgent.agent === "pi" && !ctx) throw new Error("Native Pi context is required for planning.");
-    const rootSessionPath = rootAgent.agent === "pi"
+    const rootSessionPath = hostSession
+      ? hostSession
+      : rootAgent.agent === "pi"
       ? (await inspectPiRootIdentity(ctx!)).sessionPath
       : rootAgent.agent_session.value;
     const launchProfile =
@@ -7764,10 +7808,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             throw new Error(
               "Current root does not match the designated task workspace; no topology fallback allowed.",
             );
-          const native = responseRecord(
-            await runHerdr(["agent", "get", root.pane_id], signal),
-            "task root",
-          ).agent;
+          const native = specHostMode()
+            ? undefined
+            : responseRecord(
+                await runHerdr(["agent", "get", root.pane_id], signal),
+                "task root",
+              ).agent;
           if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before dispatch.",
@@ -8167,10 +8213,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             throw new Error(
               "Current root does not match the designated task workspace; native resume cannot use a topology fallback.",
             );
-          const native = responseRecord(
-            await runHerdr(["agent", "get", root.pane_id], signal),
-            "task root",
-          ).agent;
+          const native = specHostMode()
+            ? undefined
+            : responseRecord(
+                await runHerdr(["agent", "get", root.pane_id], signal),
+                "task root",
+              ).agent;
           if (!(await rootSessionMatches(native, w.taskBinding.rootSessionPath, ctx, signal)))
             throw new Error(
               "Root incarnation changed; authorized task recovery is required before native resume.",
@@ -10861,7 +10909,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     await refreshHerdrIdentity(ctx.signal);
     await persistRootTurn(ctx, "active");
     return {
-      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY} ${ESCALATION_POLICY} ${runStateLine(await readRunState().catch(() => ({ state: "running" as const, implicit: true })))}${await rootBootstrapPrompt(ctx.cwd)}`,
+      systemPrompt: `${event.systemPrompt}\n\nHerdr controller active. Use available Herdr tools only as permitted by role; do not poll. Continue authorized safe local work until waiting, blocked, paused, or complete. Herdr delegation policy: delegate only via herdr_plan then herdr_dispatch. Every child must be a new Herdr-created session using its declared agentKind from the installed Herdr compatibility set. Never use Pi subagents, Pi background tasks, detached/background child jobs, or direct Pi child-session launches. Use herdr_observe for completion and herdr_close with evidence for extension-owned resources only. ${OPERATOR_AUTHORITY} ${ESCALATION_POLICY} ${ROOT_CONTRACT} ${runStateLine(await readRunState().catch(() => ({ state: "running" as const, implicit: true })))}${await rootBootstrapPrompt(ctx.cwd)}`,
     };
   });
 

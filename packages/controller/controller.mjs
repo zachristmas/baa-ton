@@ -4477,6 +4477,10 @@ export async function runSupervisorLoop({
   // Deploy without anyone (self-update.mjs): the real supervisor run tests
   // and fast-forwards new commits; tests pass a fake or nothing.
   selfUpdate,
+  // Spec hosts and the root turn watch (spec-hosts.mjs); tests pass fakes,
+  // false turns one off.
+  hosts,
+  turnWatch,
 } = {}) {
   assert(
     Number.isSafeInteger(intervalMs) && intervalMs >= 5_000,
@@ -4542,6 +4546,37 @@ export async function runSupervisorLoop({
       supervisorLog(resolvedConfigDir, `self-update disabled: could not start the updater: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  // The spec loop in the supervisor (spec-hosts.mjs): one spec host per
+  // Pi root with a spec, and an interrupt for a root turn over 30 minutes.
+  let specHosts = hosts;
+  let rootTurns = turnWatch;
+  if ((specHosts === undefined || rootTurns === undefined) && onCodeChange && code) {
+    try {
+      const { createSpecHosts, createRootTurnWatch } = await import("./spec-hosts.mjs");
+      let client;
+      const api = { request: (method, params) => (client ??= herdr ?? new JsonLineHerdrClient()).request(method, params) };
+      const config = () => loadConfig(resolvedConfigDir);
+      specHosts ??= createSpecHosts({ configDir: resolvedConfigDir, loadConfig: config, log: (line) => supervisorLog(resolvedConfigDir, line) });
+      rootTurns ??= createRootTurnWatch({
+        loadConfig: config,
+        status: async (paneId) => {
+          const ready = liveAgentReady(await api.request("agent.get", { target: paneId }), { pane_id: paneId });
+          return ready.agent?.agent_status;
+        },
+        interrupt: async (paneId) => {
+          const { sendKeys } = await import("./blocked-lane.mjs");
+          await sendKeys(api, paneId, ["Escape"]);
+        },
+        anomaly: async (anomaly) => {
+          const { reportAnomaly } = await import("./anomalies.mjs");
+          return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+        },
+        log: (line) => supervisorLog(resolvedConfigDir, line),
+      });
+    } catch (error) {
+      supervisorLog(resolvedConfigDir, `spec hosts disabled: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   let stopping = false;
   let ticking = false;
   let timer;
@@ -4556,6 +4591,8 @@ export async function runSupervisorLoop({
     // settled. A restart must see this process as the supervisor rather than
     // overlap a late socket delivery with a new scheduler.
     await inFlightTick;
+    // A deploy restarts the spec hosts with the supervisor.
+    if (specHosts) specHosts.stop();
     await releaseLease();
     removeRuntime();
   };
@@ -4591,6 +4628,14 @@ export async function runSupervisorLoop({
           const message = error instanceof Error ? error.message : String(error);
           if (message !== lastTickError) supervisorLog(resolvedConfigDir, `tick failed: ${message}`);
           lastTickError = message;
+        }
+        for (const [label, part] of [["spec hosts", specHosts], ["root turn watch", rootTurns]]) {
+          if (!part || stopping) continue;
+          try {
+            await part.tick();
+          } catch (error) {
+            supervisorLog(resolvedConfigDir, `${label} check failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
         // Deploys do not depend on the rest of the tick succeeding.
         if (updater && !stopping) {
