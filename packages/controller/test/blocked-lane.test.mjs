@@ -399,3 +399,13 @@ test("a real-shaped Claude question dialog reported as done is routed, not misse
   await resolveScreenPrompts({ herdr, manifest: {}, workflow, timestamp: "2026-09-26T06:31:00.000Z" });
   assert.deepEqual(herdr.calls.keys, [{ paneId: PANE, keys: ["1"] }]);
 });
+
+test("a registered agent's command that starts by cd into another worktree of its repository is judged in that worktree", async () => {
+  const { agentCommandOptions } = await import("../blocked-lane.mjs");
+  const gitDir = async (dir) => (dir.startsWith("/repo") || dir.startsWith("/scratch/wt") ? "/repo/.git" : dir === "/other" ? "/other/.git" : undefined);
+  const facts = (cwd) => ({ ownBranch: cwd === "/scratch/wt" ? "ink/fix" : "ink/admin" });
+  assert.deepEqual(await agentCommandOptions("/repo", "cd /scratch/wt && git rebase -q origin/main", { gitDir, facts }), { cwd: "/scratch/wt", ownBranch: "ink/fix" });
+  assert.deepEqual(await agentCommandOptions("/repo", "cd /other && git rebase -q origin/main", { gitDir, facts }), { cwd: "/repo", ownBranch: "ink/admin" }, "another repository: the registered folder");
+  assert.deepEqual(await agentCommandOptions("/repo", "git status", { gitDir, facts }), { cwd: "/repo", ownBranch: "ink/admin" });
+  assert.deepEqual(await agentCommandOptions(undefined, "git status", { gitDir, facts }), {});
+});

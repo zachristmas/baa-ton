@@ -2717,6 +2717,9 @@ function contract(workflow: Workflow, lane: Lane): string {
     lane.readOnly
       ? "This lane is declared read-only: do not modify files, Git state, or external systems."
       : "Contract: work only in the assigned cwd; report concise progress, commands, tests, evidence, and blockers.",
+    ...(workflow.worktree ?? workflow.cwd
+      ? [`Your working directory is ${workflow.worktree ?? workflow.cwd}, and you start in it. Run commands from it with relative paths; never retype its absolute path (one typo sends you outside it and stops you at a permission prompt).`]
+      : []),
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane. A command that outlasts the normal timeout runs with a longer timeout or in your harness's own tracked background mode (Claude: the Bash tool's run_in_background), never with &, disown, nohup or setsid.",
     "Never git stash drop, pop or clear: the stash is shared by every worktree of the repository and holds other sessions' work. Set temporary changes aside with a patch file outside the repository (git diff > <scratch>/x.patch; git checkout -- <files>; later git apply <scratch>/x.patch) or a throwaway commit on your own branch.",
@@ -4468,7 +4471,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function retireCandidates(
     cwd: string,
     manifest: ManifestWithQueue,
-    options: { auto: boolean; workflowId?: string; laneId?: string; rootPaneId?: string },
+    options: { auto: boolean; workflowId?: string; laneId?: string; rootPaneId?: string; force?: boolean },
   ): RetireCandidate[] {
     const policy = acknowledgedPolicy(cwd, manifest.approvalPolicyAck);
     const candidates: RetireCandidate[] = [];
@@ -4479,7 +4482,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const lane of workflow.lanes) {
         if (options.laneId && lane.id !== options.laneId) continue;
         if (lane.retirement && lane.retirement.status !== "partial") continue;
-        const finished = options.auto
+        // `force`: the caller decided the lane is finished (a spec lane no
+        // item maps any more, checked idle).
+        const finished = options.force
+          ? true
+          : options.auto
           ? lane.completionReceipt?.delivery === "delivered"
           : Boolean(lane.completionReceipt) || TERMINAL_LANE_STATUSES.has(lane.status);
         if (!finished) continue;
@@ -4687,6 +4694,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   }
   /** The driver logs that it is alive at least this often. */
   const SPEC_ALIVE_MS = 10 * 60_000;
+  /** A spec lane without a receipt that no item maps is retired this long after it started. */
+  const SPEC_ORPHAN_GRACE_MS = 10 * 60_000;
   /** How long the driver starts no new lanes after a shell failed to start. */
   const SPEC_SHELL_BACKOFF_MS = 10 * 60_000;
 
@@ -5111,8 +5120,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             if (!result.dispatched) run.note = `planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
             done.push(`${action.kind} ${action.targetSha!.slice(0, 12)} -> ${workflow.id}`);
           } catch (error) {
+            // A lane that could not start (no session reference yet, a shell
+            // that was not ready) is infrastructure: never an attempt; a
+            // fresh lane after a backoff.
+            const failures = ((run as { infraFailures?: number }).infraFailures ?? 0) + 1;
+            const retryAfter = new Date(Date.parse(use.now()) + infraBackoffMs(failures)).toISOString();
+            Object.assign(run, { infraFailures: failures, retryAfter });
+            delete run.lane;
             run.note = `${action.kind} failed: ${clip((error as Error).message, 300)}`;
-            done.push(`${action.kind} failed: ${clip((error as Error).message, 120)}`);
+            done.push(`${action.kind} failed (infrastructure; a fresh lane after ${retryAfter}): ${clip((error as Error).message, 120)}`);
           }
           continue;
         }
@@ -5212,6 +5228,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               }))({ repo, path: worktree, sha: record.integratedSha ?? record.integration?.sha });
             record.verifyWorktree = worktree;
             objective = verifyObjective(spec, item, {
+              worktree,
               releaseSha: record.releaseSha,
               reportPath: item.acceptance.evidence ? finalReportPath(spec, item.acceptance.evidence.report) : "",
             });
@@ -5415,9 +5432,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           done.push(`done ${item.id}`);
         } else record.note = `verifier: ${verdict.failing!.name}: ${verdict.failing!.detail}`;
       }
-      // Retire spec lanes whose receipt the driver has consumed (no item
-      // points at them any more), under the retire grant: their sessions,
-      // tabs and leases would otherwise pile up.
+      // Retire spec lanes no item points at any more, under the retire grant:
+      // their sessions, tabs and leases would otherwise pile up. A lane with
+      // a receipt has been consumed. One without (it never started, was
+      // replaced, or had its receipt inferred) goes once it started
+      // SPEC_ORPHAN_GRACE_MS ago and its agent is not working or blocked.
+      // Session data is archived, never deleted.
       if (!laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire")) {
         const current = new Set(
           Object.values(next.items as Record<string, { lane?: { workflowId: string; laneId: string } }>)
@@ -5429,13 +5449,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const latest = await loadManifest(ctx.cwd);
         for (const workflow of latest.workflows)
           for (const lane of workflow.lanes) {
-            if (!lane.specStage || !lane.completionReceipt) continue;
+            if (!lane.specStage) continue;
             if (lane.retirement && lane.retirement.status !== "partial") continue;
             if (current.has(`${workflow.id}/${lane.id}`)) continue;
-            const [candidate] = retireCandidates(ctx.cwd, latest, { auto: false, workflowId: workflow.id, laneId: lane.id });
+            const orphan = !lane.completionReceipt;
+            if (orphan) {
+              const started = Date.parse(lane.agentStartedAt ?? (lane as { tabCreateAttemptedAt?: string }).tabCreateAttemptedAt ?? "");
+              if (!Number.isFinite(started) || Date.parse(use.now()) - started < SPEC_ORPHAN_GRACE_MS) continue;
+              if (lane.paneId && (await agentPresent(lane.paneId).catch(() => true))) continue;
+            }
+            const [candidate] = retireCandidates(ctx.cwd, latest, { auto: false, workflowId: workflow.id, laneId: lane.id, force: orphan });
             if (!candidate) continue;
             try {
-              await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, "spec receipt consumed (auto-retire)", signal)))(candidate);
+              await (ports?.retire ?? ((input: RetireCandidate) => retireLane(ctx.cwd, input, orphan ? "spec lane no item maps any more (auto-retire)" : "spec receipt consumed (auto-retire)", signal)))(candidate);
               done.push(`retired ${workflow.id}/${lane.id}`);
             } catch (error) {
               done.push(`retire ${workflow.id}/${lane.id} failed: ${clip((error as Error).message, 120)}`);
@@ -5532,6 +5558,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       } finally {
         await release();
       }
+      // Finished and orphaned lanes are retired by the driver's own passes,
+      // not only when the root's turn settles (the host has no turns).
+      await autoRetireFinishedLanes(ctx);
       return { actions: done, rootAsks: step.rootAsks, waits: step.waits };
     } finally {
       specDriverRunning = false;
@@ -5617,9 +5646,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     timer.start();
   }
 
-  /** Runs when the root's turn settles: retire lanes whose completion the
-   * root has received, when the acknowledged policy grants retire and the lane
-   * agent is no longer working. Never throws into the Pi lifecycle. */
+  /** Runs when the root's turn settles and after every spec driver pass:
+   * retire lanes whose completion the root has received, when the
+   * acknowledged policy grants retire and the lane agent is no longer
+   * working. Never throws into the Pi lifecycle. */
   async function autoRetireFinishedLanes(ctx: ExtensionContext): Promise<void> {
     try {
       if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;

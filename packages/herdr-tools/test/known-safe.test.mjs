@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, classifyLocalValidation } from "../known-safe.mjs";
+import { classifyCommand, classifyLocalValidation, laneConfinedVerdict } from "../known-safe.mjs";
 
 const SCRATCH = "/private/tmp/claude-501/-Users-dev-project/0f0e-session/scratchpad";
 
@@ -149,7 +149,8 @@ test("the PermissionRequest hook allows known-safe Bash, stays silent otherwise,
       hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } },
     });
     const entry = JSON.parse((await readFile(log, "utf8")).trim());
-    assert.deepEqual(entry.rules, ["rm-created-file"]);
+    // `diff base.ts a.ts` reads worktree files (read-local); the rm is of a file the command created.
+    assert.deepEqual(entry.rules.sort(), ["read-local", "rm-created-file"]);
     assert.equal(entry.sessionId, "s-1");
 
     for (const input of [request("rm -rf ~/work"), request("rm -f a", "Edit"), "not json", { ...request("rm -f x"), hook_event_name: "PreToolUse" }]) {
@@ -500,4 +501,42 @@ Claude-Session: https://example.test/session" && git push -q -u origin ink/infra
   } finally {
     await remove(directory, { recursive: true, force: true });
   }
+});
+
+test("read-only commands on the worktree, /tmp and scratch are known-safe; credential files never are (a live lane block)", () => {
+  const cwd = "/work/spec-verify-D29";
+  const allow = (command) => assert.equal(classifyCommand(command, { cwd }).decision, "allow", command);
+  const defer = (command, why) => {
+    const verdict = classifyCommand(command, { cwd });
+    assert.equal(verdict.decision, "defer", command);
+    if (why) assert.match(verdict.reason, why);
+  };
+  allow("tail -100 /tmp/backend.log");
+  allow("tail -100 /private/tmp/backend.log | grep -n ERROR");
+  allow("head -50 /tmp/claude-501/p/s/scratchpad/run.log");
+  allow("grep -rn TODO src");
+  allow("wc -l /work/spec-verify-D29/package.json");
+  defer("ls", /no known-safe rule/);
+  defer("cat .env", /credential/);
+  defer("cat /work/spec-verify-D29/.env.local", /credential/);
+  defer("tail certs/server.key", /credential/);
+  defer("tail /Users/someone/x.log", /no known-safe rule/);
+  defer("cat ~/.zshrc");
+  defer("cat ../other/file");
+  defer("sort -o out.txt in.txt");
+  assert.equal(laneConfinedVerdict("Read", { file_path: "/tmp/backend.log" }, { cwd }).allow, true);
+  assert.equal(laneConfinedVerdict("Read", { file_path: `${cwd}/.env` }, { cwd }).allow, false);
+  assert.equal(laneConfinedVerdict("Read", { file_path: "/Users/someone/notes.txt" }, { cwd }).allow, false);
+});
+
+test("a rebase of the worktree's own feature branch is known-safe; --skip, interactive and other branches are not", () => {
+  const own = { cwd: "/w", ownBranch: "ink/fix" };
+  assert.equal(classifyCommand("git rebase -q origin/main", own).decision, "allow");
+  assert.equal(classifyCommand("cd /w && git rebase origin/main", own).decision, "allow", "a leading cd into the worktree");
+  assert.equal(classifyCommand("GIT_EDITOR=true git rebase --continue", own).decision, "allow");
+  assert.equal(classifyCommand("git rebase --abort", own).decision, "allow");
+  assert.equal(classifyCommand("git rebase --skip", own).decision, "defer");
+  assert.equal(classifyCommand("git rebase -i origin/main", own).decision, "defer");
+  assert.equal(classifyCommand("git rebase -q origin/main", { cwd: "/w" }).decision, "defer", "branch unknown");
+  assert.equal(classifyCommand("git rebase -q origin/main", { cwd: "/w", ownBranch: "HEAD" }).decision, "defer");
 });

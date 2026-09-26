@@ -424,3 +424,70 @@ test("a lane whose workflow failed to dispatch (lane still planned) climbs the l
   assert.equal(step.state.items.D05.lane, undefined);
   assert.ok(step.actions.some((action) => action.kind === "review" && action.itemId === "D05"), "a fresh review lane");
 });
+
+test("verify lanes that run the app locally take turns on the dev stack; the objective names the worktree", () => {
+  const s = spec(
+    [{ id: "V1" }, { id: "V2" }, { id: "V3" }],
+    { evidence: { report: "artifacts/{id}.docx", minImages: 2 } },
+  );
+  const state = { version: 1, items: { V1: { state: "verifying", integratedSha: "a" }, V2: { state: "verifying", integratedSha: "b" }, V3: { state: "verifying", integratedSha: "c" } } };
+  let step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
+  assert.deepEqual(step.actions.filter((action) => action.kind === "verify").map((action) => action.itemId), ["V1"], "one dev stack at a time");
+  assert.match(step.waits.V2, /dev stack busy: V1 verifying on it \(at most 1 at a time\)/);
+  // V1's lane is running: still one.
+  const running = { version: 1, items: { ...state.items, V1: { ...state.items.V1, lane: { workflowId: "w1", laneId: "lane-1" } } } };
+  step = advanceSpec({ spec: s, state: running, lane: lanes({ "w1/lane-1": { agentStatus: "working", status: "running" } }), now: at(1) });
+  assert.equal(step.actions.filter((action) => action.kind === "verify").length, 0);
+  // A spec may allow more.
+  const two = spec([{ id: "V1" }, { id: "V2" }, { id: "V3" }], { evidence: { report: "artifacts/{id}.docx", minImages: 2 }, maxDevStacks: 2 });
+  step = advanceSpec({ spec: two, state, lane: lanes({}), now: at(0) });
+  assert.deepEqual(step.actions.filter((action) => action.kind === "verify").map((action) => action.itemId), ["V1", "V2"]);
+  const objective = verifyObjective(s, s.items[0], { worktree: "/work/spec-verify-V1", releaseSha: undefined, reportPath: "artifacts/V1.docx" });
+  assert.match(objective, /Your worktree is \/work\/spec-verify-V1 .* never cd into a retyped absolute path/);
+  assert.match(objective, /the only lane running a dev stack now/);
+});
+
+test("a baseline lane that never started is infrastructure: no attempt counted, a fresh lane after a backoff", () => {
+  const s = validateSpec({
+    version: 1,
+    target: { repo: ".", remote: "origin", branch: "feature/release", suite: ["pnpm test"] },
+    items: [{ id: "Q", title: "Queued", acceptance: { text: "q" } }],
+  });
+  const sha = "f".repeat(40);
+  const state = { version: 1, items: { Q: { state: "integrating", attempts: 1 } }, baselineRun: { kind: "baseline", targetSha: sha, attempts: 1, requestedAt: at(0), lane: { workflowId: "wb", laneId: "lane-1" } } };
+  let step = advanceSpec({ spec: s, state, lane: lanes({ "wb/lane-1": { status: "planned", workflowStatus: "dispatch-failed", agentStatus: "idle" } }), targetSha: sha, now: at(1) });
+  assert.equal(step.state.baselineRun.attempts, 1, "not counted");
+  assert.equal(step.state.baselineRun.infraFailures, 1);
+  assert.equal(step.state.baselineRun.lane, undefined);
+  assert.equal(step.state.baselineRun.retryAfter, at(2), "one minute on the first failure");
+  assert.equal(step.actions.filter((action) => action.kind === "baseline").length, 0, "waits out the backoff");
+  step = advanceSpec({ spec: s, state: step.state, lane: lanes({}), targetSha: sha, now: at(3) });
+  assert.deepEqual(step.actions.filter((action) => action.kind === "baseline").map((action) => action.targetSha), [sha], "then a fresh lane");
+});
+
+test("a new stage does not inherit the last lane's receipt bookkeeping (a live false receipt-missing)", () => {
+  // As it stood live: the build lane's receipt was inferred at 18:32 and the
+  // item moved to review, but its pointed ask and inference stayed on the
+  // record and were read against the new review lane.
+  const s = spec([{ id: "D05" }]);
+  const state = {
+    version: 1,
+    items: {
+      D05: {
+        state: "reviewing",
+        since: "2026-09-24T10:32:04.000Z",
+        laneStage: "review",
+        receiptStatusReplies: 2,
+        receiptPointedAt: "2026-09-24T10:21:55.000Z",
+        receiptInferRequestedAt: "2026-09-24T10:32:00.000Z",
+        receiptInferred: { at: "2026-09-24T10:32:00.478Z", source: "its last message" },
+        lane: { workflowId: "herdr-rev", laneId: "lane-1" },
+      },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({ "herdr-rev/lane-1": { agentStatus: "working", status: "running", specStage: "review" } }), now: at(50) });
+  const record = step.state.items.D05;
+  for (const key of ["receiptPointedAt", "receiptInferRequestedAt", "receiptInferred", "receiptStatusReplies"]) assert.equal(record[key], undefined, `${key} cleared`);
+  assert.deepEqual(record.lane, { workflowId: "herdr-rev", laneId: "lane-1" }, "the current lane stays");
+  assert.equal(record.state, "reviewing");
+});
