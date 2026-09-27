@@ -50,7 +50,7 @@ const STAGE_OF = { deciding: "decide", building: "build", reviewing: "review", i
 /** Workflow statuses after which a lane no longer occupies its worktree. */
 const CLOSED_WORKFLOW = new Set(["closed", "completed", "operator-closed", "superseded", "retired"]);
 /** Per-lane receipt and background bookkeeping on an item record. */
-const LANE_BOOKKEEPING = [
+export const LANE_BOOKKEEPING = [
   "receiptAskedAt",
   "receiptPointedAt",
   "receiptInferRequestedAt",

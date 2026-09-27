@@ -82,11 +82,13 @@ test("a root turn of 30 minutes is interrupted once and reported; a turn that en
   let status = "working";
   const interrupts = [];
   const anomalies = [];
+  const told = [];
   const watch = createRootTurnWatch({
     loadConfig: async () => ({ orchestrators: [root("a")] }),
     status: async () => status,
     interrupt: async (paneId) => interrupts.push(paneId),
     anomaly: async (anomaly) => anomalies.push(anomaly),
+    tellRoot: async (orchestrator, text) => told.push([orchestrator.id, text]),
     clock: () => clock,
   });
   await watch.tick();
@@ -98,6 +100,8 @@ test("a root turn of 30 minutes is interrupted once and reported; a turn that en
   assert.deepEqual(interrupts, ["a:p1"]);
   assert.equal(anomalies[0].kind, "root-turn-too-long");
   assert.match(anomalies[0].summary, /30 min/);
+  assert.equal(told.length, 1, "the root is told why it was interrupted");
+  assert.match(told[0][1], /Your turn ran 30 min, so it was interrupted\. The spec driver runs the loop/);
   clock += 60_000;
   await watch.tick();
   assert.equal(interrupts.length, 1, "once per limit");

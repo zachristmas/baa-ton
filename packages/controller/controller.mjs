@@ -741,6 +741,15 @@ export async function refreshLiveLaneStatus(herdr, workflows, { timestamp = now(
   return live;
 }
 
+/**
+ * Whether a lane's screen shows its agent at work: Claude's spinner line
+ * with an elapsed time ("✻ Catapulting… (4m 56s · …)") or "esc to interrupt".
+ */
+export function screenShowsWork(text) {
+  const screen = String(text ?? "");
+  return /^\s*\S\s+\S[^\n]*…\s*\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\b/m.test(screen) || /esc to interrupt/i.test(screen);
+}
+
 const lastNudgeLog = new Map();
 const lastTickStatus = new Map();
 
@@ -750,11 +759,15 @@ const lastTickStatus = new Map();
  * steady state is logged once, not every tick.
  */
 export function logNudgeDecision(configDir, rootId, decision, log = (line) => supervisorLog(configDir, line)) {
+  // Compared on what the decision is (quiet and why, or due and its first
+  // reason), not the reason count or the stall flag, which can flip between
+  // ticks while nothing changed.
+  const key = decision?.quiet ? `quiet (${decision.quiet})` : `due: ${String((decision?.reasons ?? [])[0] ?? "").slice(0, 120)}`;
+  if (lastNudgeLog.get(rootId) === key) return false;
+  lastNudgeLog.set(rootId, key);
   const summary = decision?.quiet
-    ? `quiet (${decision.quiet})`
+    ? key
     : `due: ${(decision?.reasons ?? []).length} reason(s)${decision?.specStall ? ", spec stalled" : ""}: ${clipText((decision?.reasons ?? []).slice(0, 3).join("; "), 400)}`;
-  if (lastNudgeLog.get(rootId) === summary) return false;
-  lastNudgeLog.set(rootId, summary);
   log(`nudge ${rootId}: ${summary}`);
   return true;
 }
@@ -4412,7 +4425,9 @@ export async function handleHook({
       });
       if (blocked.status === "approved" || (blocked.status === "routed" && !blocked.reason)) await atomicWriteJson(mapping.workflow.manifest_path, manifest);
       // Nothing the handler could act on: that is a gap to fix.
-      if (blocked.status === "none" || blocked.status === "skipped") {
+      // A screen showing the agent at work (a spinner with its elapsed time,
+      // "esc to interrupt") was a transient blocked status, not a gap.
+      if ((blocked.status === "none" || blocked.status === "skipped") && !screenShowsWork(blocked.excerpt)) {
         try {
           const { reportAnomaly } = await import("./anomalies.mjs");
           await reportAnomaly(
@@ -4685,6 +4700,13 @@ export async function runSupervisorLoop({
         anomaly: async (anomaly) => {
           const { reportAnomaly } = await import("./anomalies.mjs");
           return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+        },
+        // Queued as an operator message to the root; the supervisor delivers
+        // it once the interrupted root is idle.
+        tellRoot: async (orchestrator, text) => {
+          const { operatorStorePath, withOperatorStore, addOperatorMessage } = await import("../herdr-tools/operator.mjs");
+          const resolved = { kind: "root", label: `root:${orchestrator.id}`, paneId: orchestrator.root.pane_id, workspaceId: orchestrator.root.workspace_id, ...(orchestrator.root.agent_kind ? { agentKind: orchestrator.root.agent_kind } : {}) };
+          await withOperatorStore(operatorStorePath(), (store) => addOperatorMessage(store, { target: "root", resolved, text, from: "baa-ton supervisor", at: now() }));
         },
         log: (line) => supervisorLog(resolvedConfigDir, line),
       });
