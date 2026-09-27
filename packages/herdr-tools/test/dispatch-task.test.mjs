@@ -398,7 +398,8 @@ test("lanes start in a lean shell, and startup waits scale with a slow process-s
     const zdotdir = join(f.ports.directory, "lane-shell");
     for (const call of creates) assert.ok(call.includes(`ZDOTDIR=${zdotdir}`), call.join(" "));
     assert.equal(await readFile(join(zdotdir, ".zshrc"), "utf8"), LANE_ZSHRC);
-    assert.doesNotMatch(LANE_ZSHRC, /p10k|powerlevel|source|compinit/);
+    const commands = LANE_ZSHRC.split("\n").filter((line) => line.trim() && !line.startsWith("#")).join("\n");
+    assert.doesNotMatch(commands, /p10k|powerlevel|source|compinit|\. /, "no prompt framework or sourced rc file");
     const starts = f.calls.filter((call) => call[0] === "agent" && call[1] === "start");
     assert.ok(starts.length > 0);
     for (const call of starts) assert.equal(call[call.indexOf("--timeout") + 1], "120000", "3x a 40 s probe");

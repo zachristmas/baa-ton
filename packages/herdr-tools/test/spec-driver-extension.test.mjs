@@ -585,13 +585,20 @@ test("slow process starts: one lane starts per pass until the probe recovers, an
     assert.deepEqual(g.calls.dispatch, ["herdr-spec1"]);
     let state = await g.state();
     assert.deepEqual(state.items.A.sameSlot, { workflowId: "herdr-spec1", laneId: "lane-1", stage: "build", attempts: 1 });
-    // After the infrastructure backoff the same workflow (its pane) is dispatched again, no new plan.
-    g.ports.now = () => "2026-09-24T12:05:00.000Z";
+    // The failed workflow keeps its pane (dispatch-failed); the driver sees it never started.
+    const manifest = await g.manifest();
+    manifest.workflows.push({ id: "herdr-spec1", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "dispatch-failed", specStage: "build", paneId: "w-spec:p9", tabId: "w-spec:t9" }], evidence: [] });
+    await writeFile(join(g.stateDir, "manifest.json"), JSON.stringify(manifest));
     g.ports.dispatch = async (workflowId) => {
       g.calls.dispatch.push(workflowId);
       return { dispatched: true };
     };
-    await g.advance();
+    // After the infrastructure backoffs the same workflow (its pane) is dispatched again, no new plan.
+    for (const at of ["2026-09-24T12:05:00.000Z", "2026-09-24T12:20:00.000Z", "2026-09-24T12:40:00.000Z"]) {
+      if (g.calls.dispatch.length > 1) break;
+      g.ports.now = () => at;
+      await g.advance();
+    }
     assert.deepEqual(g.calls.dispatch, ["herdr-spec1", "herdr-spec1"]);
     assert.equal(g.calls.plan.length, 1);
     state = await g.state();
