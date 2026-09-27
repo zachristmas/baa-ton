@@ -201,6 +201,8 @@ test("a blocked event for an agent that is already gone is 'gone', not an unhand
   assert.equal((await handleBlockedLane({ herdr: failing("pane_not_found"), manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "t" })).status, "gone");
   const broken = await handleBlockedLane({ herdr: failing("herdr: command not found"), manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "t" });
   assert.equal(broken.status, "skipped", "a missing herdr binary is a real gap");
+});
+
 test("a lane question's default never pauses: a Recommended pause is passed over for the first option that keeps work moving", async () => {
   const pauseScreen = `
  Should I pause the retries until the harness is repaired, or keep retrying?
