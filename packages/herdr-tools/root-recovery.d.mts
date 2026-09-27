@@ -18,6 +18,7 @@ export function rootRecoveryPlan(input: {
   root: any;
   session: any;
   liveWorkspaceIds: string[];
+  restart?: boolean;
 }): RootRecoveryPlan;
 
 export function readRecoveryFiles(
