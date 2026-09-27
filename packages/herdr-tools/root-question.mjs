@@ -22,6 +22,20 @@ const HUMAN_ONLY =
 
 const RECOMMENDED = /\s*\((?:recommended)\)\s*/i;
 
+/**
+ * An option that stops work: pausing, stopping or halting the run or its
+ * retries, holding, parking, deferring, freezing or blocking. An unattended
+ * default never takes one (a default once paused a whole run at night):
+ * it takes the first option that keeps work moving, and when every option
+ * stops work it does not answer at all, and the user is told.
+ */
+const STOPS_WORK =
+  /\b(pause[ds]?|pausing|stop(?:s|ped|ping)?|halt(?:s|ed|ing)?|hold(?:s|ing)?(?: off)?|park(?:s|ed|ing)?|freez(?:e|es|ing)|suspend(?:s|ed|ing)?|defer(?:s|red|ring)?|block(?:s|ed|ing)?|abort(?:s|ed|ing)?|wait (?:for|until)|don'?t (?:retry|continue|proceed|dispatch))\b/i;
+
+export function stopsWork(label) {
+  return STOPS_WORK.test(String(label ?? ""));
+}
+
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -68,20 +82,29 @@ export function autoAnswerPlan(input) {
   for (const item of questions) {
     const recommended = item.options.filter((option) => option.recommended);
     if (recommended.length > 1) return { eligible: false, reason: `more than one Recommended option for "${item.question.slice(0, 80)}"` };
-    // No Recommended option: the policy default is the first real option.
-    const choice = recommended[0] ?? item.options.find((option) => !/^(type something|chat about this|other)\b/i.test(option.label));
-    if (!choice) return { eligible: false, reason: `no option to choose for "${item.question.slice(0, 80)}"` };
-    answers.push({ question: item.question, answer: choice.label, ...(recommended[0] ? {} : { byDefault: true }) });
+    const real = item.options.filter((option) => !/^(type something|chat about this|other)\b/i.test(option.label));
+    if (!real.length) return { eligible: false, reason: `no option to choose for "${item.question.slice(0, 80)}"` };
+    // Never a default that stops work: the Recommended option only when it
+    // keeps work moving, else the first option that does.
+    const moving = real.filter((option) => !stopsWork(option.label));
+    if (!moving.length) return { eligible: false, stopsWork: true, reason: `every option for "${item.question.slice(0, 80)}" pauses or stops work, so only the user may choose` };
+    const choice = recommended[0] && !stopsWork(recommended[0].label) ? recommended[0] : moving[0];
+    answers.push({
+      question: item.question,
+      answer: choice.label,
+      ...(choice === recommended[0] ? {} : { byDefault: true }),
+      ...(recommended[0] && choice !== recommended[0] ? { declinedRecommended: recommended[0].label } : {}),
+    });
   }
   return { eligible: true, answers };
 }
 
 export function autoAnswerText(plan, minutes = Math.round(ROOT_QUESTION_AUTO_ANSWER_MS / 60_000)) {
-  const lines = plan.answers.map((item) => `- ${item.question || "Question"} -> ${item.answer}`);
+  const lines = plan.answers.map((item) => `- ${item.question || "Question"} -> ${item.answer}${item.declinedRecommended ? ` (not your Recommended "${item.declinedRecommended}": an unattended default never pauses or stops work)` : ""}`);
   return [
-    `[Baa-ton unattended default] Nobody answered your question within ${minutes} minutes, so the option you marked Recommended was taken:`,
+    `[Baa-ton unattended default] Nobody answered your question within ${minutes} minutes, so a default was taken (your Recommended option, unless it would pause or stop work):`,
     ...lines,
-    "Proceed with it. It is logged for the user's review; do not ask this question again.",
+    "Proceed with it and keep work moving. It is logged for the user's review; do not ask this question again. Only the user can pause the run.",
   ].join("\n");
 }
 

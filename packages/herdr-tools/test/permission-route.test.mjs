@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { routePermission } from "../permission-route.mjs";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
 const request = (status, extra = {}) => ({
   structuredContent: { kind: "request", request: { id: "request-1", status, ...extra } },
@@ -106,7 +108,7 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
         input: JSON.stringify({ session_id: "s-2", cwd: directory, hook_event_name: "PermissionRequest", tool_name: tool, tool_input: input }),
         encoding: "utf8",
         env: { ...process.env, FAKE_BRIDGE_LOG: bridgeLog, FAKE_BRIDGE_ANSWER: answer },
-        timeout: 120_000,
+        timeout: CHILD_TIMEOUT_MS,
       },
     );
   try {

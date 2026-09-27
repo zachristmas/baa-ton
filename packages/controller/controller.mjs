@@ -751,6 +751,22 @@ export function screenShowsWork(text) {
   return /^\s*\S\s+\S[^\n]*…\s*\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\b/m.test(screen) || /esc to interrupt/i.test(screen);
 }
 
+export const PAUSE_NOTICE_MS = 15 * 60_000;
+const pauseNoticed = new Set();
+
+/**
+ * Whether Zach should now hear about a pause: paused PAUSE_NOTICE_MS or
+ * longer with work waiting, and not yet told about this pause (one pause is
+ * one run.at). `seen` is for tests.
+ */
+export function pauseNoticeDue(run, timestamp, waiting, seen = pauseNoticed) {
+  if (run?.state !== "paused" || !waiting || !run.at) return false;
+  if (Date.parse(timestamp) - Date.parse(run.at) < PAUSE_NOTICE_MS) return false;
+  if (seen.has(run.at)) return false;
+  seen.add(run.at);
+  return true;
+}
+
 const lastNudgeLog = new Map();
 const lastTickStatus = new Map();
 
@@ -3850,6 +3866,14 @@ export async function runSupervisorTick({
       // The operator's run state is the only pause: when an operator set it
       // to running, a pause the root put on its own goal is lifted.
       const run = await operatorRunState();
+      // A run paused for PAUSE_NOTICE_MS while spec items remain: Zach hears
+      // once who paused it and why (a default once paused a run at night).
+      if (run?.state === "paused" && pauseNoticeDue(run, timestamp, specWaiting(manifestPath, manifest).counts.size > 0)) {
+        await notify({
+          title: "Baa-ton: the run is paused",
+          body: clipText(`${orchestrator.id} has been paused for ${Math.round((Date.parse(timestamp) - Date.parse(run.at)) / 60_000)} min by ${run.by ?? "unknown"}${run.reason ? `: ${run.reason}` : ""}. Spec items are waiting. Resume with: baa-ton run resume --from zach`, 400),
+        }).catch?.(() => undefined);
+      }
       if (!run.implicit && run.state === "running" && (supervisor.state === "paused" || goal.status === "paused")) {
         supervisor.state = "running";
         delete supervisor.pauseReason;

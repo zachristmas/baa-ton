@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
 const helper = fileURLToPath(new URL("../claude-startup-attest.mjs", import.meta.url));
 const profile = { provider: "claude-code", model: "claude-sonnet-5", thinking: "high", auth: "subscription" };
@@ -37,7 +39,7 @@ async function fixture(run, mutate = () => {}) {
         input: JSON.stringify(input), encoding: "utf8",
         // Generous: the hermetic runner starts test files in parallel, and a
         // loaded machine can take seconds to boot Node. Status is still asserted.
-        timeout: 120000,
+        timeout: CHILD_TIMEOUT_MS,
       },
     );
     await run({ invoke, intentPath, lane });
@@ -172,7 +174,7 @@ for (const wrong of ["session", "manifest-pane", "missing-resume"]) {
 test("no startup intent produces no task context", () => {
   const env = { ...process.env };
   delete env.BAA_STARTUP_INTENT;
-  const result = spawnSync(process.execPath, [helper], { env, input: "{}", encoding: "utf8", timeout: 120000 });
+  const result = spawnSync(process.execPath, [helper], { env, input: "{}", encoding: "utf8", timeout: CHILD_TIMEOUT_MS });
   assert.equal(result.status, 0);
   assert.equal(result.stdout, "");
 });

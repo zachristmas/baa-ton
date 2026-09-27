@@ -9,4 +9,5 @@ export function listAgents(input?: { env?: Env }): Promise<OperatorStore["agents
 export function deliverOperatorNow(input?: { env?: Env; deliver?: () => Promise<string[]> }): Promise<string[]>;
 export function formatInbox(messages: OperatorMessage[]): string;
 export function readRunState(input?: { env?: Env }): Promise<import("./operator.mjs").RunState>;
-export function changeRunState(input: { state: "running" | "paused"; reason?: string; from?: string; env?: Env }): Promise<import("./operator.mjs").RunState>;
+export function pauseRefusal(input: { from?: string; env?: Env; config?: unknown }): Promise<string | undefined>;
+export function changeRunState(input: { state: "running" | "paused"; reason?: string; from?: string; env?: Env; config?: unknown }): Promise<import("./operator.mjs").RunState>;

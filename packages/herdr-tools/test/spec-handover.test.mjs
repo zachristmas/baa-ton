@@ -5,6 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { DEFER_FILE, FRESH_MS, HOST_LEASE_FILE, renewHostLease, specHandover } from "../spec-handover.mjs";
 import { headlessContext, headlessPi, runSpecHost } from "../spec-host.mjs";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
 const T0 = Date.parse("2026-09-26T16:00:00.000Z");
 const iso = (ms) => new Date(T0 + ms).toISOString();
@@ -106,9 +108,9 @@ test("the spec host renews its lease and runs herdr_spec advance headless on its
 
 test("the headless Pi host runs commands and answers with Pi's exec shape", async () => {
   const pi = headlessPi();
-  const ok = await pi.exec(process.execPath, ["-e", "process.stdout.write('hi')"], { timeout: 120_000 });
+  const ok = await pi.exec(process.execPath, ["-e", "process.stdout.write('hi')"], { timeout: CHILD_TIMEOUT_MS });
   assert.deepEqual({ stdout: ok.stdout, code: ok.code }, { stdout: "hi", code: 0 });
-  const bad = await pi.exec(process.execPath, ["-e", "process.exit(3)"], { timeout: 120_000 });
+  const bad = await pi.exec(process.execPath, ["-e", "process.exit(3)"], { timeout: CHILD_TIMEOUT_MS });
   assert.equal(bad.code, 3);
   assert.equal(headlessContext("/x").ui.notify("anything"), undefined, "any UI call is a no-op");
 });
