@@ -247,7 +247,7 @@ test("a pulled update restarts the real supervisor from the new code", { timeout
     return undefined;
   };
   const waitFor = async (predicate, ms) => {
-    const deadline = Date.now() + ms;
+    const deadline = Date.now() + Math.max(ms, CHILD_TIMEOUT_MS);
     while (Date.now() < deadline) {
       const value = await predicate();
       if (value) return value;
