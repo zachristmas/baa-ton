@@ -26,7 +26,7 @@ import {
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
+import { ownerRecord, reclaimLockDir } from "./inbox/lock-owner.mjs";
 import { Value } from "typebox/value";
 import { Type } from "typebox";
 import {

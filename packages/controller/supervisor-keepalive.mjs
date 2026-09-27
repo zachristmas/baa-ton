@@ -13,11 +13,13 @@ import { spawn } from "node:child_process";
 import { closeSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bootTimeMs, ownerHeldSync } from "../herdr-tools/lock-owner.mjs";
+import { bootTimeMs, ownerHeldSync } from "../herdr-tools/inbox/lock-owner.mjs";
 
 export const HEARTBEAT_FILE = "supervisor-heartbeat.json";
 export const HEARTBEAT_STALE_MS = 2 * 60_000;
 export const RELAUNCH_INTERVAL_MS = 60_000;
+/** A runner that left to restart on new code (its last heartbeat says so) gets this long for the next to start: minutes on a machine that starts processes slowly. */
+export const RESTART_GRACE_MS = 10 * 60_000;
 const RELAUNCH_FILE = "supervisor-relaunch.json";
 const LEASE = join("supervisor.lock", "owner.json");
 
@@ -46,9 +48,9 @@ export function processAlive(pid) {
 }
 
 /** The runner records that it is alive; called every tick, never throws. */
-export function writeHeartbeat(configDir, { pid = process.pid, at = new Date().toISOString(), commit } = {}) {
+export function writeHeartbeat(configDir, { pid = process.pid, at = new Date().toISOString(), commit, restarting } = {}) {
   try {
-    write(join(configDir, HEARTBEAT_FILE), { pid, at, ...(commit ? { commit } : {}) });
+    write(join(configDir, HEARTBEAT_FILE), { pid, at, ...(commit ? { commit } : {}), ...(restarting ? { restarting: true } : {}) });
   } catch {
     // Best effort: the keepalive treats a missing heartbeat as stale.
   }
@@ -92,10 +94,13 @@ export async function ensureSupervisor({
   // not written its first heartbeat yet; the last one is its predecessor's.
   // It gets the full HEARTBEAT_STALE_MS from when it took the lease.
   const leased = Date.parse(owner?.created_at ?? "");
-  if (holder && heartbeat?.pid !== holder && Number.isFinite(leased) && now - leased < HEARTBEAT_STALE_MS) return { status: "starting", pid: holder };
+  // A heartbeat marked restarting (the runner left for new code) stretches
+  // both windows: the next runner may take minutes to start.
+  const window = heartbeat?.restarting ? RESTART_GRACE_MS : HEARTBEAT_STALE_MS;
+  if (holder && heartbeat?.pid !== holder && Number.isFinite(leased) && now - leased < window) return { status: "starting", pid: holder };
   // Between one runner releasing the lease and the next taking it nobody
   // holds it: a recent heartbeat means a restart in progress, not a death.
-  if (!holder && Number.isFinite(beat) && now - beat < HEARTBEAT_STALE_MS) return { status: "restarting" };
+  if (!holder && Number.isFinite(beat) && now - beat < window) return { status: "restarting" };
   const since = Number.isFinite(beat) ? new Date(beat).toISOString() : "never";
   const minutes = Number.isFinite(beat) ? Math.round((now - beat) / 60_000) : undefined;
   await Promise.resolve(

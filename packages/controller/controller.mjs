@@ -49,7 +49,7 @@ import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import { handleBlockedLane, handleIdleLane, resolveScreenPrompts, sweepLaneDialogs } from "./blocked-lane.mjs";
 import { writeHeartbeat } from "./supervisor-keepalive.mjs";
-import { ownerHeld, ownerRecord, processStartMs, reclaimLockDir } from "../herdr-tools/lock-owner.mjs";
+import { ownerHeld, ownerRecord, processStartMs, reclaimLockDir } from "../herdr-tools/inbox/lock-owner.mjs";
 import {
   enqueueWakeHint,
   inboxRoutable,
@@ -4750,7 +4750,12 @@ export async function runSupervisorLoop({
     }
     if (!fingerprint) return;
     supervisorLog(resolvedConfigDir, `code changed on disk (${code?.fingerprint ?? "?"} -> ${fingerprint}); restarting.`);
-    void stop().then(() => onCodeChange(fingerprint));
+    // The keepalive reads this: a restart in progress, which may take minutes
+    // on a machine that starts processes slowly, is not a supervisor death.
+    void stop().then(() => {
+      writeHeartbeat(resolvedConfigDir, { commit: code?.commit, restarting: true });
+      return onCodeChange(fingerprint);
+    });
   };
   process.once("SIGINT", () => void stop());
   process.once("SIGTERM", () => void stop());

@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { acquireSupervisorLease, guardSupervisorProcess } from "../controller.mjs";
-import { bootTimeMs } from "../../herdr-tools/lock-owner.mjs";
-import { HEARTBEAT_FILE, HEARTBEAT_STALE_MS, RELAUNCH_INTERVAL_MS, ensureSupervisor, writeHeartbeat } from "../supervisor-keepalive.mjs";
+import { bootTimeMs } from "../../herdr-tools/inbox/lock-owner.mjs";
+import { HEARTBEAT_FILE, HEARTBEAT_STALE_MS, RELAUNCH_INTERVAL_MS, RESTART_GRACE_MS, ensureSupervisor, writeHeartbeat } from "../supervisor-keepalive.mjs";
 
 const T0 = Date.parse("2026-09-26T19:13:16.000Z");
 // The machine booted an hour before the test leases were taken.
@@ -86,6 +86,29 @@ test("a stale heartbeat while a live process holds the lease is reported as hung
     assert.equal((await ensureSupervisor({ configDir: d.path, env: { BAA_TON_NO_SUPERVISOR_KEEPALIVE: "1" } })).status, "skipped");
     assert.equal((await ensureSupervisor({ configDir: undefined, env: {} })).status, "skipped");
     assert.equal(JSON.parse(await readFile(join(d.path, HEARTBEAT_FILE), "utf8")).pid, 42);
+  } finally {
+    await d.cleanup();
+  }
+});
+
+test("a restart onto new code that takes minutes to start is not a supervisor death (a live false alarm)", async () => {
+  const d = await dir();
+  try {
+    // The runner left for new code at T0 and marked its heartbeat; the next one took 4.5 min to start.
+    writeHeartbeat(d.path, { pid: 41, at: new Date(T0).toISOString(), restarting: true });
+    const anomalies = [];
+    const launched = [];
+    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, boot: BOOT, now, alive: () => false, launch: () => (launched.push(now), 5), anomaly: async (anomaly) => anomalies.push(anomaly) });
+    assert.deepEqual(await run(T0 + 4.5 * 60_000), { status: "restarting" });
+    assert.equal(anomalies.length, 0);
+    assert.equal(launched.length, 0, "no relaunch during a restart");
+    // Past the grace nobody came back: now it is down.
+    assert.equal((await run(T0 + RESTART_GRACE_MS + 1)).status, "relaunched");
+    assert.equal(anomalies.length, 1);
+    // An unmarked heartbeat keeps the short window.
+    writeHeartbeat(d.path, { pid: 41, at: new Date(T0).toISOString() });
+    await rm(join(d.path, "supervisor-relaunch.json"), { force: true });
+    assert.equal((await run(T0 + 4.5 * 60_000)).status, "relaunched");
   } finally {
     await d.cleanup();
   }

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { bootTimeMs, ownerHeld, ownerHeldSync, ownerRecord, processStartMs, reclaimLockDir } from "../lock-owner.mjs";
+import { bootTimeMs, ownerHeld, ownerHeldSync, ownerRecord, processStartMs, reclaimLockDir } from "../../herdr-tools/inbox/lock-owner.mjs";
 
 // Pid 1 (launchd, init) is always alive and never a Baa-ton process: the
 // shape of the reboot outage, where pid 767 had become sharingd.

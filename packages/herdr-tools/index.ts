@@ -104,7 +104,7 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 const { acknowledgeActivation } = (await freshImport("./activation-ack.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./activation-ack.mjs");
 const { loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
-const { ownerRecord: lockOwnerRecord, reclaimLockDir } = (await freshImport("./lock-owner.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./lock-owner.mjs");
+const { ownerRecord: lockOwnerRecord, reclaimLockDir } = (await freshImport("./inbox/lock-owner.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lock-owner.mjs");
 import {
   authorizeStanding,
   approvalPolicySummary,
