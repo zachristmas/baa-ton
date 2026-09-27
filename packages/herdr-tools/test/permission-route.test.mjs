@@ -103,7 +103,7 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
   const run = (tool, input, answer, extra = []) =>
     spawnSync(
       process.execPath,
-      [hook, "--log", log, "--bridge", bridge, "--intent", "/lane/intent.json", "--wait-seconds", "20", "--poll-ms", "20", ...extra],
+      [hook, "--log", log, "--bridge", bridge, "--intent", "/lane/intent.json", "--wait-seconds", String(Math.max(20, Math.round(CHILD_TIMEOUT_MS / 2_000))), "--poll-ms", "20", ...extra],
       {
         input: JSON.stringify({ session_id: "s-2", cwd: directory, hook_event_name: "PermissionRequest", tool_name: tool, tool_input: input }),
         encoding: "utf8",

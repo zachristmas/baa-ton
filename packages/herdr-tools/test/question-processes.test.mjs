@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 const worker = fileURLToPath(
   new URL("./fixtures/question-writer.mjs", import.meta.url),
 );
@@ -29,7 +31,7 @@ test("process-separated root pause and concurrent cross-checkout questions prese
       });
       let output = "",
         error = "";
-      const timeout = setTimeout(() => proc.kill(), 15000);
+      const timeout = setTimeout(() => proc.kill(), Math.max(15_000, CHILD_TIMEOUT_MS));
       proc.stdout.on("data", (b) => (output += b));
       proc.stderr.on("data", (b) => (error += b));
       proc.on("error", reject);
