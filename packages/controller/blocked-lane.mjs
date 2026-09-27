@@ -390,7 +390,7 @@ function defaultFor(screen, worktree, { laneConfinedVerdict }) {
     const moving = screen.options.filter((option) => !option.freeText && !/^(type something|chat about this|other)\b/i.test(option.label) && !STOPS_WORK.test(option.label));
     const recommended = marked && !STOPS_WORK.test(marked.label) ? marked : marked ? moving[0] : undefined;
     return recommended
-      ? { decision: "granted", keys: [String(recommended.number)], reason: recommended === marked ? `took the Recommended option: ${recommended.label}` : `took ${recommended.label}, not the Recommended "${marked.label}": a default never pauses or stops work` }
+      ? { decision: "granted", keys: [String(recommended.number)], reason: recommended === marked ? `took the Recommended option: ${recommended.label}` : `took ${recommended.label}, not the Recommended "${marked.label.replace(/\s*\(Recommended\)\s*$/i, "")}": a default never pauses or stops work` }
       : {
           decision: "denied",
           keys: screen.denyKeys,
