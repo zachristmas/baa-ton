@@ -4622,12 +4622,12 @@ export async function runSupervisorLoop({
   // fake, false turns it off.
   revive,
   // The hook queue (hook.sh): drained apart from the tick, so a long tick
-  // never delays an event. On for the real runner; tests pass true.
-  hookQueue = Boolean(onCodeChange),
+  // never delays an event. The real runner turns it on.
+  hookQueue = false,
   hookQueueMs = 1_000,
   // The process-start probe (spawn-load.mjs) and the orphaned-shell report,
-  // apart from the tick. On for the real runner; tests pass true.
-  spawnWatch = Boolean(onCodeChange),
+  // apart from the tick. The real runner turns it on.
+  spawnWatch = false,
   spawnProbeMs = 60_000,
 } = {}) {
   assert(
@@ -4772,8 +4772,8 @@ export async function runSupervisorLoop({
     if (timer) clearInterval(timer);
     if (hookTimer) clearInterval(hookTimer);
     if (probeTimer) clearInterval(probeTimer);
+    // A probe in flight is not waited for: it only times a process start.
     await draining;
-    await probing;
     // Keep the lease until a tick that already owns the manifest lock has
     // settled. A restart must see this process as the supervisor rather than
     // overlap a late socket delivery with a new scheduler.
@@ -5166,6 +5166,8 @@ async function main() {
   if (command === "supervisor-run") {
     guardSupervisorProcess("runner", supervisorDir);
     await runSupervisorLoop({
+      hookQueue: true,
+      spawnWatch: true,
       onCodeChange: () => process.exit(SUPERVISOR_RESTART_EXIT_CODE),
     });
     return;
