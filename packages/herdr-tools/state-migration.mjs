@@ -29,7 +29,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
+import { ownerRecord, reclaimLockDir } from "./inbox/lock-owner.mjs";
 
 export const LEGACY_STATE_DIRECTORY = join(".pi", "herdr-orchestrator");
 export const STATE_DIRECTORY = join(".baa-ton", "herdr-orchestrator");

@@ -18,7 +18,7 @@
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
+import { ownerRecord, reclaimLockDir } from "./inbox/lock-owner.mjs";
 import { basename, dirname, join } from "node:path";
 import { reviewVerdict, specCommitMessage } from "./spec-driver.mjs";
 

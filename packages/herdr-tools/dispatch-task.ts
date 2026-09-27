@@ -2,7 +2,7 @@ import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
-import { ownerHeldSync, ownerRecord } from "./lock-owner.mjs";
+import { ownerHeldSync, ownerRecord } from "./inbox/lock-owner.mjs";
 import {
   toPersistenceHandle,
   type CapabilityCatalog,

@@ -7,7 +7,7 @@
  * records with the installed checkout to find version skew, and the supervisor
  * re-execs itself when its own code changes on disk.
  */
-import { bootTimeMs, ownerHeldSync } from "../herdr-tools/lock-owner.mjs";
+import { bootTimeMs, ownerHeldSync } from "../herdr-tools/inbox/lock-owner.mjs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";

@@ -19,7 +19,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { ownerRecord, reclaimLockDir } from "../lock-owner.mjs";
+import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
 
 export const HERDR_LINK_PROTOCOL = "herdr-link/1";
 export const INBOX_STORE_VERSION = 1;
