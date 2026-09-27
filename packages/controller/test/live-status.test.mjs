@@ -75,5 +75,21 @@ test("each root's nudge decision is logged when it changes, not every tick", () 
   assert.equal(logNudgeDecision("/cfg", "root-a", { quiet: "run-paused" }, log), true);
   assert.equal(logNudgeDecision("/cfg", "root-a", { quiet: "run-paused" }, log), false, "unchanged: not logged again");
   logNudgeDecision("/cfg", "root-a", { reasons: ["lane w/l (done) waits on request r1: runtime launch"], specStall: true }, log);
+  // The count and the stall flag flipping while the first reason stays is no change (a live log flood).
+  logNudgeDecision("/cfg", "root-a", { reasons: ["lane w/l (done) waits on request r1: runtime launch", "spec: 3 item(s) waiting"], specStall: false }, log);
   assert.deepEqual(lines, ["nudge root-a: quiet (run-paused)", "nudge root-a: due: 1 reason(s), spec stalled: lane w/l (done) waits on request r1: runtime launch"]);
+});
+
+test("a blocked status whose screen shows the agent at work is not an unhandled block (a live false alarm)", async () => {
+  const { screenShowsWork } = await import("../controller.mjs");
+  const working = [
+    "  ⏺ Reading tests/e2e/integration/payment/split-payment-auto-disable-d04.spec.ts",
+    "  ✻ Catapulting… (4m 56s · ↓ 5.1k tokens · thinking)",
+    "  ❯",
+    "    ⏸ manual mode on · 7 shells · ← for agents",
+  ].join("\n");
+  assert.equal(screenShowsWork(working), true);
+  assert.equal(screenShowsWork("  ✳ Thinking… (12s · esc to interrupt)"), true);
+  assert.equal(screenShowsWork("  ❯ \n  ? for shortcuts"), false, "an idle prompt is not work");
+  assert.equal(screenShowsWork("Done in 12s."), false);
 });

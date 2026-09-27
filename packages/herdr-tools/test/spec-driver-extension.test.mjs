@@ -625,7 +625,15 @@ test("a lane idle without its receipt is asked, asked pointedly, then (with no r
       told.push(input);
       return { message: { delivery: { status: "delivered" } } };
     };
-    f.ports.status = async (worktree) => (worktree === "/work/wt-gone" ? " M src/gone/half-done.ts" : "");
+    let goneDirty = true;
+    f.ports.status = async (worktree) => (worktree === "/work/wt-gone" && goneDirty ? " M src/gone/half-done.ts" : "");
+    // The gone lane's half-done work is kept: committed on its branch before the retry.
+    const commits = [];
+    f.ports.commit = async (input) => {
+      commits.push(input);
+      goneDirty = false;
+      return "c".repeat(40);
+    };
 
     const first = await f.advance();
     assert.equal(told.length, 1);
@@ -635,6 +643,7 @@ test("a lane idle without its receipt is asked, asked pointedly, then (with no r
     // The gone build lane is retried in the same worktree, not counted: its worktree has changes.
     const rebuild = f.calls.plan.find((call) => call.specStage === "build");
     assert.equal(rebuild.worktree, "/work/wt-gone");
+    assert.deepEqual(commits.map((commit) => commit.paths), [["src/gone/half-done.ts"]], "its half-done work was committed first");
     let state = await f.state();
     assert.equal(state.items.GONE.attempts, 1, "a retry with work in the worktree is not an attempt");
 
@@ -2085,7 +2094,7 @@ test("missing or invalid demo evidence is never terminal: a demo lane is dispatc
       defaults: { evidence: { report: "artifacts/{id}.docx", minImages: 3 } },
       items: [{ id: "D04", title: "Demo", acceptance: { text: "d" } }],
     },
-    seed: { version: 1, items: { D04: { state: "verifying", attempts: 1, integratedSha: "a".repeat(40), verified: "2026-09-24T11:00:00.000Z" } } },
+    seed: { version: 1, items: { D04: { state: "verifying", attempts: 1, integratedSha: "a".repeat(40), verified: "2026-09-24T11:00:00.000Z", receiptPointedAt: "2026-09-24T10:36:06.518Z" } } },
   });
   try {
     f.ports.ancestor = async () => true;
@@ -2107,6 +2116,7 @@ test("missing or invalid demo evidence is never terminal: a demo lane is dispatc
     assert.match(demo.laneObjective, /The last run's demo evidence failed the check: .*Producing that evidence is this lane's main job/);
     state = await f.state();
     assert.ok(state.items.D04.lane, "a demo lane runs");
+    assert.equal(state.items.D04.receiptPointedAt, undefined, "the last lane's pointed ask does not carry over (a live false receipt-missing)");
   } finally {
     await f.cleanup();
   }
@@ -2153,6 +2163,33 @@ test("a lane that finished with no status event recorded is seen done through He
     await f.advance();
     assert.equal(told.length, 1, "done in Herdr: the receipt is asked for");
     assert.ok((await f.state()).items.D02.receiptAskedAt);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a rebuild into a worktree an earlier lane left dirty commits that work first, then dispatches (a live stall)", async () => {
+  // As it stood live: rebuild 2 of D16 never started, "worktreeCwd must be
+  // clean before Herdr dispatch", retried forever as infrastructure.
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D16", title: "Image QA", owns: ["apps/backoffice/src/features/products/**"], acceptance: { text: "q" } }] },
+    seed: { version: 1, items: { D16: { state: "ready", attempts: 2, worktree: "/work/spec-D16", branch: "spec/D16" } } },
+  });
+  try {
+    let dirty = true;
+    f.ports.status = async () => (dirty ? "M  apps/backoffice/src/features/products/utils/product-image-qa.ts\nA  apps/backoffice/src/features/products/utils/product-image-qa.test.ts" : "");
+    const commits = [];
+    f.ports.commit = async (input) => {
+      commits.push(input);
+      dirty = false;
+      return "c".repeat(40);
+    };
+    const result = await f.advance();
+    assert.equal(commits.length, 1, "the earlier lane's work is committed on the item's branch");
+    assert.deepEqual(commits[0].paths.sort(), ["apps/backoffice/src/features/products/utils/product-image-qa.test.ts", "apps/backoffice/src/features/products/utils/product-image-qa.ts"]);
+    assert.match(commits[0].message, /^spec\(D16\): keep an earlier lane's uncommitted work$/);
+    assert.equal(f.calls.dispatch.length, 1, "then the rebuild is dispatched");
+    assert.match(result.content[0].text, /build D16 -> /);
   } finally {
     await f.cleanup();
   }

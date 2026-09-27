@@ -143,7 +143,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -5136,7 +5136,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             { at: use.now(), from: stage, to: stage, note: `left untracked, uncommitted: ${untracked.slice(0, 20).join(", ")}${untracked.length > 20 ? `, and ${untracked.length - 20} more` : ""}` },
           ];
         if (!changes.paths.length) return false;
-        const message = specCommitMessage(item.id, "adopt work as built");
+        const message = specCommitMessage(item.id, record.adopted ? "adopt work as built" : "keep an earlier lane's uncommitted work");
         try {
           const sha = await (ports?.commit ?? commitExactPaths)({ worktree, paths: changes.paths, message });
           record.adoptCommit = { sha, paths: changes.paths, at: use.now() };
@@ -5394,8 +5394,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           } else if (action.kind === "build") {
             profile = spec.stages.build?.profile ?? "implementation";
             // A build into an adopted worktree starts from the adopted work,
-            // committed the same way as before a review.
-            if (record.adopted && record.worktree) {
+            // committed the same way as before a review. So does a rebuild
+            // into a worktree an earlier lane left dirty (its work staged but
+            // never committed): Herdr dispatches only into a clean worktree,
+            // and that work is the item's own, kept rather than discarded.
+            if (record.worktree && (record.adopted || (await statusOf(record.worktree).catch(() => "")).trim())) {
               const held = await commitAdoptedWork(item, record, branch, "building");
               if (held) continue;
             }
@@ -5454,6 +5457,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           }
           if (action.kind === "build") record.buildWorkflows = [...(record.buildWorkflows ?? []), workflow.id];
           record.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+          // A new lane starts with no receipt or background bookkeeping of
+          // the last one (a pointed ask carried over made a lane that never
+          // started look overdue for its receipt).
+          for (const key of LANE_BOOKKEEPING) delete record[key];
           record.laneStage = action.kind;
           delete record.note;
           const result = await use.dispatch(workflow.id);
@@ -5534,7 +5541,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           const retryAfter = new Date(Date.parse(use.now()) + Math.min(10 * 60_000 * 2 ** (retries - 1), 2 * 60 * 60_000)).toISOString();
           record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "verifying", note: `evidence check failed (${clip(verdict.failing!.detail, 160)}); a demo lane produces it after ${retryAfter}` }];
           Object.assign(record, { evidenceRetries: retries, evidenceProblem: verdict.failing!.detail, evidenceRetryAfter: retryAfter });
-          for (const key of ["verified", "lane", "evidence", "note"]) delete record[key];
+          for (const key of ["verified", "lane", "evidence", "note", ...LANE_BOOKKEEPING]) delete record[key];
           if (retries === 3) step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its demo evidence failed the check 3 times (${clip(verdict.failing!.detail, 200)}); the driver keeps dispatching demo lanes. No action needed unless the requirement is unclear.` });
           done.push(`evidence for ${item.id} failed the check; a demo lane follows`);
         } else record.note = `verifier: ${verdict.failing!.name}: ${verdict.failing!.detail}`;

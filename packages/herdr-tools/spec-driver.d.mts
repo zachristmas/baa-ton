@@ -71,6 +71,7 @@ export const DEMO_TOOL: string;
 export function demoRule(report: string, minImages: number): string;
 export const RECEIPT_RULE: string;
 export const INFRA_KINDS: Set<string>;
+export const LANE_BOOKKEEPING: string[];
 export const INFRA_BACKOFF_MAX_MS: number;
 export function infraBackoffMs(failures: number): number;
 export function countedDeclines(declines: unknown, stage: string): number;

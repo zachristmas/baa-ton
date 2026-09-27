@@ -22,6 +22,10 @@ export const HOST_RESTART_MIN_MS = 30_000;
 export const HOST_RESTART_MAX_MS = 10 * 60_000;
 export const ROOT_TURN_LIMIT_MS = 30 * 60_000;
 
+/** What an interrupted root is told. */
+export const ROOT_TURN_NOTICE = (minutes) =>
+  `[Baa-ton supervisor] Your turn ran ${minutes} min, so it was interrupted. The spec driver runs the loop on its own timer: your job is to answer its rootAsks and decisions, dispatch a lane for any work (never debug or run a lane's work yourself), and end your turn. Keep turns short; one over 30 min is interrupted.`;
+
 /** The roots that get a spec host: Pi roots whose project has a spec. */
 export function specRoots(config, exists = existsSync) {
   return (config?.orchestrators ?? []).filter(
@@ -100,7 +104,7 @@ export function createSpecHosts({ configDir, loadConfig, spawnHost = defaultSpaw
  * answers Herdr's agent_status (or undefined), `interrupt(paneId)` sends
  * Escape. A turn is continuous "working"; any other status ends it.
  */
-export function createRootTurnWatch({ loadConfig, status, interrupt, anomaly = async () => undefined, clock = () => Date.now(), log = () => {} }) {
+export function createRootTurnWatch({ loadConfig, status, interrupt, anomaly = async () => undefined, tellRoot = async () => undefined, clock = () => Date.now(), log = () => {} }) {
   const turns = new Map();
   return {
     async tick() {
@@ -129,6 +133,8 @@ export function createRootTurnWatch({ loadConfig, status, interrupt, anomaly = a
         turn.lastInterruptAt = now;
         turn.since = now;
         log(`root turn in ${paneId} ran ${minutes} min; interrupted it`);
+        // Tell the root why, or it goes straight back to the same long turn.
+        await Promise.resolve(tellRoot(orchestrator, ROOT_TURN_NOTICE(minutes))).catch(() => undefined);
         await Promise.resolve(
           anomaly({
             kind: "root-turn-too-long",
