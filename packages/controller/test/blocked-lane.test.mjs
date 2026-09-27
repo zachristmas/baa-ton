@@ -184,6 +184,25 @@ test("a question dialog: the root's option is selected; with no answer the Recom
   assert.match(manifest2.unattendedDecisions[0].reason, /Recommended option: Unit and e2e/);
 });
 
+test("a blocked event for an agent that is already gone is 'gone', not an unhandled block; other read failures stay skipped", async () => {
+  const failing = (message) => ({
+    calls: { reads: 0, keys: [] },
+    async request() {
+      throw new Error(message);
+    },
+    async sendKeys() {
+      throw new Error("no keys to a gone agent");
+    },
+  });
+  const workflow = workflowFixture();
+  const gone = await handleBlockedLane({ herdr: failing("agent target w22:p9S not found"), manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "2026-09-27T14:40:00.000Z" });
+  assert.equal(gone.status, "gone");
+  assert.match(gone.reason, /the lane's agent is gone: agent target w22:p9S not found/);
+  assert.equal((await handleBlockedLane({ herdr: failing("pane_not_found"), manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "t" })).status, "gone");
+  const broken = await handleBlockedLane({ herdr: failing("herdr: command not found"), manifest: {}, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "t" });
+  assert.equal(broken.status, "skipped", "a missing herdr binary is a real gap");
+});
+
 test("a prompt that is gone by the time the answer comes is closed without keys", async () => {
   const herdr = fakeHerdr({ screens: questionScreen });
   const workflow = workflowFixture();

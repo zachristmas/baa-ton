@@ -19,6 +19,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { ownerRecord, reclaimLockDir } from "../lock-owner.mjs";
 
 export const HERDR_LINK_PROTOCOL = "herdr-link/1";
 export const INBOX_STORE_VERSION = 1;
@@ -194,37 +195,15 @@ async function atomicWrite(path, value) {
   }
 }
 
-function processAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
-
 /**
  * A lock left by a process that died holding it (killed, crashed) blocked
  * every later receipt and hook for hours. It is reclaimed when its owner is
- * dead, or when its owner file is missing or unreadable and the lock is
- * older than STALE_UNREADABLE_LOCK_MS (a live writer fills it at once).
+ * dead or from an earlier boot (a reused pid is another process,
+ * lock-owner.mjs), or when its owner file is missing or unreadable and the
+ * lock is older than 30 s (a live writer fills it at once).
  */
-const STALE_UNREADABLE_LOCK_MS = 30_000;
 async function reclaimStaleLock(lockPath) {
-  let owner;
-  try {
-    owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8"));
-  } catch {
-    owner = undefined;
-  }
-  if (owner && processAlive(owner.pid)) return false;
-  if (!owner) {
-    const created = await stat(lockPath).then((details) => details.mtimeMs, () => undefined);
-    if (created === undefined || Date.now() - created < STALE_UNREADABLE_LOCK_MS) return false;
-  }
-  await rm(lockPath, { recursive: true, force: true });
-  return true;
+  return reclaimLockDir(lockPath);
 }
 
 async function acquireLock(path) {
@@ -235,7 +214,7 @@ async function acquireLock(path) {
       await mkdir(lockPath, { recursive: false, mode: 0o700 });
       await writeFile(
         join(lockPath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, created_at: now() })}\n`,
+        `${JSON.stringify(ownerRecord())}\n`,
         { mode: 0o600 },
       );
       return async () => rm(lockPath, { recursive: true, force: true });

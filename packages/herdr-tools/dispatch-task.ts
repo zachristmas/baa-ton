@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
+import { ownerHeldSync, ownerRecord } from "./lock-owner.mjs";
 import {
   toPersistenceHandle,
   type CapabilityCatalog,
@@ -474,13 +475,8 @@ export async function dispatchTask(
         throw new Error(
           "Dispatch lock exists without a verifiable owner (possibly a live mid-acquire race or a pre-owner lock); inspect it before retrying dispatch.",
         );
-      let alive = false;
-      try {
-        process.kill(owner.pid, 0);
-        alive = true;
-      } catch (signalError) {
-        alive = (signalError as NodeJS.ErrnoException).code === "EPERM";
-      }
+      // A holder from an earlier boot is gone even when its pid is reused (lock-owner.mjs).
+      const alive = ownerHeldSync(owner);
       if (alive)
         throw new Error(
           "Dispatch is already active; no duplicate start allowed.",
@@ -490,7 +486,7 @@ export async function dispatchTask(
     }
     await writeFile(
       ownerPath,
-      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }),
+      JSON.stringify(ownerRecord()), 
       { mode: 0o600 },
     );
   };
@@ -1129,13 +1125,8 @@ export async function resumeTask(
       throw new Error(
         "Native session resume lock exists without a verifiable owner; inspect it before retrying.",
       );
-    let alive = false;
-    try {
-      process.kill(owner.pid, 0);
-      alive = true;
-    } catch (signalError) {
-      alive = (signalError as NodeJS.ErrnoException).code === "EPERM";
-    }
+    // A holder from an earlier boot is gone even when its pid is reused (lock-owner.mjs).
+    const alive = ownerHeldSync(owner);
     if (alive)
       throw new Error("Native session resume is already active; no duplicate start allowed.");
     await rm(lock, { recursive: true, force: true });
@@ -1143,7 +1134,7 @@ export async function resumeTask(
   }
   await writeFile(
     ownerPath,
-    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }),
+    JSON.stringify(ownerRecord()), 
     { mode: 0o600 },
   );
   let currentWorkflow = workflow;

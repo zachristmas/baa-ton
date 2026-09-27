@@ -448,7 +448,11 @@ export async function handleBlockedLane({ herdr, manifest, workflow, laneId, pan
   try {
     text = await readScreen(herdr, target, paneId);
   } catch (error) {
-    return { status: "skipped", reason: `screen read failed: ${error instanceof Error ? error.message : String(error)}` };
+    const message = error instanceof Error ? error.message : String(error);
+    // The agent or pane is gone by the time the event is handled: nothing
+    // waits on a prompt, and the gone-lane path takes it from here.
+    if (/\b(?:agent|pane|target)\b[^\n]*\bnot[ _]found\b|\b(?:agent|pane)_not_found\b/i.test(message)) return { status: "gone", reason: `the lane's agent is gone: ${message}` };
+    return { status: "skipped", reason: `screen read failed: ${message}` };
   }
   const screen = classifyScreen(text);
   if (screen.kind === "unknown") return { status: "none", reason: "no permission prompt or question dialog on the visible screen", lines: screenLines(text).length, excerpt: screenLines(text).join("\n") };

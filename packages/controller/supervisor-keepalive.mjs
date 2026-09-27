@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { closeSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { bootTimeMs, ownerHeldSync } from "../herdr-tools/lock-owner.mjs";
 
 export const HEARTBEAT_FILE = "supervisor-heartbeat.json";
 export const HEARTBEAT_STALE_MS = 2 * 60_000;
@@ -77,13 +78,16 @@ export async function ensureSupervisor({
   alive = processAlive,
   launch = defaultLaunch,
   anomaly = async () => undefined,
+  boot = bootTimeMs(),
 } = {}) {
   if (!configDir || env.BAA_TON_NO_SUPERVISOR_KEEPALIVE === "1") return { status: "skipped" };
   const heartbeat = read(join(configDir, HEARTBEAT_FILE));
   const beat = Date.parse(heartbeat?.at ?? "");
   if (Number.isFinite(beat) && now - beat < HEARTBEAT_STALE_MS && alive(heartbeat.pid)) return { status: "alive" };
   const owner = read(join(configDir, LEASE));
-  const holder = owner && alive(owner.pid) ? owner.pid : undefined;
+  // A lease from an earlier boot, or naming a pid that is now another
+  // process, is nobody (lock-owner.mjs): after a reboot pid 767 was sharingd.
+  const holder = ownerHeldSync(owner, { alive, boot }) ? owner.pid : undefined;
   // A runner that took the lease a moment ago (a restart on new code) has
   // not written its first heartbeat yet; the last one is its predecessor's.
   // It gets the full HEARTBEAT_STALE_MS from when it took the lease.

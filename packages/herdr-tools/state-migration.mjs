@@ -29,6 +29,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
 
 export const LEGACY_STATE_DIRECTORY = join(".pi", "herdr-orchestrator");
 export const STATE_DIRECTORY = join(".baa-ton", "herdr-orchestrator");
@@ -141,13 +142,15 @@ async function acquireLock(lockPath) {
       await mkdir(lockPath, { mode: 0o700 });
       await writeFile(
         join(lockPath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString(), purpose: "state-migration" })}\n`,
+        `${JSON.stringify(ownerRecord({ extra: { purpose: "state-migration" } }))}\n`,
         { mode: 0o600 },
       );
       return async () => rm(lockPath, { recursive: true, force: true });
     } catch (error) {
       if (error?.code === "ENOENT") return async () => {};
       if (error?.code !== "EEXIST") throw error;
+      // A lock left by a dead holder, or from an earlier boot, is reclaimed (lock-owner.mjs).
+      if (await reclaimLockDir(lockPath).catch(() => false)) continue;
       if (Date.now() >= deadline)
         throw new Error(
           `Timed out waiting for ${lockPath}; another Baa-ton writer is active. Retry when it finishes.`,

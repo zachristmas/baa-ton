@@ -49,6 +49,7 @@ import { promisify } from "node:util";
 import { handleActivation } from "./activation.mjs";
 import { handleBlockedLane, handleIdleLane, resolveScreenPrompts, sweepLaneDialogs } from "./blocked-lane.mjs";
 import { writeHeartbeat } from "./supervisor-keepalive.mjs";
+import { ownerHeld, ownerRecord, processStartMs, reclaimLockDir } from "../herdr-tools/lock-owner.mjs";
 import {
   enqueueWakeHint,
   inboxRoutable,
@@ -1792,12 +1793,15 @@ async function acquireManifestLock(manifestPath) {
       await mkdir(lockPath, { mode: 0o700 });
       await writeFile(
         join(lockPath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, created_at: now() })}\n`,
+        `${JSON.stringify(ownerRecord())}\n`,
         { mode: 0o600 },
       );
       return async () => rm(lockPath, { recursive: true, force: true });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
+      // A lock left by a dead holder, or by one from an earlier boot, would
+      // hold every manifest write forever (lock-owner.mjs).
+      if (await reclaimLockDir(lockPath).catch(() => false)) continue;
       if (Date.now() >= deadline)
         throw new ControllerError(
           `Timed out acquiring controller lock for ${manifestPath}.`,
@@ -4486,16 +4490,6 @@ export async function handleHook({
   }
 }
 
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to another user; any other
-    // failure (notably ESRCH) means a stale lease may be reclaimed.
-    return error.code === "EPERM";
-  }
-}
 
 async function supervisorLeaseDirectory(configDir) {
   assertString(configDir, "HERDR_PLUGIN_CONFIG_DIR");
@@ -4518,41 +4512,30 @@ async function supervisorLeaseDirectory(configDir) {
   return directory;
 }
 
-async function acquireSupervisorLease(leaseDirectory) {
+export async function acquireSupervisorLease(leaseDirectory) {
   // Herdr may create a fresh state directory for each startup invocation.
   // The plugin config directory is stable per linked plugin, so the singleton
   // lease must live there rather than in an invocation-local state directory.
   const leasePath = join(leaseDirectory, "supervisor.lock");
+  // The lease names this process by pid, boot, token and its own start time
+  // (lock-owner.mjs): after a reboot a bare pid named an unrelated process,
+  // and every supervisor start exited for 43 minutes.
+  const start = await processStartMs(process.pid, { timeoutMs: 30_000 });
   while (true) {
     try {
       await mkdir(leasePath, { mode: 0o700 });
       await writeFile(
         join(leasePath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, created_at: now() })}\n`,
+        `${JSON.stringify(ownerRecord({ start }))}\n`,
         { mode: 0o600 },
       );
       return async () => rm(leasePath, { recursive: true, force: true });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      try {
-        const owner = JSON.parse(
-          await readRegularFile(
-            join(leasePath, "owner.json"),
-            "Supervisor lease",
-          ),
-        );
-        if (
-          Number.isSafeInteger(owner.pid) &&
-          owner.pid > 0 &&
-          !processIsAlive(owner.pid)
-        ) {
-          await rm(leasePath, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // An incomplete or unreadable lease could belong to a process that is
-        // still starting. Keep it rather than risking a duplicate supervisor.
-      }
+      // Held only by a live owner of this boot with the recorded start. An
+      // unreadable owner file is kept while it may be a lease being written,
+      // then reclaimed.
+      if (await reclaimLockDir(leasePath, { held: (owner) => ownerHeld(owner), log: (message) => supervisorLog(leaseDirectory, message) }).catch(() => false)) continue;
       return undefined;
     }
   }

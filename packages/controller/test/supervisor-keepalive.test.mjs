@@ -4,10 +4,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { guardSupervisorProcess } from "../controller.mjs";
+import { acquireSupervisorLease, guardSupervisorProcess } from "../controller.mjs";
+import { bootTimeMs } from "../../herdr-tools/lock-owner.mjs";
 import { HEARTBEAT_FILE, HEARTBEAT_STALE_MS, RELAUNCH_INTERVAL_MS, ensureSupervisor, writeHeartbeat } from "../supervisor-keepalive.mjs";
 
 const T0 = Date.parse("2026-09-26T19:13:16.000Z");
+// The machine booted an hour before the test leases were taken.
+const BOOT = T0 - 3_600_000;
 
 async function dir() {
   const path = await mkdtemp(join(tmpdir(), "baa-keepalive-"));
@@ -25,7 +28,7 @@ test("a fresh heartbeat is alive; a stale one with no lease holder is relaunched
     const launched = [];
     const anomalies = [];
     const alive = (pid) => pid === 42;
-    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, now, alive, launch: ({ configDir }) => (launched.push(configDir), 777), anomaly: async (anomaly) => anomalies.push(anomaly) });
+    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, boot: BOOT, now, alive, launch: ({ configDir }) => (launched.push(configDir), 777), anomaly: async (anomaly) => anomalies.push(anomaly) });
     writeHeartbeat(d.path, { pid: 42, at: new Date(T0).toISOString() });
     assert.equal((await run(T0 + 30_000)).status, "alive");
     // The supervisor (pid 42) and its launcher died: the heartbeat goes stale and nobody holds the lease.
@@ -54,11 +57,11 @@ test("a runner that just took the lease after a restart is starting, not hung (a
     await mkdir(join(d.path, "supervisor.lock"), { recursive: true });
     await writeFile(join(d.path, "supervisor.lock", "owner.json"), JSON.stringify({ pid: 42, created_at: new Date(T0 + 39_000).toISOString() }));
     const anomalies = [];
-    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, now, alive: (pid) => pid === 42, launch: () => 1, anomaly: async (anomaly) => anomalies.push(anomaly) });
+    const run = (now) => ensureSupervisor({ configDir: d.path, env: {}, boot: BOOT, now, alive: (pid) => pid === 42, launch: () => 1, anomaly: async (anomaly) => anomalies.push(anomaly) });
     assert.deepEqual(await run(T0 + 60_000), { status: "starting", pid: 42 });
     assert.equal(anomalies.length, 0, "no report during a restart");
     // In the gap before anyone holds the lease, a recent heartbeat means a restart too.
-    const gap = await ensureSupervisor({ configDir: d.path, env: {}, now: T0 + 20_000, alive: () => false, launch: () => { throw new Error("no relaunch in a restart gap"); }, anomaly: async (anomaly) => anomalies.push(anomaly) });
+    const gap = await ensureSupervisor({ configDir: d.path, env: {}, boot: BOOT, now: T0 + 20_000, alive: () => false, launch: () => { throw new Error("no relaunch in a restart gap"); }, anomaly: async (anomaly) => anomalies.push(anomaly) });
     assert.deepEqual(gap, { status: "restarting" });
     assert.equal(anomalies.length, 0);
     // Still no heartbeat of its own 2 min after taking the lease: now it is hung.
@@ -76,13 +79,48 @@ test("a stale heartbeat while a live process holds the lease is reported as hung
     await lease(d.path, 42);
     const launched = [];
     const anomalies = [];
-    const result = await ensureSupervisor({ configDir: d.path, env: {}, now: T0 + 10 * 60_000, alive: () => true, launch: () => launched.push(1), anomaly: async (anomaly) => anomalies.push(anomaly) });
+    const result = await ensureSupervisor({ configDir: d.path, env: {}, boot: BOOT, now: T0 + 10 * 60_000, alive: () => true, launch: () => launched.push(1), anomaly: async (anomaly) => anomalies.push(anomaly) });
     assert.deepEqual(result, { status: "hung", pid: 42 });
     assert.equal(launched.length, 0);
     assert.match(anomalies[0].summary, /pid 42 still holds the lease \(hung\?\)/);
     assert.equal((await ensureSupervisor({ configDir: d.path, env: { BAA_TON_NO_SUPERVISOR_KEEPALIVE: "1" } })).status, "skipped");
     assert.equal((await ensureSupervisor({ configDir: undefined, env: {} })).status, "skipped");
     assert.equal(JSON.parse(await readFile(join(d.path, HEARTBEAT_FILE), "utf8")).pid, 42);
+  } finally {
+    await d.cleanup();
+  }
+});
+
+test("after a reboot, a lease naming a pid that is now another live process holds nothing: the keepalive relaunches and the supervisor takes it", async () => {
+  const d = await dir();
+  try {
+    // The outage: the lease said pid 767 from the previous boot; pid 767 was now sharingd.
+    // Pid 1 stands in: always alive, never a supervisor.
+    writeHeartbeat(d.path, { pid: 767, at: new Date(T0).toISOString() });
+    await mkdir(join(d.path, "supervisor.lock"), { recursive: true });
+    await writeFile(join(d.path, "supervisor.lock", "owner.json"), JSON.stringify({ pid: 1, created_at: new Date(T0).toISOString() }));
+    const launched = [];
+    const anomalies = [];
+    const result = await ensureSupervisor({ configDir: d.path, env: {}, boot: T0 + 60 * 60_000, now: T0 + 62 * 60_000, alive: () => true, launch: () => (launched.push(1), 9), anomaly: async (anomaly) => anomalies.push(anomaly) });
+    assert.deepEqual(result, { status: "relaunched", pid: 9 }, "not 'hung': the lease is from before this boot");
+    assert.match(anomalies[0].summary, /no process holds its lease/);
+
+    // The supervisor itself reclaims the stale lease and takes it, with its full identity.
+    const release = await acquireSupervisorLease(d.path);
+    assert.ok(release, "the lease was taken");
+    const owner = JSON.parse(await readFile(join(d.path, "supervisor.lock", "owner.json"), "utf8"));
+    assert.equal(owner.pid, process.pid);
+    assert.match(owner.boot, /^\d{4}-/);
+    assert.match(owner.token, /^[0-9a-f-]{36}$/);
+    assert.equal(await acquireSupervisorLease(d.path), undefined, "a live holder of this boot keeps it");
+    await release();
+
+    // A lease written in this boot by a live pid with another start time is a reused pid.
+    await mkdir(join(d.path, "supervisor.lock"), { recursive: true });
+    await writeFile(join(d.path, "supervisor.lock", "owner.json"), JSON.stringify({ pid: 1, boot: new Date(bootTimeMs()).toISOString(), start: new Date(Date.now() + 3_600_000).toISOString(), token: "x" }));
+    const again = await acquireSupervisorLease(d.path);
+    assert.ok(again, "pid 1's real start does not match the recorded one");
+    await again();
   } finally {
     await d.cleanup();
   }
