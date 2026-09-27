@@ -1,0 +1,11 @@
+export type LockOwner = { pid: number; boot?: string; token?: string; created_at?: string; start?: string; [key: string]: unknown };
+export const BOOT_TOLERANCE_MS: number;
+export const START_TOLERANCE_MS: number;
+export const UNREADABLE_LOCK_MS: number;
+export function bootTimeMs(now?: number, up?: number): number;
+export function pidAlive(pid: unknown): boolean;
+export function processStartMs(pid: number, options?: { timeoutMs?: number }): Promise<number | undefined>;
+export function ownerRecord(options?: { start?: number; now?: number; boot?: number; extra?: Record<string, unknown> }): LockOwner;
+export function ownerHeldSync(owner: unknown, options?: { alive?: (pid: number) => boolean; boot?: number }): boolean;
+export function ownerHeld(owner: unknown, options?: { alive?: (pid: number) => boolean; boot?: number; startOf?: (pid: number) => Promise<number | undefined> }): Promise<boolean>;
+export function reclaimLockDir(lockPath: string, options?: { held?: (owner: any) => boolean | Promise<boolean>; now?: number; unreadableMs?: number; log?: (message: string) => void }): Promise<boolean>;

@@ -104,6 +104,7 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 const { acknowledgeActivation } = (await freshImport("./activation-ack.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./activation-ack.mjs");
 const { loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
+const { ownerRecord: lockOwnerRecord, reclaimLockDir } = (await freshImport("./lock-owner.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./lock-owner.mjs");
 import {
   authorizeStanding,
   approvalPolicySummary,
@@ -1046,12 +1047,16 @@ async function acquireManifestLock(
       await mkdir(lockPath, { mode: 0o700 });
       await writeFile(
         join(lockPath, "owner.json"),
-        `${jsonText({ pid: process.pid, createdAt: now() })}\n`,
+        `${jsonText(lockOwnerRecord())}\n`,
         { mode: 0o600 },
       );
       return async () => rm(lockPath, { recursive: true, force: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        // A lock left by a dead holder, or by one from an earlier boot (a
+        // reused pid is another process), is reclaimed rather than holding
+        // every manifest write forever (lock-owner.mjs).
+        if (await reclaimLockDir(lockPath).catch(() => false)) continue;
         if (Date.now() < deadline) {
           // Bounded contention on the shared filesystem lock, never agent polling.
           await lockRetryDelay(10);

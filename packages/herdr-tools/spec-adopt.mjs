@@ -18,6 +18,7 @@
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
 import { basename, dirname, join } from "node:path";
 import { reviewVerdict, specCommitMessage } from "./spec-driver.mjs";
 
@@ -198,12 +199,14 @@ async function withManifestLock(cwd, action) {
       await mkdir(lockPath, { mode: 0o700 });
       break;
     } catch (error) {
+      // A lock left by a dead holder, or from an earlier boot, is reclaimed (lock-owner.mjs).
+      if (error.code === "EEXIST" && (await reclaimLockDir(lockPath).catch(() => false))) continue;
       if (error.code !== "EEXIST" || Date.now() > deadline) throw new Error(`Cannot take the manifest lock: ${error.message}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
   try {
-    await writeFile(join(lockPath, "owner.json"), `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+    await writeFile(join(lockPath, "owner.json"), `${JSON.stringify(ownerRecord())}\n`, { mode: 0o600 });
     return await action();
   } finally {
     await rm(lockPath, { recursive: true, force: true });

@@ -7,6 +7,7 @@
  * records with the installed checkout to find version skew, and the supervisor
  * re-execs itself when its own code changes on disk.
  */
+import { bootTimeMs, ownerHeldSync } from "../herdr-tools/lock-owner.mjs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -99,13 +100,9 @@ export function codeChangeWatcher(loaded, root = loaded.checkout ?? checkoutRoot
   };
 }
 
-function processAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
+/** Alive in this boot: a record from before a reboot names a pid that may now be another process (lock-owner.mjs). */
+function recordAlive(record) {
+  return ownerHeldSync(record);
 }
 
 export function runtimeDirectory(configDir) {
@@ -125,7 +122,7 @@ export function recordRuntime(configDir, record) {
     const temporary = `${path}.${Date.now()}.tmp`;
     writeFileSync(
       temporary,
-      `${JSON.stringify({ ...record, pid: process.pid, startedAt: new Date().toISOString() }, null, 2)}\n`,
+      `${JSON.stringify({ ...record, pid: process.pid, startedAt: new Date().toISOString(), boot: new Date(bootTimeMs()).toISOString() }, null, 2)}\n`,
       { mode: 0o600 },
     );
     renameSync(temporary, path);
@@ -159,13 +156,13 @@ export function pruneRuntime(configDir) {
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     const path = join(runtimeDirectory(configDir), name);
-    let pid;
+    let record;
     try {
-      pid = JSON.parse(readFileSync(path, "utf8")).pid;
+      record = JSON.parse(readFileSync(path, "utf8"));
     } catch {
-      pid = Number(/-(\d+)\.json$/.exec(name)?.[1]);
+      record = { pid: Number(/-(\d+)\.json$/.exec(name)?.[1]) };
     }
-    if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) continue;
+    if (recordAlive(record)) continue;
     try {
       rmSync(path, { force: true });
       removed += 1;
@@ -190,7 +187,7 @@ export function listRuntime(configDir) {
     if (!name.endsWith(".json")) continue;
     try {
       const record = JSON.parse(readFileSync(join(runtimeDirectory(configDir), name), "utf8"));
-      if (Number.isSafeInteger(record.pid) && processAlive(record.pid)) records.push(record);
+      if (recordAlive(record)) records.push(record);
     } catch {
       // Unreadable records are skipped.
     }

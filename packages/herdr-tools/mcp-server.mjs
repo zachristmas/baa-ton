@@ -26,6 +26,7 @@ import {
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { ownerRecord, reclaimLockDir } from "./lock-owner.mjs";
 import { Value } from "typebox/value";
 import { Type } from "typebox";
 import {
@@ -398,9 +399,12 @@ async function acquireManifestLock(manifestPath) {
   while (true) {
     try {
       await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(join(lockPath, "owner.json"), `${JSON.stringify(ownerRecord())}\n`, { mode: 0o600 });
       return async () => rm(lockPath, { recursive: true, force: true });
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
+      // A lock left by a dead holder, or from an earlier boot, is reclaimed (lock-owner.mjs).
+      if (await reclaimLockDir(lockPath).catch(() => false)) continue;
       if (Date.now() >= deadline) throw new Error("Timed out acquiring MCP lifecycle lock.");
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
     }
