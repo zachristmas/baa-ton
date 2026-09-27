@@ -4217,6 +4217,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           request.note = `local-validation: ${verdict.classes.join(", ")}`;
           return grant();
         }
+        // A spec verify lane records its demo against the running app: its
+        // dev server is part of the validation, and dev stacks take turns
+        // (defaults.maxDevStacks), so it never waits on the root.
+        const lane = workflow.lanes.find((item) => item.id === request.laneId) as { specStage?: string } | undefined;
+        if (request.kind === "runtime-launch" && lane?.specStage === "verify" && /^(?:pnpm|npm|yarn)(?: run)? (?:dev|start|preview)(?:\s+--[\w-]+(?:=\S+)?)*$/.test(validationCommand.trim())) {
+          request.note = "local-validation: the demo's dev server (verify lanes take turns on the dev stack; use your leased ports)";
+          return grant();
+        }
         validationReason = `not local validation (${verdict.reason})`;
       }
     }
@@ -4651,6 +4659,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     restore?(input: { worktree: string; paths: string[] }): Promise<void>;
     /** Save `paths`' changes as a patch file, then restore them to HEAD. */
     setAside?(input: { worktree: string; paths: string[]; patch: string }): Promise<void>;
+    /** Herdr's live agent status for a lane's pane ("gone" when no agent), or undefined when unknown. */
+    liveStatus?(paneId: string): Promise<string | undefined>;
     /** The loaded code's fingerprint (holds retry once it changes). */
     codeVersion?: string;
     /** Stage exactly `paths` in `worktree`, commit them with `message`, return the new SHA. */
@@ -4749,16 +4759,46 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ...ports,
       };
       const state = await loadSpecState(ctx.cwd);
+      // Herdr's live answer for every lane an item or the baseline points at.
+      // Status events arrive through the plugin hook, which can be late or
+      // lost (a hook that could not start in time, a lock timeout); a lane
+      // that finished without its event looked busy forever and held a slot.
+      const liveStatus = new Map<string, string>();
+      {
+        const refs = [
+          ...(Object.values(state.items ?? {}) as Array<{ lane?: { workflowId: string; laneId: string } }>).map((record) => record.lane),
+          (state as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane,
+        ].filter((ref): ref is { workflowId: string; laneId: string } => Boolean(ref));
+        const readLive =
+          ports?.liveStatus ??
+          (async (paneId: string) => {
+            try {
+              const result = await runHerdr(["agent", "get", paneId], signal);
+              const info = isRecord(result) && isRecord(result.result) ? result.result : result;
+              return isRecord(info) && isRecord(info.agent) && typeof info.agent.agent_status === "string" ? info.agent.agent_status : "gone";
+            } catch (error) {
+              return /agent_not_found|agent_pane_not_found|not[ _-]?found/i.test(String((error as Error)?.message ?? error)) ? "gone" : undefined;
+            }
+          });
+        for (const ref of refs) {
+          const paneId = manifest.workflows.find((item) => item.id === ref.workflowId)?.lanes.find((item) => item.id === ref.laneId)?.paneId;
+          if (!paneId) continue;
+          const status = await readLive(paneId).catch(() => undefined);
+          if (status) liveStatus.set(`${ref.workflowId}/${ref.laneId}`, status);
+        }
+      }
       const laneView = (ref: { workflowId: string; laneId: string }) => {
         const workflow = manifest.workflows.find((item) => item.id === ref.workflowId);
         const lane = workflow?.lanes.find((item) => item.id === ref.laneId);
         if (!lane) return undefined;
-        // Herdr's view of the agent: the lane's latest status event, or a
-        // session the observer recorded as gone or done.
+        // Herdr's view of the agent: its live status when Herdr answered,
+        // else the lane's latest status event, or a session the observer
+        // recorded as gone or done.
         const events = (workflow as { eventController?: { events?: Array<{ lane_id?: string; source?: { agent_status?: string } }> } }).eventController?.events ?? [];
         const latest = [...events].reverse().find((event) => event.lane_id === ref.laneId)?.source?.agent_status;
+        const live = liveStatus.get(`${ref.workflowId}/${ref.laneId}`);
         const session = lane.sessionLog?.status;
-        const agentStatus = session === "gone" ? "gone" : latest ?? (session === "done" ? "done" : undefined);
+        const agentStatus = session === "gone" ? "gone" : live ?? latest ?? (session === "done" ? "done" : undefined);
         const lastMessageAt = (workflow!.messageRequests ?? [])
           .filter((message) => message.laneId === ref.laneId)
           .map((message) => message.requestedAt)
@@ -5240,13 +5280,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         }
         // An adopted item keeps its own branch and worktree.
         const branch = record.branch ?? `spec/${item.id}`;
-        // Verification never shares the integration worktree: each pushed
-        // item is verified in its own detached worktree at its pushed commit.
+        // Verification never shares the integration worktree. A verify lane
+        // that runs the app (dev stacks take turns) uses the one shared
+        // spec-verify worktree, switched to the item's commit and keeping its
+        // install: every fresh worktree and node_modules is thousands of new
+        // executables the OS vets before their first run, which starved the
+        // machine. Other verify lanes keep a worktree per item, reused too.
         const worktree =
           action.kind === "integrate"
             ? integrationWorktree
             : action.kind === "verify"
-              ? join(worktreeRoot, `spec-verify-${item.id}`)
+              ? join(worktreeRoot, item.acceptance.evidence && (spec.defaults.maxDevStacks ?? 1) === 1 ? "spec-verify" : `spec-verify-${item.id}`)
               : record.worktree ?? join(worktreeRoot, `spec-${item.id}`);
         try {
           let profile: string;
@@ -5258,6 +5302,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             profile = spec.stages.verify?.profile ?? "quick";
             await (ports?.detachedWorktree ??
               (async ({ repo: repoPath, path, sha }: { repo: string; path: string; sha: string }) => {
+                // Reuse: an existing worktree is switched to the commit and
+                // cleaned of untracked files, keeping ignored ones (the
+                // install, build caches). Only a missing or broken one is
+                // created fresh.
+                const existing = await execFile("git", ["-C", path, "rev-parse", "--is-inside-work-tree"], { timeout: 30_000 }).then(() => true, () => false);
+                if (existing) {
+                  try {
+                    await execFile("git", ["-C", path, "checkout", "--detach", "--force", sha], { signal, timeout: 120_000 });
+                    await execFile("git", ["-C", path, "clean", "-fd"], { signal, timeout: 120_000 });
+                    return;
+                  } catch {
+                    // Fall through to a fresh worktree.
+                  }
+                }
                 await execFile("git", ["-C", repoPath, "worktree", "remove", "--force", path], { timeout: 60_000 }).catch(() => undefined);
                 await rm(path, { recursive: true, force: true });
                 await mkdir(dirname(path), { recursive: true });
@@ -5563,6 +5621,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const record = next.items[item.id];
         if (!record?.verifyWorktree || record.state === "verifying") continue;
         const path = record.verifyWorktree as string;
+        // The shared verify worktree (and its install) stays for the next item.
+        if (path === join(worktreeRoot, "spec-verify")) {
+          delete record.verifyWorktree;
+          continue;
+        }
         try {
           await (ports?.removeWorktree ??
             (async ({ repo: repoPath, path: target }: { repo: string; path: string }) => {

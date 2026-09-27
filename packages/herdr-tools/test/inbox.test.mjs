@@ -189,3 +189,22 @@ test("herdr-link/1 envelope rejects cross-workspace routes", () => {
   );
 });
 
+
+test("a lock left by a process that died holding it is reclaimed, never blocking every later write (a live outage)", async () => {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const directory = await mkdtemp(join(tmpdir(), "baa-inbox-stale-"));
+  try {
+    const path = join(directory, "inbox.json");
+    // As it stood live: the owner died hours ago with the lock held.
+    await mkdir(`${path}.lock`);
+    await writeFile(join(`${path}.lock`, "owner.json"), JSON.stringify({ pid: 999_999_999, created_at: "2026-09-26T21:42:44.008Z" }));
+    const hint = await enqueueWakeHint(path, { recipient: endpoint("w-root:p1"), occurrenceId: "occ-1" });
+    assert.ok(hint, "the write went through");
+    // A lock whose owner is alive still waits (and times out) as before.
+    await mkdir(`${path}.lock`);
+    await writeFile(join(`${path}.lock`, "owner.json"), JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }));
+    await assert.rejects(enqueueWakeHint(path, { recipient: endpoint("w-root:p1"), occurrenceId: "occ-2" }), /Timed out acquiring inbox lock/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

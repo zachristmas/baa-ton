@@ -689,11 +689,74 @@ function upgradeNudgeInterval(manifest, orchestrator, supervisor, timestamp) {
   return true;
 }
 
-function latestLaneStatus(workflow, laneId) {
+/**
+ * A lane's status: Herdr's live answer when the caller has one (`live`, a
+ * Map of "workflowId/laneId" to agent_status from refreshLiveLaneStatus),
+ * else its latest status event. Events come through the plugin hook and can
+ * be lost or stale: a lane whose last event said working, though its agent
+ * finished long ago, kept every nudge quiet and every slot held.
+ */
+export function latestLaneStatus(workflow, laneId, live) {
+  const known = live?.get?.(`${workflow?.id}/${laneId}`);
+  if (known) return known;
   const events = Array.isArray(workflow?.eventController?.events) ? workflow.eventController.events : [];
   for (let index = events.length - 1; index >= 0; index -= 1)
     if (events[index].lane_id === laneId) return events[index].source?.agent_status;
   return undefined;
+}
+
+/**
+ * Ask Herdr (over its socket: no process start) for the live status of every
+ * unfinished lane in these workflows; "gone" when no agent is there.
+ * Unanswered lanes keep their event status.
+ */
+export const LIVE_STATUS_STALE_MS = 10 * 60_000;
+
+export async function refreshLiveLaneStatus(herdr, workflows, { timestamp = now() } = {}) {
+  const live = new Map();
+  for (const workflow of Array.isArray(workflows) ? workflows : []) {
+    if (!isRecord(workflow) || ["completed", "closed", "operator-closed", "superseded", "retired"].includes(workflow.status)) continue;
+    const events = Array.isArray(workflow.eventController?.events) ? workflow.eventController.events : [];
+    for (const lane of Array.isArray(workflow.lanes) ? workflow.lanes : []) {
+      if (!isRecord(lane) || !lane.paneId || lane.retirement || lane.completionReceipt) continue;
+      // Only a busy status that has not changed for LIVE_STATUS_STALE_MS is
+      // doubted: a fresh event is Herdr's word already.
+      const latest = [...events].reverse().find((event) => event?.lane_id === lane.id);
+      const busy = ["working", "blocked"].includes(latest?.source?.agent_status);
+      const at = Date.parse(latest?.received_at ?? latest?.at ?? "");
+      if (!busy || !Number.isFinite(at) || Date.parse(timestamp) - at < LIVE_STATUS_STALE_MS) continue;
+      const key = `${workflow.id}/${lane.id}`;
+      try {
+        const result = await herdr.request("agent.get", { target: lane.paneId });
+        const info = isRecord(result) && isRecord(result.result) ? result.result : result;
+        const agent = isRecord(info) && isRecord(info.agent) ? info.agent : undefined;
+        // Another pane's agent answering is no answer about this lane.
+        if (agent && agent.pane_id === lane.paneId && typeof agent.agent_status === "string") live.set(key, agent.agent_status);
+        else if (isRecord(info) && info.type === "agent_info" && !agent) live.set(key, "gone");
+      } catch (error) {
+        if (error instanceof HerdrApiError && ["agent_not_found", "agent_pane_not_found"].includes(error.code)) live.set(key, "gone");
+      }
+    }
+  }
+  return live;
+}
+
+const lastNudgeLog = new Map();
+const lastTickStatus = new Map();
+
+/**
+ * Log a root's nudge decision to supervisor.log whenever it changes: quiet
+ * with its reason, or the reasons a nudge is due. Every skip is visible; a
+ * steady state is logged once, not every tick.
+ */
+export function logNudgeDecision(configDir, rootId, decision, log = (line) => supervisorLog(configDir, line)) {
+  const summary = decision?.quiet
+    ? `quiet (${decision.quiet})`
+    : `due: ${(decision?.reasons ?? []).length} reason(s)${decision?.specStall ? ", spec stalled" : ""}: ${clipText((decision?.reasons ?? []).slice(0, 3).join("; "), 400)}`;
+  if (lastNudgeLog.get(rootId) === summary) return false;
+  lastNudgeLog.set(rootId, summary);
+  log(`nudge ${rootId}: ${summary}`);
+  return true;
 }
 
 /** Mirrors the extension: a planned workflow bound to a root session other
@@ -730,7 +793,7 @@ function pendingForUser(manifest, owned) {
  * answer. Otherwise it nudges only when there is actionable work, and the
  * reasons name it.
  */
-export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run }) {
+export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run, live: liveStatus }) {
   if (run?.state === "paused") return { quiet: "run-paused" };
   if (QUIET_PARENT_GOAL_STATUSES.has(goal.status)) return { quiet: `goal-${goal.status}` };
   const routes = orchestrator.workflows.filter(
@@ -751,7 +814,7 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run 
   for (const workflow of owned) {
     for (const request of Array.isArray(workflow.laneRequests) ? workflow.laneRequests : []) {
       if (!isRecord(request) || request.status !== "open") continue;
-      const status = latestLaneStatus(workflow, request.laneId);
+      const status = latestLaneStatus(workflow, request.laneId, liveStatus);
       // A permission request is filed by the lane's PermissionRequest hook,
       // which holds the tool call while it waits, so Herdr can report the
       // lane as working even though it is stopped on the root's answer.
@@ -786,11 +849,11 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run 
   const liveLanes = owned.flatMap((workflow) =>
     (Array.isArray(workflow.lanes) ? workflow.lanes : [])
       .filter((lane) => isRecord(lane) && !lane.completionReceipt && !["completed", "closed", "operator-closed", "superseded", "retired"].includes(workflow.status))
-      .map((lane) => latestLaneStatus(workflow, lane.id))
+      .map((lane) => latestLaneStatus(workflow, lane.id, liveStatus))
       .filter((status) => status === "working" || status === "blocked"),
   );
   let specStall = false;
-  const spec = specWaiting(manifestPath, manifest);
+  const spec = specWaiting(manifestPath, manifest, liveStatus);
   // With a spec, its own lanes decide liveness; otherwise every owned lane.
   const anyLive = spec.hasSpec ? spec.live : liveLanes.length > 0;
   if (!anyLive && !awaitingUser.length) {
@@ -809,7 +872,7 @@ export function nudgeDecision({ goal, manifest, orchestrator, manifestPath, run 
     const live = owned.flatMap((workflow) =>
       (Array.isArray(workflow.lanes) ? workflow.lanes : [])
         .filter((lane) => isRecord(lane) && !lane.completionReceipt && !["completed", "closed", "operator-closed", "superseded", "retired"].includes(workflow.status))
-        .map((lane) => latestLaneStatus(workflow, lane.id))
+        .map((lane) => latestLaneStatus(workflow, lane.id, liveStatus))
         .filter((status) => status === "working" || status === "blocked"),
     );
     if (!live.length)
@@ -3497,7 +3560,7 @@ async function runStateDigestLine() {
  * cancel a stall. An in-flight item whose lane finished without a receipt
  * counts as waiting ("in flight without a receipt").
  */
-function specWaiting(manifestPath, manifest) {
+function specWaiting(manifestPath, manifest, liveStatus) {
   try {
     const spec = JSON.parse(readFileSync(join(dirname(dirname(manifestPath)), "spec.json"), "utf8"));
     let state = {};
@@ -3515,7 +3578,7 @@ function specWaiting(manifestPath, manifest) {
       const laneRef = isRecord(record.lane) ? record.lane : undefined;
       const workflow = laneRef ? workflows.find((candidate) => isRecord(candidate) && candidate.id === laneRef.workflowId) : undefined;
       const laneRecord = workflow?.lanes?.find?.((candidate) => candidate?.id === laneRef?.laneId);
-      const status = workflow && laneRef ? latestLaneStatus(workflow, laneRef.laneId) : undefined;
+      const status = workflow && laneRef ? latestLaneStatus(workflow, laneRef.laneId, liveStatus) : undefined;
       if (laneRef && (status === "working" || status === "blocked")) live = true;
       const finishedWithoutReceipt = laneRef && (status === "done" || status === "idle") && !laneRecord?.completionReceipt;
       const waiting = ["awaiting-push", "pending", "ready", "failed"].includes(stage) || (stage === "blocked" && record.blockedReason === "exhausted") || (stage === "integrating" && !record.lane);
@@ -3800,7 +3863,15 @@ export async function runSupervisorTick({
         results.push({ manifestPath, status: "uncertain" });
         continue;
       }
-      const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath, run });
+      // Judge lanes by Herdr's live status, not only the (possibly lost) events.
+      let live;
+      try {
+        live = await refreshLiveLaneStatus(api, manifest.workflows, { timestamp });
+      } catch {
+        live = undefined;
+      }
+      const decision = nudgeDecision({ goal, manifest, orchestrator, manifestPath, run, live });
+      logNudgeDecision(configDir, orchestrator.id, decision);
       // Self-healing: anomalies with evidence go to lane-admin (and decisions
       // to the root), once per signature (anomalies.mjs).
       try {
@@ -3985,8 +4056,10 @@ export async function runSupervisorTick({
         outcome.status,
         { attempts: 1, reason: outcome.reason },
       );
+      supervisorLog(configDir, `nudge ${orchestrator.id}: sent (${outcome.status}${outcome.reason ? `: ${outcome.reason}` : ""}); next at ${supervisor.nextNudgeAt}`);
       results.push({ manifestPath, status: outcome.status });
     } catch (error) {
+      supervisorLog(configDir, `nudge ${orchestrator.id}: tick failed: ${error instanceof Error ? error.message : String(error)}`);
       results.push(await recordManifestSkip(stateDir, { orchestrator, manifestPath, stage: "supervise", error, timestamp }));
     } finally {
       await release();
@@ -4017,6 +4090,15 @@ export async function runSupervisorTick({
     operator = await deliverOperatorQueue({ herdr: api, timestamp });
   } catch {
     operator = [];
+  }
+  // Every skip is visible: a root's tick status is logged when it changes
+  // (quiet, not-due, root-turn-not-idle, pending, root-not-idle, sent).
+  for (const result of results) {
+    if (!result?.manifestPath || !result.status) continue;
+    const summary = `${result.status}${result.reason ? ` (${result.reason})` : ""}`;
+    if (lastTickStatus.get(result.manifestPath) === summary) continue;
+    lastTickStatus.set(result.manifestPath, summary);
+    supervisorLog(configDir, `nudge tick ${result.manifestPath}: ${summary}`);
   }
   return { accepted: true, results, pendingWakes, ...(operator.length ? { operator } : {}) };
 }

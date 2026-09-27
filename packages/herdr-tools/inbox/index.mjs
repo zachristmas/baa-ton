@@ -15,6 +15,7 @@ import {
   readFile,
   rename,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -193,6 +194,39 @@ async function atomicWrite(path, value) {
   }
 }
 
+function processAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * A lock left by a process that died holding it (killed, crashed) blocked
+ * every later receipt and hook for hours. It is reclaimed when its owner is
+ * dead, or when its owner file is missing or unreadable and the lock is
+ * older than STALE_UNREADABLE_LOCK_MS (a live writer fills it at once).
+ */
+const STALE_UNREADABLE_LOCK_MS = 30_000;
+async function reclaimStaleLock(lockPath) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8"));
+  } catch {
+    owner = undefined;
+  }
+  if (owner && processAlive(owner.pid)) return false;
+  if (!owner) {
+    const created = await stat(lockPath).then((details) => details.mtimeMs, () => undefined);
+    if (created === undefined || Date.now() - created < STALE_UNREADABLE_LOCK_MS) return false;
+  }
+  await rm(lockPath, { recursive: true, force: true });
+  return true;
+}
+
 async function acquireLock(path) {
   const lockPath = `${path}.lock`;
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -207,6 +241,7 @@ async function acquireLock(path) {
       return async () => rm(lockPath, { recursive: true, force: true });
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
+      if (await reclaimStaleLock(lockPath).catch(() => false)) continue;
       if (Date.now() >= deadline)
         throw new Error(`Timed out acquiring inbox lock for ${path}.`);
       await new Promise((resolveSleep) =>

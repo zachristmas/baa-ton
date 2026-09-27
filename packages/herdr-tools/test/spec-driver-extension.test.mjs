@@ -424,12 +424,14 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     const verify = f.calls.plan[0];
     assert.equal(verify.specStage, "verify");
     assert.equal(verify.taskProfile, "quick");
-    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-verify-A"), "never the integration worktree");
-    assert.deepEqual(f.calls.detached, [{ repo: f.calls.detached[0].repo, path: join(f.worktreeRoot, "spec-verify-A"), sha }], "detached at the pushed commit");
+    // A demo (evidence) lane runs the app: the one shared verify worktree,
+    // reused with its install, never the integration worktree.
+    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-verify"), "the shared verify worktree");
+    assert.deepEqual(f.calls.detached, [{ repo: f.calls.detached[0].repo, path: join(f.worktreeRoot, "spec-verify"), sha }], "switched to the pushed commit");
     assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
 
-    await mkdir(join(f.worktreeRoot, "spec-verify-A", "artifacts"), { recursive: true });
-    await writeDemo(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), 2);
+    await mkdir(join(f.worktreeRoot, "spec-verify", "artifacts"), { recursive: true });
+    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "a.final.docx"), 2);
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
     result = await f.advance();
@@ -438,7 +440,7 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     assert.equal(state.items.A.state, "done");
     assert.equal(state.items.A.evidence.images, 2);
     assert.equal(state.items.A.evidence.path, join(f.stateDir, "evidence", "A", "a.final.docx"), "kept in the state folder");
-    assert.deepEqual(f.calls.removed.map((call) => call.path), [join(f.worktreeRoot, "spec-verify-A")], "the verify worktree is removed once done");
+    assert.deepEqual(f.calls.removed ?? [], [], "the shared verify worktree (and its install) stays for the next item");
     assert.equal(state.items.A.verifyWorktree, undefined);
   } finally {
     await f.cleanup();
@@ -2127,6 +2129,30 @@ test("an item whose review failed on demo evidence gets one fresh review; one th
     await writeFile(join(f.stateDir, "spec-state.json"), JSON.stringify(again));
     await f.advance();
     assert.equal((await f.state()).items.E.state, "failed", "only once");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lane that finished with no status event recorded is seen done through Herdr's live status: its receipt is asked for (a live stall)", async () => {
+  // As it stood live: four review lanes done in Herdr, no events recorded,
+  // holding every slot while the next items waited on capacity.
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D02", title: "Review", acceptance: { text: "r" } }] },
+    seed: { version: 1, items: { D02: { state: "reviewing", attempts: 1, laneStage: "review", lane: { workflowId: "herdr-36292b13", laneId: "lane-1" } } } },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-36292b13", status: "running", lanes: [{ id: "lane-1", status: "running", specStage: "review", paneId: "w22:p5T", sessionLog: { status: "working" } }], evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const told = [];
+    f.ports.tell = async (input) => (told.push(input), { message: { delivery: { status: "delivered" } } });
+    await f.advance();
+    assert.equal(told.length, 0, "without a live answer the lane still looks busy");
+    f.ports.liveStatus = async (paneId) => (paneId === "w22:p5T" ? "done" : undefined);
+    await f.advance();
+    assert.equal(told.length, 1, "done in Herdr: the receipt is asked for");
+    assert.ok((await f.state()).items.D02.receiptAskedAt);
   } finally {
     await f.cleanup();
   }
