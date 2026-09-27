@@ -4,8 +4,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { busyPorts, elapsedMs, killLaneProcesses, laneProcesses, orphanShells, parseProcessTable, portListening } from "../lane-processes.mjs";
-import { readSpawnProbe, recordSpawnProbe, spawnThrottled, startupWait } from "../spawn-load.mjs";
+import { busyPorts, elapsedMs, killLaneProcesses, laneProcesses, orphanShells, parseProcessTable, portListening } from "../inbox/lane-processes.mjs";
+import { readSpawnProbe, recordSpawnProbe, spawnThrottled, startupWait } from "../inbox/spawn-load.mjs";
 
 const INTENT = "/state/herdr-d03-lane-1-startup.json";
 const TABLE = [

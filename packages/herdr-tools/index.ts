@@ -140,8 +140,8 @@ const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecove
 const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
-const { readSpawnProbe, spawnThrottled } = (await freshImport("./spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spawn-load.mjs");
-const { busyPorts, killLaneProcesses } = (await freshImport("./lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./lane-processes.mjs");
+const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
+const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");

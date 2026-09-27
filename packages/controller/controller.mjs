@@ -4990,7 +4990,7 @@ export function createSpawnWatch({
   let lastOrphans = -Infinity;
   return {
     async tick() {
-      const load = await import("../herdr-tools/spawn-load.mjs");
+      const load = await import("../herdr-tools/inbox/spawn-load.mjs");
       const ms = await (measure ?? load.measureSpawn)();
       const throttled = load.spawnThrottled(ms);
       (record ?? load.recordSpawnProbe)({ ms, at: new Date(clock()).toISOString(), throttled });
@@ -5002,7 +5002,7 @@ export function createSpawnWatch({
       }
       if (clock() - lastOrphans >= orphanEveryMs) {
         lastOrphans = clock();
-        const processes = await import("../herdr-tools/lane-processes.mjs");
+        const processes = await import("../herdr-tools/inbox/lane-processes.mjs");
         const orphans = processes.orphanShells(await (table ?? processes.readProcessTable)());
         if (orphans.length) {
           const days = (item) => `${item.command.split("/").pop()} ${item.pid} (${Math.floor((item.ageMs ?? 0) / 86_400_000)} d)`;
