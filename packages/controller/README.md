@@ -8,6 +8,8 @@ The plugin declares one harness-neutral event:
 
 - `pane.agent_status_changed` — classifies `done` and `blocked` states for every supported Herdr agent kind.
 
+The hook command is `hook.sh`, a shell forwarder: it writes the event to `<config dir>/hook-queue/` and exits, and the supervisor handles the queue (no Node process per event). When queued events sit unhandled for 2 minutes, it runs `node controller.mjs hook-drain` (at most one at a time), which restarts a dead supervisor and handles the queue itself.
+
 An opted-in workflow may perform one bounded recent-output read after an `idle` or `working` event to classify a paused goal. This is optional and never changes generic `done` or `blocked` behavior. There is no polling, `agent.wait`, `agent.prompt --wait`, or foreground wait.
 
 ## Install (parent review only)

@@ -1,0 +1,11 @@
+type Env = Record<string, string | undefined>;
+export const SPAWN_THROTTLE_MS: number;
+export const STARTUP_WAIT_CAP_MS: number;
+export const SPAWN_PROBE_MAX_AGE_MS: number;
+export const SPAWN_PROBE_FILE: string;
+export function spawnProbePath(env?: Env): string;
+export function measureSpawn(options?: { execPath?: string; timeoutMs?: number }): Promise<number>;
+export function recordSpawnProbe(probe: { ms: number; at: string; throttled?: boolean }, env?: Env): void;
+export function readSpawnProbe(env?: Env, options?: { now?: number; maxAgeMs?: number }): number | undefined;
+export function startupWait(baseMs: number, probeMs: number | undefined): number;
+export function spawnThrottled(probeMs: number | undefined): boolean;

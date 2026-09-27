@@ -453,7 +453,7 @@ test("manifest has the required ID, compatible version floor, and supported even
   assert.deepEqual(manifest.events, [
     {
       on: "pane.agent_status_changed",
-      command: ["node", "controller.mjs", "hook"],
+      command: ["sh", "hook.sh"],
     },
   ]);
 });
@@ -1574,7 +1574,9 @@ test("the Herdr-owned supervisor nudges a due running parent goal, names why, an
         request.params.text,
         /Parent goal parent-bb029 is active and work is waiting on you:\n1\) lane herdr-bb029\/lane-child \(status unknown\) waits on request request-waiting: runtime launch: npm run dev/,
       );
-      assert.match(request.params.text, /record a truthful goal state/);
+      assert.match(request.params.text, /Record a truthful goal state only when the goal is completed/);
+      assert.match(request.params.text, /Never pause, park or wait in your turn for Zach/);
+      assert.doesNotMatch(request.params.text, /paused, or action-required/);
       assert.doesNotMatch(request.params.text, /observational only/);
       assert.doesNotMatch(
         request.params.text,

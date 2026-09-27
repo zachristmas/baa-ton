@@ -20,4 +20,4 @@ command = ["sh", "-c", "node \"$HERDR_PLUGIN_ROOT/sidebar-configure.mjs\" --appl
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["node", "controller.mjs", "hook"]
+command = ["sh", "hook.sh"]
