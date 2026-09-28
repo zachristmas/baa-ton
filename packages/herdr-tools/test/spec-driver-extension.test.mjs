@@ -13,7 +13,7 @@ const { validateApprovalPolicy, approvalPolicyHash } = await jiti.import("../app
 
 const launch = (provider, model) => ({ provider, model, thinking: "high", auth: "subscription" });
 
-async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b", decide = false, specDocument, seed } = {}) {
+async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "model-b", decide = false, specDocument, seed, exec } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "baa-spec-driver-"));
   const configDir = join(directory, "config");
   const parent = join(directory, "parent");
@@ -81,7 +81,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     },
     registerCommand() {},
     registerTool: (definition) => tools.set(definition.name, definition),
-    async exec() {
+    async exec(command, args) {
+      if (exec) return exec(command, args);
       throw new Error("no herdr in this test");
     },
   });
@@ -2300,5 +2301,32 @@ test("the root requeues a blocked or failed item under the retry grant while the
     await assert.rejects(g.tools.get("herdr_spec").execute("spec", { action: "requeue", itemId: "A" }, undefined, undefined, g.ctx), /Requeue needs the retry grant/);
   } finally {
     await g.cleanup();
+  }
+});
+
+test("one pass reads every lane's live status from a single herdr pane list, not an agent get per lane (the spec host's largest spawn source)", async () => {
+  const calls = [];
+  const exec = async (_command, args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "pane" && args[1] === "list")
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: { panes: [{ pane_id: "w-spec:p5", agent: "claude", agent_status: "done" }, { pane_id: "w-spec:p6", agent: "claude", agent_status: "working" }] } }) };
+    return { code: 1, stderr: "", stdout: JSON.stringify({ error: { code: "unexpected", message: args.join(" ") } }) };
+  };
+  const seed = { version: 1, items: { A: { state: "building", attempts: 1, lane: { workflowId: "herdr-live", laneId: "lane-1" } } } };
+  const f = await fixture({ seed, exec });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push(
+      { id: "herdr-live", status: "running", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "working", specStage: "build", paneId: "w-spec:p6" }], evidence: [] },
+      // Old integrate and verify lanes of unfinished workflows: each used to cost an agent get per pass.
+      ...Array.from({ length: 12 }, (_, index) => ({ id: `herdr-old${index}`, status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "dispatch-failed", specStage: index % 2 ? "verify" : "integrate", paneId: `w22:p${index}` }], evidence: [] })),
+    );
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    await f.advance();
+    assert.equal(calls.filter((call) => call === "pane list").length, 1, "one pane list per pass");
+    assert.equal(calls.filter((call) => call.startsWith("agent get")).length, 0, "no agent get per lane");
+    assert.equal((await f.state()).items.A.state, "building", "a working lane keeps its item building");
+  } finally {
+    await f.cleanup();
   }
 });
