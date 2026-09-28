@@ -4771,6 +4771,7 @@ export async function runSupervisorLoop({
   let timer;
   let hookTimer;
   let draining;
+  let hookEvents = 0;
   let probeTimer;
   let probing;
   let inFlightTick;
@@ -4878,6 +4879,9 @@ export async function runSupervisorLoop({
   const drainHooks = () => {
     if (draining || stopping) return draining;
     draining = drainHookQueue({ configDir: resolvedConfigDir, stateDir: resolvedStateDir, herdr, log: (message) => supervisorLog(resolvedConfigDir, message) })
+      .then((result) => {
+        hookEvents += result?.handled ?? 0;
+      })
       .catch((error) => supervisorLog(resolvedConfigDir, `hook queue failed: ${error instanceof Error ? error.message : String(error)}`))
       .finally(() => {
         draining = undefined;
@@ -4885,7 +4889,16 @@ export async function runSupervisorLoop({
     return draining;
   };
   if (hookQueue) hookTimer = setInterval(() => void drainHooks(), hookQueueMs);
-  const watch = spawnWatch ? createSpawnWatch({ log: (message) => supervisorLog(resolvedConfigDir, message) }) : undefined;
+  const watch = spawnWatch
+    ? createSpawnWatch({
+        log: (message) => supervisorLog(resolvedConfigDir, message),
+        takeHookEvents: () => {
+          const count = hookEvents;
+          hookEvents = 0;
+          return count;
+        },
+      })
+    : undefined;
   const probeSpawn = () => {
     if (!watch || probing || stopping) return probing;
     probing = watch.tick().catch((error) => supervisorLog(resolvedConfigDir, `spawn probe failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
@@ -4994,6 +5007,10 @@ export function createSpawnWatch({
   clock = () => Date.now(),
   logEveryMs = 10 * 60_000,
   orphanEveryMs = 60 * 60_000,
+  // The processes Baa-ton started since the last tick (spawn-count.mjs) and
+  // the hook events queued meanwhile, logged once a minute.
+  spawnCounts,
+  takeHookEvents = () => 0,
 } = {}) {
   let lastState;
   let lastLog = 0;
@@ -5024,6 +5041,15 @@ export function createSpawnWatch({
             evidence: orphans.slice(0, 20).map((item) => `pid ${item.pid}: ${item.command}`),
           }).catch(() => undefined);
         }
+      }
+      try {
+        const count = await import("../herdr-tools/inbox/spawn-count.mjs");
+        spawnCounts ??= count.createSpawnCountReader();
+        const counted = spawnCounts.read();
+        const hooks = takeHookEvents();
+        if (counted.total || hooks) log(count.formatSpawnCounts(counted, { "hook events": hooks }));
+      } catch {
+        // Best effort.
       }
       return { ms, throttled };
     },
@@ -5175,6 +5201,8 @@ async function main() {
   }
   if (command === "supervisor-run") {
     guardSupervisorProcess("runner", supervisorDir);
+    // Its spawns join the per-minute count in supervisor.log (spawn-count.mjs).
+    (await import("../herdr-tools/inbox/spawn-count.mjs")).installSpawnCounter("supervisor");
     await runSupervisorLoop({
       hookQueue: true,
       spawnWatch: true,
