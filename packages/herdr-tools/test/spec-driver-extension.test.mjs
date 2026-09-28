@@ -2247,3 +2247,33 @@ test("a rebuild into a worktree an earlier lane left dirty commits that work fir
     await f.cleanup();
   }
 });
+
+test("the root requeues a blocked or failed item under the retry grant while the spec host owns the loop; a push gate and a live item are refused", async () => {
+  const seed = {
+    version: 1,
+    items: {
+      A: { state: "failed", note: "build failed: Pane w22:p74 shell did not become ready for agent start", laneStage: "build", attempts: 3, history: [] },
+      B: { state: "blocked", blockedReason: "human-gate", note: "push to production needs approval", history: [] },
+    },
+  };
+  const f = await fixture({ grants: ["dispatch", "integrate", "retry"], seed });
+  try {
+    const result = await f.tools.get("herdr_spec").execute("spec", { action: "requeue", itemId: "A", text: "its lanes never started (dead panes)" }, undefined, undefined, f.ctx);
+    assert.match(result.content[0].text, /Requeued A for build \(failed -> building\)/);
+    const state = await f.state();
+    assert.equal(state.items.A.state, "building");
+    assert.equal(state.items.A.attempts, 2);
+    assert.equal(state.items.A.note, undefined);
+    assert.match(state.items.A.history.at(-1).note, /requeued by the root for build: its lanes never started/);
+    await assert.rejects(f.tools.get("herdr_spec").execute("spec", { action: "requeue", itemId: "B" }, undefined, undefined, f.ctx), /waits on a person for push, deploy, production or scope/);
+    await assert.rejects(f.tools.get("herdr_spec").execute("spec", { action: "requeue", itemId: "A" }, undefined, undefined, f.ctx), /is building, not blocked or failed/);
+  } finally {
+    await f.cleanup();
+  }
+  const g = await fixture({ seed });
+  try {
+    await assert.rejects(g.tools.get("herdr_spec").execute("spec", { action: "requeue", itemId: "A" }, undefined, undefined, g.ctx), /Requeue needs the retry grant/);
+  } finally {
+    await g.cleanup();
+  }
+});
