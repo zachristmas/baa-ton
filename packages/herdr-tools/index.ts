@@ -228,6 +228,24 @@ export async function restoreToHead(worktree: string, paths: string[], timeout =
     for (const path of added) await rm(join(worktree, path), { force: true });
   }
 }
+/**
+ * Put the shared integration worktree back to its last commit after a lane
+ * stopped mid-merge or staged, saving everything first as a patch. The patch
+ * holds staged and unstaged changes alike: a build or codegen that rewrote a
+ * merged file after staging made `merge --abort` refuse ("Entry ... not
+ * uptodate"), so once saved the worktree is reset outright. Untracked files
+ * are left alone.
+ */
+export async function cleanIntegrationWorktree({ worktree, patchPath }: { worktree: string; patchPath: string }) {
+  const porcelain = (await execFile("git", ["-C", worktree, "status", "--porcelain=v1", "--untracked-files=no"], { timeout: 30_000 })).stdout;
+  const merging = await execFile("git", ["-C", worktree, "rev-parse", "-q", "--verify", "MERGE_HEAD"], { timeout: 30_000 }).then(() => true, () => false);
+  if (!porcelain.trim() && !merging) return undefined;
+  await mkdir(dirname(patchPath), { recursive: true });
+  const diff = (await execFile("git", ["-C", worktree, "diff", "--binary", "HEAD"], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 })).stdout;
+  await writeFile(patchPath, diff);
+  await execFile("git", ["-C", worktree, "reset", "--hard", "--quiet", "HEAD"], { timeout: 60_000 });
+  return { merging, files: porcelain.split("\n").filter(Boolean).length };
+}
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
 const MESSAGE_SUMMARY_MAX_LENGTH = 4000;
@@ -5532,6 +5550,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               evidenceProblem: record.evidenceProblem,
               releaseSha: record.releaseSha,
               reportPath: item.acceptance.evidence ? finalReportPath(spec, item.acceptance.evidence.report) : "",
+              ...(action.tests?.length ? { tests: action.tests } : {}),
+              ...(action.testsOnly ? { testsOnly: true } : {}),
             });
           } else if (action.kind === "integrate") {
             profile = spec.stages.integrate?.profile ?? "balanced";
@@ -5539,17 +5559,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             // An earlier lane that stopped mid-merge left it staged: save that
             // work as a patch in the state folder, then put the worktree back
             // to its last commit, so this lane starts (and dispatches) clean.
-            const leftover = await (ports?.cleanIntegration ??
-              (async ({ worktree: path, patchPath }: { worktree: string; patchPath: string }) => {
-                const porcelain = (await execFile("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=no"], { timeout: 30_000 })).stdout;
-                const merging = await execFile("git", ["-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD"], { timeout: 30_000 }).then(() => true, () => false);
-                if (!porcelain.trim() && !merging) return undefined;
-                await mkdir(dirname(patchPath), { recursive: true });
-                const diff = (await execFile("git", ["-C", path, "diff", "HEAD"], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 })).stdout;
-                await writeFile(patchPath, diff);
-                await execFile("git", ["-C", path, merging ? "merge" : "reset", merging ? "--abort" : "--merge"], { timeout: 60_000 });
-                return { merging, files: porcelain.split("\n").filter(Boolean).length };
-              }))({ worktree, patchPath: join(ctx.cwd, ".baa-ton", "herdr-orchestrator", "aborted-integrations", `${item.id}-${use.now().replace(/[:.]/g, "-")}.patch`) });
+            const leftover = await (ports?.cleanIntegration ?? cleanIntegrationWorktree)({ worktree, patchPath: join(ctx.cwd, ".baa-ton", "herdr-orchestrator", "aborted-integrations", `${item.id}-${use.now().replace(/[:.]/g, "-")}.patch`) });
             if (leftover) {
               record.history = [...(record.history ?? []), { at: use.now(), from: record.state, to: record.state, note: `spec-integration had ${leftover.merging ? "a half-done merge" : "staged changes"} (${leftover.files} file(s)) from an earlier lane: saved as a patch and aborted before this lane` }];
               done.push(`cleaned spec-integration before integrating ${item.id}`);

@@ -139,15 +139,28 @@ export function decideResult(summary) {
   };
 }
 
-/** Parse a verify lane's receipt: PREVIEW: <spec> pass|fail|blocked and REPORT: <path> lines. */
+/** Parse a verify lane's receipt: PREVIEW: <spec> pass|fail|blocked, TEST: <command> pass|fail|blocked and REPORT: <path> lines. */
 export function verifyResult(summary) {
   const lines = String(summary ?? "").split("\n");
   const previews = lines
     .map((line) => /^\s*PREVIEW\s*:\s*(\S+)\s+(pass|fail|blocked)\b/i.exec(line))
     .filter(Boolean)
     .map((match) => ({ spec: match[1], result: match[2].toLowerCase() }));
+  const tests = lines
+    .map((line) => /^\s*TEST\s*:\s*(.+?)\s+(pass|fail|blocked)\b(?:\s*[.:;,(\u2014-].*)?$/i.exec(line))
+    .filter(Boolean)
+    .map((match) => ({ command: match[1].replace(/^`(.*)`$/, "$1").trim(), result: match[2].toLowerCase() }));
   const report = lines.map((line) => /^\s*REPORT\s*:\s*(\S+)\s*$/i.exec(line)?.[1]).find(Boolean);
-  return { previews, ...(report ? { report } : {}) };
+  return { previews, tests, ...(report ? { report } : {}) };
+}
+
+/** An item's acceptance tests with no run recorded at its integrated commit
+ * (an item a batch lane merged is integrated with none). A recording at the
+ * item's own integrated commit stays valid however far the target moves. */
+export function untestedAtIntegration(item, current) {
+  if (!current?.integratedSha) return [];
+  const runs = Array.isArray(current.tests) ? current.tests : [];
+  return item.acceptance.tests.filter((command) => !runs.some((run) => run.command === command && run.sha === current.integratedSha));
 }
 
 /** The demo generator lanes use (absolute path, for their Playwright runs). */
@@ -632,12 +645,37 @@ for (const item of spec.items) {
       if (!view) continue;
       if (view.receipt) {
         const result = verifyResult(view.receipt.summary);
-        const runs = result.previews.map((run) => ({ ...run, sha: current.integratedSha, releaseSha: current.releaseSha, at: now }));
+        // A lane sent only to record the item's tests judges nothing else.
+        const testsOnly = Boolean(current.verifyTestsOnly);
+        delete current.verifyTestsOnly;
+        const asked = untestedAtIntegration(item, current);
+        const testRuns = result.tests
+          .filter((run) => item.acceptance.tests.includes(run.command) && run.result !== "blocked")
+          .map((run) => ({ ...run, sha: current.integratedSha, at: now, by: "verify" }));
+        if (testRuns.length) current.tests = [...(Array.isArray(current.tests) ? current.tests : []), ...testRuns];
+        const testsBlocked = result.tests.some((run) => run.result === "blocked");
+        const testsFailed = testRuns.filter((run) => run.result === "fail");
+        const testsMissing = untestedAtIntegration(item, current).filter((command) => asked.includes(command));
+        const runs = testsOnly ? [] : result.previews.map((run) => ({ ...run, sha: current.integratedSha, releaseSha: current.releaseSha, at: now }));
         const failed = runs.filter((run) => run.result !== "pass");
-        const missing = item.acceptance.preview.filter((path) => !runs.some((run) => run.spec === path));
+        const missing = testsOnly ? [] : item.acceptance.preview.filter((path) => !runs.some((run) => run.spec === path));
         current.preview = [...(Array.isArray(current.preview) ? current.preview : []), ...runs];
         current.verifyLane = current.lane;
+        if (testsBlocked || (testsMissing.length && !testsFailed.length)) {
+          // Nothing recorded: the tests could not run (a stack, a database) or
+          // the receipt has no TEST: line for them. A fresh lane runs them.
+          if (testsBlocked || STACK_LAUNCH_FAILURE.test(view.receipt.summary))
+            retryStage(item, current, "verify", "infrastructure", `the verify lane could not run the item's tests: ${String(view.receipt.summary).split("\n").find((line) => /blocked|TEST|launch|start|ECONN|EADDR/i.test(line))?.slice(0, 200) ?? "see its receipt"}`);
+          else retryStage(item, current, "verify", "unclear receipt", `the verify receipt has no TEST: <command> pass|fail line for ${testsMissing.join("; ")}`);
+          continue;
+        }
         delete current.lane;
+        if (testsFailed.length) {
+          move(item.id, "blocked", { blockedReason: "human-gate", note: `test failed at the integrated commit ${String(current.integratedSha).slice(0, 12)}: ${testsFailed.map((run) => run.command).join("; ")}` });
+          rootAsks.push({ itemId: item.id, reason: `${item.id}: its tests fail at its integrated commit ${String(current.integratedSha).slice(0, 12)} (${testsFailed.map((run) => run.command).join("; ")}); decide whether to fix forward` });
+          continue;
+        }
+        if (testsOnly) continue;
         if (result.report) current.finalReport = result.report;
         // A lane that could not launch its stack verified nothing: retry the
         // stage as infrastructure (never counted), never a human gate.
@@ -916,13 +954,19 @@ for (const item of spec.items) {
   const onDevStack = spec.items.filter((item) => runsDevStack(item) && next.items[item.id]?.state === "verifying" && next.items[item.id]?.lane).map((item) => item.id);
   for (const item of spec.items) {
     const current = next.items[item.id];
-    if (current?.state !== "verifying" || current.lane || current.verified) continue;
+    if (current?.state !== "verifying" || current.lane) continue;
+    // Tests with no run recorded at the integrated commit (a batch-merged
+    // item has none): a verify lane runs them there, rather than the item
+    // waiting on a recording nothing will make.
+    const untested = untestedAtIntegration(item, current);
+    const testsOnly = Boolean(current.verified) && untested.length > 0;
+    if (current.verified && !testsOnly) continue;
     // A demo lane after an evidence failure waits out its backoff.
     if (typeof current.evidenceRetryAfter === "string" && Date.parse(now) < Date.parse(current.evidenceRetryAfter)) {
       waits[item.id] = `evidence: a demo lane after ${current.evidenceRetryAfter}`;
       continue;
     }
-    const needsLane = item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
+    const needsLane = testsOnly || untested.length > 0 || item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
     if (!needsLane) {
       current.verified = now;
       continue;
@@ -931,7 +975,7 @@ for (const item of spec.items) {
       waits[item.id] = `integration worktree busy: ${reservedBy}`;
       continue;
     }
-    if (item.acceptance.preview.length && spec.target.preview) {
+    if (!testsOnly && item.acceptance.preview.length && spec.target.preview) {
       const releaseSha = released.get(item.id);
       if (!releaseSha) {
         waits[item.id] = "preview: the release check does not report a deploy containing this commit yet";
@@ -944,7 +988,9 @@ for (const item of spec.items) {
       continue;
     }
     if (runsDevStack(item)) onDevStack.push(item.id);
-    actions.push({ kind: "verify", itemId: item.id, attempt: 1 });
+    if (testsOnly) current.verifyTestsOnly = true;
+    else delete current.verifyTestsOnly;
+    actions.push({ kind: "verify", itemId: item.id, attempt: 1, ...(untested.length ? { tests: untested } : {}), ...(testsOnly ? { testsOnly: true } : {}) });
   }
 
   // 1e. The decide stage (when configured) runs before an item can build,
@@ -1066,7 +1112,19 @@ export function decideObjective(spec, item) {
 }
 
 /** The verify lane's objective: preview specs against the deployed release, then the final report. */
-export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, evidenceProblem }) {
+export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, evidenceProblem, tests = [], testsOnly = false }) {
+  const testLines = tests.length
+    ? `Run the item's tests at this commit (the item's integrated commit; nothing else records them): ${tests.join("; ")}. Report each on its own line, TEST: <command> pass or TEST: <command> fail; if a test could not run at all (no database, a service down), TEST: <command> blocked and why.`
+    : "";
+  if (testsOnly)
+    return [
+      `Record the tests of spec item ${item.id}: ${item.title}, at its integrated commit. Everything else about the item is already verified.`,
+      worktree ? `Your worktree is ${worktree} (a detached checkout of that commit), and you start in it: run every command from it with relative paths.` : "",
+      testLines,
+      LONG_COMMANDS,
+      "Do not change code or Git state; this stage only runs the tests.",
+      "Finish with herdr_complete: the TEST: lines, then the failing output for any fail.",
+    ].filter(Boolean).join("\n");
   return [
     `Verify spec item ${item.id}: ${item.title}, now pushed to ${spec.target.remote}/${spec.target.branch}${releaseSha ? ` and deployed (release ${releaseSha})` : ""}.`,
     evidenceProblem
@@ -1085,8 +1143,9 @@ export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, 
     item.acceptance.evidence
       ? `${demoRule(reportPath, item.acceptance.evidence.minImages)} Run it against the preview.`
       : "",
+    testLines,
     "Do not change code or Git state; this stage only verifies.",
-    "Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, and REPORT: <path of the report you wrote>. If the app or its services could not be started at all, write PREVIEW: <spec path> blocked and say why: that is retried as infrastructure, not recorded as a failure.",
+    `Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, ${tests.length ? "one TEST: line per test, " : ""}and REPORT: <path of the report you wrote>. If the app or its services could not be started at all, write PREVIEW: <spec path> blocked and say why: that is retried as infrastructure, not recorded as a failure.`,
   ].filter(Boolean).join("\n");
 }
 
@@ -1112,7 +1171,8 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,
-    `Never leave ${integrationBranch} half-merged or staged: if you stop before committing (a conflict you cannot resolve, a failing hook, a decline), run git merge --abort (or git reset --merge) so the worktree is clean for the next lane.`,
+    `Before you commit, run git status: every file you changed to resolve the merge must be staged, not only the ones that had conflict markers, and generated files your builds rewrote (openapi specs, API clients) go back with git restore --worktree -- <file> unless the merge needs them.`,
+    `Never leave ${integrationBranch} half-merged or staged: if you stop before committing (a conflict you cannot resolve, a failing hook, a decline), run git merge --abort (or git reset --merge) so the worktree is clean for the next lane. If that refuses ("not uptodate": a build or codegen rewrote a file after you staged it), save git diff --binary HEAD to a patch file outside the repository, run git restore --worktree -- <each file it names>, and abort again.`,
     "Never use git stash (it is shared by every worktree of the repository); set changes aside with a patch file outside the repository or a throwaway commit on your own branch.",
     "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the resulting commit> and SUITE: pass or SUITE: fail, then the FAILED lines, what you changed and the suite output for a failure.",
   ].filter(Boolean).join("\n");
