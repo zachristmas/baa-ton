@@ -425,16 +425,17 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     const verify = f.calls.plan[0];
     assert.equal(verify.specStage, "verify");
     assert.equal(verify.taskProfile, "quick");
-    // A demo (evidence) lane runs the app: the one shared verify worktree,
-    // reused with its install, never the integration worktree.
-    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-verify"), "the shared verify worktree");
-    assert.deepEqual(f.calls.detached, [{ repo: f.calls.detached[0].repo, path: join(f.worktreeRoot, "spec-verify"), sha }], "switched to the pushed commit");
+    // A demo of the preview runs no local stack: its own verify worktree
+    // (reused), so such lanes run side by side; never the integration worktree.
+    assert.equal(verify.worktree, join(f.worktreeRoot, "spec-verify-A"), "its own verify worktree");
+    assert.deepEqual(f.calls.detached, [{ repo: f.calls.detached[0].repo, path: join(f.worktreeRoot, "spec-verify-A"), sha }], "switched to the pushed commit");
+    assert.match(verify.laneObjective, /runs against the preview, not a local stack/);
     assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
 
-    await mkdir(join(f.worktreeRoot, "spec-verify", "artifacts"), { recursive: true });
+    await mkdir(join(f.worktreeRoot, "spec-verify-A", "artifacts"), { recursive: true });
     // A demo of the preview counts only with a healthy check at every step.
     assert.match(verify.laneObjective, /createDemoRecorder\(\{ dir, health: "https:\/\/preview\.example\.test\/" \}\)/);
-    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "a.final.docx"), 2, { url: "https://preview.example.test/", status: 200, wake: false, at: "2026-09-28T00:00:00.000Z" });
+    await writeDemo(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), 2, { url: "https://preview.example.test/", status: 200, wake: false, at: "2026-09-28T00:00:00.000Z" });
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
     result = await f.advance();
@@ -443,7 +444,7 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     assert.equal(state.items.A.state, "done");
     assert.equal(state.items.A.evidence.images, 2);
     assert.equal(state.items.A.evidence.path, join(f.stateDir, "evidence", "A", "a.final.docx"), "kept in the state folder");
-    assert.deepEqual(f.calls.removed ?? [], [], "the shared verify worktree (and its install) stays for the next item");
+    assert.deepEqual((f.calls.removed ?? []).map((call) => call.path ?? call), [join(f.worktreeRoot, "spec-verify-A")], "an item's own verify worktree goes once it is done");
     assert.equal(state.items.A.verifyWorktree, undefined);
   } finally {
     await f.cleanup();

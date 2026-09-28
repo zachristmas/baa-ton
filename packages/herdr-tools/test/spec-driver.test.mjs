@@ -315,9 +315,17 @@ test("an item integrated with no test run at its commit (batch-merged) gets a ve
   assert.deepEqual(record.tests.map((run) => [run.command, run.sha, run.result, run.by]), tests.map((command) => [command, SHA_A, "pass", "verify"]), "recorded at the item's own integrated commit");
   assert.ok(!passed.actions.some((action) => action.itemId === "A"), "recorded: nothing more to dispatch");
 
-  const failed = receipt(`TEST: ${tests[0]} pass\nTEST: ${tests[1]} fail`);
-  assert.equal(failed.state.items.A.state, "blocked");
-  assert.match(failed.state.items.A.note, /test failed at the integrated commit/);
+  const failed = receipt(`TEST: ${tests[0]} pass\nTEST: ${tests[1]} fail\n  FAIL src/web/cart.test.ts > applies the discount`);
+  assert.notEqual(failed.state.items.A.state, "blocked", "a test failure is never a human gate");
+  assert.ok(["ready", "building"].includes(failed.state.items.A.state), "back to build");
+  assert.match(failed.state.items.A.findings, /fail at its integrated commit[\s\S]*--filter=@x\/web[\s\S]*FAIL src\/web\/cart\.test\.ts > applies the discount/);
+  // A failure the suite baseline has too (same package and task) does not block.
+  const withBaseline = structuredClone(step.state);
+  withBaseline.baselines = { [SHA_B]: { suite: "fail", failures: [{ package: "@x/web", task: "test" }], at: at(0) } };
+  const known = advanceSpec({ spec: s, state: withBaseline, lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: `TEST: ${tests[0]} pass\nTEST: ${tests[1]} fail` } } }), now: at(2) });
+  assert.equal(known.state.items.A.state, "verifying");
+  assert.deepEqual(known.state.items.A.tests.at(-1), { command: tests[1], result: "pass", sha: SHA_A, at: at(2), by: "verify", relativeToBaseline: true, baselineSha: SHA_B });
+  assert.match(verifyObjective(s, s.items[0], { worktree: "/w", reportPath: "", tests, testsOnly: true }), /never check out another one[\s\S]*leased database[\s\S]*DATABASE_URL/);
 
   const blocked = receipt(`TEST: ${tests[0]} blocked: no database`);
   assert.equal(blocked.state.items.A.state, "verifying");
@@ -426,16 +434,47 @@ test("items queued for integration hold no maxParallel slot; live lanes do", () 
   assert.deepEqual(later.actions.filter((action) => action.kind === "build").map((action) => action.itemId), ["R0", "R1", "R2", "R3"], "the retry of R0 plus three new builds");
 });
 
-test("an open verify lane also reserves the integration worktree", () => {
-  const s = spec([{ id: "V" }, { id: "I" }]);
+test("a verify lane runs in its own worktree: it never holds the integration worktree or other verify lanes", () => {
+  const s = spec([{ id: "V" }, { id: "I" }, { id: "W", acceptance: { text: "w", tests: ["npm test"] } }]);
   const step = advanceSpec({
     spec: s,
-    state: { version: 1, items: { V: { state: "verifying", integratedSha: "x", lane: { workflowId: "wv", laneId: "l" } }, I: { state: "integrating", attempts: 1 } } },
+    state: { version: 1, items: { V: { state: "verifying", integratedSha: "x", lane: { workflowId: "wv", laneId: "l" } }, I: { state: "integrating", attempts: 1 }, W: { state: "verifying", integratedSha: "y" } } },
     lane: lanes({ "wv/l": { status: "working", workflowStatus: "running" } }),
     now: at(0),
   });
-  assert.equal(step.actions.some((action) => action.kind === "integrate"), false);
-  assert.match(step.waits.I, /integration worktree busy: V's lane wv is still open/);
+  assert.ok(step.actions.some((action) => action.kind === "integrate" && action.itemId === "I"));
+  assert.ok(step.actions.some((action) => action.kind === "verify" && action.itemId === "W"));
+});
+
+test("demos of the preview are not serialized by the dev stack; local demos still take turns (only one demo lane ran with maxParallel 4)", () => {
+  const s = spec(
+    [
+      { id: "P1", acceptance: { text: "p", evidence: { report: "a/p1.docx", onPreview: true } } },
+      { id: "P2", acceptance: { text: "p", evidence: { report: "a/p2.docx", onPreview: true } } },
+      { id: "L1", acceptance: { text: "l", evidence: { report: "a/l1.docx" } } },
+      { id: "L2", acceptance: { text: "l", evidence: { report: "a/l2.docx" } } },
+    ],
+    { maxParallel: 4 },
+    undefined,
+    { url: "https://pv.example.test", health: "/healthz" },
+  );
+  const items = Object.fromEntries(["P1", "P2", "L1", "L2"].map((id) => [id, { state: "verifying", integratedSha: SHA_A }]));
+  const step = advanceSpec({ spec: s, state: { version: 1, items }, lane: lanes({}), now: at(0) });
+  assert.deepEqual(step.actions.filter((action) => action.kind === "verify").map((action) => action.itemId), ["P1", "P2", "L1"]);
+  assert.match(step.waits.L2, /dev stack busy: L1/);
+});
+
+test("items an older driver held at the human gate on a recorded test failure are re-armed: the failing runs dropped, the tests run again", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", tests: ["pnpm turbo run test --filter=@x/order"] } }]);
+  const state = {
+    version: 1,
+    items: { D: { state: "blocked", blockedReason: "human-gate", note: "test failed at the integrated commit aaaaaaaaaaaa: pnpm turbo run test --filter=@x/order", integratedSha: SHA_A, verified: at(0), tests: [{ command: "pnpm turbo run test --filter=@x/order", sha: SHA_A, result: "fail" }] } },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(1) });
+  assert.equal(step.state.items.D.state, "verifying");
+  assert.equal(step.state.items.D.blockedReason, undefined);
+  assert.deepEqual(step.state.items.D.tests, []);
+  assert.deepEqual(step.actions.find((action) => action.itemId === "D"), { kind: "verify", itemId: "D", attempt: 1, tests: ["pnpm turbo run test --filter=@x/order"], testsOnly: true });
 });
 
 test("a decline is an explicit DECLINED line, or decline language where the stage's required lines are missing", async () => {

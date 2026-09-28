@@ -195,6 +195,29 @@ export function demoRunObjective(spec, items, { worktree, sha, reports, pins }) 
   ].filter(Boolean).join("\n");
 }
 
+/** Env-dependent suites run against the lane's own leased database, never fail for want of one. */
+export const LANE_DATABASE_RULE =
+  "Tests that need a database run against your own leased database: create it if needed, run the migrations, and set DATABASE_URL (and the other connection variables the tests read) to it for the test command. Never use another lane's or a shared database. A suite that fails only because DATABASE_URL was missing has not been run.";
+
+/** The package and task a test command runs (turbo run <task> --filter=<pkg>, pnpm --filter <pkg> <task>). */
+export function testTarget(command) {
+  const text = String(command ?? "");
+  const pkg = /--filter[=\s]+["']?([^\s"']+)/.exec(text)?.[1];
+  const task = /\bturbo\s+(?:run\s+)?([\w:.-]+)/.exec(text)?.[1] ?? /--filter[=\s]+\S+\s+(?:run\s+)?([\w:.-]+)/.exec(text)?.[1] ?? (/\btest\b/.test(text) ? "test" : undefined);
+  return pkg && task ? { package: pkg.replace(/^\.\//, ""), task } : undefined;
+}
+
+/** Whether a failing test command fails on a recorded suite baseline too (same package and task). */
+export function knownBaselineFailure(command, baselines) {
+  const target = testTarget(command);
+  if (!target) return undefined;
+  const same = (name) => name === target.package || name.split("/").at(-1) === target.package.split("/").at(-1);
+  for (const [sha, baseline] of Object.entries(baselines ?? {}))
+    if (baseline?.suite === "fail" && Array.isArray(baseline.failures) && baseline.failures.some((failure) => failure.task === target.task && same(String(failure.package))))
+      return { sha, package: target.package, task: target.task };
+  return undefined;
+}
+
 /** An item's acceptance tests with no run recorded at its integrated commit
  * (an item a batch lane merged is integrated with none). A recording at the
  * item's own integrated commit stays valid however far the target moves. */
@@ -448,6 +471,17 @@ export function advanceSpec({
   for (const item of spec.items) {
     const current = next.items[item.id];
     if (current?.state !== "blocked" || current.blockedReason !== "human-gate" || current.blockedCause) continue;
+    // Held on a recorded test failure (test failures are never a human
+    // gate): the runs are dropped and the tests run again, on a prepared
+    // checkout with the lane's own database, under the baseline-relative gate.
+    if (/^test failed at the integrated commit/.test(current.note ?? "")) {
+      const sha = current.integratedSha;
+      current.tests = (Array.isArray(current.tests) ? current.tests : []).filter((run) => !(run.sha === sha && run.result === "fail"));
+      move(item.id, "verifying", { note: undefined }, "re-armed: a recorded test failure is not a human gate; its tests run again, judged against the suite baseline");
+      delete current.note;
+      delete current.blockedReason;
+      continue;
+    }
     const idle = /^(decide|build|review|integrate|verify) lane is idle without a receipt, even after being asked$/.exec(current.note ?? "")?.[1];
     const unclear = /^integration receipt has no INTEGRATED/.test(current.note ?? "") ? "integrate" : /^review receipt has no VERDICT/.test(current.note ?? "") ? "review" : undefined;
     const stage = idle ?? unclear;
@@ -695,9 +729,17 @@ for (const item of spec.items) {
         const testsOnly = Boolean(current.verifyTestsOnly);
         delete current.verifyTestsOnly;
         const asked = untestedAtIntegration(item, current);
+        // Baseline-relative, like the integration gate: a test that fails
+        // the same way on a recorded suite baseline (same package and task)
+        // is not the item's failure.
         const testRuns = result.tests
           .filter((run) => item.acceptance.tests.includes(run.command) && run.result !== "blocked")
-          .map((run) => ({ ...run, sha: current.integratedSha, at: now, by: "verify" }));
+          .map((run) => {
+            const known = run.result === "fail" ? knownBaselineFailure(run.command, next.baselines) : undefined;
+            return known
+              ? { command: run.command, result: "pass", sha: current.integratedSha, at: now, by: "verify", relativeToBaseline: true, baselineSha: known.sha }
+              : { ...run, sha: current.integratedSha, at: now, by: "verify" };
+          });
         if (testRuns.length) current.tests = [...(Array.isArray(current.tests) ? current.tests : []), ...testRuns];
         const testsBlocked = result.tests.some((run) => run.result === "blocked");
         const testsFailed = testRuns.filter((run) => run.result === "fail");
@@ -717,8 +759,15 @@ for (const item of spec.items) {
         }
         delete current.lane;
         if (testsFailed.length) {
-          move(item.id, "blocked", { blockedReason: "human-gate", note: `test failed at the integrated commit ${String(current.integratedSha).slice(0, 12)}: ${testsFailed.map((run) => run.command).join("; ")}` });
-          rootAsks.push({ itemId: item.id, reason: `${item.id}: its tests fail at its integrated commit ${String(current.integratedSha).slice(0, 12)} (${testsFailed.map((run) => run.command).join("; ")}); decide whether to fix forward` });
+          // A new failure is the item's to fix: back to build with the
+          // failing tests quoted, never a human gate.
+          const attempts = current.attempts ?? 1;
+          const quoted = String(view.receipt.summary).split("\n").filter((line) => /\bTEST\s*:|\bFAIL|✕|✗|failed|Error\b|error TS\d+/i.test(line)).slice(0, 40).join("\n");
+          const findings = `Its tests fail at its integrated commit ${String(current.integratedSha).slice(0, 12)}, in ways the suite baseline does not: ${testsFailed.map((run) => run.command).join("; ")}. Fix them on spec/${item.id} (rebase onto spec-integration first):\n${quoted.slice(0, 6000)}`;
+          if (attempts >= spec.defaults.maxBuildAttempts) {
+            move(item.id, "failed", { findings }, "tests failed at the integrated commit");
+            rootAsks.push({ itemId: item.id, reason: `${item.id} failed ${attempts} build attempt(s): its tests fail at its integrated commit (${testsFailed.map((run) => run.command).join("; ")})` });
+          } else move(item.id, "ready", { findings, attempts: attempts + 1 }, "tests failed at the integrated commit");
           continue;
         }
         if (testsOnly) continue;
@@ -884,7 +933,8 @@ for (const item of spec.items) {
     if (!current?.lane) return false;
     const view = lane(current.lane);
     const stage = current.laneStage ?? view?.specStage ?? STAGE_OF[current.state];
-    if (stage !== "integrate" && stage !== "verify") return false;
+    // Verify lanes run in their own worktrees (spec-verify*), never here.
+    if (stage !== "integrate") return false;
     if (view && CLOSED_WORKFLOW.has(view.workflowStatus ?? "")) return false;
     const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone" || LANE_ENDED.has(view.status ?? ""));
     const waitingOnIt = STAGE_OF[current.state] === stage && !current.receiptEscalatedAt;
@@ -1011,7 +1061,8 @@ for (const item of spec.items) {
   // A verify lane that records an evidence report runs the app locally (a
   // dev stack: ports, a database); two at once collide, so they take turns.
   const devStacks = spec.defaults.maxDevStacks ?? 1;
-  const runsDevStack = (item) => Boolean(item.acceptance.evidence);
+  // A demo of the preview needs no local stack: those lanes run in parallel.
+  const runsDevStack = (item) => Boolean(item.acceptance.evidence) && !demoOnPreview(spec, item);
   const onDevStack = spec.items.filter((item) => runsDevStack(item) && next.items[item.id]?.state === "verifying" && next.items[item.id]?.lane).map((item) => item.id);
 
   // 1d1. The demo runner (defaults.demoRunner): one lane runs the demos of
@@ -1027,6 +1078,7 @@ for (const item of spec.items) {
     !current.lane &&
     !current.verified &&
     Boolean(item.acceptance.evidence) &&
+    !demoOnPreview(spec, item) &&
     !item.acceptance.preview.length &&
     !untestedAtIntegration(item, current).length;
   if (runner && next.demoRun?.lane) {
@@ -1119,10 +1171,6 @@ for (const item of spec.items) {
     const needsLane = testsOnly || untested.length > 0 || item.acceptance.preview.length > 0 || Boolean(item.acceptance.evidence);
     if (!needsLane) {
       current.verified = now;
-      continue;
-    }
-    if (reservedBy) {
-      waits[item.id] = `integration worktree busy: ${reservedBy}`;
       continue;
     }
     if (!testsOnly && item.acceptance.preview.length && spec.target.preview) {
@@ -1263,8 +1311,14 @@ export function decideObjective(spec, item) {
 
 /** The verify lane's objective: preview specs against the deployed release, then the final report. */
 export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, evidenceProblem, tests = [], testsOnly = false }) {
+  const prepare = spec.target.suite.filter((command) => /\b(?:install|build|generate|codegen)\b/.test(command) && !/\btest\b/.test(command));
   const testLines = tests.length
-    ? `Run the item's tests at this commit (the item's integrated commit; nothing else records them): ${tests.join("; ")}. Report each on its own line, TEST: <command> pass or TEST: <command> fail; if a test could not run at all (no database, a service down), TEST: <command> blocked and why.`
+    ? [
+        `Run the item's tests at this commit (the item's integrated commit; nothing else records them): ${tests.join("; ")}. Stay on this commit: never check out another one, since the results are recorded here.`,
+        prepare.length ? `Prepare the checkout first as the integration suite does: ${prepare.join("; ")}. A test that fails only because the checkout was not built or generated is not a result.` : "",
+        LANE_DATABASE_RULE,
+        "Report each on its own line, TEST: <command> pass or TEST: <command> fail, and quote the failing test names and errors under it; if a test could not run at all (no database, a service down), TEST: <command> blocked and why.",
+      ].filter(Boolean).join(" ")
     : "";
   if (testsOnly)
     return [
@@ -1284,7 +1338,9 @@ export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, 
       ? `Your worktree is ${worktree} (a detached checkout of the pushed commit), and you start in it: run every command from it with relative paths, never cd into a retyped absolute path.`
       : "",
     item.acceptance.evidence
-      ? "If you start the app locally, you are the only lane running a dev stack now (the driver serializes them); stop it before you finish."
+      ? demoOnPreview(spec, item)
+        ? "This demo runs against the preview, not a local stack: do not start the app locally (other lanes run at the same time)."
+        : "If you start the app locally, you are the only lane running a dev stack now (the driver serializes them); stop it before you finish."
       : "",
     item.acceptance.preview.length && spec.target.preview
       ? `Run these browser specs against the preview at ${spec.target.preview.url}: ${item.acceptance.preview.join(", ")}.`
@@ -1317,6 +1373,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
       ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference. A migration journal that orders by time (drizzle's meta/_journal.json "when", and tools like it) must stay increasing: give each renumbered entry a timestamp later than every entry before it, or migrators skip it silently on any database that already has the newer one.`
       : "",
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
+    spec.target.suite.length || item.acceptance.tests.length ? LANE_DATABASE_RULE : "",
     LONG_COMMANDS,
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",

@@ -5158,7 +5158,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const workflow of manifest.workflows) {
         if (integrationLive || closedWorkflow.has(workflow.status)) continue;
         for (const lane of workflow.lanes)
-          if ((lane.specStage === "integrate" || lane.specStage === "verify") && lane.paneId && (await agentPresent(lane.paneId))) {
+          // Verify lanes run in their own worktrees, never the integration one.
+          if (lane.specStage === "integrate" && lane.paneId && (await agentPresent(lane.paneId))) {
             integrationLive = `the ${lane.specStage} lane ${workflow.id}/${lane.id} is still live`;
             break;
           }
@@ -5643,7 +5644,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           action.kind === "integrate"
             ? integrationWorktree
             : action.kind === "verify"
-              ? join(worktreeRoot, item.acceptance.evidence && (spec.defaults.maxDevStacks ?? 1) === 1 ? "spec-verify" : `spec-verify-${item.id}`)
+              ? join(worktreeRoot, item.acceptance.evidence && !demoOnPreview(spec, item) && (spec.defaults.maxDevStacks ?? 1) === 1 ? "spec-verify" : `spec-verify-${item.id}`)
               : record.worktree ?? join(worktreeRoot, `spec-${item.id}`);
         try {
           let profile: string;
