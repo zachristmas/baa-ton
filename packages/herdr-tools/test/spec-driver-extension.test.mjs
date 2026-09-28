@@ -2424,3 +2424,37 @@ test("the demo runner: one lane at the target tip demos each item on one stack, 
     await f.cleanup();
   }
 });
+
+test("a pre-commit hook failure (lint-staged, eslint) sends the item back to build with its errors and the full output in a file, never a human gate (D19)", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "C", title: "Hook", owns: ["src/c/**"], acceptance: { text: "c" } }] },
+    seed: { version: 1, items: { C: { state: "reviewing", attempts: 1, worktree: "/work/wt-c", branch: "demo/c", adopted: { worktree: "/work/wt-c" } } } },
+  });
+  try {
+    f.ports.status = async () => " M src/c/y.ts\n?? src/c/new.ts";
+    const setAside = [];
+    f.ports.setAsideStaged = async (input) => void setAside.push(input);
+    const noise = "\n/work/wt-c/src/c/seed.ts\n  0:0  warning  File ignored because of a matching ignore pattern. Use \"--no-ignore\" to disable file ignore settings or use \"--no-warn-ignored\" to suppress this warning\n";
+    const real = Array.from({ length: 30 }, (_, index) => `  ${index + 1}:5  error  'x${index}' is defined but never used  @typescript-eslint/no-unused-vars`).join("\n");
+    f.ports.commit = async () => {
+      throw Object.assign(new Error("Command failed: git commit"), { stdout: `${noise}\n/work/wt-c/src/c/y.ts\n${real}\n\n✖ 30 problems (30 errors, 0 warnings)\n`, stderr: "husky - pre-commit script failed (code 1)" });
+    };
+    const result = await f.advance();
+    assert.match(result.content[0].text, /C: commit hooks failed; back to build with \d+ error line\(s\)/);
+    const state = await f.state();
+    const record = state.items.C;
+    assert.notEqual(record.state, "blocked");
+    assert.ok(["ready", "building"].includes(record.state), record.state);
+    assert.equal(record.blockedReason, undefined);
+    assert.match(record.findings, /failed the repository's commit hooks[\s\S]*git apply --index [^\n]*hook-failures\/C-[^\n]*\.patch[\s\S]*never --no-verify/);
+    assert.match(record.findings, /\/work\/wt-c\/src\/c\/y\.ts\n  1:5  error  'x0' is defined but never used[\s\S]*30:5  error[\s\S]*✖ 30 problems/, "the errors, with their file");
+    assert.doesNotMatch(record.findings, /File ignored because of a matching ignore pattern/, "not the harmless warning");
+    const logPath = /Full hook output: (\S+)/.exec(record.findings)[1];
+    assert.match(await readFile(logPath, "utf8"), /File ignored[\s\S]*30:5  error[\s\S]*husky - pre-commit script failed/, "the whole output, kept in a file");
+    assert.deepEqual(setAside.map((input) => [input.worktree, input.paths]), [["/work/wt-c", ["src/c/y.ts", "src/c/new.ts"]]]);
+    const ask = (await f.manifest()).rootSupervision[0].alerts.map((alert) => alert.text).join("\n");
+    assert.match(ask, /went back to build with the errors[\s\S]*1:5  error  'x0'/, "the root sees the errors, not the first line");
+  } finally {
+    await f.cleanup();
+  }
+});

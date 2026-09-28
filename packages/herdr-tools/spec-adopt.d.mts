@@ -10,6 +10,8 @@ export function itemOwnedChanges(
   sharedTouch?: string[],
 ): { paths: string[]; secrets: string[]; outside: string[]; untracked: string[] };
 export function specCommitMessage(itemId: string, subject: string): string;
+export function fullFailureOutput(error: unknown): string;
+export function hookErrors(output: string, max?: number): string;
 export function failureOutput(error: unknown, lines?: number): string;
 export function itemDeferred(item: Spec["items"][number]): boolean;
 export function proposeAdoption(input: {

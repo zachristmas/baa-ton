@@ -93,6 +93,44 @@ export function failureOutput(error, lines = 40) {
   return text.split("\n").slice(-lines).join("\n");
 }
 
+/** A failed command's whole output: stderr and stdout both (a hook writes to either). */
+export function fullFailureOutput(error) {
+  const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+  const stdout = typeof error?.stdout === "string" ? error.stdout.trim() : "";
+  const text = [stdout, stderr].filter(Boolean).join("\n");
+  return text || String(error?.message ?? error);
+}
+
+/**
+ * The errors in a commit hook's output (lint-staged, eslint, tsc, tsc-files),
+ * without the noise before them: an ESLint "File ignored because of a
+ * matching ignore pattern" warning led a held item's note while dozens of
+ * real errors followed. Each file header is kept with its error lines.
+ */
+export function hookErrors(output, max = 80) {
+  const lines = String(output ?? "").split("\n");
+  const kept = [];
+  let header;
+  for (const line of lines) {
+    const text = line.replace(/\s+$/, "");
+    if (!text.trim()) continue;
+    if (/File ignored because of a matching ignore pattern|--no-warn-ignored/.test(text)) continue;
+    if (/^\S.*\.[cm]?[jt]sx?$/.test(text.trim()) && !/\berror\b/i.test(text)) {
+      header = text.trim();
+      continue;
+    }
+    const isError = /\berror\b|error TS\d+|✖|✗|\bproblems?\b|failed|ERR!|Type error/i.test(text) && !/^\s*\d+:\d+\s+warning\b/.test(text);
+    if (!isError) continue;
+    if (header) {
+      kept.push(header);
+      header = undefined;
+    }
+    kept.push(text);
+    if (kept.length >= max) break;
+  }
+  return kept.length ? kept.join("\n") : lines.filter((line) => line.trim() && !/File ignored because of a matching ignore pattern/.test(line)).slice(-40).join("\n");
+}
+
 /** Deferred: the acceptance says so and the item owns no files. */
 export function itemDeferred(item) {
   return /\bdeferred\b/i.test(item.acceptance.text) && item.owns.length === 0;

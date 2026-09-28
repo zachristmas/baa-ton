@@ -153,7 +153,7 @@ const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, re
 const { SPEC_PATH, SPEC_STATE_PATH, demoOnPreview, finalReportPath, gitAncestor, loadSpec, previewHealthUrl, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
 const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, demoRunObjective, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
-const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
+const { adoptSpec, adoptionTable, failureOutput, fullFailureOutput, globToRegExp, hookErrors, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
 const { specHandover } = (await freshImport("./spec-handover.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-handover.mjs");
 
@@ -4815,6 +4815,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     restore?(input: { worktree: string; paths: string[] }): Promise<void>;
     /** Save `paths`' changes as a patch file, then restore them to HEAD. */
     setAside?(input: { worktree: string; paths: string[]; patch: string }): Promise<void>;
+    setAsideStaged?(input: { worktree: string; paths: string[]; patch: string }): Promise<void>;
     /** Herdr's live agent status for a lane's pane ("gone" when no agent), or undefined when unknown. */
     liveStatus?(paneId: string): Promise<string | undefined>;
     /** The loaded code's fingerprint (holds retry once it changes). */
@@ -5381,6 +5382,58 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           done.push(`committed ${changes.paths.length} adopted path(s) for ${item.id} on ${branch}`);
           return false;
         } catch (error) {
+          // A commit hook (lint-staged, eslint, tsc) rejected the work: the
+          // item's own errors, never a human gate. The whole output goes to a
+          // file, the work is saved as a patch and the worktree restored, and
+          // the item goes back to build with the errors and both paths.
+          // A commit-msg hook (commitlint) judges the driver's own message,
+          // not the item's code: that one is still held for the root.
+          const hookOutput = fullFailureOutput(error);
+          const messageHook = /commit-msg|commitlint|subject may not be empty|\[(?:subject|type|header|scope)-[\w-]+\]/i.test(hookOutput);
+          if (!messageHook && /husky|lint-staged|pre-commit|eslint|tsc-files|error TS\d+|✖ \d+ problems?/i.test(hookOutput)) {
+            const full = fullFailureOutput(error);
+            const errors = hookErrors(full);
+            const stamp = use.now().replace(/[:.]/g, "-");
+            const base = join(dirname(manifestPath(ctx.cwd)), "hook-failures");
+            const logPath = join(base, `${item.id}-${stamp}.log`);
+            const patchPath = join(base, `${item.id}-${stamp}.patch`);
+            try {
+              await mkdir(base, { recursive: true, mode: 0o700 });
+              await writeFile(logPath, full, { mode: 0o600 });
+              await (ports?.setAsideStaged ??
+                (async ({ worktree: path, paths, patch }: { worktree: string; paths: string[]; patch: string }) => {
+                  await execFile("git", ["-C", path, "add", "--", ...paths], { timeout: 60_000 });
+                  const { stdout } = await execFile("git", ["-C", path, "diff", "--cached", "--binary", "--", ...paths], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+                  await writeFile(patch, stdout, { mode: 0o600 });
+                  await restoreToHead(path, paths, 60_000);
+                }))({ worktree, paths: changes.paths, patch: patchPath });
+            } catch (saveError) {
+              return hold(
+                `committing the work failed its hooks, and saving it failed (${clip((saveError as Error).message, 200)}):\n${errors}`,
+                `${item.id}: its commit hooks failed in ${worktree}, and saving the work as a patch failed. Errors:\n${errors}\nFull output: ${logPath}`,
+                "adopt-commit",
+              );
+            }
+            const findings = [
+              `Committing this item's work in ${worktree} failed the repository's commit hooks (lint-staged, eslint, typecheck). The work is saved as ${patchPath} and the worktree is back at its last commit.`,
+              `Apply it first (git apply --index ${patchPath}), fix every error below, run the repo's lint and typecheck on the changed files until they are clean, then commit with the hooks (never --no-verify).`,
+              `Errors:\n${errors}`,
+              `Full hook output: ${logPath}`,
+            ].join("\n");
+            const attempts = (record.attempts as number | undefined) ?? 0;
+            const note = `commit hooks failed; back to build with the errors (${logPath})`;
+            if (attempts >= spec.defaults.maxBuildAttempts) {
+              Object.assign(record, { state: "failed", findings, note, since: use.now() });
+              step.rootAsks.push({ itemId: item.id, reason: `${item.id} failed ${attempts} build attempt(s): its commit hooks still fail. Errors:\n${errors.split("\n").slice(0, 30).join("\n")}\nFull output: ${logPath}; its work: ${patchPath}` });
+            } else {
+              Object.assign(record, { state: "ready", findings, note, since: use.now() });
+              step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its commit hooks failed, so it went back to build with the errors (no action needed). Errors:\n${errors.split("\n").slice(0, 30).join("\n")}\nFull output: ${logPath}` });
+            }
+            for (const key of ["lane", "blockedReason", "blockedCause", "blockedByCode"]) delete record[key];
+            record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: record.state, note }];
+            done.push(`${item.id}: commit hooks failed; back to build with ${errors.split("\n").length} error line(s)`);
+            return true;
+          }
           // The hook's own output (commitlint, lint-staged, eslint), not the command line.
           const output = failureOutput(error);
           return hold(
