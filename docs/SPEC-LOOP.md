@@ -39,7 +39,7 @@ Run Baa-ton and Herdr in a loop until a written spec is met, asking the user onl
     "repo": "~/src/example-app",
     "remote": "origin",
     "branch": "feature/example-release",
-    "preview": { "url": "https://preview.example.test", "releaseCheck": "https://preview.example.test/api/version" }
+    "preview": { "url": "https://preview.example.test", "releaseCheck": "https://preview.example.test/api/version", "health": "/healthz" }
   },
   "defaults": { "maxParallel": 4, "maxBuildAttempts": 3 },
   "stages": {
@@ -209,6 +209,7 @@ These refine the design where it meets existing invariants:
 - **PR 5 (built):** preview verification.
   - **Waiting for the deploy:** a pushed item (`verifying`, with `integratedSha`) that has preview specs waits until `target.preview.releaseCheck` reports a deployed SHA containing its commit. That's one GET per driver pass; the SHA is read from a JSON field (`sha`, `commit`, `gitSha`, `revision`, `version`, including nested `build`/`git`/`release`) or the first SHA in a text body. A `maxParallel` slot is held only by a live lane (or a building/reviewing item whose dispatch is being retried). Items queued for the serial integration lane, and verifying items waiting for a deploy, hold none.
   - **Verify lane:** runs on the verify stage's profile (default `quick`) in the integration worktree. It runs the item's preview specs against `target.preview.url`, writes the final evidence report, and reports `PREVIEW: <spec> pass|fail` lines and `REPORT: <path>`. By default the final report sits alongside the build lane's (`<name>.final.<ext>`); with `defaults.finalReport: "replace"` it uses the spec's path. Both options exist because this was open question 3.
+  - **A healthy preview:** a demo of the preview (an item whose evidence sets `onPreview: true`, one with preview specs, or a demo whose steps show the preview URL) counts only if the preview was healthy at every screenshot. That means `target.preview.health` (default: the preview URL) answered 200 and was not a wake page (`target.preview.wakePattern` overrides the default pattern). The demo recorder, `createDemoRecorder({ dir, health })`, checks health at each step, refuses to capture an unhealthy preview, and records the check in the steps manifest. The verifier fails a preview demo with any step missing a healthy check.
   - **Recording:** the driver records the preview runs (with the release SHA) and the report's path, SHA-256 and image count. The verifier then decides: only a pass moves the item to `done`.
   - **Failures:** a failed or missing preview run blocks the item (human-gate) and asks the root whether to fix forward. An item with no preview specs and no evidence report goes straight to the verifier after the push.
   - **Digest line:** every root digest now starts with the burn-down line (`spec N/M done · 2 building · 1 awaiting-push · 1 blocked(decision)`), computed by the controller from `spec.json` and `spec-state.json`.

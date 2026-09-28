@@ -19,6 +19,7 @@
  */
 import { fileURLToPath } from "node:url";
 import { BASELINES_KEPT, baselineNote, baselineResult, compareToBaseline, formatFailures, knownFailures, suiteFailures } from "./spec-baseline.mjs";
+import { demoOnPreview, previewHealthUrl } from "./spec.mjs";
 
 /** How build and integration lanes run a suite that outlasts a normal command timeout. */
 const LONG_COMMANDS =
@@ -167,12 +168,15 @@ export function untestedAtIntegration(item, current) {
 export const DEMO_TOOL = fileURLToPath(new URL("./demo-report.mjs", import.meta.url));
 
 /** The feature demo rule for build and verify lanes. */
-export function demoRule(report, minImages) {
+export function demoRule(report, minImages, preview) {
   return [
     `Required output: the feature demo ${report}, a Word document with a screenshot for every navigation or action (page visit, click, fill, submit, and the resulting state), each captioned with its step number, the action and what it shows${minImages > 0 ? `; at least ${minImages} screenshots` : ""}.`,
     `Record it from your Playwright run with the demo recorder: import { createDemoRecorder } from ${JSON.stringify(DEMO_TOOL)}; call demo.step(page, "<action>", "<what it shows>") after each navigation or action, then demo.finish({ out: ${JSON.stringify(report)}, title: "<item>: <feature>" }). It writes the .docx and ${report}.steps.json, which the verifier checks (every screenshot captioned, one per recorded step). From saved screenshots: node ${JSON.stringify(DEMO_TOOL)} --steps <steps.json> --out ${report}.`,
     "Write that command on one line, with no backslash line continuations, and keep --steps and --out inside your worktree: then it runs without a permission prompt.",
-  ].join(" ");
+    preview?.health
+      ? `This demo shows the preview, so it is evidence only while the preview is healthy: create the recorder with createDemoRecorder({ dir, health: ${JSON.stringify(preview.health)}${preview.wakePattern ? `, wakePattern: ${JSON.stringify(preview.wakePattern)}` : ""} }), which checks the health endpoint at every screenshot and refuses to capture a preview that is down (not HTTP 200, or a wake page); by hand, record node ${JSON.stringify(DEMO_TOOL)} --health ${JSON.stringify(preview.health)} as each step's "health". A crash-looping or asleep preview is never a pass: if it does not come up healthy, report the preview blocked with what you saw.`
+      : "",
+  ].filter(Boolean).join(" ");
 }
 
 /** Every spec lane's last instruction: the work ends with the receipt tool call, not a plain-text report. */
@@ -1141,7 +1145,7 @@ export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, 
       : "",
     `Acceptance: ${item.acceptance.text}`,
     item.acceptance.evidence
-      ? `${demoRule(reportPath, item.acceptance.evidence.minImages)} Run it against the preview.`
+      ? `${demoRule(reportPath, item.acceptance.evidence.minImages, demoOnPreview(spec, item) ? { health: previewHealthUrl(spec), wakePattern: spec.target.preview?.wakePattern } : undefined)} Run it against the preview.`
       : "",
     testLines,
     "Do not change code or Git state; this stage only verifies.",
@@ -1164,7 +1168,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
       : "",
     `This worktree is on ${integrationBranch}: the target tip plus the items already integrated. Merge ${itemBranch} into it (git merge --no-ff -m "${specCommitMessage(item.id, "integrate")}" ${itemBranch}) and resolve any conflicts.`,
     item.migrations
-      ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference.`
+      ? `The item adds ${item.migrations} migration(s). If a number collides with one already on ${integrationBranch}, renumber the item's migrations to the next free numbers in order and update every reference. A migration journal that orders by time (drizzle's meta/_journal.json "when", and tools like it) must stay increasing: give each renumbered entry a timestamp later than every entry before it, or migrators skip it silently on any database that already has the newer one.`
       : "",
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     LONG_COMMANDS,

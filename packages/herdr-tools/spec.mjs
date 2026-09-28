@@ -106,13 +106,25 @@ export function validateSpec(input) {
   if (!/^[\w./-]+$/.test(target.branch) || target.branch.includes("..")) throw new Error("spec.target.branch must be a branch name.");
   if (input.target.preview !== undefined) {
     if (!isRecord(input.target.preview)) throw new Error("spec.target.preview must be an object.");
-    onlyKeys(input.target.preview, ["url", "releaseCheck"], "spec.target.preview");
+    onlyKeys(input.target.preview, ["url", "releaseCheck", "health", "wakePattern"], "spec.target.preview");
     target.preview = {
       url: text(input.target.preview.url, "spec.target.preview.url", { max: 500 }),
       ...(input.target.preview.releaseCheck !== undefined
         ? { releaseCheck: text(input.target.preview.releaseCheck, "spec.target.preview.releaseCheck", { max: 500 }) }
         : {}),
+      // The preview's health endpoint (absolute, or a path on the preview):
+      // a demo of the preview is evidence only while it answers 200 and not
+      // a wake page. Without it, the preview URL itself is checked.
+      ...(input.target.preview.health !== undefined ? { health: text(input.target.preview.health, "spec.target.preview.health", { max: 500 }) } : {}),
+      ...(input.target.preview.wakePattern !== undefined ? { wakePattern: text(input.target.preview.wakePattern, "spec.target.preview.wakePattern", { max: 500 }) } : {}),
     };
+    try {
+      new URL(target.preview.url);
+      if (target.preview.health) new URL(target.preview.health, target.preview.url);
+      if (target.preview.wakePattern) new RegExp(target.preview.wakePattern, "i");
+    } catch (error) {
+      throw new Error(`spec.target.preview: ${error.message}`);
+    }
   }
   const defaults = { maxParallel: 4, maxBuildAttempts: 3, pushGate: "round", finalReport: "alongside", generatedArtifacts: [...DEFAULT_GENERATED_ARTIFACTS] };
   // Optional live capacity floor the driver samples before dispatching.
@@ -205,11 +217,18 @@ export function validateSpec(input) {
     if (item.acceptance.evidence !== undefined) {
       const evidence = item.acceptance.evidence;
       if (!isRecord(evidence)) throw new Error(`${label}.acceptance.evidence must be an object.`);
-      onlyKeys(evidence, ["report", "minImages"], `${label}.acceptance.evidence`);
+      onlyKeys(evidence, ["report", "minImages", "onPreview"], `${label}.acceptance.evidence`);
       acceptance.evidence = {
         report: relativePath(evidence.report, `${label}.acceptance.evidence.report`),
         minImages: positiveInteger(evidence.minImages, `${label}.acceptance.evidence.minImages`, { min: 0 }) ?? 0,
       };
+      // The demo is captured on the preview: it counts only while the
+      // preview is healthy at every screenshot.
+      if (evidence.onPreview !== undefined) {
+        if (typeof evidence.onPreview !== "boolean") throw new Error(`${label}.acceptance.evidence.onPreview must be true or false.`);
+        if (evidence.onPreview && !target.preview) throw new Error(`${label}.acceptance.evidence.onPreview needs spec.target.preview (its url, and its health endpoint).`);
+        if (evidence.onPreview) acceptance.evidence.onPreview = true;
+      }
     }
     let adopt;
     if (item.adopt !== undefined) {
@@ -441,12 +460,59 @@ export async function gitAncestor(repo, ancestor, descendant) {
   }
 }
 
+/** The preview's health endpoint, when the spec has a preview. */
+export function previewHealthUrl(spec) {
+  const preview = spec.target.preview;
+  if (!preview) return undefined;
+  try {
+    return new URL(preview.health ?? preview.url, preview.url).href;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether an item's demo is captured on the preview, by its spec. */
+export function demoOnPreview(spec, item) {
+  return Boolean(spec.target.preview && item.acceptance.evidence && (item.acceptance.evidence.onPreview || item.acceptance.preview.length));
+}
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A demo of the preview is evidence only when the preview was healthy at
+ * every screenshot: its health endpoint answered 200 with no wake page (a
+ * demo passed while the preview's replica crash-looped). The demo recorder
+ * records that check per step. Undefined when it holds.
+ */
+export function previewHealthProblem(spec, item, steps) {
+  const healthUrl = previewHealthUrl(spec);
+  if (!healthUrl) return undefined;
+  const previewOrigin = originOf(spec.target.preview.url);
+  const onPreview = demoOnPreview(spec, item) || steps.some((step) => typeof step?.url === "string" && originOf(step.url) === previewOrigin);
+  if (!onPreview) return undefined;
+  for (const [index, step] of steps.entries()) {
+    const n = step?.n ?? index + 1;
+    const health = step?.health;
+    if (!health || typeof health !== "object")
+      return `step ${n} of this preview demo has no preview health check at capture (record it with createDemoRecorder({ dir, health: ${JSON.stringify(healthUrl)} }))`;
+    if (health.status !== 200) return `the preview was not healthy when step ${n} was captured (${health.url ?? healthUrl} answered ${health.status || health.error || "nothing"})`;
+    if (health.wake) return `the preview showed a wake page when step ${n} was captured (${health.url ?? healthUrl})`;
+  }
+  return undefined;
+}
+
 /**
  * A feature demo's rule: a screenshot for every navigation or action, each
  * with a caption, and at least as many images as the steps the demo recorded
  * (<report>.steps.json, written by demo-report.mjs). Undefined when it holds.
  */
-async function demoReportProblem(buffer, reportPath, images) {
+async function demoReportProblem(buffer, reportPath, images, spec, item) {
   const captions = docxCaptions(buffer);
   if (!captions) return "report is not a readable .docx (no word/document.xml)";
   if (captions.uncaptioned) return `${captions.uncaptioned} of ${captions.images} screenshots have no caption (a step number, the action, what it shows)`;
@@ -459,7 +525,7 @@ async function demoReportProblem(buffer, reportPath, images) {
   const steps = Array.isArray(manifest?.steps) ? manifest.steps.length : 0;
   if (!steps) return "the steps manifest records no steps";
   if (images < steps) return `report has ${images} screenshots for ${steps} recorded steps`;
-  return undefined;
+  return previewHealthProblem(spec, item, manifest.steps);
 }
 
 /**
@@ -488,7 +554,7 @@ export async function verifyItem(spec, state, item, { repo, ancestor = gitAncest
       const sha256 = createHash("sha256").update(buffer).digest("hex");
       if (images === undefined) check("evidence", false, `report ${evidence.report} is not a readable .docx`);
       else if (images < evidence.minImages) check("evidence", false, `report has ${images} of ${evidence.minImages} images`);
-      else if (/\.docx$/i.test(evidence.report) && (demoProblem = await demoReportProblem(buffer, reportPath, images))) check("evidence", false, demoProblem);
+      else if (/\.docx$/i.test(evidence.report) && (demoProblem = await demoReportProblem(buffer, reportPath, images, spec, item))) check("evidence", false, demoProblem);
       else if (!record.evidence?.sha256) check("evidence", false, "report hash is not recorded");
       else if (record.evidence.sha256 !== sha256) check("evidence", false, "report changed since it was recorded");
       else check("evidence", true, `${images} images, hash matches`);

@@ -16,12 +16,12 @@ export type SpecItem = {
     text: string;
     tests: string[];
     preview: string[];
-    evidence?: { report: string; minImages: number };
+    evidence?: { report: string; minImages: number; onPreview?: boolean };
   };
 };
 export type Spec = {
   version: 1;
-  target: { repo: string; remote: string; branch: string; suite: string[]; preview?: { url: string; releaseCheck?: string } };
+  target: { repo: string; remote: string; branch: string; suite: string[]; preview?: { url: string; releaseCheck?: string; health?: string; wakePattern?: string } };
   defaults: {
     maxParallel: number;
     maxBuildAttempts: number;
