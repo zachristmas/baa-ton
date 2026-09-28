@@ -26,6 +26,9 @@ export function spawnCountPath(env = process.env) {
 export function spawnKey(file, args = []) {
   const name = basename(String(file ?? "?"));
   if (name === "herdr" && args[0] === "tab" && args[1] === "create") return "lane-shell (herdr tab create)";
+  // Which herdr call: the subcommand pair names what polls.
+  if (name === "herdr" && /^[a-z-]+$/.test(String(args[0] ?? ""))) return `herdr ${args[0]}${/^[a-z-]+$/.test(String(args[1] ?? "")) ? ` ${args[1]}` : ""}`;
+  if (name === "git") return `git ${String(args.find((arg) => /^[a-z][a-z-]*$/.test(String(arg))) ?? "")}`.trim();
   if ((name === "sh" || name === "bash" || name === "zsh") && args[0] === "-c") return `${name} -c ${basename(String(args[1] ?? "").split(/\s+/)[0] || "?")}`;
   return name;
 }

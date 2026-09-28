@@ -31,6 +31,7 @@ test("every process a Baa-ton process starts is counted by command, flushed as o
 
 test("lane shells are counted apart from other herdr calls", () => {
   assert.equal(spawnKey("/usr/local/bin/herdr", ["tab", "create", "--workspace", "w1"]), "lane-shell (herdr tab create)");
-  assert.equal(spawnKey("herdr", ["agent", "get", "w1:p1"]), "herdr");
+  assert.equal(spawnKey("herdr", ["agent", "get", "w1:p1"]), "herdr agent get");
+  assert.equal(spawnKey("/usr/bin/git", ["-C", "/w", "status", "--porcelain"]), "git status");
   assert.equal(spawnKey("/bin/sh", ["-c", "pnpm test"]), "sh -c pnpm");
 });
