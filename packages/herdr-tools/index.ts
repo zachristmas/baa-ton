@@ -140,6 +140,7 @@ const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecove
 const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyDevStack, classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
+const { demoPinLines, findDemoPins } = (await freshImport("./demo-pins.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./demo-pins.mjs");
 const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
 // The root's (or spec host's) spawns join the per-minute count in supervisor.log;
 // a lane bridge installs its own first, and the first install wins.
@@ -1758,6 +1759,7 @@ function normalizedLanes(
       ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
       ...(configuredProfile?.permissionMode ? { permissionMode: configuredProfile.permissionMode } : {}),
       ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
+      ...((input as { demoPins?: unknown }).demoPins ? { demoPins: (input as { demoPins?: unknown }).demoPins } : {}),
     };
   });
 }
@@ -2777,11 +2779,19 @@ function contractWithLeases(
   leases: Lease[] | undefined,
 ): string {
   const base = contract(workflow, lane);
-  if (!leases?.length) return base;
+  // An item's own demo scripts may pin ports and a database: those are the
+  // lane's too (a verify lane leased other ports refused the demo and stalled).
+  const pins = demoPinLines((lane as { demoPins?: Parameters<typeof demoPinLines>[0] }).demoPins);
+  if (!leases?.length && !pins.length) return base;
   return [
     base,
-    "Runtime leases reserved for this lane (use only these ports and names; request more with herdr_lease):",
-    ...leaseLines(leases).map((line) => `- ${line}`),
+    ...(leases?.length
+      ? [
+          `Runtime leases reserved for this lane (use only these ports and names${pins.length ? ", and the demo pins below" : ""}; request more with herdr_lease):`,
+          ...leaseLines(leases).map((line) => `- ${line}`),
+        ]
+      : []),
+    ...pins,
   ].join("\n");
 }
 
@@ -4754,7 +4764,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   type SpecDriverPorts = {
     /** Create (or reuse) the item's worktree on spec/<id> from the target tip. */
     worktree(input: { repo: string; path: string; branch: string; base: string }, signal?: AbortSignal): Promise<void>;
-    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" | "baseline" }): Promise<Workflow>;
+    plan(input: { objective: string; laneObjective: string; readOnly: boolean; taskProfile: string; worktree?: string; specStage: "decide" | "build" | "review" | "integrate" | "verify" | "baseline"; demoPins?: unknown }): Promise<Workflow>;
     dispatch(workflowId: string): Promise<{ dispatched?: boolean; cancelled?: boolean; parentApprovalRequired?: boolean }>;
     /** `git status --porcelain=v1` of a worktree (adopted work to commit before integrating). */
     status?(worktree: string): Promise<string>;
@@ -4876,8 +4886,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           await mkdir(dirname(path), { recursive: true });
           await execFile("git", ["-C", repoPath, "worktree", "add", ...(existing ? [path, branch] : ["-b", branch, path, base])], { signal: abort, timeout: 120_000 });
         },
-        plan: ({ objective, laneObjective, readOnly, taskProfile, worktree, specStage }) =>
-          plan(ctx.cwd, objective, [{ objective: laneObjective, readOnly, taskProfile, specStage }], worktree, undefined, undefined, undefined, undefined, taskProfile, headless),
+        plan: ({ objective, laneObjective, readOnly, taskProfile, worktree, specStage, demoPins }) =>
+          plan(ctx.cwd, objective, [{ objective: laneObjective, readOnly, taskProfile, specStage, ...(demoPins ? { demoPins } : {}) }], worktree, undefined, undefined, undefined, undefined, taskProfile, headless),
         dispatch: (workflowId) => dispatch(ctx.cwd, workflowId, true, headless, signal),
         now,
         ...ports,
@@ -5653,6 +5663,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             // The decide stage reads the project, not an item worktree.
             ...(action.kind === "decide" ? {} : { worktree }),
             specStage: action.kind,
+            // The item's own demo scripts' pinned ports and database.
+            ...(() => {
+              const pins = action.kind === "decide" ? undefined : findDemoPins(worktree, item.id);
+              return pins ? { demoPins: pins } : {};
+            })(),
           });
           if (action.kind === "build" || action.kind === "review") {
             record.worktree = worktree;

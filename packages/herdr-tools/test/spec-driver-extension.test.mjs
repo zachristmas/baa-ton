@@ -2330,3 +2330,17 @@ test("one pass reads every lane's live status from a single herdr pane list, not
     await f.cleanup();
   }
 });
+
+test("a lane planned for an item with its own demo scripts carries their pinned ports and database", async () => {
+  const f = await fixture({ specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D03", title: "Store create", acceptance: { text: "d" } }] } });
+  try {
+    const worktree = join(f.worktreeRoot, "spec-D03");
+    await mkdir(join(worktree, "scripts", "demo-d03"), { recursive: true });
+    await writeFile(join(worktree, "scripts", "demo-d03", "lane-config.sh"), "export BACKEND_PORT=3710\nexport DB_NAME=gsd_demo_store_create_20260921\n");
+    await f.advance();
+    const planned = f.calls.plan.find((call) => call.specStage === "build");
+    assert.deepEqual(planned.demoPins, { dirs: ["scripts/demo-d03"], ports: [3710], databases: ["gsd_demo_store_create_20260921"] });
+  } finally {
+    await f.cleanup();
+  }
+});
