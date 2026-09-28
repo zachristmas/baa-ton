@@ -2348,3 +2348,29 @@ test("a lane planned for an item with its own demo scripts carries their pinned 
     await f.cleanup();
   }
 });
+
+test("an integration merge whose migration journal goes back in time is sent back to build and rolled off spec-integration", async () => {
+  const f = await fixture();
+  const sha = "c".repeat(40);
+  const checked = [];
+  const rolled = [];
+  f.ports.journalProblems = async (repo, merge, base) => (checked.push([merge, base]), merge === sha ? ['db/migrations/meta/_journal.json: 0053_x (idx 53) has "when" 1 not later than 0052_y'] : []);
+  f.ports.rollBackIntegration = async (input) => (rolled.push(input), true);
+  try {
+    await f.advance();
+    await f.laneReceipt("herdr-spec1", "Committed.");
+    await f.advance();
+    await f.laneReceipt("herdr-spec2", "VERDICT: PASS");
+    await f.advance();
+    await f.laneReceipt("herdr-spec3", `INTEGRATED: ${sha}\nSUITE: pass`);
+    const result = await f.advance();
+    assert.deepEqual(checked.find(([merge]) => merge === sha), [sha, checked[0][1]]);
+    const state = await f.state();
+    assert.notEqual(state.items.A.state, "awaiting-push");
+    assert.match(state.items.A.findings ?? state.items.A.history.map((entry) => entry.note).join("\n"), /migration journal/);
+    assert.deepEqual(rolled.map((input) => [input.sha, /spec-integration$/.test(input.worktree)]), [[sha, true]]);
+    assert.match(result.content[0].text, /rolled spec-integration back off A's merge cccccccccccc/);
+  } finally {
+    await f.cleanup();
+  }
+});

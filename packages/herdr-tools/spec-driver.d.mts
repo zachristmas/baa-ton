@@ -27,6 +27,8 @@ export const RECEIPT_REASK_BASE_MS: number;
 export const RECEIPT_ASK_INTERVAL_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
+  /** Items whose integration merge has migration journal entries out of order. */
+  journalProblems?: Map<string, string[]>;
   state: SpecState | undefined;
   lane: (ref: { workflowId: string; laneId: string }) =>
     | { status?: string; workflowStatus?: string; agentStatus?: string; specStage?: string; lastMessageAt?: string; receipt?: { summary: string } }
@@ -46,6 +48,8 @@ export function advanceSpec(input: {
   actions: SpecAction[];
   rootAsks: Array<{ itemId: string; reason: string; kind?: "push" | "decisions"; items?: string[]; sha?: string; questions?: string[]; baselineFailures?: Array<{ package: string; task: string }> }>;
   waits: Record<string, string>;
+  /** Integration merges the driver did not keep, to take off spec-integration. */
+  rollbacks: Array<{ itemId: string; sha: string }>;
 };
 export function buildObjective(
   spec: Spec,
