@@ -584,7 +584,7 @@ test("a lane's own dev stack: dev scripts scoped to its worktree, logs to /tmp, 
   ])
     assert.equal(classifyDevStack(command, { cwd }).matched, true, command);
   for (const [command, reason] of [
-    ["pnpm dev && curl http://example.com", /more than one command/],
+    ["pnpm dev && curl http://example.com", /not a localhost health check/],
     ["cd /other/repo && pnpm dev", /leaves the working directory/],
     ["pnpm dev > /etc/motd", /writes outside the worktree/],
     ["pnpm dev > /tmp/../etc/x", /writes outside the worktree/],
@@ -595,4 +595,29 @@ test("a lane's own dev stack: dev scripts scoped to its worktree, logs to /tmp, 
     ["pnpm dev $(cat /etc/passwd)", /substitution/],
   ])
     assert.match(classifyDevStack(command, { cwd }).reason, reason, command);
+});
+
+test("a lane's own dev-stack start is known-safe: backgrounded, logged to /tmp, a pidfile, a sleep and a localhost health check (a live verify lane block)", () => {
+  const cwd = "/work/tree";
+  for (const command of [
+    // The exact command D03's verify lane sat on ("Contains simple_expansion").
+    "pnpm dev:backend > /tmp/backend.log 2>&1 & echo $! > /tmp/backend.pid; sleep 25",
+    "pnpm dev:backend > /tmp/backend.log 2>&1 &\nsleep 20\ncurl -s http://localhost:3000/health | head -c 200",
+    "curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:5173/",
+    "tail -n 50 /tmp/backend.log",
+  ]) {
+    const verdict = classifyCommand(command, { cwd });
+    assert.equal(verdict.decision, "allow", command);
+  }
+  assert.deepEqual(classifyCommand("pnpm dev:backend > /tmp/backend.log 2>&1 & echo $! > /tmp/backend.pid; sleep 25", { cwd }).rules, ["dev-stack"]);
+  for (const command of [
+    "pnpm dev > /tmp/x.log 2>&1 & curl -s https://example.com/health",
+    "curl -s -d @secrets.json http://localhost:3000/login",
+    "curl -X DELETE http://localhost:3000/items",
+    "pnpm dev & echo $! > /etc/dev.pid",
+    "pnpm dev & rm -rf node_modules",
+    "tail -n 5 /Users/someone/.ssh/config",
+  ])
+    assert.equal(classifyCommand(command, { cwd }).decision, "defer", command);
+  assert.equal(classifyCommand("pnpm dev:backend > /tmp/backend.log 2>&1 &", {}).decision, "defer", "only inside a known worktree");
 });

@@ -529,6 +529,15 @@ function stripRedirects(segment) {
  * Returns { decision: "allow", rules } or { decision: "defer", reason }.
  */
 export function classifyCommand(command, options = {}) {
+  const verdict = classifyKnownCommand(command, options);
+  if (verdict.decision === "allow" || !options.cwd) return verdict;
+  // A lane starting its own dev stack in its worktree (backgrounded, logged
+  // to /tmp, a pidfile, a sleep, a localhost health check): a live verify
+  // lane sat on Claude's own prompt for one with nobody to answer.
+  return classifyDevStack(command, options).matched ? { decision: "allow", rules: ["dev-stack"] } : verdict;
+}
+
+function classifyKnownCommand(command, options = {}) {
   if (typeof command !== "string" || !command.trim()) return { decision: "defer", reason: "empty command" };
   // A backslash line continuation is one line to the shell; read it so.
   // A line that is only `\` (a command starting with one) joins the same way.
@@ -722,45 +731,12 @@ const PM_DIR_FLAGS = new Set(["-C", "--dir", "--prefix", "--cwd"]);
 const PM_SCOPE_FLAGS = new Set(["--filter", "-F", "--workspace", "-w"]);
 
 /**
- * A lane's own dev stack (the local-validation grant): its package manager's
- * dev, start, preview, serve or storybook script, optionally scoped to a
- * workspace package or a directory inside the worktree, with PORT-style
- * environment assignments, or `docker compose ... up` for its local
- * services. A leading cd stays inside the worktree. Nothing else chains in.
- * Returns { matched: true } or { matched: false, reason }.
+ * One dev-stack launch: the package manager's dev, start, preview, serve or
+ * storybook script, optionally scoped to a workspace package or a directory
+ * inside the worktree, after PORT-style environment assignments; or
+ * `docker compose ... up` for the lane's local services.
  */
-export function classifyDevStack(command, options = {}) {
-  if (typeof command !== "string" || !command.trim()) return { matched: false, reason: "empty command" };
-  // A dev server started in the background with its output in a log:
-  // `timeout 120 pnpm dev > /tmp/dev.log 2>&1 &`. Logs may go to /tmp, a
-  // session scratchpad or the worktree; nothing else is written.
-  let normalized = command.trim().replace(/\s*&\s*$/, "").replace(/\s2>&1\b/g, "");
-  for (const match of [...normalized.matchAll(/(?:^|\s)(?:\d?>>?|&>)\s*("?[^\s;&|"]+"?)/g)]) {
-    const target = match[1].replace(/^"|"$/g, "");
-    const cwd = options.cwd?.replace(/\/+$/, "");
-    const allowed = !target.includes("..") && (target === "/dev/null" || /^\/(?:private\/)?tmp\/[^/.][^\s]*$/.test(target) || SESSION_SCRATCHPAD.test(target) ||
-      !target.startsWith("/") || Boolean(cwd && target.startsWith(`${cwd}/`)));
-    if (!allowed) return { matched: false, reason: `writes outside the worktree and /tmp: ${target}` };
-    normalized = normalized.replace(match[0], " ");
-  }
-  normalized = normalized.replace(/(^|&&\s*)timeout\s+\d+[smh]?\s+/g, "$1").trim();
-  command = normalized;
-  const { segments, expandingBody } = commandSegments(command);
-  if (expandingBody || /`|\$\(|<\(|>\(/.test(command)) return { matched: false, reason: "command or process substitution" };
-  let launch;
-  for (const segment of segments) {
-    const redirect = redirectVerdict(segment);
-    if (redirect) return { matched: false, reason: redirect.reason };
-    const plain = stripRedirects(segment).trim();
-    if (/^cd(\s|$)/.test(plain) && !launch) {
-      const cd = cdVerdict(plain, options);
-      if (cd) return { matched: false, reason: cd.reason };
-      continue;
-    }
-    if (launch) return { matched: false, reason: `more than one command: ${segment.slice(0, 120)}` };
-    launch = plain;
-  }
-  if (!launch) return { matched: false, reason: "no launch command" };
+function devLaunch(launch, options) {
   const words = launch.split(/\s+/);
   while (words.length && /^[A-Z_][A-Z0-9_]*=[\w./:@-]*$/.test(words[0])) words.shift();
   const [tool, ...rest] = words;
@@ -782,7 +758,7 @@ export function classifyDevStack(command, options = {}) {
     }
     return { matched: false, reason: "only docker compose up" };
   }
-  if (!["pnpm", "npm", "yarn", "bun"].includes(tool)) return { matched: false, reason: `not a package manager launch: ${launch.slice(0, 120)}` };
+  if (!["pnpm", "npm", "yarn", "bun"].includes(tool)) return { matched: false, reason: `not a dev-stack command: ${launch.slice(0, 120)}` };
   let index = 0;
   while (index < rest.length) {
     const arg = rest[index];
@@ -809,6 +785,86 @@ export function classifyDevStack(command, options = {}) {
   const tail = rest.slice(index + 1);
   if (!tail.every((item) => /^(?:--|--?[\w-]+(?:=[\w./:@-]+)?|[\w./:@-]+)$/.test(item))) return { matched: false, reason: `unexpected arguments: ${tail.join(" ")}` };
   return { matched: true };
+}
+
+const LOCAL_URL = /^['"]?https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:\/[^\s'"]*)?['"]?$/;
+const CURL_FLAGS = new Set(["-s", "-S", "-f", "-sS", "-fs", "-sf", "-fsS", "-sSf", "-fSs", "-I", "-i", "-v", "-L", "--silent", "--show-error", "--fail", "--head", "--include", "--location", "--retry-connrefused"]);
+const CURL_VALUE_FLAGS = new Set(["-m", "--max-time", "--connect-timeout", "--retry", "--retry-delay", "-w", "--write-out", "-o", "--output"]);
+
+/** A GET to a localhost URL (a health check): no data, method, upload or credentials. */
+function localCurl(piece, writable) {
+  const words = piece.split(/\s+/).slice(1);
+  let url = false;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if (CURL_FLAGS.has(word)) continue;
+    if (CURL_VALUE_FLAGS.has(word)) {
+      const value = words[++index];
+      if (value === undefined) return false;
+      if ((word === "-o" || word === "--output") && !writable(value.replace(/^['"]|['"]$/g, ""))) return false;
+      continue;
+    }
+    if (LOCAL_URL.test(word)) {
+      url = true;
+      continue;
+    }
+    if (/^['"]%\{/.test(word) || /^%\{/.test(word)) continue;
+    return false;
+  }
+  return url;
+}
+
+/**
+ * A lane's own dev stack (the local-validation grant, and known-safe for a
+ * lane's permission prompts): dev-stack launches (devLaunch), backgrounded
+ * with `&` and logged to /tmp, a session scratchpad or the worktree, with
+ * `echo $! > <pidfile>`, `sleep N`, `timeout N`, a cd inside the worktree,
+ * and curl health checks against localhost (optionally piped to head or
+ * tail). Nothing else chains in. Returns { matched: true } or
+ * { matched: false, reason }.
+ */
+export function classifyDevStack(command, options = {}) {
+  if (typeof command !== "string" || !command.trim()) return { matched: false, reason: "empty command" };
+  command = command.replace(/(^|[ \t])\\\r?\n[ \t]*/gm, "$1").trim();
+  const { segments, expandingBody } = commandSegments(command);
+  if (expandingBody || /`|\$\(|<\(|>\(/.test(command)) return { matched: false, reason: "command or process substitution" };
+  const cwd = options.cwd?.replace(/\/+$/, "");
+  const writable = (target) =>
+    !target.includes("..") && (target === "/dev/null" || /^\/(?:private\/)?tmp\/[^/.][^\s]*$/.test(target) || SESSION_SCRATCHPAD.test(target) || !target.startsWith("/") || Boolean(cwd && target.startsWith(`${cwd}/`)));
+  let useful = false;
+  for (const segment of segments) {
+    // A lone & backgrounds (not && and not &> or 2>&1).
+    for (const raw of segment.replace(/\s2>&1\b/g, "").split(/(?<![&>])&(?![&>])/)) {
+      let piece = raw.trim();
+      if (!piece) continue;
+      for (const match of [...piece.matchAll(/(?:^|\s)(?:\d?>>?|&>)\s*("?[^\s;&|"]+"?)/g)]) {
+        const target = match[1].replace(/^"|"$/g, "");
+        if (!writable(target)) return { matched: false, reason: `writes outside the worktree and /tmp: ${target}` };
+        piece = piece.replace(match[0], " ");
+      }
+      piece = piece.replace(/^timeout\s+\d+[smh]?\s+/, "").trim();
+      if (/^cd(\s|$)/.test(piece)) {
+        const cd = cdVerdict(piece, options);
+        if (cd) return { matched: false, reason: cd.reason };
+        continue;
+      }
+      if (/^sleep\s+\d+(?:\.\d+)?[smh]?$/.test(piece) || /^echo\s+\$!$/.test(piece) || /^(?:head|tail)(?:\s+-[cn]\s*\d+|\s+-\d+|\s+-f)*$/.test(piece)) continue;
+      if (/^(?:head|tail)\b/.test(piece)) {
+        const file = piece.split(/\s+/).at(-1);
+        if (writable(file) && !/^-/.test(file)) continue;
+        return { matched: false, reason: `reads outside the worktree and /tmp: ${file}` };
+      }
+      if (/^curl(\s|$)/.test(piece)) {
+        if (!localCurl(piece, writable)) return { matched: false, reason: `not a localhost health check: ${piece.slice(0, 120)}` };
+        useful = true;
+        continue;
+      }
+      const launch = devLaunch(piece, options);
+      if (!launch.matched) return launch;
+      useful = true;
+    }
+  }
+  return useful ? { matched: true } : { matched: false, reason: "no dev-stack launch or health check" };
 }
 
 /*
