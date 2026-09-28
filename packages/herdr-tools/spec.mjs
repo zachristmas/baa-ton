@@ -129,7 +129,7 @@ export function validateSpec(input) {
         throw new Error('spec.defaults.evidence.report must be a path containing {id}, for example "artifacts/{id}.docx".');
       defaults.evidence = {
         report: evidence.report,
-        minImages: positiveInteger(evidence.minImages, "spec.defaults.evidence.minImages", { min: 0 }) ?? 1,
+        minImages: positiveInteger(evidence.minImages, "spec.defaults.evidence.minImages", { min: 0 }) ?? 0,
       };
     }
     if (input.defaults.maxDeclines !== undefined) defaults.maxDeclines = positiveInteger(input.defaults.maxDeclines, "spec.defaults.maxDeclines", { max: 10 });

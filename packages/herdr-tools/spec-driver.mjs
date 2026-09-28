@@ -156,7 +156,7 @@ export const DEMO_TOOL = fileURLToPath(new URL("./demo-report.mjs", import.meta.
 /** The feature demo rule for build and verify lanes. */
 export function demoRule(report, minImages) {
   return [
-    `Required output: the feature demo ${report}, a Word document with a screenshot for every navigation or action (page visit, click, fill, submit, and the resulting state), each captioned with its step number, the action and what it shows; at least ${minImages} screenshots.`,
+    `Required output: the feature demo ${report}, a Word document with a screenshot for every navigation or action (page visit, click, fill, submit, and the resulting state), each captioned with its step number, the action and what it shows${minImages > 0 ? `; at least ${minImages} screenshots` : ""}.`,
     `Record it from your Playwright run with the demo recorder: import { createDemoRecorder } from ${JSON.stringify(DEMO_TOOL)}; call demo.step(page, "<action>", "<what it shows>") after each navigation or action, then demo.finish({ out: ${JSON.stringify(report)}, title: "<item>: <feature>" }). It writes the .docx and ${report}.steps.json, which the verifier checks (every screenshot captioned, one per recorded step). From saved screenshots: node ${JSON.stringify(DEMO_TOOL)} --steps <steps.json> --out ${report}.`,
     "Write that command on one line, with no backslash line continuations, and keep --steps and --out inside your worktree: then it runs without a permission prompt.",
   ].join(" ");
@@ -397,6 +397,19 @@ export function advanceSpec({
     retryStage(item, current, stage, idle ? "idle without a receipt" : "unclear receipt", current.note);
     delete current.note;
   }
+
+// A3. An item resolved by decision whose spec now asks for evidence (its
+// adopt.resolved removed, acceptance.evidence added) no longer counts as
+// done: it is verified like any other, against the target tip when it has
+// no integrated commit of its own (no code changed), so its demo is made.
+for (const item of spec.items) {
+  const current = next.items[item.id];
+  if (current?.state !== "resolved" || !item.acceptance.evidence || item.adopt?.resolved) continue;
+  const sha = current.integratedSha ?? (typeof targetSha === "string" && targetSha ? targetSha : undefined);
+  if (!sha) continue;
+  delete current.resolution;
+  move(item.id, "verifying", { integratedSha: sha }, "the spec now requires evidence: resolved by decision no longer counts; verified with a demo");
+}
 
   // A2. Items parked or failed by an infrastructure error (a shell that was
   // not ready, a session reference missing, a runtime launch nobody
