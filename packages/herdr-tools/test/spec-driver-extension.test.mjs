@@ -389,8 +389,8 @@ function docx(images) {
 }
 
 /** Write a demo report and its steps manifest. */
-async function writeDemo(path, images) {
-  const { docx: buffer, manifest } = assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG })) });
+async function writeDemo(path, images, health) {
+  const { docx: buffer, manifest } = assembleDemo({ steps: Array.from({ length: images }, (_, index) => ({ action: `Step action ${index + 1}`, shows: `state ${index + 1}`, data: TINY_PNG, ...(health ? { health } : {}) })) });
   await writeFile(path, buffer);
   await writeFile(`${path}.steps.json`, JSON.stringify(manifest));
   return buffer;
@@ -432,7 +432,9 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
     assert.match(verify.laneObjective, /artifacts\/a\.final\.docx/);
 
     await mkdir(join(f.worktreeRoot, "spec-verify", "artifacts"), { recursive: true });
-    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "a.final.docx"), 2);
+    // A demo of the preview counts only with a healthy check at every step.
+    assert.match(verify.laneObjective, /createDemoRecorder\(\{ dir, health: "https:\/\/preview\.example\.test\/" \}\)/);
+    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "a.final.docx"), 2, { url: "https://preview.example.test/", status: 200, wake: false, at: "2026-09-28T00:00:00.000Z" });
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
     result = await f.advance();

@@ -14,6 +14,11 @@
  *
  * From recorded steps: node demo-report.mjs --steps steps.json --out report.docx [--title "..."]
  * (steps.json: { "steps": [{ "action": "...", "shows": "...", "image": "path.png" }] })
+ *
+ * A demo of the preview checks the preview's health at every screenshot and
+ * refuses to capture one that is down: createDemoRecorder({ dir, health: url }).
+ * By hand: node demo-report.mjs --health <url> prints the check for a step's
+ * "health" field (exit 1 when the preview is not healthy).
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
@@ -155,7 +160,7 @@ export function assembleDemo({ title, steps, compress = false }) {
     { name: "word/document.xml", data: document, compress },
     ...media,
   ]);
-  const manifest = { version: 1, title: title ?? "Feature demo", steps: steps.map((step, index) => ({ n: index + 1, action: step.action, ...(step.shows ? { shows: step.shows } : {}), ...(step.image ? { image: step.image } : {}) })) };
+  const manifest = { version: 1, title: title ?? "Feature demo", steps: steps.map((step, index) => ({ n: index + 1, action: step.action, ...(step.shows ? { shows: step.shows } : {}), ...(step.image ? { image: step.image } : {}), ...(step.url ? { url: step.url } : {}), ...(step.health ? { health: step.health } : {}) })) };
   return { docx, manifest };
 }
 
@@ -171,20 +176,51 @@ export async function writeDemoReport({ out, title, steps, compress }) {
   return { out, steps: manifest.steps.length };
 }
 
+/** A page a sleeping or starting host serves in place of the app. */
+export const DEFAULT_WAKE_PATTERN = "waking up|wake(?:s)? (?:it )?up|is (?:asleep|sleeping|starting|spinning up)|starting up|spinning up|cold start|please wait while|activating|service unavailable";
+
+/** One check of the preview's health: { url, status, wake, at } (status 0 and error when it did not answer). */
+export async function probePreviewHealth(url, { wakePattern = DEFAULT_WAKE_PATTERN, fetchImpl = globalThis.fetch, timeoutMs = 15_000, now = () => new Date().toISOString() } = {}) {
+  const at = now();
+  try {
+    const response = await fetchImpl(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs), headers: { "cache-control": "no-cache" } });
+    const body = (await response.text()).slice(0, 20_000);
+    return { url, status: response.status, wake: new RegExp(wakePattern, "i").test(body), at };
+  } catch (error) {
+    return { url, status: 0, wake: false, error: String(error?.message ?? error).slice(0, 200), at };
+  }
+}
+
+export const previewHealthy = (health) => health?.status === 200 && !health.wake;
+
 /**
  * A recorder for a Playwright run: step(page, action, shows) takes one
- * screenshot per navigation or action; finish() writes the report.
+ * screenshot per navigation or action; finish() writes the report. With
+ * `health` (a demo of the preview), every step first checks the preview's
+ * health endpoint and throws, capturing nothing, when it is down.
  */
-export function createDemoRecorder({ dir }) {
+export function createDemoRecorder({ dir, health, wakePattern, probe = probePreviewHealth }) {
   const steps = [];
   return {
     steps,
     async step(page, action, shows) {
       if (!action) throw new Error("Each demo step needs its action (what was done).");
+      let checked;
+      if (health) {
+        checked = await probe(health, { ...(wakePattern ? { wakePattern } : {}) });
+        if (!previewHealthy(checked))
+          throw new Error(`The preview is not healthy (${health} answered ${checked.status || checked.error || "nothing"}${checked.wake ? ", a wake page" : ""}): an unhealthy preview is never evidence. Wait until it is healthy, or report the preview blocked with what you saw.`);
+      }
       await mkdir(dir, { recursive: true });
       const image = join(dir, `step-${String(steps.length + 1).padStart(2, "0")}.png`);
       await page.screenshot({ path: image });
-      steps.push({ action, shows, image });
+      let url;
+      try {
+        url = typeof page.url === "function" ? page.url() : undefined;
+      } catch {
+        url = undefined;
+      }
+      steps.push({ action, shows, image, ...(url ? { url } : {}), ...(checked ? { health: checked } : {}) });
       return image;
     },
     async finish({ out, title }) {
@@ -199,6 +235,12 @@ async function main(argv) {
     const index = argv.indexOf(`--${name}`);
     return index >= 0 ? argv[index + 1] : undefined;
   };
+  if (flag("health")) {
+    const checked = await probePreviewHealth(flag("health"), flag("wake-pattern") ? { wakePattern: flag("wake-pattern") } : {});
+    process.stdout.write(`${JSON.stringify(checked)}\n`);
+    if (!previewHealthy(checked)) process.exitCode = 1;
+    return;
+  }
   const stepsPath = flag("steps");
   const out = flag("out");
   if (!stepsPath || !out) throw new Error('Usage: node demo-report.mjs --steps steps.json --out report.docx [--title "..."]');
