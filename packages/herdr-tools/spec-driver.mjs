@@ -237,7 +237,12 @@ export function demoRule(report, minImages, preview) {
     `Record it from your Playwright run with the demo recorder: import { createDemoRecorder } from ${JSON.stringify(DEMO_TOOL)}; call demo.step(page, "<action>", "<what it shows>") after each navigation or action, then demo.finish({ out: ${JSON.stringify(report)}, title: "<item>: <feature>" }). It writes the .docx and ${report}.steps.json, which the verifier checks (every screenshot captioned, one per recorded step). From saved screenshots: node ${JSON.stringify(DEMO_TOOL)} --steps <steps.json> --out ${report}.`,
     "Write that command on one line, with no backslash line continuations, and keep --steps and --out inside your worktree: then it runs without a permission prompt.",
     preview?.health
-      ? `This demo shows the preview, so it is evidence only while the preview is healthy: create the recorder with createDemoRecorder({ dir, health: ${JSON.stringify(preview.health)}${preview.wakePattern ? `, wakePattern: ${JSON.stringify(preview.wakePattern)}` : ""} }), which checks the health endpoint at every screenshot and refuses to capture a preview that is down (not HTTP 200, or a wake page); by hand, record node ${JSON.stringify(DEMO_TOOL)} --health ${JSON.stringify(preview.health)} as each step's "health". A crash-looping or asleep preview is never a pass: if it does not come up healthy, report the preview blocked with what you saw.`
+      ? [
+          `This demo shows the preview, so it is evidence only when the preview's health was checked, and healthy, at every screenshot (step 1 included); a report without that check at every step fails the verifier, however good it looks.`,
+          `With Playwright: const demo = createDemoRecorder({ dir: "<steps dir>", previewUrl: ${JSON.stringify(preview.health)}${preview.wakePattern ? `, wakePattern: ${JSON.stringify(preview.wakePattern)}` : ""} }); then await demo.step(page, "<action>", "<what it shows>") after each navigation or action. Each step checks the preview's health first and throws, capturing nothing, when it is down (not HTTP 200, or a wake page).`,
+          `With any other screenshot tool (a browser MCP, a script): right after each screenshot, record it with node ${JSON.stringify(DEMO_TOOL)} --record <steps.json> --image <png> --action "<action>" --shows "<what it shows>" --url <page url> --preview-url ${JSON.stringify(preview.health)}, which checks the preview's health at that moment; then build the report with node ${JSON.stringify(DEMO_TOOL)} --steps <steps.json> --out <report> --preview-url ${JSON.stringify(preview.health)}, which refuses steps without a healthy check. Never assemble a preview demo from screenshots taken without it.`,
+          "A crash-looping, asleep or unreachable preview is never a pass: if it does not come up healthy, report the preview blocked with what you saw.",
+        ].join(" ")
       : "",
   ].filter(Boolean).join(" ");
 }
@@ -465,6 +470,18 @@ export function advanceSpec({
     (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `${stage} lane${from ? ` ${from}` : ""} did not finish (${kind}, ${count}): ${String(reason).slice(0, 160)}; retrying${choice.profile ? ` with profile ${choice.profile}` : " with a fresh lane"}` });
     return true;
   };
+
+  // A0. Demos that failed only for want of a preview health check (lanes
+  // assembled them from screenshots taken without one) get a fresh demo
+  // lane now, under the recorder that checks it, rather than after their backoff.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    if (current?.state !== "verifying" || current.lane || current.healthRuleRearmedAt) continue;
+    if (!/no preview health check at capture/.test(current.evidenceProblem ?? "")) continue;
+    current.healthRuleRearmedAt = now;
+    delete current.evidenceRetryAfter;
+    (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" });
+  }
 
   // A. Items an older driver held at the human gate for a mechanical reason
   // (an idle lane, an unclear receipt) go back on the retry ladder.

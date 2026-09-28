@@ -434,7 +434,7 @@ test("verification: waits for the deploy, runs the preview specs, records the fi
 
     await mkdir(join(f.worktreeRoot, "spec-verify-A", "artifacts"), { recursive: true });
     // A demo of the preview counts only with a healthy check at every step.
-    assert.match(verify.laneObjective, /createDemoRecorder\(\{ dir, health: "https:\/\/preview\.example\.test\/" \}\)/);
+    assert.match(verify.laneObjective, /createDemoRecorder\(\{ dir: "<steps dir>", previewUrl: "https:\/\/preview\.example\.test\/" \}\)[\s\S]*--record <steps\.json>[\s\S]*--preview-url "https:\/\/preview\.example\.test\/"/);
     await writeDemo(join(f.worktreeRoot, "spec-verify-A", "artifacts", "a.final.docx"), 2, { url: "https://preview.example.test/", status: 200, wake: false, at: "2026-09-28T00:00:00.000Z" });
     f.pushedShas.add(sha);
     await f.laneReceipt("herdr-spec1", "PREVIEW: e2e/a.spec.ts pass\nREPORT: artifacts/a.final.docx");
