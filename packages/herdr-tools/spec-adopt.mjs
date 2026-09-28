@@ -115,6 +115,8 @@ export function hookErrors(output, max = 80) {
     const text = line.replace(/\s+$/, "");
     if (!text.trim()) continue;
     if (/File ignored because of a matching ignore pattern|--no-warn-ignored/.test(text)) continue;
+    // lint-staged's own progress ([STARTED] ..., [FAILED] <command and 60 file paths>).
+    if (/^\s*\[(?:STARTED|COMPLETED|SKIPPED|FAILED|TITLE)\]/.test(text)) continue;
     if (/^\S.*\.[cm]?[jt]sx?$/.test(text.trim()) && !/\berror\b/i.test(text)) {
       header = text.trim();
       continue;
@@ -125,7 +127,7 @@ export function hookErrors(output, max = 80) {
       kept.push(header);
       header = undefined;
     }
-    kept.push(text);
+    kept.push(text.length > 240 ? `${text.slice(0, 240)}…` : text);
     if (kept.length >= max) break;
   }
   return kept.length ? kept.join("\n") : lines.filter((line) => line.trim() && !/File ignored because of a matching ignore pattern/.test(line)).slice(-40).join("\n");
