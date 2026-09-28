@@ -2125,6 +2125,8 @@ test("spec lanes without a receipt that no item maps are retired once idle and p
       { id: "herdr-rootfail", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "gone", paneId: "w:gone", tabId: "t:gone" }], evidence: [] },
       // A root-dispatched lane of a completed workflow, its receipt never delivered, its agent gone.
       { id: "herdr-rootdone", status: "completed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "completion-reported", paneId: "w:done", tabId: "t:done", completionReceipt: { id: "r", summary: "done", delivery: "pending" } }], evidence: [] },
+      // The same, but the root told it something 5 minutes ago: left alone (a lane retired 35 s after being told to keep working).
+      { id: "herdr-roottold", status: "completed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "completion-reported", paneId: "w:told", tabId: "t:told", completionReceipt: { id: "r", summary: "BLOCKED", delivery: "pending" } }], laneMessages: [{ id: "lane-message-1", laneId: "lane-1", from: "root", text: "Go ahead with the demo.", createdAt: "2026-09-24T11:55:00.000Z", delivery: { status: "delivered" } }], evidence: [] },
       // The same, but its agent is still working: left alone.
       { id: "herdr-rootbusy", status: "completed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "completion-reported", paneId: "w:busy", tabId: "t:rb", completionReceipt: { id: "r", summary: "done", delivery: "pending" } }], evidence: [] },
     );

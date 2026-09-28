@@ -56,6 +56,16 @@ export function laneGuardVerdict({ tool_name: tool, tool_input: input = {}, cwd 
   }
   if (tool === "Bash") {
     const command = String(input.command ?? "");
+    // Machine-wide kills: a lane's `killall node pnpm turbo` took down the
+    // supervisor, the spec host and every lane's MCP bridge. A lane stops
+    // its own processes by pid (echo $! > pidfile, then kill $(cat pidfile))
+    // or with a pkill pattern naming its own worktree.
+    const own = "stop your own processes by pid (start them with `echo $! > /tmp/<name>.pid`, stop them with `kill $(cat /tmp/<name>.pid)`) or with `pkill -f` and a pattern that names your worktree path";
+    if (/(?:^|[\s;&|(])killall(?:\s|$)/.test(command)) return { deny: `killall stops every matching process on the machine, other lanes' and Baa-ton's too; ${own}` };
+    if (/(?:^|[\s;&|(])kill\s+(?:-\S+\s+)*(?:-1|0)(?:\s|$)/.test(command)) return { deny: `kill -1 and kill 0 reach far beyond this lane; ${own}` };
+    for (const match of command.matchAll(/(?:^|[\s;&|(])pkill\b([^;&|]*)/g)) {
+      if (!(worktree && match[1].includes(worktree))) return { deny: `pkill without your worktree path in its pattern can stop other lanes and Baa-ton itself; ${own}` };
+    }
     if (CREDENTIAL_COMMAND.test(command) || CREDENTIAL_PATH.test(command)) return { deny: "this command reads credentials (keys, tokens, keychain or cloud credentials), which lanes never do" };
     for (const match of command.matchAll(/(?:^|[\s'"=<>])((?:~|\/)[^\s'";|&<>]*\/\.env(?:\.[\w-]+)?)(?=$|[\s'";|&<>])/g)) {
       const path = match[1].startsWith("~") ? `${home}${match[1].slice(1)}` : match[1];
