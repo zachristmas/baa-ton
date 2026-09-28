@@ -110,6 +110,9 @@ test("herdr_tell types into an idle lane, queues for a busy one, and is root-onl
     assert.match(prompts[0].text, /^\[Baa-ton root message\] lane-message-\w+: Use migration slot 3; proceed\./);
     assert.match(prompts[0].text, /herdr_message/);
 
+    // A STOP order while the run is running is refused: only the user pauses the run.
+    await assert.rejects(tell({ workflowId: "herdr-tell0001", laneId: "lane-idle", text: "STOP all further work. No more Git actions." }), /only the user pauses the run, and the run state is running/);
+    assert.equal(prompts.length, 1, "nothing was typed");
     const queued = await tell({ workflowId: "herdr-tell0001", laneId: "lane-busy", text: "Stop after the current test run." });
     assert.equal(queued.details.message.delivery.status, "pending");
     assert.match(queued.content[0].text, /queued \(lane is working\)/);

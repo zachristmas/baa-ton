@@ -1007,6 +1007,27 @@ async function handleRequest(request) {
   error(id, -32601, `Unsupported method: ${method}`);
 }
 
+// The bridge lives exactly as long as its session. A lane's stray
+// `killall node` (or a broad pkill) once sent every bridge SIGTERM; Claude
+// Code never restarts a dead MCP server, so those lanes could not file their
+// receipts. SIGTERM is ignored while the session is there; the bridge ends
+// when its stdin closes or its parent is gone.
+const sessionGone = () => process.ppid === 1 || process.stdin.readableEnded || process.stdin.destroyed;
+process.on("SIGTERM", () => {
+  if (sessionGone()) process.exit(0);
+});
+let inFlight = 0;
+// Exit only once stdout has flushed the last response.
+const quit = () => process.stdout.write("", () => process.exit(0));
+let stdinEnded = false;
+process.stdin.on("end", () => {
+  stdinEnded = true;
+  if (!inFlight) quit();
+});
+setInterval(() => {
+  if (process.ppid === 1) process.exit(0);
+}, 30_000).unref();
+
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -1024,6 +1045,10 @@ process.stdin.on("data", (chunk) => {
       error(null, -32700, "Invalid JSON-RPC request.");
       continue;
     }
-    void handleRequest(request);
+    inFlight += 1;
+    void Promise.resolve(handleRequest(request)).finally(() => {
+      inFlight -= 1;
+      if (stdinEnded && !inFlight) quit();
+    });
   }
 });

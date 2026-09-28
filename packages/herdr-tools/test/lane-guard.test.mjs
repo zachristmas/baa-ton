@@ -40,3 +40,13 @@ test("as a hook it answers deny with a reason on stdout, and nothing otherwise",
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /^Baa-ton lane guard: Write outside the lane's worktree/);
   assert.equal(run({ tool_name: "Write", tool_input: { file_path: "/work/lanes/d03/a.ts" }, cwd }).stdout, "");
 });
+
+test("the lane guard stops machine-wide kills; a lane stops its own processes by pid or with its worktree in the pattern (a live killall that took down Baa-ton)", () => {
+  assert.match(call("Bash", { command: "killall node pnpm turbo 2>/dev/null; sleep 2" }).deny, /killall stops every matching process/);
+  assert.match(call("Bash", { command: "pkill -f node" }).deny, /pkill without your worktree path/);
+  assert.match(call("Bash", { command: "pkill -f \"pnpm dev\"" }).deny, /pkill without your worktree path/);
+  assert.match(call("Bash", { command: "kill -9 -1" }).deny, /kill -1 and kill 0/);
+  assert.equal(call("Bash", { command: "pkill -f \"/work/lanes/d03/node_modules/.bin/vite\"" }), undefined, "its own worktree in the pattern");
+  assert.equal(call("Bash", { command: "kill $(cat /tmp/backend.pid)" }), undefined, "by pid");
+  assert.equal(call("Bash", { command: "kill 4242" }), undefined);
+});
