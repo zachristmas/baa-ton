@@ -18,6 +18,9 @@ export type SpecAction = {
   /** baseline / fix-baseline: the target SHA, and the failures to fix. */
   targetSha?: string;
   failures?: Array<{ package: string; task: string }>;
+  /** verify: the item's tests with no run at its integrated commit, and whether they are all the lane does. */
+  tests?: string[];
+  testsOnly?: boolean;
 };
 export const RECEIPT_ASK_TIMEOUT_MS: number;
 export const RECEIPT_REASK_BASE_MS: number;
@@ -63,8 +66,9 @@ export function integrateObjective(
     baseline?: { sha: string; failures: Array<{ package: string; task: string }> };
   },
 ): string;
-export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; report?: string };
-export function verifyObjective(spec: Spec, item: SpecItem, options: { releaseSha?: string; reportPath: string }): string;
+export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; tests: Array<{ command: string; result: string }>; report?: string };
+export function untestedAtIntegration(item: SpecItem, current: { integratedSha?: string; tests?: unknown } | undefined): string[];
+export function verifyObjective(spec: Spec, item: SpecItem, options: { worktree?: string; releaseSha?: string; reportPath: string; evidenceProblem?: string; tests?: string[]; testsOnly?: boolean }): string;
 export function specCommitMessage(itemId: string, subject: string): string;
 export const DECLINE_RULE: string;
 export const DEMO_TOOL: string;

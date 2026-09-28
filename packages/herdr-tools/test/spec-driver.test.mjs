@@ -277,8 +277,56 @@ test("the decide stage runs first; leftover questions go to the user in one roun
 test("verify receipts list preview specs and the report path", () => {
   assert.deepEqual(verifyResult("PREVIEW: e2e/a.spec.ts pass\nPREVIEW: e2e/b.spec.ts FAIL (timeout)\nREPORT: artifacts/a.final.docx"), {
     previews: [{ spec: "e2e/a.spec.ts", result: "pass" }, { spec: "e2e/b.spec.ts", result: "fail" }],
+    tests: [],
     report: "artifacts/a.final.docx",
   });
+  assert.deepEqual(verifyResult("TEST: `pnpm turbo run test --filter=@x/db` pass\nTEST: pnpm test --filter=@x/web FAIL"), {
+    previews: [],
+    tests: [{ command: "pnpm turbo run test --filter=@x/db", result: "pass" }, { command: "pnpm test --filter=@x/web", result: "fail" }],
+  });
+});
+
+test("an item integrated with no test run at its commit (batch-merged) gets a verify lane that records them there (the live stuck D02-D18)", () => {
+  const tests = ["pnpm turbo run test --force --filter=@x/db", "pnpm turbo run test --force --filter=@x/web"];
+  const s = spec([{ id: "A", acceptance: { text: "a", tests, preview: ["e2e/a.spec.ts"], evidence: { report: "artifacts/a.docx" } } }, { id: "N", acceptance: { text: "n", tests: [tests[0]] } }], {}, undefined, { url: "https://preview.example.test", releaseCheck: "https://preview.example.test/api/version" });
+  const state = {
+    version: 1,
+    items: {
+      // Everything else verified long ago; the tip has moved on since.
+      A: { state: "verifying", integratedSha: SHA_A, integration: { sha: SHA_A, contained: true }, verified: at(0), preview: [{ spec: "e2e/a.spec.ts", result: "pass", sha: SHA_A }] },
+      N: { state: "verifying", integratedSha: SHA_B, integration: { sha: SHA_B, contained: true } },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(1) });
+  assert.deepEqual(step.actions.find((action) => action.itemId === "A"), { kind: "verify", itemId: "A", attempt: 1, tests, testsOnly: true }, "no release wait: only the tests are left");
+  assert.deepEqual(step.actions.find((action) => action.itemId === "N"), { kind: "verify", itemId: "N", attempt: 1, tests: [tests[0]] }, "nothing else to verify is no longer verified untested");
+  assert.equal(step.state.items.N.verified, undefined);
+  const objective = verifyObjective(s, s.items[0], { worktree: "/work/spec-verify", reportPath: "", tests, testsOnly: true });
+  assert.match(objective, /at its integrated commit[\s\S]*TEST: <command> pass/);
+  assert.doesNotMatch(objective, /preview|demo/i);
+
+  step.state.items.A.lane = { workflowId: "wv", laneId: "l1" };
+  const receipt = (summary) => advanceSpec({ spec: s, state: structuredClone(step.state), lane: lanes({ "wv/l1": { status: "completed", receipt: { summary } } }), now: at(2) });
+  const passed = receipt(`TEST: ${tests[0]} pass\nTEST: ${tests[1]} pass`);
+  const record = passed.state.items.A;
+  assert.equal(record.state, "verifying");
+  assert.equal(record.lane, undefined);
+  assert.equal(record.verified, at(0), "a tests-only receipt judges no preview (none reported here)");
+  assert.deepEqual(record.tests.map((run) => [run.command, run.sha, run.result, run.by]), tests.map((command) => [command, SHA_A, "pass", "verify"]), "recorded at the item's own integrated commit");
+  assert.ok(!passed.actions.some((action) => action.itemId === "A"), "recorded: nothing more to dispatch");
+
+  const failed = receipt(`TEST: ${tests[0]} pass\nTEST: ${tests[1]} fail`);
+  assert.equal(failed.state.items.A.state, "blocked");
+  assert.match(failed.state.items.A.note, /test failed at the integrated commit/);
+
+  const blocked = receipt(`TEST: ${tests[0]} blocked: no database`);
+  assert.equal(blocked.state.items.A.state, "verifying");
+  assert.equal(blocked.state.items.A.infraFailures, 1, "a test that could not run is infrastructure, retried");
+  assert.equal(blocked.state.items.A.tests, undefined);
+
+  const silent = receipt("All tests green.");
+  assert.equal(silent.state.items.A.declines.at(-1).kind, "unclear receipt");
+  assert.equal(silent.state.items.A.lane, undefined, "a fresh lane follows");
 });
 
 test("verification waits for a deploy containing the commit, then one verify lane records the preview runs", () => {
