@@ -27,6 +27,9 @@ import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { ownerRecord, reclaimLockDir } from "./inbox/lock-owner.mjs";
+import { installSpawnCounter } from "./inbox/spawn-count.mjs";
+// A lane bridge's spawns join the per-minute count in supervisor.log.
+installSpawnCounter("lane-bridge");
 import { Value } from "typebox/value";
 import { Type } from "typebox";
 import {

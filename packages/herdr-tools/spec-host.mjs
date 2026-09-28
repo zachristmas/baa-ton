@@ -182,6 +182,8 @@ async function defaultLoadExtension() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // Its spawns join the per-minute count in supervisor.log (spawn-count.mjs).
+  (await import("./inbox/spawn-count.mjs")).installSpawnCounter("spec-host");
   // The supervisor holds the other end: when it exits, so does the host.
   process.on("disconnect", () => process.exit(0));
   runSpecHost().catch((error) => {

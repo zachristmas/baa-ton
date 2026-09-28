@@ -141,6 +141,9 @@ const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } 
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyDevStack, classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
 const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
+// The root's (or spec host's) spawns join the per-minute count in supervisor.log;
+// a lane bridge installs its own first, and the first install wins.
+((await import("./inbox/spawn-count.mjs")) as typeof import("./inbox/spawn-count.mjs")).installSpawnCounter(process.env.BAATON_SPEC_HOST === "1" ? "spec-host" : "root-extension");
 const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
