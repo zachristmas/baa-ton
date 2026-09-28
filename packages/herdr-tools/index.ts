@@ -209,6 +209,24 @@ const BB029_AUTHORIZATION_SCOPE = "BB-029";
 // runner raises this so a slow fake herdr is not a failure.
 const HERDR_COMMAND_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 35_000;
 const execFile = promisify(execFileCallback);
+
+/**
+ * Put paths in a worktree back to HEAD. A file that is not in HEAD (added,
+ * staged or not) is removed instead: `git checkout HEAD --` fails on it, and
+ * that held a build (the set-aside patch already holds its content).
+ */
+export async function restoreToHead(worktree: string, paths: string[], timeout = 60_000) {
+  if (!paths.length) return;
+  const { stdout } = await execFile("git", ["-C", worktree, "ls-tree", "-r", "--name-only", "HEAD", "--", ...paths], { timeout, maxBuffer: 16 * 1024 * 1024 });
+  const inHead = new Set(stdout.split("\n").filter(Boolean));
+  const tracked = paths.filter((path) => inHead.has(path));
+  const added = paths.filter((path) => !inHead.has(path));
+  if (tracked.length) await execFile("git", ["-C", worktree, "checkout", "HEAD", "--", ...tracked], { timeout });
+  if (added.length) {
+    await execFile("git", ["-C", worktree, "rm", "-q", "--cached", "--force", "--ignore-unmatch", "--", ...added], { timeout });
+    for (const path of added) await rm(join(worktree, path), { force: true });
+  }
+}
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
 const MESSAGE_SUMMARY_MAX_LENGTH = 4000;
@@ -5202,7 +5220,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           await (ports?.restore ??
             (async ({ worktree, paths }: { worktree: string; paths: string[] }) => {
               // From HEAD, so a staged regeneration is put back too.
-              await execFile("git", ["-C", worktree, "checkout", "HEAD", "--", ...paths], { timeout: 30_000 });
+              await restoreToHead(worktree, paths, 30_000);
             }))({ worktree: record.worktree, paths: generated });
         } catch (error) {
           record.history = [...(record.history ?? []), { at: use.now(), from: stage, to: stage, note: `restoring generated artifacts failed: ${clip((error as Error).message, 200)}` }];
@@ -5227,7 +5245,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         try {
           await (ports?.restore ??
             (async ({ worktree: path, paths }: { worktree: string; paths: string[] }) => {
-              await execFile("git", ["-C", path, "checkout", "HEAD", "--", ...paths], { timeout: 30_000 });
+              await restoreToHead(path, paths, 30_000);
             }))({ worktree, paths: generated });
           done.push(`restored ${generated.length} generated artifact(s) in the ${label} worktree`);
         } catch (error) {
@@ -5267,7 +5285,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 const { stdout } = await execFile("git", ["-C", path, "diff", "HEAD", "--", ...paths], { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
                 await mkdir(dirname(patch), { recursive: true, mode: 0o700 });
                 await writeFile(patch, stdout, { mode: 0o600 });
-                await execFile("git", ["-C", path, "checkout", "HEAD", "--", ...paths], { timeout: 60_000 });
+                await restoreToHead(path, paths, 60_000);
               }))({ worktree, paths: outside, patch: patchPath });
           } catch (error) {
             return hold(
