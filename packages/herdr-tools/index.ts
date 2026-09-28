@@ -1738,6 +1738,7 @@ function normalizedLanes(
           }
         : {}),
       ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
+      ...(configuredProfile?.permissionMode ? { permissionMode: configuredProfile.permissionMode } : {}),
       ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
     };
   });

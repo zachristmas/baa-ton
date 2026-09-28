@@ -143,6 +143,15 @@ const LANE_PERMISSIONS = {
     "Bash(git push:*)",
     "Bash(git merge:*)",
     "Bash(gh pr create:*)",
+    "Bash(gh pr merge:*)",
+    // Destructive history and worktree resets (lanes run in bypassPermissions
+    // mode: these denies, not prompts, are the limit).
+    "Bash(git reset --hard:*)",
+    "Bash(git clean -f:*)",
+    "Bash(git clean -fd:*)",
+    "Bash(git clean -fdx:*)",
+    "Bash(git clean -xfd:*)",
+    "Bash(git branch -D:*)",
     // The stash is shared by every worktree of a repository: a positional
     // drop or pop can remove another lane's (or the user's) stash. Lanes set
     // changes aside with a patch file or a throwaway commit instead; list
@@ -160,6 +169,11 @@ const LANE_PERMISSIONS = {
   ],
 };
 
+/** PreToolUse guard: writes only inside the lane's worktree, no credentials. */
+export const LANE_GUARD_HOOK = fileURLToPath(new URL("./lane-guard.mjs", import.meta.url));
+/** A lane's permission mode unless its task profile names another. */
+export const DEFAULT_LANE_PERMISSION_MODE = "bypassPermissions";
+export const LANE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"];
 /** PermissionRequest hook that approves known-safe Bash commands. */
 export const KNOWN_SAFE_HOOK = fileURLToPath(new URL("./known-safe-hook.mjs", import.meta.url));
 /** Audit log of the hook's decisions, next to the manifest. */
@@ -170,6 +184,12 @@ export const PERMISSION_ROUTE_WAIT_SECONDS = 300;
 /** Auto-mode classifier allow rule for a dispatched lane's Baa-ton tools. */
 export const LANE_AUTO_MODE_ALLOW =
   "This session is a Baa-ton child lane dispatched by the user's registered root. Calling its herdr-orchestrator MCP tools (herdr_complete, herdr_message, herdr_request, herdr_lease, herdr_service, herdr_permission_prompt) to report this lane's own progress, receipt, questions and resource requests to that parent root is the assigned contract and is expected; it does not bypass auto mode, grant new authority or reach external services.";
+
+export function lanePermissionMode(mode?: string): string {
+  if (mode === undefined) return DEFAULT_LANE_PERMISSION_MODE;
+  if (!LANE_PERMISSION_MODES.includes(mode)) throw new Error(`Unknown Claude permission mode ${JSON.stringify(mode)}; use one of ${LANE_PERMISSION_MODES.join(", ")}.`);
+  return mode;
+}
 
 function buildClaudeLaunchArguments(
   paths: ClaudeAdapterPaths,
@@ -206,6 +226,21 @@ function buildClaudeLaunchArguments(
             {
               type: "command",
               command: `node ${JSON.stringify(paths.attestHelper)}`,
+            },
+          ],
+        },
+      ],
+      // The hard limits, enforced in every permission mode (lanes run in
+      // bypassPermissions by default): writes only inside the lane's own
+      // worktree, /tmp and its scratch, and no credentials. Deny rules below
+      // also apply in every mode.
+      PreToolUse: [
+        {
+          matcher: "*",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${JSON.stringify(LANE_GUARD_HOOK)} --scratch ${JSON.stringify(paths.scratchDirectory)}`,
             },
           ],
         },
@@ -289,6 +324,10 @@ function buildClaudeLaunchArguments(
     "--mcp-config",
     mcpConfigPath,
     "--strict-mcp-config",
+    // No prompts in an unattended lane; the deny rules and the PreToolUse
+    // guard above are the limits (a task profile may name another mode).
+    "--permission-mode",
+    lanePermissionMode(context?.permissionMode),
   ];
   const permissionPromptTool =
     paths.permissionPromptTool === undefined

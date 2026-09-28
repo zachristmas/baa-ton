@@ -150,6 +150,8 @@ export type LaunchContext = {
   /** A spec integration lane: lift the harness's own ban on local merges
    * (push, PR and every other deny stay). */
   allowLocalMerge?: boolean;
+  /** The task profile's permission mode for harnesses that have one (Claude: bypassPermissions unless named). */
+  permissionMode?: string;
 };
 
 export type RequiredAdapterCapability =
