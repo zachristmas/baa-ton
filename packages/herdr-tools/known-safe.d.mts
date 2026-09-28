@@ -31,3 +31,5 @@ export function laneConfinedVerdict(
 ): { allow: boolean; reason: string };
 export function splitOutsideQuotes(body: string): string[];
 export function askRuleMatchers(rules?: string[]): RegExp[];
+
+export function classifyDevStack(command: string, options?: { cwd?: string }): { matched: true } | { matched: false; reason: string };

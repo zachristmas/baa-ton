@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, classifyLocalValidation, laneConfinedVerdict } from "../known-safe.mjs";
+import { classifyCommand, classifyDevStack, classifyLocalValidation, laneConfinedVerdict } from "../known-safe.mjs";
 
 const SCRATCH = "/private/tmp/claude-501/-Users-dev-project/0f0e-session/scratchpad";
 
@@ -568,4 +568,31 @@ test("a command that starts with a lone backslash line, and a lane's own scratch
   assert.equal(classifyCommand(`node ${scratch}/capture.mjs --out .claude-artifacts/d03 /tmp/backend.log`, { cwd }).decision, "allow");
   assert.equal(classifyCommand(`node ${scratch}/capture.mjs /Users/someone/secret-notes`, { cwd }).decision, "defer");
   assert.equal(classifyCommand("node ./capture.mjs", { cwd }).decision, "defer", "a script outside scratch is not this rule");
+});
+
+test("a lane's own dev stack: dev scripts scoped to its worktree, logs to /tmp, compose up; nothing else chains in (live demo-lane blocks)", () => {
+  const cwd = "/work/tree";
+  for (const command of [
+    "pnpm dev",
+    "timeout 120 pnpm dev > /tmp/dev-server.log 2>&1 &",
+    "PORT=3001 HOST=localhost pnpm --filter @example/web run dev",
+    "cd /work/tree/apps/web && npm run start -- --port 3001",
+    "pnpm -C apps/backoffice preview",
+    "docker compose up -d postgres redis",
+    "docker compose -f infra/compose.yml up --wait",
+    "yarn dev:web > logs/web.log",
+  ])
+    assert.equal(classifyDevStack(command, { cwd }).matched, true, command);
+  for (const [command, reason] of [
+    ["pnpm dev && curl http://example.com", /more than one command/],
+    ["cd /other/repo && pnpm dev", /leaves the working directory/],
+    ["pnpm dev > /etc/motd", /writes outside the worktree/],
+    ["pnpm dev > /tmp/../etc/x", /writes outside the worktree/],
+    ["pnpm run deploy", /not a dev, start or preview script/],
+    ["pnpm -C /other/app dev", /directory outside the worktree/],
+    ["docker compose -f /etc/compose.yml up", /compose file outside the worktree/],
+    ["docker run -p 80:80 nginx", /only docker compose up/],
+    ["pnpm dev $(cat /etc/passwd)", /substitution/],
+  ])
+    assert.match(classifyDevStack(command, { cwd }).reason, reason, command);
 });

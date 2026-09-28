@@ -139,7 +139,7 @@ import {
 const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } = (await freshImport("./root-recovery.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-recovery.mjs");
 const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
-const { classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
+const { classifyDevStack, classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
 const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
 const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
@@ -4212,6 +4212,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           ? request.payload.input.command
           : undefined;
     let validationReason: string | undefined;
+    const specLane = typeof (workflow.lanes.find((item) => item.id === request.laneId) as { specStage?: string } | undefined)?.specStage === "string";
     if (validationCommand !== undefined) {
       validationReason = laneLeaseRefusal(cwd, manifest.approvalPolicyAck, "local-validation");
       if (!validationReason) {
@@ -4225,22 +4226,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           request.note = `local-validation: ${verdict.classes.join(", ")}`;
           return grant();
         }
-        // A spec verify lane records its demo against the running app: its
-        // dev server is part of the validation, and dev stacks take turns
-        // (defaults.maxDevStacks), so it never waits on the root.
-        const lane = workflow.lanes.find((item) => item.id === request.laneId) as { specStage?: string } | undefined;
-        if (request.kind === "runtime-launch" && lane?.specStage === "verify" && /^(?:pnpm|npm|yarn)(?: run)? (?:dev|start|preview)(?:\s+--[\w-]+(?:=\S+)?)*$/.test(validationCommand.trim())) {
-          request.note = "local-validation: the demo's dev server (verify lanes take turns on the dev stack; use your leased ports)";
+        // A spec lane's own dev stack (its dev/start/preview script, scoped
+        // to its worktree, or docker compose up for its local services) is
+        // part of its validation: demo and verify lanes record against the
+        // running app, and dev stacks take turns (defaults.maxDevStacks).
+        // Left for the root, an idle root made those lanes decline.
+        if (specLane && classifyDevStack(validationCommand, { cwd: workflow.worktree ?? workflow.cwd }).matched) {
+          request.note = "local-validation: the lane's own dev stack (dev stacks take turns; use your leased ports)";
           return grant();
         }
         validationReason = `not local validation (${verdict.reason})`;
       }
     }
-    const refusal = laneLeaseRefusal(
-      cwd,
-      manifest.approvalPolicyAck,
-      request.kind === "lease" ? "lease" : "runtime-launch",
-    );
+    // A spec lane's leases (ports and names for its own dev stack) follow
+    // the local-validation grant too.
+    const localLease = request.kind === "lease" && specLane && !laneLeaseRefusal(cwd, manifest.approvalPolicyAck, "local-validation");
+    const refusal = localLease
+      ? undefined
+      : laneLeaseRefusal(
+          cwd,
+          manifest.approvalPolicyAck,
+          request.kind === "lease" ? "lease" : "runtime-launch",
+        );
     if (refusal) return leaveOpen(validationReason ? `${validationReason}; ${refusal}` : refusal);
     if (request.kind === "lease" && "resource" in request.payload) {
       const config = runtimeConfigFor(cwd);

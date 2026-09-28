@@ -139,11 +139,11 @@ export function decideResult(summary) {
   };
 }
 
-/** Parse a verify lane's receipt: PREVIEW: <spec> pass|fail and REPORT: <path> lines. */
+/** Parse a verify lane's receipt: PREVIEW: <spec> pass|fail|blocked and REPORT: <path> lines. */
 export function verifyResult(summary) {
   const lines = String(summary ?? "").split("\n");
   const previews = lines
-    .map((line) => /^\s*PREVIEW\s*:\s*(\S+)\s+(pass|fail)\b/i.exec(line))
+    .map((line) => /^\s*PREVIEW\s*:\s*(\S+)\s+(pass|fail|blocked)\b/i.exec(line))
     .filter(Boolean)
     .map((match) => ({ spec: match[1], result: match[2].toLowerCase() }));
   const report = lines.map((line) => /^\s*REPORT\s*:\s*(\S+)\s*$/i.exec(line)?.[1]).find(Boolean);
@@ -237,6 +237,8 @@ export function integrationCommitFor(log, id) {
  * retry with backoff instead.
  */
 export const INFRA_KINDS = new Set(["never started", "infrastructure"]);
+/** A verify lane that could not bring its stack up: infrastructure, not a failed preview. */
+export const STACK_LAUNCH_FAILURE = /runtime launch (?:was )?(?:blocked|denied|not answered|refused)|could(?: not|n't) (?:start|launch|bring up|run) (?:the |its |my )?(?:app|stack|dev server|server|services?|preview)|cannot (?:start|launch) (?:the |its )?(?:app|stack|dev server|server|services?|pnpm dev|npm run dev)|failed to (?:start|launch) (?:the |its )?(?:app|stack|dev server|server|services?)|(?:dev server|stack|app|services?) (?:did not|didn't|never) (?:start|come up)|ECONNREFUSED|EADDRINUSE|address already in use/i;
 export const INFRA_BACKOFF_MAX_MS = 30 * 60_000;
 /** The wait before retry number `failures` (1, 2, ...) after an infrastructure error. */
 export function infraBackoffMs(failures) {
@@ -569,6 +571,15 @@ export function advanceSpec({
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {
     const current = record(item.id);
+    // Parked before launch failures counted as infrastructure: a verify
+    // human gate whose lane only failed to bring its stack up goes back.
+    if (current.state === "blocked" && current.blockedReason === "human-gate" && /^preview (?:failed|not run)/.test(current.note ?? "") && current.verifyLane) {
+      const summary = lane(current.verifyLane)?.receipt?.summary;
+      if (summary && (/^\s*PREVIEW\s*:\s*\S+\s+blocked\b/im.test(summary) || STACK_LAUNCH_FAILURE.test(summary))) {
+        retryStage(item, current, "verify", "infrastructure", "the verify lane could not launch its stack (recovered from a human gate)");
+        continue;
+      }
+    }
     if (current.state === "verifying") {
       const view = current.lane ? lane(current.lane) : undefined;
       if (!view) continue;
@@ -581,6 +592,12 @@ export function advanceSpec({
         current.verifyLane = current.lane;
         delete current.lane;
         if (result.report) current.finalReport = result.report;
+        // A lane that could not launch its stack verified nothing: retry the
+        // stage as infrastructure (never counted), never a human gate.
+        if ((failed.length || missing.length) && (runs.some((run) => run.result === "blocked") || STACK_LAUNCH_FAILURE.test(view.receipt.summary))) {
+          retryStage(item, current, "verify", "infrastructure", `the verify lane could not launch its stack: ${String(view.receipt.summary).split("\n").find((line) => /blocked|STACK|launch|start|ECONN|EADDR/i.test(line))?.slice(0, 200) ?? "see its receipt"}`);
+          continue;
+        }
         if (failed.length || missing.length) {
           move(item.id, "blocked", {
             blockedReason: "human-gate",
@@ -1022,7 +1039,7 @@ export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, 
       ? `${demoRule(reportPath, item.acceptance.evidence.minImages)} Run it against the preview.`
       : "",
     "Do not change code or Git state; this stage only verifies.",
-    "Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, and REPORT: <path of the report you wrote>.",
+    "Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, and REPORT: <path of the report you wrote>. If the app or its services could not be started at all, write PREVIEW: <spec path> blocked and say why: that is retried as infrastructure, not recorded as a failure.",
   ].filter(Boolean).join("\n");
 }
 
