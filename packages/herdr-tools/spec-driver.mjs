@@ -237,6 +237,10 @@ export function integrationCommitFor(log, id) {
  * retry with backoff instead.
  */
 export const INFRA_KINDS = new Set(["never started", "infrastructure"]);
+/** A lane that could not start at all: an infrastructure error, not an attempt. */
+export const INFRA_FAILURE = /shell did not become ready|native session reference missing|attestation incomplete or unavailable|agent_not_ready|runtime launch (?:was )?(?:blocked|denied)|could not launch its stack/i;
+/** A decline about the lane's environment (its stack or tooling), not the work. */
+export const ENVIRONMENT_DECLINE = /runtime launch|pnpm dev|dev server|browser (?:automation|tooling)|playwright|demo-recorder|environment|could(?: not|n't) (?:start|launch|run)|tooling (?:is )?(?:not )?available|no browser/i;
 /** A verify lane that could not bring its stack up: infrastructure, not a failed preview. */
 export const STACK_LAUNCH_FAILURE = /runtime launch (?:was )?(?:blocked|denied|not answered|refused)|could(?: not|n't) (?:start|launch|bring up|run) (?:the |its |my )?(?:app|stack|dev server|server|services?|preview)|cannot (?:start|launch) (?:the |its )?(?:app|stack|dev server|server|services?|pnpm dev|npm run dev)|failed to (?:start|launch) (?:the |its )?(?:app|stack|dev server|server|services?)|(?:dev server|stack|app|services?) (?:did not|didn't|never) (?:start|come up)|ECONNREFUSED|EADDRINUSE|address already in use/i;
 export const INFRA_BACKOFF_MAX_MS = 30 * 60_000;
@@ -392,6 +396,45 @@ export function advanceSpec({
     delete current.blockedReason;
     retryStage(item, current, stage, idle ? "idle without a receipt" : "unclear receipt", current.note);
     delete current.note;
+  }
+
+  // A2. Items parked or failed by an infrastructure error (a shell that was
+  // not ready, a session reference missing, a runtime launch nobody
+  // answered, a stack that would not start) before those counted as
+  // infrastructure go back on the retry ladder, once per item. A human gate
+  // for push, deploy, production or scope is never touched.
+  for (const item of spec.items) {
+    const current = next.items[item.id];
+    if (!current || current.rearmed) continue;
+    const lastDecline = (current.declines ?? []).at(-1);
+    const verifySummary = current.verifyLane ? lane(current.verifyLane)?.receipt?.summary : undefined;
+    let stage;
+    let reason;
+    if (current.state === "blocked" && current.blockedReason === "human-gate" && /^preview (?:failed|not run)/.test(current.note ?? "")) {
+      const launch = verifySummary && (/^\s*PREVIEW\s*:\s*\S+\s+blocked\b/im.test(verifySummary) || STACK_LAUNCH_FAILURE.test(verifySummary));
+      const declined = lastDecline?.stage === "verify" && ["declined", "never started", "infrastructure"].includes(lastDecline.kind);
+      if (launch || declined) {
+        stage = "verify";
+        reason = launch ? "the verify lane could not launch its stack" : `the verify lane did not run the previews (${lastDecline.kind}: ${String(lastDecline.reason).slice(0, 160)})`;
+      }
+    } else if (current.state === "blocked" && current.blockedReason === "exhausted") {
+      const exhaustedStage = /^(decide|build|review|integrate|verify):/.exec(current.note ?? "")?.[1];
+      const stageDeclines = (current.declines ?? []).filter((entry) => entry.stage === exhaustedStage && !INFRA_KINDS.has(entry.kind));
+      if (exhaustedStage && stageDeclines.length && stageDeclines.every((entry) => ENVIRONMENT_DECLINE.test(String(entry.reason)))) {
+        stage = exhaustedStage;
+        reason = "every lane declined for an environment problem (runtime launch, dev server or browser tooling), not the work";
+      }
+    } else if (current.state === "failed" && INFRA_FAILURE.test(current.note ?? "")) {
+      stage = /^(decide|build|review|integrate|verify) failed:/.exec(current.note ?? "")?.[1] ?? current.laneStage;
+      reason = `it failed on an infrastructure error, not its work: ${String(current.note).slice(0, 160)}`;
+      // The attempts spent on lanes that never started do not count.
+      if (stage === "build" && (current.attempts ?? 0) >= spec.defaults.maxBuildAttempts) current.attempts = spec.defaults.maxBuildAttempts - 1;
+    }
+    if (!stage || !STATE_OF[stage]) continue;
+    current.rearmed = { at: now, from: current.state, reason };
+    delete current.blockedReason;
+    delete current.note;
+    retryStage(item, current, stage, "infrastructure", `re-armed: ${reason}`);
   }
 
   // B. The suite baseline at the target tip: a baseline lane's receipt
@@ -571,15 +614,6 @@ export function advanceSpec({
   // 1. Receipts and lane endings advance in-flight items.
   for (const item of spec.items) {
     const current = record(item.id);
-    // Parked before launch failures counted as infrastructure: a verify
-    // human gate whose lane only failed to bring its stack up goes back.
-    if (current.state === "blocked" && current.blockedReason === "human-gate" && /^preview (?:failed|not run)/.test(current.note ?? "") && current.verifyLane) {
-      const summary = lane(current.verifyLane)?.receipt?.summary;
-      if (summary && (/^\s*PREVIEW\s*:\s*\S+\s+blocked\b/im.test(summary) || STACK_LAUNCH_FAILURE.test(summary))) {
-        retryStage(item, current, "verify", "infrastructure", "the verify lane could not launch its stack (recovered from a human gate)");
-        continue;
-      }
-    }
     if (current.state === "verifying") {
       const view = current.lane ? lane(current.lane) : undefined;
       if (!view) continue;

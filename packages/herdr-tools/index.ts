@@ -12088,6 +12088,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet: "Show spec progress (N/M done) and each item's blocker.",
     promptGuidelines: [
       "Use herdr_spec action=status as the burn-down instead of counting items by hand; an item is done only when the verifier says so, never by judgment.",
+      "When the supervisor spec host owns the loop and an item is blocked or failed for a mechanical reason (a lane that never started, a stack that would not launch), move it with herdr_spec action=requeue itemId=<id> [stage=<stage>] text=<why>; it needs the retry grant and is recorded in the item history. Push, deploy, production and scope gates stay with the user.",
     ],
     parameters: Type.Object(
       {
@@ -12098,7 +12099,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           Type.Literal("answer"),
           Type.Literal("adopt"),
           Type.Literal("reopen"),
+          Type.Literal("requeue"),
         ]),
+        stage: Type.Optional(Type.Union([Type.Literal("decide"), Type.Literal("build"), Type.Literal("review"), Type.Literal("integrate"), Type.Literal("verify")])),
         dryRun: Type.Optional(Type.Boolean()),
         force: Type.Optional(Type.Boolean()),
         itemId: Type.Optional(Type.String()),
@@ -12160,6 +12163,50 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           await release();
         }
         return { content: [{ type: "text", text: `Reopened ${params.itemId}; it goes through the loop again.` }], details: { itemId: params.itemId } };
+      }
+      if (params.action === "requeue") {
+        // The root's safe transition while the spec host owns the loop: a
+        // blocked or failed item goes back to a stage (its last one by
+        // default) under the retry grant, recorded in its history. The host
+        // reads the state on its next pass. A human gate for push, deploy,
+        // production or scope stays with the user.
+        requireRootManifestExecutor(ctx.cwd);
+        if (!params.itemId) throw new Error("itemId is required to requeue an item.");
+        const refusal = laneLeaseRefusal(ctx.cwd, (await loadManifest(ctx.cwd)).approvalPolicyAck, "retry");
+        if (refusal) throw new Error(`Requeue needs the retry grant: ${refusal}.`);
+        const spec = await loadSpec(ctx.cwd);
+        if (!spec) throw new Error(`No ${SPEC_PATH} in ${ctx.cwd}.`);
+        const STAGE_STATE: Record<string, string> = { decide: "deciding", build: "building", review: "reviewing", integrate: "integrating", verify: "verifying" };
+        const release = await acquireManifestLock(ctx.cwd, 10_000);
+        let moved: { from: string; to: string; stage: string };
+        try {
+          const state = await loadSpecState(ctx.cwd);
+          const record = state.items[params.itemId] as Record<string, any> | undefined;
+          if (!record) throw new Error(`Spec item ${params.itemId} has no recorded state.`);
+          if (!["blocked", "failed"].includes(record.state))
+            throw new Error(`Spec item ${params.itemId} is ${record.state}, not blocked or failed; the loop moves it.`);
+          if (record.blockedReason === "human-gate" && /\b(?:push|deploy|production|prod|scope)\b/i.test(record.note ?? ""))
+            throw new Error(`Spec item ${params.itemId} waits on a person for push, deploy, production or scope (${record.note}); it is not requeued.`);
+          const stage = params.stage ?? record.laneStage ?? /^(decide|build|review|integrate|verify)\b/.exec(record.note ?? "")?.[1] ?? "build";
+          const to = STAGE_STATE[stage];
+          const at = now();
+          const reason = params.text?.trim() || "requeued by the root";
+          record.history = [...(record.history ?? []), { at, from: record.state, to, note: `requeued by the root for ${stage}: ${reason}` }];
+          moved = { from: record.state, to, stage };
+          Object.assign(record, { state: to, since: at, requeued: { at, stage, reason, by: "root" } });
+          for (const key of ["blockedReason", "note", "lane", "infraRetryAfter", "declined", "sameSlot", "receiptAskedAt", "receiptEscalatedAt", "receiptAskAfter"]) delete record[key];
+          if (stage === "build" && (record.attempts ?? 0) >= spec.defaults.maxBuildAttempts) record.attempts = spec.defaults.maxBuildAttempts - 1;
+          const path = join(ctx.cwd, SPEC_STATE_PATH);
+          const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+          await writeFile(temporary, `${jsonText(state)}\n`, { mode: 0o600 });
+          await rename(temporary, path);
+        } finally {
+          await release();
+        }
+        return {
+          content: [{ type: "text", text: `Requeued ${params.itemId} for ${moved.stage} (${moved.from} -> ${moved.to}); the spec host picks it up on its next pass.` }],
+          details: { itemId: params.itemId, ...moved },
+        };
       }
       if (params.action === "answer") {
         requireRootManifestExecutor(ctx.cwd);

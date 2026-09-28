@@ -520,3 +520,39 @@ test("a review never judges the demo evidence: the verify stage produces it", ()
   assert.match(objective, /Do not judge the demo evidence or runtime proof/);
   assert.doesNotMatch(objective, /Check the evidence report/);
 });
+
+test("items parked or failed by an infrastructure error are re-armed once; a real failure and a push gate stay (the live stuck run)", () => {
+  const s = spec([{ id: "D04" }, { id: "D08" }, { id: "D06" }, { id: "D13" }, { id: "P1" }], { maxBuildAttempts: 3 });
+  const decline = (stage, kind, reason) => ({ at: at(0), stage, kind, reason });
+  const state = {
+    version: 1,
+    items: {
+      // Verify human gate from a lane that could not start its stack.
+      D04: { state: "blocked", blockedReason: "human-gate", note: "preview failed: D04", laneStage: "verify", attempts: 1, verifyLane: { workflowId: "wv", laneId: "l1" }, declines: [decline("verify", "declined", "Runtime launch blocked. Cannot start pnpm dev required for E2E demo capture.")] },
+      // Every verify lane declined for missing browser tooling.
+      D08: { state: "blocked", blockedReason: "exhausted", note: "verify: 4 lane(s) did not finish (declined) with every configured profile: not fabricating demo evidence", laneStage: "verify", attempts: 2, declines: [decline("verify", "declined", "not fabricating demo evidence. This lane has no browser automation tooling available"), decline("verify", "declined", "Runtime launch (pnpm dev) denied by root")] },
+      // Failed on lanes whose shells never became ready.
+      D06: { state: "failed", note: "build failed: Pane w22:p74 shell did not become ready for agent start; inspect it before retrying.", laneStage: "build", attempts: 3, declines: [decline("build", "infrastructure", "Pane w22:p74 shell did not become ready")] },
+      // A real integration suite failure (an older infra decline notwithstanding).
+      D13: { state: "failed", note: "", laneStage: "integrate", attempts: 3, declines: [decline("integrate", "infrastructure", "Pane w22:p9Q shell did not become ready")] },
+      // A push gate is a person's call.
+      P1: { state: "blocked", blockedReason: "human-gate", note: "push to production needs approval", laneStage: "integrate", declines: [] },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: "PREVIEW: D04 fail" } } }), now: at(5) });
+  const items = step.state.items;
+  assert.equal(items.D04.state, "verifying");
+  assert.equal(items.D04.blockedReason, undefined);
+  assert.match(items.D04.rearmed.reason, /did not run the previews \(declined: Runtime launch blocked/);
+  assert.equal(items.D08.state, "verifying");
+  assert.match(items.D08.rearmed.reason, /environment problem/);
+  assert.equal(items.D06.state, "building");
+  assert.equal(items.D06.attempts, 2, "the attempts spent on lanes that never started do not count");
+  assert.equal(items.D13.state, "failed", "a real failure stays failed");
+  assert.equal(items.P1.state, "blocked", "a push gate stays with a person");
+  for (const id of ["D04", "D08", "D06"]) assert.equal(items[id].declines.at(-1).kind, "infrastructure", id);
+  // Once only: parked again later, it stays parked for a person.
+  const again = structuredClone(step.state);
+  Object.assign(again.items.D04, { state: "blocked", blockedReason: "human-gate", note: "preview failed: D04" });
+  assert.equal(advanceSpec({ spec: s, state: again, lane: lanes({}), now: at(9) }).state.items.D04.state, "blocked");
+});
