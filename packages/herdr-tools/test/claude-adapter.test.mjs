@@ -432,3 +432,25 @@ test("lanes are denied detaching jobs with disown, nohup or setsid", async () =>
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("a launched Claude lane runs in bypassPermissions by default, with the deny rules and the lane guard as its limits", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "baa-claude-bypass-"));
+  try {
+    const adapter = claudeLaunchAdapter({ bridge: "/bridge/mcp-server.mjs", attestHelper: "/bridge/claude-startup-attest.mjs", scratchDirectory: scratch });
+    const args = adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json" });
+    assert.equal(args[args.indexOf("--permission-mode") + 1], "bypassPermissions");
+    const settings = JSON.parse(await readFile(args[args.indexOf("--settings") + 1], "utf8"));
+    for (const rule of ["Bash(git push:*)", "Bash(git merge:*)", "Bash(gh pr create:*)", "Bash(git reset --hard:*)", "Bash(git clean -f:*)", "Bash(git clean -fd:*)"])
+      assert.ok(settings.permissions.deny.includes(rule), rule);
+    const guard = settings.hooks.PreToolUse[0];
+    assert.equal(guard.matcher, "*");
+    assert.match(guard.hooks[0].command, /lane-guard\.mjs" --scratch "/);
+    assert.ok(existsSync(guard.hooks[0].command.match(/^node "([^"]+)"/)[1]), "the guard ships next to the adapter");
+    // A task profile may name another mode; an unknown one fails closed.
+    const auto = adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json", permissionMode: "auto" });
+    assert.equal(auto[auto.indexOf("--permission-mode") + 1], "auto");
+    assert.throws(() => adapter.launchArguments(profile, "/source/index.ts", { startupIntentPath: "/intents/lane.json", permissionMode: "yolo" }), /Unknown Claude permission mode/);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

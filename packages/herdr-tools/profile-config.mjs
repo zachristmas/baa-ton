@@ -73,10 +73,19 @@ export function resolveTaskProfile(cwd, name) {
   const configured = config?.profiles?.[name];
   if (!isRecord(configured) || !configured.launchProfile)
     throw new Error(`Task profile ${name} has no exact launchProfile. Configure provider, model, thinking, and auth in ${taskProfileConfigPath(cwd)}.`);
-  const launchProfile = exactLaunchProfile(configured.launchProfile, name);
+  // permissionMode may sit in launchProfile too; the exact profile itself
+  // keeps only provider, model, thinking and auth.
+  const { permissionMode: _profileMode, ...exactFields } = isRecord(configured.launchProfile) ? configured.launchProfile : {};
+  const launchProfile = exactLaunchProfile(isRecord(configured.launchProfile) ? exactFields : configured.launchProfile, name);
   const agentKind = configured.agentKind;
   if (agentKind !== undefined && (typeof agentKind !== "string" || !agentKind))
     throw new Error(`Task profile ${name} has an invalid agentKind.`);
+  // The harness permission mode for its lanes (Claude): bypassPermissions
+  // unless the profile names another; the deny rules and lane guard apply in
+  // every mode.
+  const permissionMode = configured.permissionMode ?? configured.launchProfile?.permissionMode;
+  if (permissionMode !== undefined && !["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].includes(permissionMode))
+    throw new Error(`Task profile ${name} has an invalid permissionMode ${JSON.stringify(permissionMode)}.`);
   return {
     name,
     description: typeof configured.description === "string" ? configured.description : defaultsForName.description,
@@ -86,6 +95,7 @@ export function resolveTaskProfile(cwd, name) {
     contextPreference: defaultsForName.contextPreference,
     preferredHarnesses: [...defaultsForName.preferredHarnesses],
     ...(agentKind ? { agentKind } : {}),
+    permissionMode: permissionMode ?? "bypassPermissions",
     launchProfile,
   };
 }

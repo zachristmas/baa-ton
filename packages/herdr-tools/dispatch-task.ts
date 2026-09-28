@@ -854,6 +854,7 @@ export async function dispatchTask(
                 startupIntentPath: lane.startupIntentPath!,
                 extraMcpServers: lane.mcpServers,
                 allowLocalMerge: lane.specStage === "integrate",
+                ...(lane.permissionMode ? { permissionMode: lane.permissionMode } : {}),
               }),
             ], signal);
           } catch (error) {
@@ -1409,7 +1410,7 @@ export async function resumeTask(
           profile,
           info.session,
           port.source,
-          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers, allowLocalMerge: lane.specStage === "integrate" },
+          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers, allowLocalMerge: lane.specStage === "integrate", ...(lane.permissionMode ? { permissionMode: lane.permissionMode } : {}) },
         );
         await startWhenShellReady(port, lane.paneId!,
           [
