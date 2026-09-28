@@ -141,6 +141,7 @@ const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } 
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyDevStack, classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
 const { demoPinLines, findDemoPins } = (await freshImport("./demo-pins.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./demo-pins.mjs");
+const { mergeJournalProblems } = (await freshImport("./migration-journal.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./migration-journal.mjs");
 const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
 // The root's (or spec host's) spawns join the per-minute count in supervisor.log;
 // a lane bridge installs its own first, and the first install wins.
@@ -150,7 +151,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateFromText, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -4826,6 +4827,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     removeWorktree?(input: { repo: string; path: string }): Promise<void>;
     /** Save and abort a half-done merge or staged changes left in the integration worktree; undefined when clean. */
     cleanIntegration?(input: { worktree: string; patchPath: string }): Promise<{ merging: boolean; files: number } | undefined>;
+    journalProblems?(repo: string, sha: string, base: string): Promise<string[]>;
+    rollBackIntegration?(input: { worktree: string; sha: string }): Promise<boolean>;
     /** A lane pane's visible screen (to infer a receipt from its final report). */
     readScreen?(paneId: string): Promise<string>;
     /** Push `sha` to `remote`'s `branch` from the integration worktree (spec-push grant). */
@@ -5208,10 +5211,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ports?.revParse ??
         (async (repoPath: string, ref: string) => (await execFile("git", ["-C", repoPath, "rev-parse", "--verify", "-q", ref], { timeout: 30_000 })).stdout.trim() || undefined)
       )(repo, targetRef).catch(() => undefined);
+      // An integration receipt's merge is checked for migration journal
+      // entries that go back in time before it is kept.
+      const journalProblems = new Map<string, string[]>();
+      for (const item of spec.items) {
+        const record = state.items?.[item.id] as { state?: string; lane?: { workflowId: string; laneId: string } } | undefined;
+        if (record?.state !== "integrating" || !record.lane) continue;
+        const sha = integrationResult(laneView(record.lane)?.receipt?.summary).sha;
+        if (!sha) continue;
+        const problems = await (ports?.journalProblems ?? mergeJournalProblems)(repo, sha, targetSha ?? targetRef).catch(() => [] as string[]);
+        if (problems.length) journalProblems.set(item.id, problems);
+      }
       const step = advanceSpec({
         spec,
         state,
         targetSha,
+        journalProblems,
         lane: laneView,
         dirty,
         background,
@@ -5226,6 +5241,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const integrationWorktree = join(worktreeRoot, "spec-integration");
       const next = step.state;
       const done: string[] = [];
+      // A merge the driver did not keep comes off spec-integration, while it
+      // is still the tip (a later merge on top is left for the root).
+      for (const rollback of step.rollbacks ?? []) {
+        try {
+          const rolled = await (ports?.rollBackIntegration ??
+            (async ({ worktree, sha }: { worktree: string; sha: string }) => {
+              const head = (await execFile("git", ["-C", worktree, "rev-parse", "HEAD"], { timeout: 30_000 })).stdout.trim();
+              if (head !== sha) return false;
+              await execFile("git", ["-C", worktree, "reset", "--hard", "--quiet", `${sha}^1`], { timeout: 60_000 });
+              return true;
+            }))({ worktree: integrationWorktree, sha: rollback.sha });
+          done.push(rolled ? `rolled spec-integration back off ${rollback.itemId}'s merge ${rollback.sha.slice(0, 12)} (migration journal out of order)` : `${rollback.itemId}'s merge ${rollback.sha.slice(0, 12)} is no longer the spec-integration tip; not rolled back`);
+          if (!rolled) step.rootAsks.push({ itemId: rollback.itemId, reason: `${rollback.itemId}: its merge ${rollback.sha.slice(0, 12)} has migration journal entries out of order and was sent back to build, but it is no longer the spec-integration tip; take it off spec-integration before the next push` });
+        } catch (error) {
+          done.push(`rolling spec-integration back off ${rollback.itemId}'s merge failed: ${clip((error as Error).message, 160)}`);
+        }
+      }
       if (backoff && !(typeof capacityWaiting === "string" && capacityWaiting.startsWith("backing off")))
         delete (next as { dispatchBackoff?: unknown }).dispatchBackoff;
       /**

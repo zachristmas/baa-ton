@@ -631,3 +631,22 @@ test("evidence has no image minimum unless the spec names one; an item resolved 
   assert.equal(step.state.items.D23.state, "resolved", "no evidence asked for: still resolved");
   assert.equal(step.state.items.D24.state, "resolved", "the spec still says resolved");
 });
+
+test("an integration whose migration journal goes back in time is not kept: back to build with the finding, spec-integration rolled back", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a", tests: ["npm test"] } }], { maxBuildAttempts: 2 });
+  const receipt = `INTEGRATED: ${SHA_A}\nSUITE: pass`;
+  const state = { version: 1, items: { A: { state: "integrating", attempts: 1, lane: { workflowId: "wi", laneId: "l1" } } } };
+  const problem = 'db/migrations/meta/_journal.json: 0053_x (idx 53) has "when" 1 not later than 0052_y';
+  const step = advanceSpec({ spec: s, state, lane: lanes({ "wi/l1": { status: "completed", receipt: { summary: receipt } } }), journalProblems: new Map([["A", [problem]]]), now: at(1) });
+  const record = step.state.items.A;
+  assert.notEqual(record.state, "awaiting-push");
+  assert.equal(record.integration, undefined);
+  assert.match(record.findings, /was not kept: the item's migration journal[\s\S]*0053_x[\s\S]*Rebase spec\/A onto spec-integration/);
+  assert.deepEqual(step.rollbacks, [{ itemId: "A", sha: SHA_A }]);
+  const exhausted = advanceSpec({ spec: s, state: { version: 1, items: { A: { ...state.items.A, attempts: 2 } } }, lane: lanes({ "wi/l1": { status: "completed", receipt: { summary: receipt } } }), journalProblems: new Map([["A", [problem]]]), now: at(1) });
+  assert.equal(exhausted.state.items.A.state, "failed");
+  assert.match(exhausted.rootAsks[0].reason, /migration journal is out of order/);
+  const clean = advanceSpec({ spec: s, state, lane: lanes({ "wi/l1": { status: "completed", receipt: { summary: receipt } } }), now: at(1) });
+  assert.equal(clean.state.items.A.state, "awaiting-push");
+  assert.deepEqual(clean.rollbacks, []);
+});

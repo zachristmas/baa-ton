@@ -326,6 +326,7 @@ export function advanceSpec({
   spec,
   state,
   lane,
+  journalProblems = new Map(),
   capacityWaiting = false,
   pushed = new Set(),
   released = new Map(),
@@ -341,6 +342,7 @@ export function advanceSpec({
   for (const item of Object.values(next.items)) dropStaleBookkeeping(item);
   const actions = [];
   const rootAsks = [];
+  const rollbacks = [];
   const reclaimed = [];
   const waits = {};
   const record = (id) => (next.items[id] ??= { state: "pending" });
@@ -729,6 +731,21 @@ for (const item of spec.items) {
             else current.newFailures = verdict.fresh;
           }
         }
+        // A merge whose migration journal goes back in time is not kept:
+        // databases already past the newer entry would skip the item's
+        // migrations silently. The item goes back to build with the finding,
+        // and spec-integration is rolled back off the merge.
+        const journal = result.sha ? journalProblems.get(item.id) : undefined;
+        if (journal?.length) {
+          const attempts = current.attempts ?? 1;
+          const findings = `Integration onto spec-integration at ${result.sha.slice(0, 12)} was not kept: the item's migration journal entries are not later than the ones before them, so migrators skip them on any database that already has the newer migration.\n${journal.map((line) => `- ${line}`).join("\n")}\nRebase spec/${item.id} onto spec-integration, then give each of the item's journal entries a "when" later than every entry before it (renumber the migrations after the ones already there if needed).`;
+          rollbacks.push({ itemId: item.id, sha: result.sha });
+          if (attempts >= spec.defaults.maxBuildAttempts) {
+            move(item.id, "failed", { findings, lane: undefined }, "migration journal out of order");
+            rootAsks.push({ itemId: item.id, reason: `${item.id} failed integration after ${attempts} build attempt(s): its migration journal is out of order` });
+          } else move(item.id, "ready", { findings, lane: undefined }, "migration journal out of order");
+          continue;
+        }
         if (result.sha && (result.suite === "pass" || relative)) {
           next.integrationCounter = (next.integrationCounter ?? 0) + 1;
           move(
@@ -1080,7 +1097,7 @@ for (const item of spec.items) {
     actions.push({ kind: "build", itemId: item.id, attempt, ...(current.findings ? { findings: current.findings } : {}) });
     slots -= 1;
   }
-  return { state: next, actions, rootAsks, waits };
+  return { state: next, actions, rootAsks, waits, rollbacks };
 }
 
 /** The build lane's objective, generated from the spec item. */
