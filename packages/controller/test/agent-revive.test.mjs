@@ -106,6 +106,55 @@ test("a dead pane is relaunched once confirmed, rate-limited, budget kept in the
   }
 });
 
+test("after a Herdr restart: a session live in another pane is followed, a gone pane is reported once, and a failed relaunch is never logged as relaunched", async () => {
+  // The session moved: w2F:p2 is gone and s-1 now runs in w2K:p1.
+  const s = await store({ "lane-admin": { ...admin } });
+  try {
+    let clock = 0;
+    const runs = [];
+    const reviver = createAgentReviver({ env: s.env, clock: () => clock, paneState: async () => ({ dead: true, reason: "agent_not_found" }), sessionPane: async (agent) => (agent.sessionId === "s-1" ? { paneId: "w2K:p1", workspaceId: "w2K" } : undefined), run: async (...args) => runs.push(args) });
+    const { events } = await reviver.tick();
+    assert.match(events[0], /its session s-1 runs in pane w2K:p1; registration moved from w2F:p2/);
+    assert.equal((await s.read()).agents["lane-admin"].paneId, "w2K:p1");
+    assert.equal((await s.read()).agents["lane-admin"].workspaceId, "w2K");
+    assert.equal(runs.length, 0, "never a second copy of a live session");
+  } finally {
+    await s.cleanup();
+  }
+  // The pane is gone and the session runs nowhere: one report, no relaunch attempts.
+  const g = await store({ "lane-admin": { ...admin } });
+  try {
+    let clock = 0;
+    const runs = [];
+    const notes = [];
+    const reviver = createAgentReviver({ env: g.env, clock: () => clock, paneState: async () => ({ dead: true, reason: "agent_not_found" }), paneExists: async () => false, run: async (...args) => runs.push(args), notify: async (note) => notes.push(note) });
+    await reviver.tick();
+    clock = REVIVE_CONFIRM_MS + 1;
+    const first = await reviver.tick();
+    assert.match(first.events[0], /pane w2F:p2 no longer exists and its session runs nowhere; not relaunched/);
+    clock += REVIVE_INTERVAL_MS + 1;
+    assert.deepEqual((await reviver.tick()).events, [], "reported once");
+    assert.equal(runs.length, 0);
+    assert.equal(notes.length, 1);
+  } finally {
+    await g.cleanup();
+  }
+  // The relaunch command fails: a failure event, no "relaunched" and no anomaly.
+  const f = await store({ "lane-admin": { ...admin } });
+  try {
+    let clock = 0;
+    const anomalies = [];
+    const reviver = createAgentReviver({ env: f.env, clock: () => clock, paneState: async () => ({ dead: true, reason: "agent_not_found" }), run: async () => { throw new Error("pane_not_found"); }, anomaly: async (value) => anomalies.push(value) });
+    await reviver.tick();
+    clock = REVIVE_CONFIRM_MS + 1;
+    const { events } = await reviver.tick();
+    assert.deepEqual(events, ["lane-admin: relaunch in pane w2F:p2 failed: pane_not_found"]);
+    assert.equal(anomalies.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("a pane that looks dead once and then alive is left alone", async () => {
   const s = await store({ "lane-admin": admin });
   try {

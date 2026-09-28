@@ -4742,9 +4742,19 @@ export async function runSupervisorLoop({
         request: (method, params) => (client ??= herdr ?? new JsonLineHerdrClient()).request(method, params),
         ...(typeof herdr?.processInfo === "function" ? { processInfo: herdr.processInfo.bind(herdr) } : {}),
       };
+      const livePanes = async () => {
+        const { stdout } = await execFileAsync("herdr", ["pane", "list"], { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+        const parsed = JSON.parse(stdout);
+        return (parsed.result ?? parsed).panes ?? [];
+      };
       reviver = createAgentReviver({
         paneState: (agent) => revivePaneState(api, agent.paneId),
         run: (paneId, command) => execFileAsync("herdr", ["pane", "run", paneId, command], { timeout: 10_000 }),
+        sessionPane: async (agent) => {
+          const pane = (await livePanes()).find((item) => item?.agent_session?.value === agent.sessionId);
+          return pane ? { paneId: pane.pane_id, workspaceId: pane.workspace_id } : undefined;
+        },
+        paneExists: async (paneId) => (await livePanes()).some((item) => item?.pane_id === paneId),
         anomaly: async (anomaly) => {
           const { reportAnomaly } = await import("./anomalies.mjs");
           return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });

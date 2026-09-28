@@ -176,6 +176,8 @@ let goalResumePromptCount = 0;
 let worktreeClean = true;
 let registeredParentCheckout = "";
 let openWorktreeWorkspaceId = null;
+// After a Herdr restart the source checkout may be open in no workspace.
+let sourceWorkspaceOpen = true;
 let parentWorkspaceMode = "one";
 let genericWorkspaceCount = 0;
 const missingWorkspaceIds = new Set();
@@ -240,7 +242,7 @@ extension.default({
             repo_key: "repo-smoke",
             repo_root: registeredParentCheckout,
             source_checkout_path: registeredParentCheckout,
-            source_workspace_id: "w-parent",
+            ...(sourceWorkspaceOpen ? { source_workspace_id: "w-parent" } : {}),
           },
           worktrees: [
             {
@@ -283,6 +285,7 @@ extension.default({
       });
     }
     if (args[0] === "workspace" && args[1] === "create") {
+      if (!sourceWorkspaceOpen && args[args.indexOf("--cwd") + 1] === registeredParentCheckout) sourceWorkspaceOpen = true;
       const workspaceId = `w-generic-${++genericWorkspaceCount}`;
       return response({
         result: {
@@ -1237,6 +1240,23 @@ try {
   assert.equal(planned.taskBinding.workspaceId, rootWorkspaceId, "the task binding stays with the root");
   assert.ok(planned.evidence.some((entry) => entry.kind === "worktree-open-elsewhere"));
   openWorktreeWorkspaceId = previousOpen;
+  // The source checkout open in no workspace (after a Herdr restart): the
+  // plan opens a workspace there itself instead of failing on a missing
+  // source_workspace_id.
+  sourceWorkspaceOpen = false;
+  const createsBefore = calls.filter((args) => args[0] === "workspace" && args[1] === "create").length;
+  await tools.get("herdr_plan").execute(
+    "source-closed",
+    { objective: "review with the source closed", worktreeCwd: dirtyWorktreeCwd, lanes: [{ objective: "review it", readOnly: true }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const sourceCreates = calls.filter((args) => args[0] === "workspace" && args[1] === "create").slice(createsBefore);
+  assert.equal(sourceCreates.length, 1, "one workspace opened at the source");
+  assert.equal(sourceCreates[0][sourceCreates[0].indexOf("--cwd") + 1], registeredParentCheckout);
+  assert.ok(sourceCreates[0].includes("--no-focus"));
+  assert.equal(sourceWorkspaceOpen, true);
 } finally {
   if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
   else process.env.HERDR_ENV = previousHerdrEnv;
