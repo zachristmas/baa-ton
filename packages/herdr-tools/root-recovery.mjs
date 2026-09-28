@@ -9,7 +9,10 @@ const receipt = lane => typeof lane?.completionReceipt?.id === 'string' && lane.
 
 // Input is the raw validated document, so unrelated and forward-compatible
 // fields survive migration. Workflow taskBindings and receipts remain historical.
-export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, session, liveWorkspaceIds }) {
+// `restart`: a Herdr server restart renamed every pane, so the old root's
+// workflows ended with their panes and are not required to be quiescent;
+// they stay as historical records under their old task binding.
+export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, session, liveWorkspaceIds, restart = false }) {
   if (config.version !== 2 || !Array.isArray(config.orchestrators) || manifest.version !== 2 || !Array.isArray(manifest.workflows))
     throw new Error('Recovery requires valid version-2 controller and manifest documents');
   const matches = config.orchestrators.filter(item => item.id === oldRootId);
@@ -33,7 +36,7 @@ export function rootRecoveryPlan({ config, manifest, cwd, oldRootId, root, sessi
   }
   const owned = manifest.workflows.filter(flow => routed.has(flow.id) ||
     (flow.taskBinding?.rootPaneId === old.root.pane_id && flow.taskBinding?.workspaceId === old.root.workspace_id));
-  for (const flow of owned) {
+  for (const flow of restart ? [] : owned) {
     if (flow.taskBinding && (flow.taskBinding.rootPaneId !== old.root.pane_id || flow.taskBinding.workspaceId !== old.root.workspace_id))
       throw new Error(`Workflow ${flow.id} has a different historical owner`);
     const untouchedPlan = flow.status === 'planned' && !routed.has(flow.id) &&

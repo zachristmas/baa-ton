@@ -6601,7 +6601,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const latestConfig = await loadControllerConfig(configPath);
         if (!latestConfig)
           throw new Error("Herdr controller config disappeared during reconciliation.");
-        const current = findRoot(latestConfig);
+        let current: ControllerOrchestrator;
+        try {
+          current = findRoot(latestConfig);
+        } catch (error) {
+          if (!/is not a registered root/.test((error as Error).message)) throw error;
+          // A Herdr server restart renames every pane: the same root session
+          // comes back in a new pane. Rebind it rather than refuse (a refusal
+          // led to a second orchestrator beside the dead one).
+          return await rebindRestartedRoot(cwd, root, rootAgent, latestConfig, configPath, manifestFile, error as Error, signal);
+        }
         const previousRoot = { ...current.root };
         const nextRoot: ControllerRootMapping = {
           ...current.root,
@@ -6693,6 +6702,65 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } finally {
       await releaseManifest();
     }
+  }
+
+  /** Whether a root pane no longer holds any agent (Herdr answers agent_not_found). */
+  async function rootPaneGone(paneId: string, signal?: AbortSignal): Promise<boolean> {
+    try {
+      await runHerdr(["agent", "get", paneId], signal);
+      return false;
+    } catch (error) {
+      return /agent_not_found|pane_not_found|\bnot found\b/i.test(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * After a Herdr restart: the one root registered for this project has a
+   * pane that is gone, and the current pane runs the same native harness
+   * session the manifest recorded for it. Migrate it to the current pane
+   * through the audited root recovery (restart mode: its old workflows ended
+   * with their panes). Anything less certain stays refused.
+   */
+  async function rebindRestartedRoot(
+    cwd: string,
+    root: ControllerRootMapping,
+    rootAgent: unknown,
+    config: ControllerConfig,
+    configPath: string,
+    manifestFile: string,
+    notRegistered: Error,
+    signal?: AbortSignal,
+  ) {
+    const owners = config.orchestrators.filter((candidate) => candidate.program.id !== "legacy-global" && rootOwnsManifest(candidate, cwd));
+    const gone: ControllerOrchestrator[] = [];
+    for (const candidate of owners) if (await rootPaneGone(candidate.root.pane_id, signal)) gone.push(candidate);
+    if (gone.length !== 1) throw notRegistered;
+    const stale = gone[0];
+    const manifest = await loadManifest(cwd);
+    const recorded = manifest.rootSessionLogs?.find((entry) => entry.rootId === stale.id)?.sessionRef;
+    const live = rootSessionPersistence(root, rootAgent);
+    if (!recorded?.sessionId || !live.nativeHandle || recorded.sessionId !== live.sessionId)
+      throw new Error(
+        `${notRegistered.message} This project's root ${stale.id} (pane ${stale.root.pane_id}) is gone, but it ran another session (${recorded?.sessionId ?? "none recorded"}), so it is not rebound automatically; herdr_recover_root migrates it with explicit evidence.`,
+      );
+    const workspaces = responseRecord(await runHerdr(["workspace", "list"], signal), "root rebind workspace list");
+    if (!Array.isArray(workspaces.workspaces)) throw new Error("No authoritative workspace list.");
+    const liveWorkspaceIds = workspaces.workspaces.map((item) => requiredString(item as Record<string, unknown>, "workspace_id", "root rebind workspace list"));
+    const auditDir = join(dirname(manifestPath(cwd)), "root-recovery");
+    await assertNoPendingRecovery(auditDir);
+    const before = await readRecoveryFiles(configPath, manifestPath(cwd));
+    const session = rootSessionEntry(root, rootAgent, undefined, now(), undefined);
+    const plan = rootRecoveryPlan({ config: JSON.parse(before.config), manifest: JSON.parse(before.manifest), cwd, oldRootId: stale.id, root, session, liveWorkspaceIds, restart: true });
+    const evidence = `Herdr restart: root ${stale.id} pane ${stale.root.pane_id} is gone and the same session ${live.sessionId} now runs in ${root.pane_id}`;
+    await commitRootRecovery({ configPath, manifestPath: manifestPath(cwd), auditDir, before, plan, evidence });
+    return {
+      reconciled: true,
+      root,
+      previousRoot: stale.root,
+      configPath,
+      manifestPath: manifestFile,
+      evidence: [`Rebound root ${stale.id} to ${plan.newRootId} (${stale.root.pane_id} -> ${root.pane_id}): ${evidence}.`],
+    };
   }
 
   async function discoverControllerRoot(
@@ -6798,6 +6866,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const resolvedCwd = resolve(cwd);
     const configPath = await controllerConfigPath(signal);
     const config = await loadControllerConfig(configPath);
+    // One project, one orchestrator per root: a root whose pane is gone (a
+    // Herdr restart renames panes) is rebound by herdr_reconcile_root, never
+    // joined by a second orchestrator that leaves the supervisor and spec
+    // host targeting the dead pane.
+    if (add && config)
+      for (const record of config.orchestrators)
+        if (
+          record.program.id !== "legacy-global" &&
+          rootOwnsManifest(record, cwd) &&
+          record.root.pane_id !== root.pane_id &&
+          (await rootPaneGone(record.root.pane_id, signal))
+        )
+          throw new Error(
+            `This project's root ${record.id} is gone (pane ${record.root.pane_id} no longer exists). Call herdr_reconcile_root from this pane to rebind it here instead of adding a second orchestrator.`,
+          );
     const manifestHasState = (manifest: ManifestWithQueue): boolean =>
       manifest.workflows.length > 0 ||
       manifest.parentGoal !== undefined ||
