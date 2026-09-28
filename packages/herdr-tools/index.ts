@@ -4868,6 +4868,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // Status events arrive through the plugin hook, which can be late or
       // lost (a hook that could not start in time, a lock timeout); a lane
       // that finished without its event looked busy forever and held a slot.
+      // One `herdr pane list` per pass answers every lane's live status: an
+      // `agent get` per lane (dozens of old lanes, every few seconds) was the
+      // spec host's largest source of process starts.
+      let paneSnapshot: Promise<Map<string, Record<string, unknown>> | undefined> | undefined;
+      const livePanes = () =>
+        (paneSnapshot ??= runHerdr(["pane", "list"], signal)
+          .then((raw) => {
+            const result = isRecord(raw) && isRecord(raw.result) ? raw.result : raw;
+            const panes = isRecord(result) && Array.isArray(result.panes) ? result.panes : undefined;
+            return panes ? new Map(panes.filter(isRecord).map((pane) => [String(pane.pane_id), pane as Record<string, unknown>])) : undefined;
+          })
+          .catch(() => undefined));
       const liveStatus = new Map<string, string>();
       {
         const refs = [
@@ -4877,6 +4889,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const readLive =
           ports?.liveStatus ??
           (async (paneId: string) => {
+            const snapshot = await livePanes();
+            if (snapshot) {
+              const pane = snapshot.get(paneId);
+              return pane && typeof pane.agent === "string" && pane.agent ? (typeof pane.agent_status === "string" ? pane.agent_status : "unknown") : "gone";
+            }
             try {
               const result = await runHerdr(["agent", "get", paneId], signal);
               const info = isRecord(result) && isRecord(result.result) ? result.result : result;
@@ -5065,6 +5082,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const agentPresent =
         ports?.agentPresent ??
         (async (paneId: string) => {
+          const snapshot = await livePanes();
+          if (snapshot) {
+            const pane = snapshot.get(paneId);
+            if (!pane || typeof pane.agent !== "string" || !pane.agent) return false;
+            return !["done", "idle"].includes(String(pane.agent_status ?? ""));
+          }
           const result = await runHerdr(["agent", "get", paneId], signal).catch(() => undefined);
           const info = isRecord(result) && isRecord(result.result) ? result.result : result;
           if (!isRecord(info) || !isRecord(info.agent) || typeof info.agent.agent !== "string" || !info.agent.agent) return false;
