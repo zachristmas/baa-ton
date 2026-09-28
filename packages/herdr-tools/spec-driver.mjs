@@ -1307,8 +1307,9 @@ export function buildObjective(spec, item, { branch, findings, decided, answers 
     item.acceptance.tests.length ? `Run until green: ${item.acceptance.tests.join("; ")}.` : "",
     LONG_COMMANDS,
     item.acceptance.evidence ? demoRule(item.acceptance.evidence.report, item.acceptance.evidence.minImages) : "",
-    `Commit your work on ${branch} in this worktree (local commits only).`,
-    findings ? `The previous attempt failed review. Findings to address:\n${findings}` : "",
+    "Before you report done, run the repository's lint and typecheck on the files you changed (the checks its commit hooks run: lint-staged, eslint, tsc) and fix every error, so the commit passes its hooks.",
+    `Commit your work on ${branch} in this worktree (local commits only), with the hooks (never --no-verify).`,
+    findings ? `The previous attempt did not pass. Findings to address:\n${findings}` : "",
     "Finish with herdr_complete: the commit SHA, the checks you ran and their results, and the evidence report path.",
   ].filter(Boolean).join("\n");
 }

@@ -89,7 +89,7 @@ test("review FAIL rebuilds with findings until maxBuildAttempts, then the root i
   let step = reviewFail(state, 10);
   assert.equal(step.state.items.A.state, "building");
   assert.deepEqual(step.actions[0], { kind: "build", itemId: "A", attempt: 2, findings: "VERDICT: FAIL\nsrc/a.ts:10 total ignores shipping" });
-  assert.match(buildObjective(s, s.items[0], { branch: "spec/A", findings: step.actions[0].findings }), /previous attempt failed review[\s\S]*total ignores shipping/);
+  assert.match(buildObjective(s, s.items[0], { branch: "spec/A", findings: step.actions[0].findings }), /previous attempt did not pass[\s\S]*total ignores shipping/);
   step = reviewFail(step.state, 20);
   assert.equal(step.state.items.A.state, "failed");
   assert.deepEqual(step.rootAsks, [{ itemId: "A", reason: "A failed 2 build attempt(s): review failed" }]);
