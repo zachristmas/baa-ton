@@ -130,7 +130,21 @@ export function validateSpec(input) {
   // Optional live capacity floor the driver samples before dispatching.
   if (input.defaults !== undefined) {
     if (!isRecord(input.defaults)) throw new Error("spec.defaults must be an object.");
-    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines", "evidence", "maxDevStacks"], "spec.defaults");
+    onlyKeys(input.defaults, ["maxParallel", "maxBuildAttempts", "pushGate", "finalReport", "minFreeMemoryGb", "maxSwapUsedGb", "generatedArtifacts", "fixBaseline", "maxDeclines", "evidence", "maxDevStacks", "demoRunner"], "spec.defaults");
+    // One lane runs the demos of every verifying item that needs only one,
+    // in turn, on one long-lived local dev stack, instead of a stack per item.
+    if (input.defaults.demoRunner !== undefined) {
+      const runner = input.defaults.demoRunner;
+      if (runner === true) defaults.demoRunner = {};
+      else {
+        if (!isRecord(runner)) throw new Error("spec.defaults.demoRunner must be true or an object.");
+        onlyKeys(runner, ["seedReset", "maxItems"], "spec.defaults.demoRunner");
+        defaults.demoRunner = {
+          ...(runner.seedReset !== undefined ? { seedReset: text(runner.seedReset, "spec.defaults.demoRunner.seedReset", { max: 500 }) } : {}),
+          ...(runner.maxItems !== undefined ? { maxItems: positiveInteger(runner.maxItems, "spec.defaults.demoRunner.maxItems", { max: 50 }) } : {}),
+        };
+      }
+    }
     // Evidence every item needs unless it names its own: a Word demo with
     // captioned screenshots. The report path may use {id}.
     if (input.defaults.evidence !== undefined) {

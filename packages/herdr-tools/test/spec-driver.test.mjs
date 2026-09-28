@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { validateSpec } from "../spec.mjs";
-import { advanceSpec, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict, verifyObjective, verifyResult } from "../spec-driver.mjs";
+import { advanceSpec, demoRunObjective, demoRunResult, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict, verifyObjective, verifyResult } from "../spec-driver.mjs";
 
 const spec = (items, defaults = {}, stages, preview) =>
   validateSpec({
@@ -649,4 +649,65 @@ test("an integration whose migration journal goes back in time is not kept: back
   const clean = advanceSpec({ spec: s, state, lane: lanes({ "wi/l1": { status: "completed", receipt: { summary: receipt } } }), now: at(1) });
   assert.equal(clean.state.items.A.state, "awaiting-push");
   assert.deepEqual(clean.rollbacks, []);
+});
+
+test("the demo runner: one lane demos every evidence-only item in turn on one stack; its receipt only ends the run", () => {
+  const s = spec(
+    [
+      { id: "A", acceptance: { text: "a", evidence: { report: "artifacts/a.docx" } } },
+      { id: "B", acceptance: { text: "b", evidence: { report: "artifacts/b.docx" } } },
+      { id: "P", acceptance: { text: "p", preview: ["e2e/p.spec.ts"], evidence: { report: "artifacts/p.docx" } } },
+      { id: "T", acceptance: { text: "t", tests: ["npm test"], evidence: { report: "artifacts/t.docx" } } },
+    ],
+    { demoRunner: { seedReset: "pnpm db:reset-seed" } },
+  );
+  const state = {
+    version: 1,
+    items: {
+      A: { state: "verifying", integratedSha: SHA_A },
+      B: { state: "verifying", integratedSha: SHA_B },
+      P: { state: "verifying", integratedSha: SHA_A },
+      T: { state: "verifying", integratedSha: SHA_A },
+    },
+  };
+  const first = advanceSpec({ spec: s, state, lane: lanes({}), targetSha: SHA_B, now: at(0) });
+  assert.deepEqual(first.actions.find((action) => action.kind === "demo-run"), { kind: "demo-run", itemId: "", attempt: 1, items: ["A", "B"], targetSha: SHA_B });
+  assert.ok(!first.actions.some((action) => action.kind === "verify" && ["A", "B"].includes(action.itemId)), "no per-item demo lanes for them");
+  assert.ok(!first.actions.some((action) => action.itemId === "T"), "an item with tests to record keeps its own lane, after the run: one dev stack");
+  assert.match(first.waits.T, /dev stack busy: the demo run/);
+  assert.equal(first.state.demoRun.sha, SHA_B, "the target tip contains every pushed item");
+  assert.match(first.waits.A, /demo run: starting/);
+
+  // Dispatched: while it runs, nothing else starts on the dev stack.
+  const running = structuredClone(first.state);
+  running.demoRun.lane = { workflowId: "wd", laneId: "l1" };
+  running.items.T.lane = undefined;
+  const during = advanceSpec({ spec: s, state: running, lane: lanes({ "wd/l1": { status: "active", agentStatus: "working" } }), targetSha: SHA_B, now: at(1) });
+  assert.ok(!during.actions.some((action) => action.kind === "demo-run"));
+  assert.match(during.waits.A, /demo run: lane wd is running its demo/);
+
+  const idle = advanceSpec({ spec: s, state: structuredClone(running), lane: lanes({ "wd/l1": { status: "active", agentStatus: "done" } }), targetSha: SHA_B, now: at(2) });
+  assert.deepEqual(idle.actions.filter((action) => action.kind === "ask-demo-receipt").map((action) => action.lane), [{ workflowId: "wd", laneId: "l1" }]);
+
+  // A was picked up as soon as it was written (verified by the controller); B was blocked.
+  const ended = structuredClone(running);
+  ended.items.A.verified = at(1);
+  const receipt = advanceSpec({ spec: s, state: ended, lane: lanes({ "wd/l1": { status: "completed", receipt: { summary: "DEMO: A written\nDEMO: B blocked: the seed has no stores" } } }), targetSha: SHA_B, now: at(3) });
+  assert.equal(receipt.state.demoRun, undefined, "the run is over");
+  assert.equal(receipt.state.items.A.evidenceRetryAfter, undefined);
+  assert.match(receipt.state.items.B.evidenceProblem, /the seed has no stores/);
+  assert.ok(receipt.state.items.B.evidenceRetryAfter > at(3), "B joins a later run after a wait");
+
+  const stack = advanceSpec({ spec: s, state: structuredClone(running), lane: lanes({ "wd/l1": { status: "completed", receipt: { summary: "DEMO-STACK: blocked: port 5173 in use" } } }), targetSha: SHA_B, now: at(3) });
+  assert.ok(stack.state.demoRunRetryAfter > at(3), "a stack that never came up retries the whole run after a backoff");
+  assert.equal(stack.state.items.A.evidenceProblem, undefined, "not the items' fault");
+  const later = advanceSpec({ spec: s, state: stack.state, lane: lanes({}), targetSha: SHA_B, now: "2026-09-24T10:03:30.000Z" });
+  assert.match(later.waits.A, /demo run: a fresh run after/);
+
+  assert.deepEqual([...demoRunResult("DEMO: A written\nDEMO: B blocked - no data").items], [["A", { result: "written", reason: "" }], ["B", { result: "blocked", reason: "no data" }]]);
+  const objective = demoRunObjective(s, [s.items[0], s.items[1]], { worktree: "/w/spec-verify", sha: SHA_B, reports: { A: { path: "artifacts/a.final.docx" }, B: { path: "artifacts/b.final.docx" } } });
+  assert.match(objective, /Start the dev stack once[\s\S]*Never restart it between items/);
+  assert.match(objective, /reset the seed data with pnpm db:reset-seed against the running database; the stack stays up/);
+  assert.match(objective, /1\. A: Item A[\s\S]*screenshot for every navigation or action[\s\S]*artifacts\/a\.final\.docx[\s\S]*2\. B: Item B/);
+  assert.match(objective, /as soon as its demo is done[\s\S]*DEMO: <id> written/);
 });

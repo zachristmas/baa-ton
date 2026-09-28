@@ -2374,3 +2374,52 @@ test("an integration merge whose migration journal goes back in time is sent bac
     await f.cleanup();
   }
 });
+
+test("the demo runner: one lane at the target tip demos each item on one stack, and each report is verified as soon as it is written", async () => {
+  const target = "d".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      defaults: { demoRunner: { seedReset: "pnpm db:reset-seed" } },
+      items: [
+        { id: "A", title: "Store banner", acceptance: { text: "a", evidence: { report: "artifacts/a.docx" } } },
+        { id: "B", title: "Split payment", acceptance: { text: "b", evidence: { report: "artifacts/b.docx" } } },
+      ],
+    },
+    seed: { version: 1, items: { A: { state: "verifying", integratedSha: "a".repeat(40) }, B: { state: "verifying", integratedSha: "b".repeat(40) } } },
+  });
+  f.ports.revParse = async () => target;
+  try {
+    let result = await f.advance();
+    assert.match(result.content[0].text, /demo run A, B -> herdr-spec1/);
+    assert.equal(f.calls.plan.length, 1, "one lane for both items");
+    const run = f.calls.plan[0];
+    assert.equal(run.specStage, "verify");
+    assert.equal(run.worktree, join(f.worktreeRoot, "spec-verify"));
+    assert.deepEqual(f.calls.detached.map((call) => call.sha), [target]);
+    assert.match(run.laneObjective, /one local dev stack[\s\S]*pnpm db:reset-seed[\s\S]*1\. A: Store banner[\s\S]*artifacts\/a\.final\.docx[\s\S]*2\. B: Split payment/);
+
+    // A's report lands mid-run: verified now, with no receipt yet.
+    f.pushedShas.add("a".repeat(40));
+    f.pushedShas.add("b".repeat(40));
+    await mkdir(join(f.worktreeRoot, "spec-verify", "artifacts"), { recursive: true });
+    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "a.final.docx"), 2);
+    result = await f.advance();
+    assert.match(result.content[0].text, /done A/);
+    let state = await f.state();
+    assert.equal(state.items.A.state, "done");
+    assert.equal(state.items.B.state, "verifying");
+    assert.equal(state.demoRun.lane.workflowId, "herdr-spec1", "the run goes on");
+    assert.equal(f.calls.plan.length, 1, "no second lane while it runs");
+
+    await writeDemo(join(f.worktreeRoot, "spec-verify", "artifacts", "b.final.docx"), 3);
+    await f.laneReceipt("herdr-spec1", "DEMO: A written\nDEMO: B written");
+    result = await f.advance();
+    state = await f.state();
+    assert.equal(state.items.B.state, "done");
+    assert.equal(state.demoRun, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
