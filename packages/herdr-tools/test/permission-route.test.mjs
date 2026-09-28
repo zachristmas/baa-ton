@@ -112,14 +112,14 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
       },
     );
   try {
-    const granted = run("Bash", { command: "docker compose up -d db" }, "granted");
+    const granted = run("Bash", { command: "docker run -d postgres" }, "granted");
     assert.equal(granted.status, 0);
     assert.deepEqual(JSON.parse(granted.stdout).hookSpecificOutput.decision, { behavior: "allow" });
     const calls = (await readFile(bridgeLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(calls[0].method, "initialize");
     assert.deepEqual(calls[1].params, {
       name: "herdr_request",
-      arguments: { action: "open", kind: "permission", toolName: "Bash", input: { command: "docker compose up -d db" } },
+      arguments: { action: "open", kind: "permission", toolName: "Bash", input: { command: "docker run -d postgres" } },
     });
     assert.ok(calls.every((call) => call.intent === "/lane/intent.json" && call.herdr === "1"), "the bridge gets the lane's startup intent");
 
@@ -129,7 +129,7 @@ test("the hook routes an unclassified prompt through the lane's bridge and answe
     assert.match(decision.message, /request-9: not on a shared database/);
 
     // No answer: the unattended policy decides instead of leaving a pane prompt.
-    const timedOut = run("Bash", { command: "docker compose up -d db" }, "open", ["--wait-seconds", "0"]);
+    const timedOut = run("Bash", { command: "docker run -d postgres" }, "open", ["--wait-seconds", "0"]);
     const denied2 = JSON.parse(timedOut.stdout).hookSpecificOutput.decision;
     assert.equal(denied2.behavior, "deny");
     assert.match(denied2.message, /unattended policy \(no answer within 0 s\): `docker` reaches outside the lane[\s\S]*herdr_request/);
