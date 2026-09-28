@@ -5189,6 +5189,27 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         done.push(`restored ${generated.length} generated artifact(s) in ${item.id}'s worktree`);
         return statusOf(record.worktree).catch(() => "");
       };
+      // A shared worktree (the suite baseline, verify, the fix-baseline
+      // integration) owns no files: every tracked generated artifact its own
+      // builds rewrote is restored to HEAD before a lane is dispatched there,
+      // since Herdr dispatches only into a clean tree (the baseline failed
+      // every 30 min on its own regenerated openapi specs).
+      const restoreGeneratedIn = async (worktree: string, label: string) => {
+        if (!generatedPatterns.length) return;
+        const porcelain = await statusOf(worktree).catch(() => "");
+        if (!porcelain.trim()) return;
+        const generated = itemOwnedChanges(porcelain, [], undefined).outside.filter((path) => generatedPatterns.some((pattern) => pattern.test(path)));
+        if (!generated.length) return;
+        try {
+          await (ports?.restore ??
+            (async ({ worktree: path, paths }: { worktree: string; paths: string[] }) => {
+              await execFile("git", ["-C", path, "checkout", "HEAD", "--", ...paths], { timeout: 30_000 });
+            }))({ worktree, paths: generated });
+          done.push(`restored ${generated.length} generated artifact(s) in the ${label} worktree`);
+        } catch (error) {
+          done.push(`restoring generated artifacts in the ${label} worktree failed: ${clip((error as Error).message, 120)}`);
+        }
+      };
       const commitAdoptedWork = async (item: (typeof spec.items)[number], record: Record<string, any>, branch: string, stage: "reviewing" | "building" = "reviewing") => {
         const worktree = record.worktree as string;
         const ownsOf = (next.items[item.id]?.decided?.owns as string[] | undefined) ?? item.owns;
@@ -5290,6 +5311,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             const fix = action.kind === "fix-baseline";
             const worktree = fix ? integrationWorktree : join(worktreeRoot, "spec-baseline");
             await use.worktree({ repo, path: worktree, branch: fix ? "spec-integration" : "spec-baseline", base: targetRef }, signal);
+            await restoreGeneratedIn(worktree, fix ? "integration" : "baseline");
             const workflow = await use.plan({
               objective: fix ? `spec fix-baseline at ${action.targetSha!.slice(0, 12)}` : `spec baseline suite at ${action.targetSha!.slice(0, 12)}`,
               laneObjective: [
@@ -5443,6 +5465,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 await mkdir(dirname(path), { recursive: true });
                 await execFile("git", ["-C", repoPath, "worktree", "add", "--detach", path, sha], { signal, timeout: 120_000 });
               }))({ repo, path: worktree, sha: record.integratedSha ?? record.integration?.sha });
+            await restoreGeneratedIn(worktree, "verify");
             record.verifyWorktree = worktree;
             objective = verifyObjective(spec, item, {
               worktree,

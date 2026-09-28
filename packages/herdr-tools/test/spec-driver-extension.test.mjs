@@ -1523,6 +1523,31 @@ async function receive(f, ref, summary, specStage = "integrate") {
   await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
 }
 
+test("the baseline worktree's own regenerated artifacts are restored before its lane is dispatched (a live 30-minute failure loop)", async () => {
+  const target = "2".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release", suite: ["pnpm turbo run test"] },
+      defaults: { generatedArtifacts: ["apps/services/*/openapi-spec.json"] },
+      items: [{ id: "D03", title: "Batch", acceptance: { text: "b" } }],
+    },
+    seed: { version: 1, items: { D03: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    f.ports.revParse = async (_repo, ref) => (ref === "refs/remotes/origin/feature/release" ? target : undefined);
+    f.ports.status = async (path) => (path.endsWith("spec-baseline") ? " M apps/services/order/openapi-spec.json\n M apps/services/store/openapi-spec.json\n M src/other.ts\n" : "");
+    const result = await f.advance();
+    const restore = (f.calls.restore ?? []).find((call) => call.worktree.endsWith("spec-baseline"));
+    assert.ok(restore, "the baseline worktree was restored");
+    assert.deepEqual(restore.paths, ["apps/services/order/openapi-spec.json", "apps/services/store/openapi-spec.json"], "only generated artifacts, never other changes");
+    assert.match(result.content[0].text, /restored 2 generated artifact\(s\) in the baseline worktree/);
+    assert.ok(f.calls.plan.some((call) => call.specStage === "baseline"), "and its lane is planned");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("the integration gate is baseline-relative: failures the target tip already has do not block a push", async () => {
   const target = "2".repeat(40);
   const merged = "a".repeat(40);
