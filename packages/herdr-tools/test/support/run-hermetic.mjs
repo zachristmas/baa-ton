@@ -37,7 +37,8 @@ export function hermeticEnvironment(env = process.env) {
   // A hook run by a test must never start a real supervisor.
   isolated.BAA_TON_NO_SUPERVISOR_KEEPALIVE = "1";
   // Fake herdr commands may start slowly on a loaded machine.
-  isolated.BAATON_HERDR_COMMAND_TIMEOUT_MS = "120000";
+  // BAA_TON_TEST_HERDR_TIMEOUT_MS raises it on a machine whose process starts take minutes.
+  isolated.BAATON_HERDR_COMMAND_TIMEOUT_MS = /^\d+$/.test(env.BAA_TON_TEST_HERDR_TIMEOUT_MS ?? "") ? env.BAA_TON_TEST_HERDR_TIMEOUT_MS : "120000";
   // The operator channel's store defaults to the user's real one; a
   // supervisor tick in a test would otherwise deliver its live messages.
   isolated.BAATON_OPERATOR_STORE = join(tmpdir(), `baa-hermetic-operator-${process.pid}-${Date.now()}.json`);
@@ -52,7 +53,7 @@ const suites = {
     // exhaust memory on a busy machine and starve a bridge past its timeout.
     ["--test", "--test-concurrency=4", "packages/herdr-tools/test/*.test.mjs"],
   ],
-  controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs", "packages/controller/test/blocked-lane.test.mjs", "packages/controller/test/self-update.test.mjs", "packages/controller/test/root-dialog.test.mjs", "packages/controller/test/supervisor-self-update.test.mjs", "packages/controller/test/anomalies.test.mjs", "packages/controller/test/spec-hosts.test.mjs", "packages/controller/test/agent-revive.test.mjs", "packages/controller/test/supervisor-keepalive.test.mjs", "packages/controller/test/live-status.test.mjs", "packages/controller/test/lock-owner.test.mjs"]],
+  controller: [["--test", "packages/controller/test/controller.test.mjs", "packages/controller/test/lane-services.test.mjs", "packages/controller/test/blocked-lane.test.mjs", "packages/controller/test/self-update.test.mjs", "packages/controller/test/root-dialog.test.mjs", "packages/controller/test/supervisor-self-update.test.mjs", "packages/controller/test/anomalies.test.mjs", "packages/controller/test/spec-hosts.test.mjs", "packages/controller/test/agent-revive.test.mjs", "packages/controller/test/supervisor-keepalive.test.mjs", "packages/controller/test/live-status.test.mjs", "packages/controller/test/lock-owner.test.mjs", "packages/controller/test/pause-notice.test.mjs"]],
 };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

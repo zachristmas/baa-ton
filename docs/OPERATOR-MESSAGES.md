@@ -91,6 +91,7 @@ A registered agent is covered by the blocked handler like a lane, but it has no 
 
 The run is `running` unless an operator paused it. The pause lives in the operator store, not in any agent's memory:
 - **What sets it:** only an operator message to a root whose first word is `STOP`, `PAUSE` (`PAUSE EVERYTHING`) or `RESUME`, or `baa-ton run pause|resume [--reason] [--from]`, or the `herdr_operator_run` tool. `baa-ton run status` shows it.
+- **Who may pause:** only Zach, with an explicit operator STOP or PAUSE sent `--from zach` from outside the root and lane panes. A pause from anyone else (the root, a lane, an unattended default) is refused; the message is still delivered. Anyone may resume. An unattended default never takes an option that pauses or stops work, and a run paused 15 min while items wait notifies Zach once with who paused it and why.
 - **Shown every turn:** the root's system prompt and every digest carry `Run state: …`. The running line says a pause exists only when this line says PAUSED, and is never inferred from conversation memory, an earlier message or a summary.
 - **While paused:** the spec driver dispatches and pushes nothing, and the supervisor sends no nudges (`quiet: run-paused`).
 - **Once set to running:** when an operator has set the run state to running, a pause the root put on its own goal is lifted by the supervisor, and the root gets a `run-resumed` alert.

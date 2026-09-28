@@ -203,6 +203,25 @@ test("a blocked event for an agent that is already gone is 'gone', not an unhand
   assert.equal(broken.status, "skipped", "a missing herdr binary is a real gap");
 });
 
+test("a lane question's default never pauses: a Recommended pause is passed over for the first option that keeps work moving", async () => {
+  const pauseScreen = `
+ Should I pause the retries until the harness is repaired, or keep retrying?
+
+ ❯ 1. Pause retries (Recommended)
+   2. Continue retrying
+   3. Type something.
+
+ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+`;
+  const herdr = fakeHerdr({ screens: pauseScreen });
+  const workflow = workflowFixture();
+  const manifest = {};
+  await handleBlockedLane({ herdr, manifest, workflow, laneId: "lane-1", paneId: PANE, agentKind: "claude", timestamp: "2026-09-25T10:00:00.000Z" });
+  await resolveScreenPrompts({ herdr, manifest, workflow, timestamp: "2026-09-25T10:10:00.000Z" });
+  assert.deepEqual(herdr.calls.keys, [{ paneId: PANE, keys: ["2"] }]);
+  assert.match(manifest.unattendedDecisions[0].reason, /took Continue retrying, not the Recommended "Pause retries"/);
+});
+
 test("a prompt that is gone by the time the answer comes is closed without keys", async () => {
   const herdr = fakeHerdr({ screens: questionScreen });
   const workflow = workflowFixture();

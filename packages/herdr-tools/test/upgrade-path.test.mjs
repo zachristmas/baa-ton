@@ -11,6 +11,8 @@ import { migrateProjectState } from "../state-migration.mjs";
 import { mergeDetectedProfiles, missingOptionalConfigSections } from "../setup-core.mjs";
 import { runSupervisorTick } from "../../controller/controller.mjs";
 import { validateParentGoal as validateParentGoal974a77d } from "../../controller/test/fixtures/controller-974a77d-goal-validation.mjs";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
@@ -107,7 +109,7 @@ test("updating a bd4bc81 project migrates state, keeps profile choices and stays
     const setup = spawnSync(
       process.execPath,
       [join(checkout, "packages", "herdr-tools", "setup.mjs"), "--project-root", f.project, "--non-interactive", "--harness", "claude"],
-      { encoding: "utf8", timeout: 120_000, env: { ...process.env, HOME: join(f.directory, "home") } },
+      { encoding: "utf8", timeout: CHILD_TIMEOUT_MS, env: { ...process.env, HOME: join(f.directory, "home") } },
     );
     assert.equal(setup.status, 0, setup.stderr);
     const config = JSON.parse(await readFile(join(f.project, ".baa-ton", "config.json"), "utf8"));
@@ -245,7 +247,7 @@ test("a pulled update restarts the real supervisor from the new code", { timeout
     return undefined;
   };
   const waitFor = async (predicate, ms) => {
-    const deadline = Date.now() + ms;
+    const deadline = Date.now() + Math.max(ms, CHILD_TIMEOUT_MS);
     while (Date.now() < deadline) {
       const value = await predicate();
       if (value) return value;

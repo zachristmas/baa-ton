@@ -8,6 +8,8 @@ import { join, dirname, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { HERDR_COMMAND, liveHerdrAgentList } from "../live-herdr.mjs";
+// A child process start can take minutes on a loaded machine (run-hermetic.mjs).
+const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "..", "mcp-server.mjs");
@@ -71,7 +73,7 @@ async function withMcpServer(env, run, { cwd = here } = {}) {
   const rpc = (method, params = {}) => rpcWithId(++nextId, method, params);
   // Generous: the bridge compiles the whole extension on start, which can take
   // well over 15 s while the full suite runs in parallel on a loaded machine.
-  const timeout = setTimeout(() => child.kill(), 180_000);
+  const timeout = setTimeout(() => child.kill(), Math.max(180_000, CHILD_TIMEOUT_MS));
   try {
     return await run(rpc, rpcWithId);
   } finally {

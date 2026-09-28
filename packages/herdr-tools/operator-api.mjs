@@ -45,12 +45,16 @@ async function notify(title, body, run = (args) => execFileAsync("herdr", args, 
 export async function sendOperatorMessage({ target, text, from, notify: notifyOnReply = false, env = process.env, config, deliver } = {}) {
   const path = operatorStorePath(env);
   const controllerConfig = config ?? (await readControllerConfig(env));
+  const sender = from || env.BAATON_OPERATOR || "operator";
+  // STOP / PAUSE from anyone but Zach is delivered, but never pauses the run.
+  const pauseBlocked = await pauseRefusal({ from: sender, env, config: controllerConfig });
   const message = await withOperatorStore(path, (store) => {
     const resolved = resolveOperatorTarget(target, { config: controllerConfig, agents: store.agents });
-    const added = addOperatorMessage(store, { target, resolved, text, from: from || env.BAATON_OPERATOR || "operator", notify: notifyOnReply });
+    const added = addOperatorMessage(store, { target, resolved, text, from: sender, notify: notifyOnReply });
     // STOP / PAUSE / RESUME to a root sets the durable run state.
     const wanted = resolved.kind === "root" ? runStateFromText(text) : undefined;
-    if (wanted) added.runState = setRunState(store, { state: wanted, reason: String(text).slice(0, 200), by: added.from });
+    if (wanted === "paused" && pauseBlocked) added.runStateRefused = pauseBlocked;
+    else if (wanted) added.runState = setRunState(store, { state: wanted, reason: String(text).slice(0, 200), by: added.from });
     return added;
   });
   await deliverNow({ env, deliver });
@@ -111,7 +115,29 @@ export async function readRunState({ env = process.env } = {}) {
   return runState(await readOperatorStore(operatorStorePath(env)));
 }
 
-export async function changeRunState({ state, reason, from, env = process.env } = {}) {
+/**
+ * Only Zach pauses the run: an explicit operator STOP from him, never the
+ * root, a lane or an unattended default (a default once paused a run at
+ * night). The reason a pause is refused, or undefined.
+ */
+export async function pauseRefusal({ from, env = process.env, config } = {}) {
+  if (String(from ?? "").trim().toLowerCase() !== "zach") return "only Zach can pause the run (an explicit operator STOP with --from zach); ask him instead";
+  const pane = env.HERDR_PANE_ID;
+  if (!pane) return undefined;
+  const controllerConfig = config ?? (await readControllerConfig(env).catch(() => undefined));
+  for (const orchestrator of controllerConfig?.orchestrators ?? []) {
+    if (orchestrator.root?.pane_id === pane) return "the root cannot pause the run; it can only ask Zach";
+    for (const route of orchestrator.workflows ?? [])
+      if ((route.lanes ?? []).some((lane) => lane.pane_id === pane)) return "a lane cannot pause the run; it can only ask";
+  }
+  return undefined;
+}
+
+export async function changeRunState({ state, reason, from, env = process.env, config } = {}) {
+  if (state === "paused") {
+    const refusal = await pauseRefusal({ from, env, config });
+    if (refusal) throw new Error(`Not paused: ${refusal}.`);
+  }
   return withOperatorStore(operatorStorePath(env), (store) => setRunState(store, { state, reason, by: from || env.BAATON_OPERATOR || "operator" }));
 }
 

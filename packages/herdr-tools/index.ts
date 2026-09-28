@@ -11003,7 +11003,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ctx: { cwd: string; abort?: () => void; signal?: AbortSignal },
   ): Promise<void> {
     const plan = autoAnswerPlan(input ?? {});
-    if (!plan.eligible) return;
+    if (!plan.eligible) {
+      // Every option would pause or stop work: no default; the user decides, told once.
+      if (plan.stopsWork)
+        await runHerdr(["notification", "show", "Baa-ton: the root asks whether to stop work", "--body", clip(`Only you can pause the run. Not answered automatically: ${plan.reason}.`, 400), "--sound", "request"], undefined).catch(() => undefined);
+      return;
+    }
     const spec = await loadSpec(ctx.cwd).catch(() => undefined);
     if (!spec) return;
     const manifest = await loadManifest(ctx.cwd);
@@ -11017,7 +11022,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const at = now();
         await withManifestTransaction(cwd, (stored) => {
           const log = ((stored as ManifestWithQueue).unattendedDecisions ??= []);
-          log.push({ at, kind: "root-question", toolCallId: id, answers: plan.answers, reason: "no answer; took the Recommended option", reviewed: false });
+          log.push({ at, kind: "root-question", toolCallId: id, answers: plan.answers, reason: plan.answers.some((item: { declinedRecommended?: string }) => item.declinedRecommended) ? "no answer; took the first option that keeps work moving (a default never pauses or stops work)" : "no answer; took the Recommended option", reviewed: false });
           if (log.length > 200) log.splice(0, log.length - 200);
         }).catch(() => undefined);
         await runHerdr(
@@ -12414,7 +12419,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_operator_run",
     label: "Run State",
     description:
-      "The durable run state (running or paused). status reads it; pause and resume set it, and only when the user or an operator explicitly says so now: never from conversation memory.",
+      "The durable run state (running or paused). status reads it; resume sets it running when an operator says so. Only Zach pauses the run (an operator STOP from him): pause is refused from the root and lanes, so ask him instead.",
     promptSnippet: "Read or set the durable run state (running/paused).",
     parameters: Type.Object({
       action: Type.Union([Type.Literal("status"), Type.Literal("pause"), Type.Literal("resume")]),

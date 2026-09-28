@@ -378,11 +378,19 @@ function summaryFor(screen) {
 }
 
 /** The bounded default for a prompt nobody answers. */
+/** Mirrors root-question.mjs: an option that pauses, stops or parks work. A default never takes one. */
+const STOPS_WORK =
+  /\b(pause[ds]?|pausing|stop(?:s|ped|ping)?|halt(?:s|ed|ing)?|hold(?:s|ing)?(?: off)?|park(?:s|ed|ing)?|freez(?:e|es|ing)|suspend(?:s|ed|ing)?|defer(?:s|red|ring)?|block(?:s|ed|ing)?|abort(?:s|ed|ing)?|wait (?:for|until)|don'?t (?:retry|continue|proceed|dispatch))\b/i;
+
 function defaultFor(screen, worktree, { laneConfinedVerdict }) {
   if (screen.kind === "question") {
-    const recommended = screen.options.find((option) => option.number === screen.recommended);
+    const marked = screen.options.find((option) => option.number === screen.recommended);
+    // The Recommended option only when it keeps work moving, else the first
+    // real option that does; when every option stops work, dismissed.
+    const moving = screen.options.filter((option) => !option.freeText && !/^(type something|chat about this|other)\b/i.test(option.label) && !STOPS_WORK.test(option.label));
+    const recommended = marked && !STOPS_WORK.test(marked.label) ? marked : marked ? moving[0] : undefined;
     return recommended
-      ? { decision: "granted", keys: [String(recommended.number)], reason: `took the Recommended option: ${recommended.label}` }
+      ? { decision: "granted", keys: [String(recommended.number)], reason: recommended === marked ? `took the Recommended option: ${recommended.label}` : `took ${recommended.label}, not the Recommended "${marked.label.replace(/\s*\(Recommended\)\s*$/i, "")}": a default never pauses or stops work` }
       : {
           decision: "denied",
           keys: screen.denyKeys,

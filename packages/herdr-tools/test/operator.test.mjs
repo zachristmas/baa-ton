@@ -194,9 +194,14 @@ test("the run state is durable: operator STOP/RESUME to a root and baa-ton run s
     const out = (text) => lines.push(text);
     await runOperatorCli(["run", "status"], { env, out });
     assert.match(lines.at(-1), /^Run state: running\. A pause exists only when this line says PAUSED/);
-    await sendOperatorMessage({ target: "root", text: "PAUSE EVERYTHING, driving home", from: "ops-assistant", env, config: CONFIG, deliver: async () => [] });
+    // Only Zach pauses the run: a STOP from anyone else is delivered but pauses nothing.
+    const refused = await sendOperatorMessage({ target: "root", text: "PAUSE EVERYTHING, per the default", from: "ops-assistant", env, config: CONFIG, deliver: async () => [] });
+    assert.match(refused.runStateRefused, /only Zach can pause/);
     await runOperatorCli(["run", "status"], { env, out });
-    assert.match(lines.at(-1), /^Run state: PAUSED by ops-assistant \(PAUSE EVERYTHING, driving home\)/);
+    assert.match(lines.at(-1), /^Run state: running\./);
+    await sendOperatorMessage({ target: "root", text: "PAUSE EVERYTHING, driving home", from: "zach", env, config: CONFIG, deliver: async () => [] });
+    await runOperatorCli(["run", "status"], { env, out });
+    assert.match(lines.at(-1), /^Run state: PAUSED by zach \(PAUSE EVERYTHING, driving home\)/);
     await sendOperatorMessage({ target: "herdr-a1/lane-1", text: "RESUME your build", env, config: CONFIG, deliver: async () => [] });
     await runOperatorCli(["run", "status"], { env, out });
     assert.match(lines.at(-1), /PAUSED/, "a message to a lane does not change the run state");

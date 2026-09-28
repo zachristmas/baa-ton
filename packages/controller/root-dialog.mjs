@@ -112,7 +112,8 @@ export async function superviseRootDialog({ orchestrator, manifest, manifestPath
   }
   record.appliedAt = timestamp;
   record.answer = option.label;
-  recordUnattendedDecision(manifest, { at: timestamp, kind: "root-dialog", rootId: orchestrator.id, question: screen.question.slice(0, 300), decision: option.label, reason: `open ${Math.round(ROOT_DIALOG_DEFAULT_MS / 60_000)} min in an autonomous run; took the Recommended option` });
+  const declined = plan.answers[0].declinedRecommended;
+  recordUnattendedDecision(manifest, { at: timestamp, kind: "root-dialog", rootId: orchestrator.id, question: screen.question.slice(0, 300), decision: option.label, reason: `open ${Math.round(ROOT_DIALOG_DEFAULT_MS / 60_000)} min in an autonomous run; ${declined ? `took the first option that keeps work moving, not the Recommended "${declined}" (a default never pauses or stops work)` : "took the Recommended option"}` });
   await notify({ title: "Baa-ton: root question auto-answered", body: `${orchestrator.id}: "${screen.question.slice(0, 160)}" -> ${option.label}` });
   return { changed: true, action: "answered", keys };
 }
