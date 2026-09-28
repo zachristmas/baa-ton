@@ -5042,7 +5042,8 @@ export function createSpawnWatch({
           }).catch(() => undefined);
         }
       }
-      try {
+      // Tests turn the live count off (it reads the real config dir) unless they pass one.
+      if (process.env.BAA_TON_NO_SPAWN_PROBE !== "1" || spawnCounts) try {
         const count = await import("../herdr-tools/inbox/spawn-count.mjs");
         spawnCounts ??= count.createSpawnCountReader();
         const counted = spawnCounts.read();
