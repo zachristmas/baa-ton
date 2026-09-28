@@ -2730,6 +2730,7 @@ function contract(workflow: Workflow, lane: Lane): string {
       ? [`Your working directory is ${workflow.worktree ?? workflow.cwd}, and you start in it. Run commands from it with relative paths; never retype its absolute path (one typo sends you outside it and stops you at a permission prompt).`]
       : []),
     "Write every shell command on one line: no backslash line continuations and no line that is only a backslash. Claude asks about those, and nobody may be there to answer.",
+    "Pass local connection values literally (psql -h localhost -p 5432 ...), never through shell variables such as ${LANE_DB_HOST}: the permission guard cannot expand a variable, treats the host as remote and blocks the command.",
     "Do not create subagents, background jobs, detached tasks, or another agent session.",
     "Run tests synchronously in this pane, or ask the caller to create an explicit Herdr test pane. A command that outlasts the normal timeout runs with a longer timeout or in your harness's own tracked background mode (Claude: the Bash tool's run_in_background), never with &, disown, nohup or setsid.",
     "Never git stash drop, pop or clear: the stash is shared by every worktree of the repository and holds other sessions' work. Set temporary changes aside with a patch file outside the repository (git diff > <scratch>/x.patch; git checkout -- <files>; later git apply <scratch>/x.patch) or a throwaway commit on your own branch.",
@@ -7597,10 +7598,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     options: { allowDirty?: boolean; allowUntracked?: boolean; openElsewhere?: (workspaceId: string) => void } = {},
   ): Promise<WorktreeBinding> {
     const checkoutPath = await assertCleanLocalWorktree(cwd, signal, options);
-    const worktreeList = responseRecord(
-      await runHerdr(["worktree", "list", "--cwd", checkoutPath], signal),
-      "worktree list",
-    );
+    const listWorktrees = async () =>
+      responseRecord(
+        await runHerdr(["worktree", "list", "--cwd", checkoutPath], signal),
+        "worktree list",
+      );
+    let worktreeList = await listWorktrees();
+    // After a Herdr restart the repository's source checkout may be open in
+    // no workspace, so Herdr reports no source_workspace_id. Open one there
+    // (unfocused) and list again, rather than failing every integrate and verify.
+    if (
+      isRecord(worktreeList.source) &&
+      typeof worktreeList.source.source_workspace_id !== "string" &&
+      typeof worktreeList.source.source_checkout_path === "string"
+    ) {
+      await runHerdr(
+        ["workspace", "create", "--cwd", worktreeList.source.source_checkout_path, "--label", `${basename(worktreeList.source.source_checkout_path)} (source)`, "--no-focus"],
+        signal,
+      );
+      worktreeList = await listWorktrees();
+    }
     const source = worktreeList.source;
     const worktrees = worktreeList.worktrees;
     if (!isRecord(source) || !Array.isArray(worktrees))

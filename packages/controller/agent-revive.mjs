@@ -31,10 +31,16 @@ export function reviveCommand(agent) {
  * `paneState(agent)` answers { dead: boolean, reason } or undefined when the
  * pane cannot be read (a pane that is gone cannot be relaunched in either).
  * `run(paneId, command)` types the command into the pane.
+ * `sessionPane(agent)` answers { paneId, workspaceId } where the agent's
+ * session runs now, if anywhere; `paneExists(paneId)` whether the pane is
+ * still there. A Herdr restart renames every pane: a session that lives on
+ * elsewhere is followed, never started a second time, and a pane that is
+ * gone is reported once, not retried.
  */
-export function createAgentReviver({ env = process.env, paneState, run, anomaly = async () => undefined, notify = async () => undefined, clock = () => Date.now() }) {
+export function createAgentReviver({ env = process.env, paneState, run, sessionPane = async () => undefined, paneExists = async () => true, anomaly = async () => undefined, notify = async () => undefined, clock = () => Date.now() }) {
   const deadSince = new Map();
   const exhausted = new Set();
+  const gone = new Set();
   return {
     async tick() {
       const { operatorStorePath, readOperatorStore, withOperatorStore } = await operator();
@@ -49,6 +55,18 @@ export function createAgentReviver({ env = process.env, paneState, run, anomaly 
         if (!state?.dead) {
           deadSince.delete(key);
           exhausted.delete(key);
+          gone.delete(key);
+          continue;
+        }
+        // The same session live in another pane: follow it (never a second copy).
+        const elsewhere = agent.sessionId ? await sessionPane(agent).catch(() => undefined) : undefined;
+        if (elsewhere?.paneId && elsewhere.paneId !== agent.paneId) {
+          await withOperatorStore(storePath, (store) => {
+            const record = store.agents?.[name];
+            if (record && record.paneId === agent.paneId) Object.assign(record, { paneId: elsewhere.paneId, ...(elsewhere.workspaceId ? { workspaceId: elsewhere.workspaceId } : {}) });
+          });
+          deadSince.delete(key);
+          events.push(`${name}: its session ${agent.sessionId} runs in pane ${elsewhere.paneId}; registration moved from ${agent.paneId}`);
           continue;
         }
         const now = clock();
@@ -67,10 +85,21 @@ export function createAgentReviver({ env = process.env, paneState, run, anomaly 
           }
           continue;
         }
+        // A pane that no longer exists cannot be relaunched in: say so once.
+        if (!(await paneExists(agent.paneId).catch(() => true))) {
+          if (!gone.has(key)) {
+            gone.add(key);
+            events.push(`${name}: pane ${agent.paneId} no longer exists and its session runs nowhere; not relaunched (register it again from its new pane)`);
+            await notify({ title: `Baa-ton: ${name} is gone`, body: `${name}'s pane ${agent.paneId} no longer exists and its session is not running anywhere. Start it again and run baa-ton operator register from its pane.` }).catch(() => undefined);
+          }
+          continue;
+        }
         const at = new Date(now).toISOString();
+        let started = true;
         try {
           await run(agent.paneId, command);
         } catch (error) {
+          started = false;
           events.push(`${name}: relaunch in pane ${agent.paneId} failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         // An attempt counts against the budget whether or not it started.
@@ -79,6 +108,7 @@ export function createAgentReviver({ env = process.env, paneState, run, anomaly 
           if (record && record.paneId === agent.paneId) record.revives = [...(record.revives ?? []).filter((item) => now - Date.parse(item) < HOUR_MS), at];
         });
         deadSince.delete(key);
+        if (!started) continue;
         events.push(`${name}: pane ${agent.paneId} was dead (${state.reason}); relaunched with "${agent.resume}"`);
         await anomaly({
           kind: "agent-relaunched",
