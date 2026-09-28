@@ -556,3 +556,30 @@ test("items parked or failed by an infrastructure error are re-armed once; a rea
   Object.assign(again.items.D04, { state: "blocked", blockedReason: "human-gate", note: "preview failed: D04" });
   assert.equal(advanceSpec({ spec: s, state: again, lane: lanes({}), now: at(9) }).state.items.D04.state, "blocked");
 });
+
+test("evidence has no image minimum unless the spec names one; an item resolved by decision that now needs evidence is verified", () => {
+  // (1) No minImages anywhere: 0, and the demo rule asks for no count.
+  const bare = validateSpec({ version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, defaults: { evidence: { report: "artifacts/{id}.docx" } }, items: [{ id: "D01", title: "Item D01", acceptance: { text: "Accept D01.", evidence: { report: "artifacts/d01.docx" } } }, { id: "D05", title: "Item D05", acceptance: { text: "Accept D05." } }] });
+  assert.equal(bare.defaults.evidence.minImages, 0);
+  assert.equal(bare.items[0].acceptance.evidence.minImages, 0);
+  assert.equal(bare.items[1].acceptance.evidence.minImages, 0, "the defaults' evidence applies with no minimum");
+  assert.doesNotMatch(buildObjective(bare, bare.items[0], { branch: "spec/d01" }), /at least \d+ screenshots/);
+  assert.match(buildObjective(bare, bare.items[0], { branch: "spec/d01" }), /a screenshot for every navigation or action/);
+
+  // (2) Resolved by decision, but the spec now asks for evidence and no longer says resolved.
+  const s = spec([
+    { id: "D01", owns: [], acceptance: { text: "Accept D01.", evidence: { report: "artifacts/d01.docx" } } },
+    { id: "D23", owns: [], acceptance: { text: "Accept D23." } },
+    { id: "D24", owns: [], adopt: { resolved: "decided: out of scope" }, acceptance: { text: "Accept D24.", evidence: { report: "artifacts/d24.docx" } } },
+  ]);
+  const resolved = { state: "resolved", resolution: { reason: "Resolved by Zach; no code change needed.", at: at(0) } };
+  const state = { version: 1, items: { D01: { ...resolved }, D23: { ...resolved }, D24: { ...resolved } } };
+  const target = "3".repeat(40);
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), targetSha: target, now: at(1) });
+  assert.equal(step.state.items.D01.state, "verifying");
+  assert.equal(step.state.items.D01.integratedSha, target, "no code of its own: verified against the target tip");
+  assert.equal(step.state.items.D01.resolution, undefined);
+  assert.match(step.state.items.D01.history.at(-1).note, /the spec now requires evidence/);
+  assert.equal(step.state.items.D23.state, "resolved", "no evidence asked for: still resolved");
+  assert.equal(step.state.items.D24.state, "resolved", "the spec still says resolved");
+});
