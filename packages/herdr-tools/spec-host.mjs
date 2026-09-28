@@ -150,7 +150,9 @@ export async function runSpecHost({ cwd = process.cwd(), loadExtension, readSess
       if (result?.actions?.length || result?.rootAsks?.length) void write({ trigger: reason, actions: result.actions, rootAsks: result.rootAsks });
     },
     onError: (error) => void write({ error: String(error?.message ?? error).slice(0, 500) }),
-    // A pass shortly after the manifest changes (lane receipts and statuses).
+    // A pass shortly after the manifest changes (lane receipts and statuses),
+    // at most one every 15 s: the manifest changes all the time.
+    minChangeGapMs: 15_000,
     watch: (onChange) => {
       try {
         const watcher = watchPath(stateDir, (_event, file) => {

@@ -8,6 +8,10 @@
  *   changes (lane receipts and statuses land there).
  * - Never two passes at once: a tick or change during a pass sets a flag,
  *   and exactly one follow-up pass runs when it finishes.
+ * - `minChangeGapMs`: a change (or follow-up) pass waits until that long
+ *   after the last pass ended. The manifest changes all the time (the
+ *   supervisor's own tick writes it), and back-to-back passes made the spec
+ *   host start ~1,700 herdr calls a minute.
  * - A pass that throws backs the timer off (doubling, up to `maxDelayMs`);
  *   the driver's own capacity and shell-timeout backoff still apply inside it.
  */
@@ -39,7 +43,11 @@ export function specDriverTimer({
   intervalMs = SPEC_TIMER_INTERVAL_MS,
   debounceMs = SPEC_TIMER_DEBOUNCE_MS,
   maxDelayMs = SPEC_TIMER_MAX_DELAY_MS,
+  minChangeGapMs = 0,
+  now = () => Date.now(),
 } = {}) {
+  let lastPassEnd = -Infinity;
+  const gapWait = (ms) => Math.max(ms, minChangeGapMs > 0 ? lastPassEnd + minChangeGapMs - now() : 0);
   let tickHandle;
   let debounceHandle;
   let stopWatching;
@@ -75,9 +83,19 @@ export function specDriverTimer({
       onError(error);
     } finally {
       running = false;
+      lastPassEnd = now();
     }
     if (again && !stopped) {
       again = false;
+      if (minChangeGapMs > 0) {
+        if (debounceHandle !== undefined) cancel(debounceHandle);
+        debounceHandle = schedule(() => {
+          debounceHandle = undefined;
+          void pass("follow-up");
+        }, gapWait(0));
+        arm();
+        return;
+      }
       return pass("follow-up");
     }
     arm();
@@ -94,7 +112,7 @@ export function specDriverTimer({
         debounceHandle = schedule(() => {
           debounceHandle = undefined;
           void pass("change");
-        }, debounceMs);
+        }, gapWait(debounceMs));
       });
       arm();
     },

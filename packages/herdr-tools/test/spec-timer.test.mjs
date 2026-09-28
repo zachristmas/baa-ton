@@ -32,6 +32,9 @@ function fakeClock() {
     get pending() {
       return timers.size;
     },
+    get time() {
+      return now;
+    },
   };
 }
 
@@ -131,4 +134,33 @@ test("passes never overlap: a tick or change during a pass leaves exactly one fo
   assert.equal(reasons.at(-1), "change");
   timer.stop();
   assert.equal(changed, undefined, "stop closes the watcher");
+});
+
+test("with minChangeGapMs, a stream of manifest changes runs one pass per gap, not back to back (a live 1,700 herdr calls a minute)", async () => {
+  const clock = fakeClock();
+  const reasons = [];
+  let onChange;
+  const timer = specDriverTimer({
+    run: async () => undefined,
+    log: (_result, reason) => reasons.push(`${reason}@${clock.time}`),
+    schedule: clock.schedule,
+    cancel: clock.cancel,
+    now: () => clock.time,
+    watch: (callback) => ((onChange = callback), () => undefined),
+    intervalMs: 25_000,
+    debounceMs: 2_000,
+    minChangeGapMs: 15_000,
+  });
+  timer.start();
+  onChange();
+  await clock.advance(2_000);
+  assert.deepEqual(reasons, ["change@2000"], "the first change waits only the debounce");
+  // The supervisor writes the manifest every 5 s: each write is a change.
+  for (let second = 3; second <= 16; second += 5) {
+    await clock.advance(5_000);
+    onChange();
+  }
+  await clock.advance(1_000);
+  assert.deepEqual(reasons, ["change@2000", "change@17000"], "the next waits until 15 s after the last pass");
+  timer.stop();
 });
