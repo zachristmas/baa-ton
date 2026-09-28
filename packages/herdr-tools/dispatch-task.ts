@@ -37,9 +37,45 @@ export type DispatchPorts = {
   busyRetryDelayMs?: number;
   /** Poll interval while Herdr has not yet registered a started agent's session. */
   sessionPollMs?: number;
-  /** Upper bound for that wait (default 60 s). */
+  /** Upper bound for that wait (default 60 s, scaled by slowStartMs). */
   sessionWaitMs?: number;
+  /** The supervisor's last process-start probe in ms (spawn-load.mjs); startup waits scale with it. */
+  slowStartMs?: number;
 };
+
+/** Mirrors spawn-load.mjs startupWait: a slow machine means slower lanes, not failed ones. 3x the probe, at least the base, at most 5 min. */
+export function startupWait(port: Pick<DispatchPorts, "slowStartMs">, baseMs: number) {
+  const probe = port.slowStartMs;
+  if (typeof probe !== "number" || !Number.isFinite(probe) || probe <= 0) return baseMs;
+  return Math.max(baseMs, Math.min(5 * 60_000, 3 * probe));
+}
+
+/** The lean lane shell's rc file: no prompt framework, no plugins. */
+export const LANE_ZSHRC = [
+  "# Baa-ton lane shell (written by dispatch). A lane needs no prompt framework:",
+  "# the user's rc files (and powerlevel10k's gitstatusd, which outlives its",
+  "# pane) cost process starts that a slow machine cannot spare. PATH is",
+  "# inherited from Herdr; duplicates are dropped.",
+  "typeset -U path PATH",
+  "PS1='%1~ %# '",
+  "",
+].join("\n");
+
+/**
+ * Tab-create environment for a lane: zsh reads its rc files from ZDOTDIR,
+ * so pointing it at a directory holding only LANE_ZSHRC starts a minimal
+ * shell. Another shell ignores it.
+ */
+export async function laneShellEnv(directory: string): Promise<string[]> {
+  const dir = join(directory, "lane-shell");
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(dir, ".zshrc"), LANE_ZSHRC, { mode: 0o600 });
+    return ["--env", `ZDOTDIR=${dir}`];
+  } catch {
+    return [];
+  }
+}
 
 export type ResumePorts = Omit<DispatchPorts, "contract">;
 
@@ -250,11 +286,11 @@ function laneSessionLog(
  * the only foreground process (shell_pid set and matching). Gating on it
  * removes the tab-create/agent-start race without prompt-string matching. */
 async function waitForShellReady(
-  port: Pick<DispatchPorts, "run">,
+  port: Pick<DispatchPorts, "run" | "slowStartMs">,
   paneId: string,
   signal?: AbortSignal,
 ) {
-  const deadline = Date.now() + 60_000;
+  const deadline = Date.now() + startupWait(port, 60_000);
   while (Date.now() < deadline) {
     const raw = await port.run(
       ["pane", "process-info", "--pane", paneId],
@@ -279,7 +315,7 @@ async function waitForShellReady(
 // Retry only its explicit pre-launch busy rejection, using the same pane and
 // arguments. Timeouts and agent_not_ready may already have launched an agent.
 async function startWhenShellReady(
-  port: Pick<DispatchPorts, "run" | "busyRetryDelayMs">,
+  port: Pick<DispatchPorts, "run" | "busyRetryDelayMs" | "slowStartMs">,
   paneId: string,
   args: string[],
   signal?: AbortSignal,
@@ -287,7 +323,7 @@ async function startWhenShellReady(
   for (let attempt = 0; ; attempt++) {
     await waitForShellReady(port, paneId, signal);
     try {
-      return await port.run(args, signal, 65_000);
+      return await port.run(args, signal, startupWait(port, 60_000) + 5_000);
     } catch (error) {
       if (attempt >= 2 || !/agent_pane_busy/.test(String(error))) throw error;
       await delay(port.busyRetryDelayMs ?? 1_500, { signal });
@@ -304,12 +340,12 @@ async function startWhenShellReady(
  * waits; any failure with a session present is final.
  */
 async function proveStartupWhenSessionReady(
-  port: Pick<DispatchPorts, "run" | "sessionPollMs" | "sessionWaitMs">,
+  port: Pick<DispatchPorts, "run" | "sessionPollMs" | "sessionWaitMs" | "slowStartMs">,
   paneId: string,
   verify: (agent: any) => StartupProof,
   signal?: AbortSignal,
 ): Promise<{ agent: any; proof: StartupProof }> {
-  const deadline = Date.now() + (port.sessionWaitMs ?? 60_000);
+  const deadline = Date.now() + (port.sessionWaitMs ?? startupWait(port, 60_000));
   for (;;) {
     const agent = nativeAgent(await port.run(["agent", "get", paneId], signal));
     try {
@@ -665,6 +701,7 @@ export async function dispatchTask(
             laneTabLabel(lane.objective ?? lane.id),
             "--env",
             `BAA_STARTUP_INTENT=${lane.startupIntentPath}`,
+            ...(await laneShellEnv(port.directory)),
             "--no-focus",
           ],
           signal,
@@ -812,7 +849,7 @@ export async function dispatchTask(
           try {
             await startWhenShellReady(port, lane.paneId!, [
               "agent", "start", lane.agentName!, "--kind", lane.agentKind,
-              "--pane", lane.paneId!, "--timeout", "60000", "--",
+              "--pane", lane.paneId!, "--timeout", String(startupWait(port, 60_000)), "--",
               ...adapters[i].launchArguments(profile, port.source, {
                 startupIntentPath: lane.startupIntentPath!,
                 extraMcpServers: lane.mcpServers,
@@ -859,7 +896,7 @@ export async function dispatchTask(
       // Bounded readiness gate, never an unbounded loop, never an early break
       // on a partial attestation.
       let hello: any = null;
-      const attestationDeadline = Date.now() + 90_000;
+      const attestationDeadline = Date.now() + startupWait(port, 90_000);
       const complete = (value: unknown) =>
         adapters[i].attestationComplete?.(value) ?? true;
       while (Date.now() < attestationDeadline) {
@@ -1255,6 +1292,7 @@ export async function resumeTask(
             laneTabLabel(currentLane.objective ?? currentLane.id),
             "--env",
             `BAA_STARTUP_INTENT=${currentLane.startupIntentPath}`,
+            ...(await laneShellEnv(port.directory)),
             "--no-focus",
           ],
           signal,
@@ -1383,7 +1421,7 @@ export async function resumeTask(
             "--pane",
             lane.paneId!,
             "--timeout",
-            "60000",
+            String(startupWait(port, 60_000)),
             "--",
             ...argumentsForResume,
           ],
@@ -1411,7 +1449,7 @@ export async function resumeTask(
       stage = "resume-startup-proof";
       await port.run(["agent", "get", lane.paneId!], signal);
       let hello: any = null;
-      const deadline = Date.now() + 90_000;
+      const deadline = Date.now() + startupWait(port, 90_000);
       const complete = (value: unknown) => adapter.attestationComplete?.(value) ?? true;
       while (Date.now() < deadline) {
         hello = await readFile(`${lane.startupIntentPath}.ready`, "utf8")

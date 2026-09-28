@@ -556,6 +556,59 @@ test("memory-aware dispatch: a live memory floor holds builds, and a shell start
   }
 });
 
+test("slow process starts: one lane starts per pass until the probe recovers, and a slow-start failure retries in the same pane", async () => {
+  const document = {
+    version: 1,
+    target: { repo: ".", remote: "origin", branch: "feature/release" },
+    items: [{ id: "A", title: "A", owns: ["src/a/**"], acceptance: { text: "a" } }, { id: "B", title: "B", owns: ["src/b/**"], acceptance: { text: "b" } }],
+  };
+  const f = await fixture({ specDocument: document });
+  try {
+    f.ports.spawnProbe = () => 4_500;
+    let result = await f.advance();
+    assert.equal(f.calls.dispatch.length, 1, "throttled: one lane this pass");
+    assert.match(result.content[0].text, /B waits: throttled: process starts are slow \(probe 4500 ms, over 2 s\), so one lane starts at a time/);
+    f.ports.spawnProbe = () => 300;
+    await f.advance();
+    assert.equal(f.calls.dispatch.length, 2, "the probe recovered: B starts");
+  } finally {
+    await f.cleanup();
+  }
+
+  const g = await fixture({ specDocument: { ...document, items: [document.items[0]] } });
+  try {
+    g.ports.dispatch = async (workflowId) => {
+      g.calls.dispatch.push(workflowId);
+      throw new Error("Claude native session reference missing; no work assigned.");
+    };
+    await g.advance();
+    assert.deepEqual(g.calls.dispatch, ["herdr-spec1"]);
+    let state = await g.state();
+    assert.deepEqual(state.items.A.sameSlot, { workflowId: "herdr-spec1", laneId: "lane-1", stage: "build", attempts: 1 });
+    // The failed workflow keeps its pane (dispatch-failed); the driver sees it never started.
+    const manifest = await g.manifest();
+    manifest.workflows.push({ id: "herdr-spec1", status: "dispatch-failed", ownership: { createdBy: "herdr-orchestrator" }, lanes: [{ id: "lane-1", status: "dispatch-failed", specStage: "build", paneId: "w-spec:p9", tabId: "w-spec:t9" }], evidence: [] });
+    await writeFile(join(g.stateDir, "manifest.json"), JSON.stringify(manifest));
+    g.ports.dispatch = async (workflowId) => {
+      g.calls.dispatch.push(workflowId);
+      return { dispatched: true };
+    };
+    // After the infrastructure backoffs the same workflow (its pane) is dispatched again, no new plan.
+    for (const at of ["2026-09-24T12:05:00.000Z", "2026-09-24T12:20:00.000Z", "2026-09-24T12:40:00.000Z"]) {
+      if (g.calls.dispatch.length > 1) break;
+      g.ports.now = () => at;
+      await g.advance();
+    }
+    assert.deepEqual(g.calls.dispatch, ["herdr-spec1", "herdr-spec1"]);
+    assert.equal(g.calls.plan.length, 1);
+    state = await g.state();
+    assert.equal(state.items.A.sameSlot, undefined);
+    assert.deepEqual(state.items.A.lane, { workflowId: "herdr-spec1", laneId: "lane-1" });
+  } finally {
+    await g.cleanup();
+  }
+});
+
 test("an adopted branch with uncommitted changes outside its files, or with no owns, goes to the root instead", async () => {
   const f = await fixture({
     specDocument: {

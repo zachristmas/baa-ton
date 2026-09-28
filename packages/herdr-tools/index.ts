@@ -140,6 +140,8 @@ const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecove
 const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
+const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-load.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/spawn-load.mjs");
+const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
 const { OPERATOR_AUTHORITY, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
@@ -4471,6 +4473,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     cwd: string;
     stops: string[][];
     services?: LaneService[];
+    /** The lane tab's BAA_STARTUP_INTENT: every process it started carries it. */
+    intentPath?: string;
+    /** Ports leased to the lane, checked free after retire. */
+    ports?: number[];
+    /** The lane's own worktree (none for a lane in the project checkout). */
+    worktree?: string;
   };
 
   function acknowledgedPolicy(cwd: string, ack: ApprovalPolicyAck | undefined) {
@@ -4522,10 +4530,58 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           services: ((workflow as WorkflowWithRequests).laneServices ?? []).filter(
             (service) => service.laneId === lane.id && service.state === "active",
           ),
+          ...(lane.startupIntentPath ? { intentPath: lane.startupIntentPath } : {}),
+          ...(workflow.worktree ? { worktree: workflow.worktree } : {}),
+          ports: activeLeases(manifest.leases)
+            .filter((lease) => lease.workflowId === workflow.id && lease.laneId === lane.id)
+            .flatMap((lease) => lease.ports ?? []),
         });
       }
     }
     return candidates;
+  }
+
+  /**
+   * Tabs a finished lane left behind: lanes open service and runtime tabs
+   * with `herdr tab create` from their own shells, and nothing else closes
+   * them. A tab goes when it holds no agent and is either a registered
+   * service pane of this lane, or has every pane inside the lane's own
+   * worktree while no other live lane works there. Never the lane's own tab
+   * (closed already) or another lane's.
+   */
+  async function closeLeftoverTabs(cwd: string, candidate: RetireCandidate, signal?: AbortSignal): Promise<string[]> {
+    const manifest = await loadManifest(cwd);
+    const within = (path: unknown, root: string) => typeof path === "string" && (path === root || path.startsWith(`${root}/`));
+    const laneTabs = new Set<string>();
+    let shared = false;
+    for (const workflow of manifest.workflows)
+      for (const lane of workflow.lanes) {
+        if (workflow.id === candidate.workflowId && lane.id === candidate.laneId) continue;
+        const live = !(lane.retirement && lane.retirement.status !== "partial") && !lane.completionReceipt && !TERMINAL_LANE_STATUSES.has(lane.status);
+        if (lane.tabId && live) laneTabs.add(lane.tabId);
+        if (live && candidate.worktree && workflow.worktree === candidate.worktree && ["starting", "running", "blocked", "unknown"].includes(workflow.status)) shared = true;
+      }
+    const servicePanes = new Set((candidate.services ?? []).filter((service) => service.kind === "pane" && service.paneId).map((service) => service.paneId!));
+    const raw = await runHerdr(["pane", "list"], signal);
+    const record = isRecord(raw) && isRecord(raw.result) ? raw.result : raw;
+    const panes = (isRecord(record) && Array.isArray(record.panes) ? record.panes : []) as Array<Record<string, unknown>>;
+    const byTab = new Map<string, Array<Record<string, unknown>>>();
+    for (const pane of panes) if (typeof pane.tab_id === "string") byTab.set(pane.tab_id, [...(byTab.get(pane.tab_id) ?? []), pane]);
+    const closed: string[] = [];
+    for (const [tabId, tabPanes] of byTab) {
+      if (tabId === candidate.tabId || laneTabs.has(tabId)) continue;
+      if (tabPanes.some((pane) => pane.agent)) continue;
+      const service = tabPanes.every((pane) => servicePanes.has(String(pane.pane_id)));
+      const inWorktree = Boolean(candidate.worktree) && !shared && tabPanes.every((pane) => within(pane.cwd, candidate.worktree!) && within(pane.foreground_cwd ?? pane.cwd, candidate.worktree!));
+      if (!service && !inWorktree) continue;
+      try {
+        await runHerdr(["tab", "close", tabId], signal);
+        closed.push(tabId);
+      } catch {
+        // Gone already, or it closes on the next retire pass.
+      }
+    }
+    return closed;
   }
 
   /** Retire one finished lane: stop its runtime services, close its tab (which
@@ -4588,6 +4644,32 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         else error = `tab close failed: ${clip(message, 500)}`;
       }
     else error = "lane has no recorded tab";
+    // Closing the tab ends its shell, not what the lane left running: dev
+    // stacks, test runners and background shells, some reparented to pid 1.
+    // Every one carries the tab's BAA_STARTUP_INTENT; kill them all, then
+    // check that the lane's ports are free (leases are kept until they are).
+    if (process.env.BAA_TON_NO_PROCESS_SWEEP !== "1") {
+      if (candidate.intentPath)
+        try {
+          const swept = await killLaneProcesses({ intentPath: candidate.intentPath });
+          if (swept.signalled.length || swept.survivors.length)
+            stops.push({
+              command: "lane process tree",
+              code: swept.survivors.length ? 1 : 0,
+              output: clip(`signalled ${swept.signalled.map((item) => `${item.command} (${item.pid})`).join(", ")}${swept.killed?.length ? `; SIGKILL ${swept.killed.join(", ")}` : ""}${swept.survivors.length ? `; still running: ${swept.survivors.join(", ")}` : ""}`, 500),
+            });
+        } catch (sweepError) {
+          stops.push({ command: "lane process tree", code: null, output: clip((sweepError as Error).message, 500) });
+        }
+      try {
+        const leftovers = await closeLeftoverTabs(cwd, candidate, signal);
+        if (leftovers.length) stops.push({ command: "leftover tabs", code: 0, output: `closed ${leftovers.join(", ")}` });
+      } catch (sweepError) {
+        stops.push({ command: "leftover tabs", code: 0, output: `not checked: ${clip((sweepError as Error).message, 300)}` });
+      }
+      const busy = await busyPorts(candidate.ports ?? []).catch(() => []);
+      if (busy.length) stops.push({ command: "ports free", code: 1, output: `still listening: ${busy.join(", ")}` });
+    }
     const stopsOk = stops.every((stop) => stop.code === 0);
     let record: NonNullable<Lane["retirement"]> | undefined;
     await withManifestTransaction(cwd, (manifest) => {
@@ -4648,6 +4730,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     status?(worktree: string): Promise<string>;
     /** Retire one finished lane (close its tab, release its leases). */
     retire?(candidate: RetireCandidate): Promise<unknown>;
+    /** The supervisor's last process-start probe in ms (spawn-load.mjs); tests pass a value. */
+    spawnProbe?(): number | undefined;
     /** Whether Herdr finds a live working (or blocked) agent in this pane; an idle or done agent holds no lock. */
     agentPresent?(paneId: string): Promise<boolean>;
     /** Background work (a suite, build or monitor) the idle agent in this pane still runs, if any. */
@@ -4718,6 +4802,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   const SPEC_ORPHAN_GRACE_MS = 10 * 60_000;
   /** How long the driver starts no new lanes after a shell failed to start. */
   const SPEC_SHELL_BACKOFF_MS = 10 * 60_000;
+  /** A lane that failed only because process starts were slow retries in its own pane this many times before a fresh one. */
+  const SAME_SLOT_ATTEMPTS = 3;
+  const SLOW_START = /shell did not become ready|native session reference missing|attestation incomplete or unavailable|agent_not_ready|timed? ?out/i;
+  /** Actions that start a lane. */
+  const LANE_ACTIONS = new Set(["baseline", "fix-baseline", "decide", "build", "review", "integrate", "verify"]);
 
   /**
    * The spec loop's driver (docs/SPEC-LOOP.md section 4). Runs on every
@@ -5158,6 +5247,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         }
       };
       let shellTimeout = false;
+      // A slow machine (spawn-load.mjs: the supervisor's process-start probe
+      // over 2 s): one new lane per pass, and none while another dispatch is
+      // still starting, until the probe recovers.
+      const spawnProbe = ports?.spawnProbe ? ports.spawnProbe() : readSpawnProbe();
+      const throttled = spawnThrottled(spawnProbe);
+      let laneStarts = throttled ? ((manifest.workflows as Workflow[]).some((workflow) => workflow.status === "starting") ? 0 : 1) : Infinity;
+      const throttledWait = `throttled: process starts are slow (probe ${Math.round(spawnProbe ?? 0)} ms, over 2 s), so one lane starts at a time`;
+      const dispatchLane = (workflowId: string, record?: Record<string, unknown>) => {
+        laneStarts -= 1;
+        // The workflow being started, for the same-pane retry below.
+        if (record) record.dispatching = workflowId;
+        return use.dispatch(workflowId);
+      };
       for (const action of step.actions) {
         if (action.kind === "ask-baseline-receipt") {
           const text = `Your spec baseline lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must start with BASELINE: ${action.targetSha} and SUITE: pass or SUITE: fail, then one FAILED: <package> <task> line per failing task.`;
@@ -5170,7 +5272,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           continue;
         }
         if (action.kind === "baseline" || action.kind === "fix-baseline") {
-          if (shellTimeout) continue;
+          if (shellTimeout || laneStarts <= 0) continue;
           const run = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string }; note?: string; declined?: { reason: string; count: number } } }).baselineRun;
           if (!run) continue;
           try {
@@ -5198,7 +5300,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             });
             run.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
             delete run.note;
-            const result = await use.dispatch(workflow.id);
+            const result = await dispatchLane(workflow.id);
             if (!result.dispatched) run.note = `planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
             done.push(`${action.kind} ${action.targetSha!.slice(0, 12)} -> ${workflow.id}`);
           } catch (error) {
@@ -5224,6 +5326,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         // After a shell failed to start, start nothing else this pass; the
         // items keep their state and are retried after the backoff.
         if (shellTimeout && action.kind !== "decide" && action.kind !== "ask-receipt") continue;
+        if (LANE_ACTIONS.has(action.kind) && laneStarts <= 0) {
+          step.waits[item.id] = throttledWait;
+          continue;
+        }
         if (action.kind === "infer-receipt") {
           // The lane's own final report: its last message after the ask, or
           // else its visible screen. Recorded as its receipt, marked inferred.
@@ -5447,6 +5553,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           ]
             .filter(Boolean)
             .join("\n");
+          // A lane that failed only because this machine started processes
+          // slowly is dispatched again in its own pane (the same slot, no new
+          // tab), up to SAME_SLOT_ATTEMPTS times, before a fresh lane.
+          const again = record.sameSlot as { workflowId: string; laneId: string; stage: string; attempts: number } | undefined;
+          if (again && again.stage === action.kind) {
+            record.lane = { workflowId: again.workflowId, laneId: again.laneId };
+            for (const key of LANE_BOOKKEEPING) delete record[key];
+            record.laneStage = action.kind;
+            delete record.note;
+            const result = await dispatchLane(again.workflowId, record);
+            delete record.sameSlot;
+            delete record.dispatching;
+            if (!result.dispatched) record.note = `${action.kind} redispatched as ${again.workflowId} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
+            done.push(`${action.kind} ${item.id} -> ${again.workflowId} (again in its own pane, attempt ${again.attempts + 1})`);
+            continue;
+          }
           const workflow = await use.plan({
             objective: `spec ${item.id} ${action.kind}${action.attempt > 1 ? ` (attempt ${action.attempt})` : ""}${declined ? ` (retry ${declined.count}: ${declined.kind ?? "declined"})` : ""}: ${item.title}`,
             laneObjective,
@@ -5468,7 +5590,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           for (const key of LANE_BOOKKEEPING) delete record[key];
           record.laneStage = action.kind;
           delete record.note;
-          const result = await use.dispatch(workflow.id);
+          const result = await dispatchLane(workflow.id, record);
+          delete record.dispatching;
           if (!result.dispatched) record.note = `${action.kind} planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
           done.push(`${action.kind} ${item.id} -> ${workflow.id}`);
         } catch (error) {
@@ -5486,6 +5609,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             record.infraAlertedAt = use.now();
             step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${action.kind} lanes failed to start ${record.infraFailures} times in a row (${clip((error as Error).message, 200)}); the driver keeps retrying, check the harness` });
           }
+          // Slow process starts: the next attempt reuses this lane's pane.
+          const failed = record.dispatching && record.lane?.workflowId === record.dispatching ? (record.lane as { workflowId: string; laneId: string }) : undefined;
+          delete record.dispatching;
+          const prior = record.sameSlot as { workflowId: string; attempts: number } | undefined;
+          const attempts = prior && failed && prior.workflowId === failed.workflowId ? prior.attempts + 1 : 1;
+          if (failed && SLOW_START.test((error as Error).message) && attempts <= SAME_SLOT_ATTEMPTS)
+            record.sameSlot = { workflowId: failed.workflowId, laneId: failed.laneId, stage: action.kind, attempts };
+          else delete record.sameSlot;
           if (/shell did not become ready/i.test((error as Error).message)) {
             shellTimeout = true;
             (next as { dispatchBackoff?: unknown }).dispatchBackoff = {
@@ -5565,6 +5696,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         );
         const baselineLane = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane;
         if (baselineLane) current.add(`${baselineLane.workflowId}/${baselineLane.laneId}`);
+        // A lane kept for a same-pane retry after a slow start.
+        for (const record of Object.values(next.items as Record<string, { sameSlot?: { workflowId: string; laneId: string } }>))
+          if (record.sameSlot) current.add(`${record.sameSlot.workflowId}/${record.sameSlot.laneId}`);
         const latest = await loadManifest(ctx.cwd);
         for (const workflow of latest.workflows)
           for (const lane of workflow.lanes) {
@@ -7952,6 +8086,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         source: fileURLToPath(import.meta.url),
         adapter: (kind) => adapters.resolve(kind),
         run: runHerdr,
+        // Startup waits scale with how slowly this machine starts processes.
+        slowStartMs: readSpawnProbe(),
         contract: (w, lane) =>
           contractWithLeases(w, lane, briefLeases.get(lane.id)),
         async update(workflowId, mutate) {
@@ -8359,6 +8495,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         source: fileURLToPath(import.meta.url),
         adapter: (kind) => adapters.resolve(kind),
         run: runHerdr,
+        // Startup waits scale with how slowly this machine starts processes.
+        slowStartMs: readSpawnProbe(),
         async update(workflowId, mutate) {
           const release = await acquireManifestLock(cwd, 10_000);
           try {

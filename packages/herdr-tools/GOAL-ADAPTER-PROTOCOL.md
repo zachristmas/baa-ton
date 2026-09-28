@@ -31,7 +31,7 @@ The supervisor is a **repeating nudge while work waits on the root**. It exists 
   - a workflow `planned` but not dispatched;
   - a pending queue item;
   - an open directive.
-- **What the nudge says:** it names each waiting item, with request, message, workflow and directive IDs, and asks the root to handle them or record a truthful goal state. There is no "observational only" wording.
+- **What the nudge says:** it names each waiting item, with request, message, workflow and directive IDs, and asks the root to handle them (answer, decide, dispatch, end the turn). It never offers pausing or parking work for the user; a truthful goal state is recorded only when the goal is completed. There is no "observational only" wording.
 - **Idle-only delivery (unchanged):**
   - An overdue `nextNudgeAt` and an identity-matched `rootTurn.state: idle` written by the root Pi extension are required.
   - Live Herdr identity and `idle`/`done` readiness are checked again before sending (`done` is Herdr's unseen ready state). A root that is `working` or `blocked` is never prompted, and a due nudge never lands mid-turn; it waits for the next settled turn.

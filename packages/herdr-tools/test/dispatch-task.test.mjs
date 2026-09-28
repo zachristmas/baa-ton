@@ -12,6 +12,8 @@ const {
   laneSlug,
   laneTabLabel,
   resumeTask,
+  LANE_ZSHRC,
+  startupWait,
 } = await jiti.import("../dispatch-task.ts");
 const { piLaunchAdapter } = await jiti.import("../pi-launch-adapter.ts");
 const { claudeLaunchAdapter } = await jiti.import(
@@ -387,6 +389,28 @@ test("opaque IDs and different checkout still produce only tabs in one designate
     await f.close();
   }
 });
+test("lanes start in a lean shell, and startup waits scale with a slow process-start probe", async () => {
+  const f = await fixture();
+  try {
+    f.ports.slowStartMs = 40_000;
+    assert.equal((await f.run()).dispatched, true);
+    const creates = f.calls.filter((call) => call[0] === "tab" && call[1] === "create");
+    const zdotdir = join(f.ports.directory, "lane-shell");
+    for (const call of creates) assert.ok(call.includes(`ZDOTDIR=${zdotdir}`), call.join(" "));
+    assert.equal(await readFile(join(zdotdir, ".zshrc"), "utf8"), LANE_ZSHRC);
+    const commands = LANE_ZSHRC.split("\n").filter((line) => line.trim() && !line.startsWith("#")).join("\n");
+    assert.doesNotMatch(commands, /p10k|powerlevel|source|compinit|\. /, "no prompt framework or sourced rc file");
+    const starts = f.calls.filter((call) => call[0] === "agent" && call[1] === "start");
+    assert.ok(starts.length > 0);
+    for (const call of starts) assert.equal(call[call.indexOf("--timeout") + 1], "120000", "3x a 40 s probe");
+    assert.equal(startupWait({}, 60_000), 60_000);
+    assert.equal(startupWait({ slowStartMs: 10 }, 60_000), 60_000);
+    assert.equal(startupWait({ slowStartMs: 400_000 }, 90_000), 300_000);
+  } finally {
+    await f.close();
+  }
+});
+
 test("shell-init race and a busy rejection self-heal within one dispatch", async () => {
   const f = await fixture({ busy: true, shellInits: 3 });
   try {

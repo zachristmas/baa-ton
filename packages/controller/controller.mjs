@@ -10,6 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
+  readdir,
   readFile,
   rename,
   rm,
@@ -3371,7 +3372,9 @@ function supervisorWakeText(goal, reasons = []) {
     ...reasons.map((reason, index) => `${index + 1}) ${reason}`),
     `Objective: ${goal.objective}`,
     `Next action: ${goal.nextAction}`,
-    "Handle these now through safe local actions, or record a truthful goal state: completed, paused, or action-required with the question for Zach. Do not push, merge, create a PR, deploy, or mutate production without explicit user approval.",
+    // Never an invitation to park: a root that waited in its turn for Zach's
+    // answer ran into the 30-minute interrupt.
+    "Handle these now through safe local actions: answer each request, decide, dispatch, then end the turn. Never pause, park or wait in your turn for Zach: decide under the escalation policy (only unclear requirements go to him, tagged [unclear-requirements], and you end the turn after asking). Record a truthful goal state only when the goal is completed; only Zach pauses the run. Do not push, merge, create a PR, deploy, or mutate production without explicit user approval.",
   ].join("\n");
 }
 
@@ -4618,6 +4621,14 @@ export async function runSupervisorLoop({
   // Dead-pane relaunch of registered agents (agent-revive.mjs); tests pass a
   // fake, false turns it off.
   revive,
+  // The hook queue (hook.sh): drained apart from the tick, so a long tick
+  // never delays an event. The real runner turns it on.
+  hookQueue = false,
+  hookQueueMs = 1_000,
+  // The process-start probe (spawn-load.mjs) and the orphaned-shell report,
+  // apart from the tick. The real runner turns it on.
+  spawnWatch = false,
+  spawnProbeMs = 60_000,
 } = {}) {
   assert(
     Number.isSafeInteger(intervalMs) && intervalMs >= 5_000,
@@ -4748,6 +4759,10 @@ export async function runSupervisorLoop({
   let stopping = false;
   let ticking = false;
   let timer;
+  let hookTimer;
+  let draining;
+  let probeTimer;
+  let probing;
   let inFlightTick;
   let lastTickError;
   let lastUpdateError;
@@ -4755,6 +4770,10 @@ export async function runSupervisorLoop({
     if (stopping) return;
     stopping = true;
     if (timer) clearInterval(timer);
+    if (hookTimer) clearInterval(hookTimer);
+    if (probeTimer) clearInterval(probeTimer);
+    // A probe in flight is not waited for: it only times a process start.
+    await draining;
     // Keep the lease until a tick that already owns the manifest lock has
     // settled. A restart must see this process as the supervisor rather than
     // overlap a late socket delivery with a new scheduler.
@@ -4846,7 +4865,29 @@ export async function runSupervisorLoop({
   // immediate startup nudge race that restoration; the first normal interval
   // is the server-settle window, then later ticks retain the same cadence.
   timer = setInterval(() => void tick(), intervalMs);
-  return { started: true, stop, tick };
+  const drainHooks = () => {
+    if (draining || stopping) return draining;
+    draining = drainHookQueue({ configDir: resolvedConfigDir, stateDir: resolvedStateDir, herdr, log: (message) => supervisorLog(resolvedConfigDir, message) })
+      .catch((error) => supervisorLog(resolvedConfigDir, `hook queue failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => {
+        draining = undefined;
+      });
+    return draining;
+  };
+  if (hookQueue) hookTimer = setInterval(() => void drainHooks(), hookQueueMs);
+  const watch = spawnWatch ? createSpawnWatch({ log: (message) => supervisorLog(resolvedConfigDir, message) }) : undefined;
+  const probeSpawn = () => {
+    if (!watch || probing || stopping) return probing;
+    probing = watch.tick().catch((error) => supervisorLog(resolvedConfigDir, `spawn probe failed: ${error instanceof Error ? error.message : String(error)}`)).finally(() => {
+      probing = undefined;
+    });
+    return probing;
+  };
+  if (watch) {
+    void probeSpawn();
+    probeTimer = setInterval(() => void probeSpawn(), spawnProbeMs);
+  }
+  return { started: true, stop, tick, drainHooks, probeSpawn };
 }
 
 /**
@@ -4923,6 +4964,133 @@ function spawnSupervisorRunner() {
   });
 }
 
+/**
+ * The supervisor's view of machine load (docs/SELF-HEALING.md). Each tick
+ * times a bare Node start and records it for dispatch (spawn-load.mjs):
+ * startup waits scale with it, and above 2 s the spec driver starts one lane
+ * at a time. The probe and throttle state are logged when the state changes
+ * and every 10 min. Once an hour, shells reparented to pid 1 and older than
+ * a day are reported once (they cost nothing but hold terminals and memory).
+ */
+export function createSpawnWatch({
+  log,
+  measure,
+  record,
+  table,
+  anomaly = async (value) => {
+    const { reportAnomaly } = await import("./anomalies.mjs");
+    return reportAnomaly(value, { timestamp: now(), notify: herdrNotification });
+  },
+  clock = () => Date.now(),
+  logEveryMs = 10 * 60_000,
+  orphanEveryMs = 60 * 60_000,
+} = {}) {
+  let lastState;
+  let lastLog = 0;
+  let lastOrphans = -Infinity;
+  return {
+    async tick() {
+      const load = await import("../herdr-tools/inbox/spawn-load.mjs");
+      const ms = await (measure ?? load.measureSpawn)();
+      const throttled = load.spawnThrottled(ms);
+      (record ?? load.recordSpawnProbe)({ ms, at: new Date(clock()).toISOString(), throttled });
+      const state = throttled ? "throttled" : "normal";
+      if (state !== lastState || clock() - lastLog >= logEveryMs) {
+        log(`spawn probe: ${ms} ms; dispatch ${throttled ? "throttled: one lane at a time" : "normal"}${lastState && state !== lastState ? ` (was ${lastState})` : ""}`);
+        lastState = state;
+        lastLog = clock();
+      }
+      if (clock() - lastOrphans >= orphanEveryMs) {
+        lastOrphans = clock();
+        const processes = await import("../herdr-tools/inbox/lane-processes.mjs");
+        const orphans = processes.orphanShells(await (table ?? processes.readProcessTable)());
+        if (orphans.length) {
+          const days = (item) => `${item.command.split("/").pop()} ${item.pid} (${Math.floor((item.ageMs ?? 0) / 86_400_000)} d)`;
+          log(`orphaned shells older than a day: ${orphans.map(days).join(", ")}`);
+          await anomaly({
+            kind: "orphan-shells",
+            signature: `orphan-shells:${orphans.map((item) => item.pid).sort((a, b) => a - b).join(",")}`,
+            summary: `${orphans.length} shell process(es) reparented to pid 1 and older than a day: ${orphans.slice(0, 10).map(days).join(", ")}`,
+            evidence: orphans.slice(0, 20).map((item) => `pid ${item.pid}: ${item.command}`),
+          }).catch(() => undefined);
+        }
+      }
+      return { ms, throttled };
+    },
+  };
+}
+
+/**
+ * The hook queue (hook.sh). Herdr's event hook only writes the event to
+ * <configDir>/hook-queue/<id>.event (line 1 the event name, the rest its
+ * JSON) and exits, so a burst of pane events starts no Node process per
+ * event. The supervisor handles the queue in order, one event at a time. A
+ * file is claimed by an atomic rename first, so a Node fallback draining at
+ * the same time never handles an event twice.
+ */
+export const HOOK_QUEUE_DIR = "hook-queue";
+const HOOK_CLAIM_STALE_MS = 10 * 60_000;
+
+export async function drainHookQueue({
+  configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? process.env.HERDR_PLUGIN_STATE_DIR,
+  stateDir = process.env.HERDR_PLUGIN_STATE_DIR ?? configDir,
+  herdr,
+  handle = handleHook,
+  log = (message) => supervisorLog(configDir, message),
+  nowMs = Date.now(),
+} = {}) {
+  const queue = join(configDir, HOOK_QUEUE_DIR);
+  await mkdir(queue, { recursive: true, mode: 0o700 });
+  const names = await readdir(queue).catch(() => []);
+  const entries = [];
+  for (const name of names) {
+    const path = join(queue, name);
+    let stats;
+    try {
+      stats = statSync(path);
+    } catch {
+      continue;
+    }
+    // A claim whose drainer died, or a write that never finished.
+    if ((name.includes(".claimed-") || name.endsWith(".tmp")) && nowMs - stats.mtimeMs > HOOK_CLAIM_STALE_MS) {
+      await rm(path, { force: true });
+      log(`hook queue: dropped stale ${name}`);
+      continue;
+    }
+    if (name.endsWith(".event")) entries.push({ name, path, at: stats.mtimeMs });
+  }
+  // The fallback lock of a hook that was killed mid-run.
+  try {
+    if (nowMs - statSync(`${queue}.fallback`).mtimeMs > HOOK_CLAIM_STALE_MS) await rm(`${queue}.fallback`, { recursive: true, force: true });
+  } catch {
+    // No lock.
+  }
+  entries.sort((a, b) => a.at - b.at || a.name.localeCompare(b.name));
+  let handled = 0;
+  for (const entry of entries) {
+    const claimed = `${entry.path.slice(0, -".event".length)}.claimed-${process.pid}`;
+    try {
+      await rename(entry.path, claimed);
+    } catch {
+      continue; // Another drainer took it.
+    }
+    try {
+      const text = await readFile(claimed, "utf8");
+      const newline = text.indexOf("\n");
+      const eventName = newline < 0 ? text : text.slice(0, newline);
+      const eventJson = newline < 0 ? "" : text.slice(newline + 1);
+      const result = await handle({ eventName, eventJson, stateDir, configDir, ...(herdr ? { herdr } : {}) });
+      if (result?.blocked) log(`hook: ${JSON.stringify(hookResponse(result)).slice(0, 400)}`);
+      handled += 1;
+    } catch (error) {
+      log(`hook ${entry.name} failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await rm(claimed, { force: true });
+    }
+  }
+  return { handled, queued: entries.length };
+}
+
 export function hookResponse(result) {
   if (result.ignored)
     return { accepted: true, ignored: true, reason: result.reason };
@@ -4968,6 +5136,24 @@ async function main() {
     }
     return;
   }
+  if (command === "hook-drain") {
+    // hook.sh's fallback, when queued events sat unhandled for 2 min: start
+    // the supervisor again if it died, then handle the queue here.
+    try {
+      const { ensureSupervisor } = await import("./supervisor-keepalive.mjs");
+      await ensureSupervisor({
+        configDir: supervisorDir,
+        anomaly: async (anomaly) => {
+          const { reportAnomaly } = await import("./anomalies.mjs");
+          return reportAnomaly(anomaly, { timestamp: now(), notify: herdrNotification });
+        },
+      });
+    } catch {
+      // Best effort: the next fallback tries again.
+    }
+    process.stdout.write(`${JSON.stringify(await drainHookQueue({ configDir: supervisorDir }))}\n`);
+    return;
+  }
   if (command === "supervisor-once") {
     process.stdout.write(`${JSON.stringify(await runSupervisorTick())}\n`);
     return;
@@ -4980,12 +5166,14 @@ async function main() {
   if (command === "supervisor-run") {
     guardSupervisorProcess("runner", supervisorDir);
     await runSupervisorLoop({
+      hookQueue: true,
+      spawnWatch: true,
       onCodeChange: () => process.exit(SUPERVISOR_RESTART_EXIT_CODE),
     });
     return;
   }
   throw new ControllerError(
-    "Usage: node controller.mjs <hook|supervisor-once|supervisor|supervisor-run>.",
+    "Usage: node controller.mjs <hook|hook-drain|supervisor-once|supervisor|supervisor-run>.",
     "usage",
   );
 }
