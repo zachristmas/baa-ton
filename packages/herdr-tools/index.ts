@@ -150,8 +150,8 @@ const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-proces
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
 const { OPERATOR_AUTHORITY, runStateFromText, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
-const { SPEC_PATH, SPEC_STATE_PATH, finalReportPath, gitAncestor, loadSpec, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { SPEC_PATH, SPEC_STATE_PATH, demoOnPreview, finalReportPath, gitAncestor, loadSpec, previewHealthUrl, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
+const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, demoRunObjective, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, globToRegExp, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -4943,6 +4943,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const refs = [
           ...(Object.values(state.items ?? {}) as Array<{ lane?: { workflowId: string; laneId: string } }>).map((record) => record.lane),
           (state as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane,
+          (state as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane,
         ].filter((ref): ref is { workflowId: string; laneId: string } => Boolean(ref));
         const readLive =
           ports?.liveStatus ??
@@ -5402,7 +5403,105 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         if (record) record.dispatching = workflowId;
         return use.dispatch(workflowId);
       };
+      // A detached checkout of one commit for verification and demos. Reuse:
+      // an existing worktree is switched to the commit and cleaned of
+      // untracked files, keeping ignored ones (the install, build caches).
+      // Only a missing or broken one is created fresh.
+      const detachedWorktree =
+        ports?.detachedWorktree ??
+        (async ({ repo: repoPath, path, sha }: { repo: string; path: string; sha: string }) => {
+          const existing = await execFile("git", ["-C", path, "rev-parse", "--is-inside-work-tree"], { timeout: 30_000 }).then(() => true, () => false);
+          if (existing) {
+            try {
+              await execFile("git", ["-C", path, "checkout", "--detach", "--force", sha], { signal, timeout: 120_000 });
+              await execFile("git", ["-C", path, "clean", "-fd"], { signal, timeout: 120_000 });
+              return;
+            } catch {
+              // Fall through to a fresh worktree.
+            }
+          }
+          await execFile("git", ["-C", repoPath, "worktree", "remove", "--force", path], { timeout: 60_000 }).catch(() => undefined);
+          await rm(path, { recursive: true, force: true });
+          await mkdir(dirname(path), { recursive: true });
+          await execFile("git", ["-C", repoPath, "worktree", "add", "--detach", path, sha], { signal, timeout: 120_000 });
+        });
+      type DemoRun = { items: string[]; sha: string; lane?: { workflowId: string; laneId: string }; worktree?: string; startedAt?: string; note?: string };
       for (const action of step.actions) {
+        if (action.kind === "ask-demo-receipt") {
+          const text = `Your spec demo run lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now: one line per item, DEMO: <id> written or DEMO: <id> blocked <why> (DEMO-STACK: blocked <why> if the stack never started). A plain-text report is not a receipt.`;
+          try {
+            const told = await (ports?.tell ?? ((input: { workflowId: string; laneId: string; text: string }) => tellLane(ctx.cwd, input, signal)))({ ...action.lane!, text });
+            done.push(`asked the demo run for its receipt (${told.message.delivery.status})`);
+          } catch (error) {
+            done.push(`demo run receipt ask failed: ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
+        if (action.kind === "demo-run") {
+          if (shellTimeout || laneStarts <= 0) continue;
+          const run = (next as { demoRun?: DemoRun }).demoRun;
+          if (!run || run.lane) continue;
+          const items = run.items.map((id) => spec.items.find((candidate) => candidate.id === id)).filter((item): item is (typeof spec.items)[number] => Boolean(item?.acceptance.evidence));
+          if (!items.length) {
+            delete (next as { demoRun?: DemoRun }).demoRun;
+            continue;
+          }
+          try {
+            // The one shared verify worktree, with its install: one stack.
+            const worktree = join(worktreeRoot, "spec-verify");
+            await detachedWorktree({ repo, path: worktree, sha: run.sha });
+            await restoreGeneratedIn(worktree, "verify");
+            // The lease covers the whole run: one lane holds its runtime
+            // leases until it is retired, plus every item's demo pins.
+            const union = { dirs: new Set<string>(), ports: new Set<number>(), databases: new Set<string>() };
+            for (const item of items) {
+              const pins = findDemoPins(worktree, item.id);
+              for (const dir of pins?.dirs ?? []) union.dirs.add(dir);
+              for (const port of pins?.ports ?? []) union.ports.add(port);
+              for (const database of pins?.databases ?? []) union.databases.add(database);
+            }
+            const pins = union.ports.size || union.databases.size ? { dirs: [...union.dirs], ports: [...union.ports], databases: [...union.databases] } : undefined;
+            const startedAt = use.now();
+            const reports = Object.fromEntries(
+              items.map((item) => [
+                item.id,
+                {
+                  path: finalReportPath(spec, item.acceptance.evidence!.report),
+                  ...(demoOnPreview(spec, item) ? { preview: { health: previewHealthUrl(spec), wakePattern: spec.target.preview?.wakePattern } } : {}),
+                },
+              ]),
+            );
+            const workflow = await use.plan({
+              objective: `spec demo run at ${run.sha.slice(0, 12)}: ${items.map((item) => item.id).join(", ")}`,
+              laneObjective: [demoRunObjective(spec, items, { worktree, sha: run.sha, reports }), RECEIPT_RULE, DECLINE_RULE].join("\n"),
+              readOnly: false,
+              taskProfile: spec.stages.verify?.profile ?? "quick",
+              worktree,
+              specStage: "verify",
+              ...(pins ? { demoPins: pins } : {}),
+            });
+            run.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+            run.worktree = worktree;
+            run.startedAt = startedAt;
+            delete run.note;
+            for (const item of items) {
+              const record = next.items[item.id];
+              if (!record) continue;
+              record.demoRun = { sha: run.sha, worktree, startedAt, workflowId: workflow.id };
+              delete record.evidenceProblem;
+            }
+            const result = await dispatchLane(workflow.id);
+            if (!result.dispatched) run.note = `planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
+            done.push(`demo run ${items.map((item) => item.id).join(", ")} -> ${workflow.id}`);
+          } catch (error) {
+            const failures = ((next as { demoRunInfraFailures?: number }).demoRunInfraFailures ?? 0) + 1;
+            const retryAfter = new Date(Date.parse(use.now()) + infraBackoffMs(failures)).toISOString();
+            Object.assign(next, { demoRunInfraFailures: failures, demoRunRetryAfter: retryAfter });
+            delete (next as { demoRun?: DemoRun }).demoRun;
+            done.push(`demo run failed (infrastructure; a fresh run after ${retryAfter}): ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
         if (action.kind === "ask-baseline-receipt") {
           const text = `Your spec baseline lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must start with BASELINE: ${action.targetSha} and SUITE: pass or SUITE: fail, then one FAILED: <package> <task> line per failing task.`;
           try {
@@ -5554,27 +5653,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             objective = decideObjective(spec, item);
           } else if (action.kind === "verify") {
             profile = spec.stages.verify?.profile ?? "quick";
-            await (ports?.detachedWorktree ??
-              (async ({ repo: repoPath, path, sha }: { repo: string; path: string; sha: string }) => {
-                // Reuse: an existing worktree is switched to the commit and
-                // cleaned of untracked files, keeping ignored ones (the
-                // install, build caches). Only a missing or broken one is
-                // created fresh.
-                const existing = await execFile("git", ["-C", path, "rev-parse", "--is-inside-work-tree"], { timeout: 30_000 }).then(() => true, () => false);
-                if (existing) {
-                  try {
-                    await execFile("git", ["-C", path, "checkout", "--detach", "--force", sha], { signal, timeout: 120_000 });
-                    await execFile("git", ["-C", path, "clean", "-fd"], { signal, timeout: 120_000 });
-                    return;
-                  } catch {
-                    // Fall through to a fresh worktree.
-                  }
-                }
-                await execFile("git", ["-C", repoPath, "worktree", "remove", "--force", path], { timeout: 60_000 }).catch(() => undefined);
-                await rm(path, { recursive: true, force: true });
-                await mkdir(dirname(path), { recursive: true });
-                await execFile("git", ["-C", repoPath, "worktree", "add", "--detach", path, sha], { signal, timeout: 120_000 });
-              }))({ repo, path: worktree, sha: record.integratedSha ?? record.integration?.sha });
+            await detachedWorktree({ repo, path: worktree, sha: record.integratedSha ?? record.integration?.sha });
             await restoreGeneratedIn(worktree, "verify");
             record.verifyWorktree = worktree;
             objective = verifyObjective(spec, item, {
@@ -5773,6 +5852,20 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // decide: only it moves an item to done.
       for (const item of spec.items) {
         const record = next.items[item.id];
+        // A demo run's report counts as soon as it is written (with its
+        // steps manifest, after the run started): no per-item receipt.
+        if (record?.state === "verifying" && !record.verified && record.demoRun?.worktree && item.acceptance.evidence) {
+          const relative = finalReportPath(spec, item.acceptance.evidence.report);
+          const written = isAbsolute(relative) ? relative : join(record.demoRun.worktree, relative);
+          const report = await stat(written).catch(() => undefined);
+          const steps = await stat(`${written}.steps.json`).catch(() => undefined);
+          const since = Date.parse(record.demoRun.startedAt ?? "") || 0;
+          if (report && steps && report.mtimeMs >= since && steps.mtimeMs >= since && report.mtimeMs > (record.demoRun.pickedMtime ?? 0)) {
+            record.demoRun.pickedMtime = report.mtimeMs;
+            Object.assign(record, { verified: use.now(), finalReport: relative, verifyWorktree: record.demoRun.worktree });
+            record.history = [...(record.history ?? []), { at: use.now(), from: "verifying", to: "verifying", note: `demo run ${record.demoRun.workflowId ?? ""} wrote ${relative}: verifying it now` }];
+          }
+        }
         if (record?.state !== "verifying" || !record.verified) continue;
         if (item.acceptance.evidence && record.finalReport && record.evidence?.reportAt !== record.verified) {
           const written = isAbsolute(record.finalReport) ? record.finalReport : join((record.verifyWorktree as string | undefined) ?? integrationWorktree, record.finalReport);
@@ -5837,6 +5930,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         );
         const baselineLane = (next as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane;
         if (baselineLane) current.add(`${baselineLane.workflowId}/${baselineLane.laneId}`);
+        const demoLane = (next as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane;
+        if (demoLane) current.add(`${demoLane.workflowId}/${demoLane.laneId}`);
         // A lane kept for a same-pane retry after a slow start.
         for (const record of Object.values(next.items as Record<string, { sameSlot?: { workflowId: string; laneId: string } }>))
           if (record.sameSlot) current.add(`${record.sameSlot.workflowId}/${record.sameSlot.laneId}`);

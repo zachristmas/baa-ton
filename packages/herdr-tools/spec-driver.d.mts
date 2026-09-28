@@ -4,7 +4,7 @@ export const ACTIVE_STATES: Set<string>;
 export function globsOverlap(left: string, right: string): boolean;
 export function reviewVerdict(summary: unknown): "pass" | "fail" | undefined;
 export type SpecAction = {
-  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt" | "infer-receipt";
+  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt" | "infer-receipt" | "demo-run" | "ask-demo-receipt";
   /** ask-receipt: the pointed second ask. infer-receipt: when the first ask went out. */
   pointed?: boolean;
   since?: string;
@@ -21,6 +21,8 @@ export type SpecAction = {
   /** verify: the item's tests with no run at its integrated commit, and whether they are all the lane does. */
   tests?: string[];
   testsOnly?: boolean;
+  /** demo-run: the items the run demos, in order. */
+  items?: string[];
 };
 export const RECEIPT_ASK_TIMEOUT_MS: number;
 export const RECEIPT_REASK_BASE_MS: number;
@@ -71,6 +73,8 @@ export function integrateObjective(
   },
 ): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; tests: Array<{ command: string; result: string }>; report?: string };
+export function demoRunResult(summary: unknown): { items: Map<string, { result: "written" | "blocked"; reason: string }>; stackBlocked?: string };
+export function demoRunObjective(spec: Spec, items: SpecItem[], options: { worktree?: string; sha: string; reports: Record<string, { path: string; preview?: { health?: string; wakePattern?: string } }>; pins?: string[] }): string;
 export function untestedAtIntegration(item: SpecItem, current: { integratedSha?: string; tests?: unknown } | undefined): string[];
 export function verifyObjective(spec: Spec, item: SpecItem, options: { worktree?: string; releaseSha?: string; reportPath: string; evidenceProblem?: string; tests?: string[]; testsOnly?: boolean }): string;
 export function specCommitMessage(itemId: string, subject: string): string;

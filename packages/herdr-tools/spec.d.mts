@@ -35,6 +35,9 @@ export type Spec = {
     fixBaseline?: boolean;
     /** Declines per profile before the stage's next fallback profile (default 2). */
     maxDeclines?: number;
+    /** One sequential demo lane on one long-lived dev stack (seedReset: the command that resets the seed between items). */
+    demoRunner?: { seedReset?: string; maxItems?: number };
+    maxDevStacks?: number;
     /** Evidence for every item without its own (report path with {id}). */
     evidence?: { report: string; minImages: number };
   };
@@ -86,3 +89,6 @@ export function releaseShaFrom(body: string): string | undefined;
 export const DEFAULT_GENERATED_ARTIFACTS: string[];
 export function docxEntry(buffer: Buffer, name: string): Buffer | undefined;
 export function docxCaptions(buffer: Buffer): { images: number; uncaptioned: number } | undefined;
+export function previewHealthUrl(spec: Spec): string | undefined;
+export function demoOnPreview(spec: Spec, item: SpecItem): boolean;
+export function previewHealthProblem(spec: Spec, item: SpecItem, steps: unknown[]): string | undefined;

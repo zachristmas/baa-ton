@@ -155,6 +155,46 @@ export function verifyResult(summary) {
   return { previews, tests, ...(report ? { report } : {}) };
 }
 
+/** Parse a demo run's receipt: DEMO: <id> written|blocked [reason] lines, and DEMO-STACK: blocked <why>. */
+export function demoRunResult(summary) {
+  const lines = String(summary ?? "").split("\n");
+  const items = new Map();
+  for (const line of lines) {
+    const match = /^\s*DEMO\s*:\s*([\w.-]+)\s+(written|done|blocked|skipped)\b[\s:,-]*(.*)$/i.exec(line);
+    if (match) items.set(match[1], { result: /^(written|done)$/i.test(match[2]) ? "written" : "blocked", reason: match[3].trim() });
+  }
+  const stackBlocked = lines.map((line) => /^\s*DEMO-STACK\s*:\s*blocked\b[\s:,-]*(.*)$/i.exec(line)?.[1]).find((reason) => reason !== undefined);
+  return { items, ...(stackBlocked !== undefined ? { stackBlocked: stackBlocked.trim() || "blocked" } : {}) };
+}
+
+/** The demo runner lane's objective: one dev stack, each item's demo in turn. */
+export function demoRunObjective(spec, items, { worktree, sha, reports, pins }) {
+  const reset = spec.defaults.demoRunner?.seedReset;
+  return [
+    `Run the feature demos of ${items.length} spec item(s), one after another, on one local dev stack at commit ${sha} (the target tip; it contains every item below).`,
+    worktree ? `Your worktree is ${worktree} (a detached checkout of that commit), and you start in it: run every command from it with relative paths, never cd into a retyped absolute path.` : "",
+    "Start the dev stack once, on your leased ports and databases (and the demo pins below), and keep it up for the whole run. Never restart it between items; restart it only if it crashed, and say so in your receipt.",
+    reset
+      ? `Before each item, reset the seed data with ${reset} against the running database; the stack stays up.`
+      : "Before each item, reset the seed data against the running database with the project's own seed or reset script, without restarting the stack.",
+    "Stop the stack when every item is done.",
+    LONG_COMMANDS,
+    "The items, in order:",
+    ...items.map((item, index) => {
+      const report = reports[item.id];
+      return [
+        `${index + 1}. ${item.id}: ${item.title}. Acceptance: ${item.acceptance.text}`,
+        `   ${demoRule(report.path, item.acceptance.evidence.minImages, report.preview)}`,
+      ].join("\n");
+    }),
+    ...(pins?.length ? pins : []),
+    "Write each item's report (the .docx and its steps manifest) as soon as its demo is done, before you start the next item: the driver picks each one up and verifies it right away. Keep each item's screenshots in its own steps directory.",
+    "If one item's demo cannot be done, say why and move on to the next; do not stop the run for it.",
+    "Do not change code or Git state; this lane only runs demos.",
+    "Finish with herdr_complete. In the summary, one line per item: DEMO: <id> written, or DEMO: <id> blocked <why>. If the stack could not be started at all, a line DEMO-STACK: blocked <why>.",
+  ].filter(Boolean).join("\n");
+}
+
 /** An item's acceptance tests with no run recorded at its integrated commit
  * (an item a batch lane merged is integrated with none). A recording at the
  * item's own integrated commit stays valid however far the target moves. */
@@ -973,9 +1013,98 @@ for (const item of spec.items) {
   const devStacks = spec.defaults.maxDevStacks ?? 1;
   const runsDevStack = (item) => Boolean(item.acceptance.evidence);
   const onDevStack = spec.items.filter((item) => runsDevStack(item) && next.items[item.id]?.state === "verifying" && next.items[item.id]?.lane).map((item) => item.id);
+
+  // 1d1. The demo runner (defaults.demoRunner): one lane runs the demos of
+  // every verifying item that needs only its demo, one at a time, on one
+  // long-lived local dev stack at the target tip (it contains every pushed
+  // item), resetting the seed between items. Each report is picked up and
+  // verified as soon as it is written (the controller watches the files);
+  // the run's receipt only ends the run.
+  const runner = spec.defaults.demoRunner;
+  const demoOnly = (item, current) =>
+    Boolean(runner) &&
+    current?.state === "verifying" &&
+    !current.lane &&
+    !current.verified &&
+    Boolean(item.acceptance.evidence) &&
+    !item.acceptance.preview.length &&
+    !untestedAtIntegration(item, current).length;
+  if (runner && next.demoRun?.lane) {
+    const run = next.demoRun;
+    const view = lane(run.lane);
+    const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone") && !background.has(`${run.lane.workflowId}/${run.lane.laneId}`);
+    // A lane not in the manifest yet is starting; one missing for 30 min is gone.
+    const missing = !view && Date.parse(now) - Date.parse(run.requestedAt ?? now) > 30 * 60_000;
+    const ended = missing || (view && (LANE_ENDED.has(view.status ?? "") || view.workflowStatus === "dispatch-failed"));
+    const overdue = idle && run.askedAt && Date.parse(now) - Date.parse(run.askedAt) > RECEIPT_ASK_TIMEOUT_MS;
+    if (view?.receipt || ended || overdue) {
+      const result = demoRunResult(view?.receipt?.summary);
+      const neverStarted = view?.status === "dispatch-failed" || view?.workflowStatus === "dispatch-failed";
+      for (const id of run.items) {
+        const current = next.items[id];
+        const line = result.items.get(id);
+        if (current?.state !== "verifying" || current.verified || current.evidence) continue;
+        // Written at the end of the run: the controller picks it up this
+        // pass; it joins no new run meanwhile.
+        if (line?.result === "written") current.evidenceRetryAfter = new Date(Date.parse(now) + 10 * 60_000).toISOString();
+        else if (line?.result === "blocked" || (!line && !result.stackBlocked && !neverStarted)) {
+          current.evidenceProblem = line?.reason ? `the demo run could not do it: ${line.reason}` : "the demo run ended without writing its report";
+          current.evidenceRetryAfter = new Date(Date.parse(now) + 10 * 60_000).toISOString();
+        }
+        (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `demo run ${run.lane.workflowId} ended: ${line ? `${line.result}${line.reason ? ` (${line.reason.slice(0, 120)})` : ""}` : result.stackBlocked ? `the stack could not start (${result.stackBlocked.slice(0, 120)})` : "no DEMO line for it"}` });
+      }
+      // A stack that never came up, or a lane that never started, is
+      // infrastructure: the whole run is retried after a backoff.
+      if (result.stackBlocked || neverStarted) {
+        next.demoRunInfraFailures = (next.demoRunInfraFailures ?? 0) + 1;
+        next.demoRunRetryAfter = new Date(Date.parse(now) + infraBackoffMs(next.demoRunInfraFailures)).toISOString();
+      } else delete next.demoRunInfraFailures;
+      delete next.demoRun;
+    } else if (idle && !run.askedAt) {
+      run.askedAt = now;
+      actions.push({ kind: "ask-demo-receipt", itemId: "", attempt: 1, lane: run.lane });
+    }
+  }
+  if (runner) {
+    if (next.demoRun) {
+      for (const id of next.demoRun.items)
+        if (next.items[id]?.state === "verifying" && !next.items[id].verified) waits[id] = `demo run: ${next.demoRun.lane ? `lane ${next.demoRun.lane.workflowId} is running its demo` : "starting"}`;
+    } else {
+      const backoff = typeof next.demoRunRetryAfter === "string" && Date.parse(now) < Date.parse(next.demoRunRetryAfter);
+      const ready = spec.items.filter((item) => {
+        const current = next.items[item.id];
+        return demoOnly(item, current) && !(typeof current.evidenceRetryAfter === "string" && Date.parse(now) < Date.parse(current.evidenceRetryAfter));
+      });
+      const batch = ready.slice(0, runner.maxItems ?? 12);
+      if (batch.length && !backoff && !capacityWaiting && targetSha && onDevStack.length < devStacks) {
+        next.demoRun = { items: batch.map((item) => item.id), sha: targetSha, requestedAt: now };
+        for (const item of batch) {
+          next.items[item.id].demoRun = { sha: targetSha, requestedAt: now };
+          waits[item.id] = "demo run: starting";
+        }
+      } else
+        for (const item of ready)
+          waits[item.id] = backoff
+            ? `demo run: a fresh run after ${next.demoRunRetryAfter}`
+            : onDevStack.length >= devStacks
+              ? `demo run: dev stack busy (${onDevStack.join(", ")})`
+              : "demo run: waiting to start";
+    }
+    if (next.demoRun && !next.demoRun.lane) {
+      delete next.demoRun.retryAfter;
+      actions.push({ kind: "demo-run", itemId: "", attempt: 1, items: next.demoRun.items, targetSha: next.demoRun.sha });
+    }
+    if (next.demoRun) onDevStack.push("the demo run");
+  }
+
   for (const item of spec.items) {
     const current = next.items[item.id];
     if (current?.state !== "verifying" || current.lane) continue;
+    // The demo runner does these.
+    if (demoOnly(item, current)) {
+      waits[item.id] ??= "demo run: waiting for the next run";
+      continue;
+    }
     // Tests with no run recorded at the integrated commit (a batch-merged
     // item has none): a verify lane runs them there, rather than the item
     // waiting on a recording nothing will make.
