@@ -514,7 +514,7 @@ export function previewHealthProblem(spec, item, steps) {
     const n = step?.n ?? index + 1;
     const health = step?.health;
     if (!health || typeof health !== "object")
-      return `step ${n} of this preview demo has no preview health check at capture (record it with createDemoRecorder({ dir, health: ${JSON.stringify(healthUrl)} }))`;
+      return `step ${n} of this preview demo has no preview health check at capture (record every step with createDemoRecorder({ dir, previewUrl: ${JSON.stringify(healthUrl)} }), or right after each screenshot with demo-report.mjs --record <steps.json> --image <png> --action "..." --preview-url ${JSON.stringify(healthUrl)})`;
     if (health.status !== 200) return `the preview was not healthy when step ${n} was captured (${health.url ?? healthUrl} answered ${health.status || health.error || "nothing"})`;
     if (health.wake) return `the preview showed a wake page when step ${n} was captured (${health.url ?? healthUrl})`;
   }

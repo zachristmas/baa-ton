@@ -750,3 +750,15 @@ test("the demo runner: one lane demos every evidence-only item in turn on one st
   assert.match(objective, /1\. A: Item A[\s\S]*screenshot for every navigation or action[\s\S]*artifacts\/a\.final\.docx[\s\S]*2\. B: Item B/);
   assert.match(objective, /as soon as its demo is done[\s\S]*DEMO: <id> written/);
 });
+
+test("demos that failed only for want of a preview health check get a fresh demo lane at once, once", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", evidence: { report: "a/d.docx", onPreview: true } } }], {}, undefined, { url: "https://pv.example.test", health: "/healthz" });
+  const state = { version: 1, items: { D: { state: "verifying", integratedSha: SHA_A, evidenceRetries: 3, evidenceProblem: "step 1 of this preview demo has no preview health check at capture (record it with ...)", evidenceRetryAfter: "2099-01-01T00:00:00.000Z" } } };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
+  assert.equal(step.state.items.D.evidenceRetryAfter, undefined);
+  assert.equal(step.state.items.D.healthRuleRearmedAt, at(0));
+  assert.ok(step.actions.some((action) => action.kind === "verify" && action.itemId === "D"));
+  const again = structuredClone(step.state);
+  again.items.D.evidenceRetryAfter = "2099-01-01T00:00:00.000Z";
+  assert.equal(advanceSpec({ spec: s, state: again, lane: lanes({}), now: at(1) }).state.items.D.evidenceRetryAfter, "2099-01-01T00:00:00.000Z", "only once");
+});

@@ -23,7 +23,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const CRC_TABLE = (() => {
@@ -199,27 +199,56 @@ export const previewHealthy = (health) => health?.status === 200 && !health.wake
  * `health` (a demo of the preview), every step first checks the preview's
  * health endpoint and throws, capturing nothing, when it is down.
  */
-export function createDemoRecorder({ dir, health, wakePattern, probe = probePreviewHealth }) {
+/** Whether a page URL is on this machine (a local dev stack), not a deployed preview. */
+export function isLocalUrl(url) {
+  try {
+    const { protocol, hostname } = new URL(url);
+    if (!/^https?:$/.test(protocol)) return true;
+    return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "0.0.0.0" || hostname === "::1" || hostname === "[::1]" || /^127\./.test(hostname) || /^(?:10|192\.168)\./.test(hostname) || /^172\.(?:1[6-9]|2\d|3[01])\./.test(hostname);
+  } catch {
+    return true;
+  }
+}
+
+function unhealthyMessage(url, checked) {
+  return `The preview is not healthy (${url} answered ${checked.status || checked.error || "nothing"}${checked.wake ? ", a wake page" : ""}): an unhealthy preview is never evidence. Wait until it is healthy, or report the preview blocked with what you saw.`;
+}
+
+/**
+ * The health endpoint a step is checked against: `health`, else
+ * `previewUrl`, else, for a page on a deployed host (not this machine),
+ * that page's own origin. A preview demo can not skip the check.
+ */
+export function healthUrlFor({ health, previewUrl, pageUrl }) {
+  if (health) return health;
+  if (previewUrl) return previewUrl;
+  if (pageUrl && !isLocalUrl(pageUrl)) return `${new URL(pageUrl).origin}/`;
+  return undefined;
+}
+
+export function createDemoRecorder({ dir, previewUrl, health, wakePattern, probe = probePreviewHealth }) {
   const steps = [];
   return {
     steps,
     async step(page, action, shows) {
       if (!action) throw new Error("Each demo step needs its action (what was done).");
-      let checked;
-      if (health) {
-        checked = await probe(health, { ...(wakePattern ? { wakePattern } : {}) });
-        if (!previewHealthy(checked))
-          throw new Error(`The preview is not healthy (${health} answered ${checked.status || checked.error || "nothing"}${checked.wake ? ", a wake page" : ""}): an unhealthy preview is never evidence. Wait until it is healthy, or report the preview blocked with what you saw.`);
-      }
-      await mkdir(dir, { recursive: true });
-      const image = join(dir, `step-${String(steps.length + 1).padStart(2, "0")}.png`);
-      await page.screenshot({ path: image });
       let url;
       try {
         url = typeof page.url === "function" ? page.url() : undefined;
       } catch {
         url = undefined;
       }
+      // Every step of a preview demo, step 1 included, first checks the
+      // preview's health, and captures nothing when it is down.
+      const target = healthUrlFor({ health, previewUrl, pageUrl: url });
+      let checked;
+      if (target) {
+        checked = await probe(target, { ...(wakePattern ? { wakePattern } : {}) });
+        if (!previewHealthy(checked)) throw new Error(unhealthyMessage(target, checked));
+      }
+      await mkdir(dir, { recursive: true });
+      const image = join(dir, `step-${String(steps.length + 1).padStart(2, "0")}.png`);
+      await page.screenshot({ path: image });
       steps.push({ action, shows, image, ...(url ? { url } : {}), ...(checked ? { health: checked } : {}) });
       return image;
     },
@@ -235,18 +264,46 @@ async function main(argv) {
     const index = argv.indexOf(`--${name}`);
     return index >= 0 ? argv[index + 1] : undefined;
   };
+  const wake = flag("wake-pattern") ? { wakePattern: flag("wake-pattern") } : {};
+  const previewUrl = flag("preview-url");
+  // Record one step right after its screenshot, with a health check of the
+  // preview at that moment (for screenshots taken with another tool).
+  if (flag("record")) {
+    const stepsPath = flag("record");
+    const image = flag("image");
+    const action = flag("action");
+    if (!image || !action) throw new Error('Usage: node demo-report.mjs --record steps.json --image step.png --action "..." [--shows "..."] [--url <page url>] [--preview-url <url>]');
+    const target = healthUrlFor({ health: flag("health"), previewUrl, pageUrl: flag("url") });
+    let checked;
+    if (target) {
+      checked = await probePreviewHealth(target, wake);
+      if (!previewHealthy(checked)) throw new Error(unhealthyMessage(target, checked));
+    }
+    const parsed = await readFile(stepsPath, "utf8").then((text) => JSON.parse(text), () => ({ steps: [] }));
+    const steps = Array.isArray(parsed) ? parsed : (parsed.steps ?? []);
+    const base = dirname(resolve(stepsPath));
+    steps.push({ action, ...(flag("shows") ? { shows: flag("shows") } : {}), image: relative(base, resolve(image)), ...(flag("url") ? { url: flag("url") } : {}), ...(checked ? { health: checked } : {}) });
+    await mkdir(base, { recursive: true });
+    await writeFile(stepsPath, `${JSON.stringify({ ...(Array.isArray(parsed) ? {} : parsed), steps }, null, 2)}\n`);
+    process.stdout.write(`recorded step ${steps.length}${checked ? ` (preview healthy: ${checked.status})` : ""}\n`);
+    return;
+  }
   if (flag("health")) {
-    const checked = await probePreviewHealth(flag("health"), flag("wake-pattern") ? { wakePattern: flag("wake-pattern") } : {});
+    const checked = await probePreviewHealth(flag("health"), wake);
     process.stdout.write(`${JSON.stringify(checked)}\n`);
     if (!previewHealthy(checked)) process.exitCode = 1;
     return;
   }
   const stepsPath = flag("steps");
   const out = flag("out");
-  if (!stepsPath || !out) throw new Error('Usage: node demo-report.mjs --steps steps.json --out report.docx [--title "..."]');
+  if (!stepsPath || !out) throw new Error('Usage: node demo-report.mjs --steps steps.json --out report.docx [--title "..."] [--preview-url <url>]');
   const parsed = JSON.parse(await readFile(stepsPath, "utf8"));
   const base = dirname(resolve(stepsPath));
   const steps = (Array.isArray(parsed) ? parsed : parsed.steps ?? []).map((step) => ({ ...step, image: resolve(base, step.image) }));
+  // A preview demo is built only from steps each checked healthy at capture.
+  const unchecked = steps.findIndex((step) => !previewHealthy(step.health) && (previewUrl || (step.url && !isLocalUrl(step.url))));
+  if (unchecked >= 0)
+    throw new Error(`step ${unchecked + 1} has no healthy preview check from its capture: record each step with createDemoRecorder({ dir, previewUrl }), or right after its screenshot with node demo-report.mjs --record ${stepsPath} --image <png> --action "..." --preview-url <url>; the verifier rejects a preview demo without one at every step`);
   const result = await writeDemoReport({ out, title: flag("title") ?? parsed.title, steps });
   process.stdout.write(`wrote ${result.out} with ${result.steps} captioned step(s) and ${result.out}.steps.json\n`);
 }
