@@ -272,6 +272,48 @@ test("local-validation: policy answers a lane's routine checks in its worktree, 
   }
 });
 
+test("local-validation: a spec lane's own dev stack and its leases are answered by policy, never left for an idle root", async () => {
+  const saved = Object.fromEntries(
+    ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map((key) => [key, process.env[key]]),
+  );
+  // No lease or runtime-launch grant: only local-validation.
+  const f = await fixture({ version: 2, grants: ["dispatch", "local-validation"] }, {
+    cwd: "/work/tree",
+    worktree: "/work/tree",
+    lanes: [
+      { id: "lane-a", paneId: "w-req:p2", status: "running", specStage: "verify" },
+      { id: "lane-b", paneId: "w-req:p3", status: "running" },
+    ],
+  });
+  const tools = new Map();
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w-req", HERDR_PLUGIN_CONFIG_DIR: f.configDir });
+  extension({ on() {}, registerCommand() {}, registerTool: (definition) => tools.set(definition.name, definition), async exec(command, args) { throw new Error(`Unexpected command: ${command} ${args.join(" ")}`); } });
+  const call = (params, pane) => {
+    process.env.HERDR_PANE_ID = pane;
+    return tools.get("herdr_request").execute("request", params, undefined, undefined, { cwd: join(f.directory, "elsewhere"), mode: "json", hasUI: false, ui: { confirm: async () => false, notify() {} } });
+  };
+  try {
+    const lease = await call({ action: "open", kind: "lease", resource: "app" }, "w-req:p2");
+    assert.equal(lease.details.request.status, "granted", "the demo lane's own ports");
+    for (const command of ["PORT=47200 pnpm --filter @example/web dev", "cd /work/tree/apps/web && pnpm run dev", "docker compose up -d", "npm start"]) {
+      const launch = await call({ action: "open", kind: "runtime-launch", command }, "w-req:p2");
+      assert.equal(launch.details.request.status, "granted", command);
+      assert.match(launch.details.request.note, /local-validation: the lane's own dev stack/);
+    }
+    for (const command of ["pnpm dev && curl http://example.com", "cd /other/repo && pnpm dev", "docker compose -f /etc/compose.yml up"]) {
+      const launch = await call({ action: "open", kind: "runtime-launch", command }, "w-req:p2");
+      assert.equal(launch.details.request.status, "open", command);
+    }
+    // A lane outside the spec loop still asks for its dev server.
+    assert.equal((await call({ action: "open", kind: "runtime-launch", command: "pnpm dev" }, "w-req:p3")).details.request.status, "open");
+  } finally {
+    for (const [key, value] of Object.entries(saved))
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("without the local-validation grant a routine check still goes to the root", async () => {
   const saved = Object.fromEntries(
     ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map((key) => [key, process.env[key]]),

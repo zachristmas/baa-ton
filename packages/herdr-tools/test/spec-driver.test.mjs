@@ -331,6 +331,28 @@ test("verification waits for a deploy containing the commit, then one verify lan
   assert.equal(failed.state.items.A.state, "blocked");
   assert.match(failed.state.items.A.note, /preview failed: e2e\/a\.spec\.ts/);
   assert.match(failed.rootAsks[0].reason, /verification on the preview failed after the push/);
+
+  // A lane that could not launch its stack verified nothing: infrastructure, retried, never a human gate.
+  for (const summary of [
+    "PREVIEW: e2e/a.spec.ts blocked: the app did not start\nREPORT: artifacts/a.final.docx",
+    "PREVIEW: e2e/a.spec.ts fail\nRuntime launch blocked. Cannot start pnpm dev until the root answers.",
+    "Could not start the dev server: EADDRINUSE 5173",
+  ]) {
+    const stuck = advanceSpec({ spec: s, state: step.state, lane: lanes({ "wv/l1": { status: "completed", receipt: { summary } } }), now: at(2) });
+    const record = stuck.state.items.A;
+    assert.equal(record.state, "verifying", summary);
+    assert.equal(record.blockedReason, undefined, summary);
+    assert.equal(record.infraFailures, 1, summary);
+    assert.equal(record.declines.at(-1).kind, "infrastructure");
+    assert.ok(!stuck.rootAsks.some((ask) => /decide whether to fix forward/.test(ask.reason)), summary);
+  }
+  // Items parked on a launch failure before this fix go back on the next pass; a real failure stays.
+  const parked = structuredClone(failed.state);
+  const again = advanceSpec({ spec: s, state: parked, lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: "PREVIEW: e2e/a.spec.ts fail\nCould not start the app: ECONNREFUSED" } } }), now: at(3) });
+  assert.equal(again.state.items.A.state, "verifying");
+  assert.equal(again.state.items.A.blockedReason, undefined);
+  const real = advanceSpec({ spec: s, state: structuredClone(failed.state), lane: lanes({ "wv/l1": { status: "completed", receipt: { summary: "PREVIEW: e2e/a.spec.ts fail\nREPORT: artifacts/a.final.docx" } } }), now: at(3) });
+  assert.equal(real.state.items.A.state, "blocked");
 });
 
 test("items queued for integration hold no maxParallel slot; live lanes do", () => {

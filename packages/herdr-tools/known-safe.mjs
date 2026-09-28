@@ -717,6 +717,100 @@ export function classifyLocalValidation(command, options = {}) {
   return classes.size ? { matched: true, classes: [...classes] } : { matched: false, reason: "no validation command" };
 }
 
+const DEV_SCRIPT = /^(?:dev|start|preview|serve|storybook)(?::[\w:-]+)?$/;
+const PM_DIR_FLAGS = new Set(["-C", "--dir", "--prefix", "--cwd"]);
+const PM_SCOPE_FLAGS = new Set(["--filter", "-F", "--workspace", "-w"]);
+
+/**
+ * A lane's own dev stack (the local-validation grant): its package manager's
+ * dev, start, preview, serve or storybook script, optionally scoped to a
+ * workspace package or a directory inside the worktree, with PORT-style
+ * environment assignments, or `docker compose ... up` for its local
+ * services. A leading cd stays inside the worktree. Nothing else chains in.
+ * Returns { matched: true } or { matched: false, reason }.
+ */
+export function classifyDevStack(command, options = {}) {
+  if (typeof command !== "string" || !command.trim()) return { matched: false, reason: "empty command" };
+  // A dev server started in the background with its output in a log:
+  // `timeout 120 pnpm dev > /tmp/dev.log 2>&1 &`. Logs may go to /tmp, a
+  // session scratchpad or the worktree; nothing else is written.
+  let normalized = command.trim().replace(/\s*&\s*$/, "").replace(/\s2>&1\b/g, "");
+  for (const match of [...normalized.matchAll(/(?:^|\s)(?:\d?>>?|&>)\s*("?[^\s;&|"]+"?)/g)]) {
+    const target = match[1].replace(/^"|"$/g, "");
+    const cwd = options.cwd?.replace(/\/+$/, "");
+    const allowed = !target.includes("..") && (target === "/dev/null" || /^\/(?:private\/)?tmp\/[^/.][^\s]*$/.test(target) || SESSION_SCRATCHPAD.test(target) ||
+      !target.startsWith("/") || Boolean(cwd && target.startsWith(`${cwd}/`)));
+    if (!allowed) return { matched: false, reason: `writes outside the worktree and /tmp: ${target}` };
+    normalized = normalized.replace(match[0], " ");
+  }
+  normalized = normalized.replace(/(^|&&\s*)timeout\s+\d+[smh]?\s+/g, "$1").trim();
+  command = normalized;
+  const { segments, expandingBody } = commandSegments(command);
+  if (expandingBody || /`|\$\(|<\(|>\(/.test(command)) return { matched: false, reason: "command or process substitution" };
+  let launch;
+  for (const segment of segments) {
+    const redirect = redirectVerdict(segment);
+    if (redirect) return { matched: false, reason: redirect.reason };
+    const plain = stripRedirects(segment).trim();
+    if (/^cd(\s|$)/.test(plain) && !launch) {
+      const cd = cdVerdict(plain, options);
+      if (cd) return { matched: false, reason: cd.reason };
+      continue;
+    }
+    if (launch) return { matched: false, reason: `more than one command: ${segment.slice(0, 120)}` };
+    launch = plain;
+  }
+  if (!launch) return { matched: false, reason: "no launch command" };
+  const words = launch.split(/\s+/);
+  while (words.length && /^[A-Z_][A-Z0-9_]*=[\w./:@-]*$/.test(words[0])) words.shift();
+  const [tool, ...rest] = words;
+  if (tool === "docker") {
+    const args = rest[0] === "compose" ? rest.slice(1) : undefined;
+    if (!args) return { matched: false, reason: "only docker compose up" };
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === "-f" || arg === "--file" || arg === "-p" || arg === "--project-name") {
+        const value = args[++index];
+        if (!value || ((arg === "-f" || arg === "--file") && cdVerdict(`cd ${value}`, options))) return { matched: false, reason: `compose file outside the worktree: ${value}` };
+        continue;
+      }
+      if (arg === "up") {
+        const tail = args.slice(index + 1);
+        return tail.every((item) => /^(?:-d|--detach|--wait|--build|[\w.-]+)$/.test(item)) ? { matched: true } : { matched: false, reason: `unexpected compose up option: ${tail.join(" ")}` };
+      }
+      return { matched: false, reason: `only docker compose up: ${arg}` };
+    }
+    return { matched: false, reason: "only docker compose up" };
+  }
+  if (!["pnpm", "npm", "yarn", "bun"].includes(tool)) return { matched: false, reason: `not a package manager launch: ${launch.slice(0, 120)}` };
+  let index = 0;
+  while (index < rest.length) {
+    const arg = rest[index];
+    if (PM_DIR_FLAGS.has(arg)) {
+      const dir = rest[index + 1];
+      if (!dir || cdVerdict(`cd ${dir}`, options)) return { matched: false, reason: `directory outside the worktree: ${dir}` };
+      index += 2;
+      continue;
+    }
+    if (PM_SCOPE_FLAGS.has(arg)) {
+      if (!rest[index + 1] || !/^[@\w./*-]+$/.test(rest[index + 1])) return { matched: false, reason: `unexpected package filter: ${rest[index + 1]}` };
+      index += 2;
+      continue;
+    }
+    if (/^--(?:filter|dir|prefix|workspace)=[@\w./*-]+$/.test(arg)) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+  if (rest[index] === "run") index += 1;
+  const script = rest[index];
+  if (!script || !DEV_SCRIPT.test(script)) return { matched: false, reason: `not a dev, start or preview script: ${script ?? "(none)"}` };
+  const tail = rest.slice(index + 1);
+  if (!tail.every((item) => /^(?:--|--?[\w-]+(?:=[\w./:@-]+)?|[\w./:@-]+)$/.test(item))) return { matched: false, reason: `unexpected arguments: ${tail.join(" ")}` };
+  return { matched: true };
+}
+
 /*
  * The unattended default for a lane's routed permission prompt that nobody
  * answered: allow what stays inside the lane (its worktree, a session
