@@ -275,7 +275,7 @@ export function updateSkillContent({ projectRoot }) {
     "",
     `Use this skill only when the user asks to update Baa-ton. The project is \`${projectRoot}\`.`,
     "",
-    "1. Preserve the project's `BAA.md`, `.baa-ton/config.json`, instruction files, and user-authored skills.",
+    "1. Preserve the project's `BAA.md`, `.baa-ton/config.json`, instruction files, and your own skills (the `baa-ton-*` project skills are Baa-ton-managed).",
     `2. Run \`git -C "${checkoutDirectory}" status --short\`. If the checkout has local changes, show them and ask the user whether to commit them to a branch first; never stash, reset, or discard them. Then update with \`git -C "${checkoutDirectory}" pull --ff-only\`; if the fast-forward fails, stop and report it.`,
     // npm's --prefix only changes where node_modules/package-lock end up; it
     // does not redirect which package.json npm reads dependencies from --
@@ -283,7 +283,7 @@ export function updateSkillContent({ projectRoot }) {
     // install` run from an unrelated directory fails looking for a
     // package.json that isn't there. cd into the checkout first instead.
     `3. Install dependency changes: \`cd "${checkoutDirectory}" && npm install --no-audit --no-fund\`.`,
-    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`. This rewrites only the managed \`baa-ton:start\` blocks and skills that carry Baa-ton markers; a hand-authored skill of the same name is left alone. It keeps every task profile that already names an agentKind or launchProfile, fills only missing profiles, and prints which it kept and which it filled. It also migrates old \`.pi/herdr-orchestrator\` state.`,
+    `4. Refresh the project integrations with \`node "${setupPath}" --project-root "${projectRoot}" --non-interactive\`. This rewrites the managed \`baa-ton:start\` blocks and every \`baa-ton-*\` project skill. A \`baa-ton-*\` copy without Baa-ton markers is replaced, with the original kept beside it as \`SKILL.md.pre-baa-ton\`, and setup lists what it replaced; other skills are left alone. It keeps every task profile that already names an agentKind or launchProfile, fills only missing profiles, and prints which it kept and which it filled. It also migrates old \`.pi/herdr-orchestrator\` state.`,
     "5. Find what is still running old code: from the root, call `herdr_doctor` and read `runtime-version-skew` and `controller-plugin-install`. Then tell the user exactly what to reload, one line per piece:",
     "   - Controller supervisor: from this version on it restarts itself within two ticks of its code changing. If the doctor says it has no version record, it predates self-restart: ask the user to restart it once at a quiet point (restarting the Herdr server does it). Never stop the Herdr server yourself.",
     "   - Root on old code: exit and restart the root in the same session (Pi: `pi --session <session path>`, which the doctor prints).",
