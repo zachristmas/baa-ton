@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFER_FILE, FRESH_MS, HOST_LEASE_FILE, renewHostLease, specHandover } from "../spec-handover.mjs";
+import { DEFER_FILE, FRESH_MS, HOST_LEASE_FILE, RESTART_GRACE_MS, renewHostLease, specHandover } from "../spec-handover.mjs";
 import { headlessContext, headlessPi, runSpecHost } from "../spec-host.mjs";
 // A child process start can take minutes on a loaded machine (run-hermetic.mjs).
 const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
@@ -26,7 +26,7 @@ test("the root drives without a host; with a live lease it stands down and recor
     const defer = JSON.parse(await readFile(join(d.path, DEFER_FILE), "utf8"));
     assert.deepEqual(defer, { pid: 10, at: iso(1000) });
     assert.equal(specHandover(d.path, { host: false, now: T0 + FRESH_MS + 1, pid: 10, alive }), undefined, "a stale lease: the root drives again");
-    assert.equal(specHandover(d.path, { host: false, now: T0 + 1000, pid: 10, alive: () => false }), undefined, "a dead host: the root drives");
+    assert.equal(specHandover(d.path, { host: false, now: T0 + RESTART_GRACE_MS + 1000, pid: 10, alive: () => false }), undefined, "a dead host, past the restart grace: the root drives");
   } finally {
     await d.cleanup();
   }
@@ -113,4 +113,22 @@ test("the headless Pi host runs commands and answers with Pi's exec shape", asyn
   const bad = await pi.exec(process.execPath, ["-e", "process.exit(3)"], { timeout: CHILD_TIMEOUT_MS });
   assert.equal(bad.code, 3);
   assert.equal(headlessContext("/x").ui.notify("anything"), undefined, "any UI call is a no-op");
+});
+
+test("a host that just died is given a restart grace before the root drives on its own (a deploy restart let the root's old code dispatch one pass)", async () => {
+  const d = await dir();
+  try {
+    renewHostLease(d.path, { startedAt: iso(0), now: T0, pid: 20 });
+    const dead = () => false;
+    // Its process is gone, its lease seconds old: probably restarting.
+    assert.match(specHandover(d.path, { host: false, now: T0 + 5_000, pid: 10, alive: dead }), /has just stopped and is probably restarting/);
+    assert.match(specHandover(d.path, { host: false, now: T0 + RESTART_GRACE_MS - 1, pid: 10, alive: dead }), /probably restarting/);
+    // Past the grace it really is dead: the root drives.
+    assert.equal(specHandover(d.path, { host: false, now: T0 + RESTART_GRACE_MS + 1, pid: 10, alive: dead }), undefined);
+    // A live host is still respected, and the root never waits on itself.
+    assert.match(specHandover(d.path, { host: false, now: T0 + 5_000, pid: 10, alive }), /drives the spec loop/);
+    assert.equal(specHandover(d.path, { host: false, now: T0 + 5_000, pid: 20, alive: dead }), undefined);
+  } finally {
+    await d.cleanup();
+  }
 });
