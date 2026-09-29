@@ -11,6 +11,8 @@ export const STALL_ANOMALY_MS = 20 * 60_000;
 export const RECEIPT_ANOMALY_MS = 30 * 60_000;
 /** Only alerts this recent count toward a repeat; older ones are history. */
 export const REPEAT_WINDOW_MS = 6 * 60 * 60_000;
+/** One item's lane launch failing this many times in a row is an anomaly on its own (two items with one cause is at once). */
+export const LAUNCH_FAILURES_BEFORE_ANOMALY = 3;
 const FIXES_BEFORE_USER = 2;
 
 function operator() {
@@ -144,6 +146,32 @@ export function detectAnomalies({ entry, specStall, specReason, specState, times
       summary: `the spec driver's push of ${String(failure.sha).slice(0, 12)} (${(failure.items ?? []).join(", ")}) failed ${failure.count ?? 1} time(s) since ${failure.at}; items wait in awaiting-push`,
       evidence: String(failure.error).split("\n").filter(Boolean).slice(-12),
     });
+  // Lanes that can not launch, for the same reason, again and again: silent
+  // infrastructure retries (the driver retries and only counts them) hid a
+  // harness that could not start review lanes for four hours.
+  const causes = new Map();
+  for (const [id, record] of Object.entries(specState?.items ?? {})) {
+    if (!record || ["done", "resolved", "deferred"].includes(record.state) || !(record.infraFailures >= 1)) continue;
+    const last = [...(Array.isArray(record.declines) ? record.declines : [])].reverse().find((entry) => entry?.kind === "infrastructure" || entry?.kind === "never started");
+    if (!last?.reason) continue;
+    const at = Date.parse(last.at ?? "");
+    if (!Number.isFinite(at) || now - at > REPEAT_WINDOW_MS) continue;
+    const key = String(last.reason).replace(/^lane \S+ (?:was planned but never launched: |dispatch-failed:? ?)/i, "").replace(/\b(?:herdr|w|p)-?[0-9a-f:]{4,}\b/gi, "").replace(/[0-9]+/g, "#").replace(/\s+/g, " ").trim().slice(0, 100);
+    const group = causes.get(key) ?? { reason: String(last.reason).slice(0, 300), items: [] };
+    group.items.push({ id, stage: last.stage, failures: record.infraFailures });
+    causes.set(key, group);
+  }
+  for (const [key, group] of causes) {
+    const worst = Math.max(...group.items.map((item) => item.failures));
+    if (group.items.length < 2 && worst < LAUNCH_FAILURES_BEFORE_ANOMALY) continue;
+    found.push({
+      kind: "launch-failing",
+      decision: true,
+      signature: `launch-failing:${key}`,
+      summary: `${group.items.length} spec item(s) can not launch lanes for the same reason: ${group.reason.slice(0, 160)}`,
+      evidence: [...group.items.slice(0, 8).map((item) => `${item.id}: ${item.stage ?? "lane"} launch failed ${item.failures} time(s)`), `reason: ${group.reason}`, "the driver only retries these as infrastructure errors; check the harness and the stage's task profile (herdr_setup / baa-ton-configure)"],
+    });
+  }
   for (const [id, record] of Object.entries(specState?.items ?? {})) {
     if (!record?.lane || !record.receiptPointedAt) continue;
     // A failed, done or held item waits on no receipt.

@@ -2630,3 +2630,49 @@ test("a sync lane idle while its suite runs in the background is not replaced, a
     await f.cleanup();
   }
 });
+
+test("a dispatch refused before Herdr marked the workflow (capability discovery) leaves it failed, not planned, and the item launches a fresh lane after its backoff (D14 held a never-launched review lane for hours)", async () => {
+  const f = await fixture({
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "A", title: "Item", owns: ["src/a/**"], acceptance: { text: "a" } }] },
+  });
+  try {
+    // The workflow the plan port "created" exists in the manifest as planned.
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-spec1", status: "planned", outcome: "unresolved", lanes: [{ id: "lane-1", status: "planned" }], evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    const refusal = "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable; refusing a static registry snapshot";
+    let refuse = true;
+    f.ports.dispatch = async (workflowId) => {
+      if (refuse) throw new Error(refusal);
+      f.calls.dispatch.push(workflowId);
+      return { dispatched: true };
+    };
+    const first = await f.advance();
+    assert.match(first.content[0].text, /build A failed: Capability discovery failed/);
+    const failed = (await f.manifest()).workflows.find((workflow) => workflow.id === "herdr-spec1");
+    assert.equal(failed.status, "dispatch-failed", "no longer planned for good");
+    assert.equal(failed.retry.failedStage, "preflight");
+    assert.match(failed.retry.error, /Capability discovery failed/);
+    assert.ok(failed.evidence.some((entry) => entry.kind === "dispatch-error"));
+    let state = await f.state();
+    assert.equal(state.items.A.infraFailures, 1);
+
+    // Its backoff over: the driver sees a never-started lane and drops it (a second, longer wait) ...
+    refuse = false;
+    f.ports.now = () => "2026-09-24T12:02:00.000Z";
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.items.A.lane, undefined);
+    assert.equal(state.items.A.infraFailures, 2);
+    assert.equal(f.calls.plan.length, 1, "not before that wait is over");
+    // ... and plans a fresh one once it is.
+    f.ports.now = () => "2026-09-24T12:08:00.000Z";
+    await f.advance();
+    state = await f.state();
+    assert.equal(f.calls.plan.length, 2, "a fresh lane was planned");
+    assert.equal(state.items.A.lane.workflowId, "herdr-spec2");
+    assert.deepEqual(f.calls.dispatch, ["herdr-spec2"]);
+  } finally {
+    await f.cleanup();
+  }
+});

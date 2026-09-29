@@ -6006,6 +6006,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             record.infraAlertedAt = use.now();
             step.rootAsks.push({ itemId: item.id, reason: `${item.id}: its ${action.kind} lanes failed to start ${record.infraFailures} times in a row (${clip((error as Error).message, 200)}); the driver keeps retrying, check the harness` });
           }
+          // A dispatch refused before Herdr marked the workflow (capability
+          // discovery, preflight) leaves it planned for good: mark it failed, so
+          // the lane is retried after its backoff and later retired, instead of
+          // the item waiting on a lane that will never exist.
+          if (record.dispatching) {
+            const workflowId = record.dispatching as string;
+            const reason = clip((error as Error).message, 400);
+            await withManifestTransaction(ctx.cwd, (stored) => {
+              const failedWorkflow = stored.workflows.find((candidate) => candidate.id === workflowId) as (Workflow & { retry?: unknown }) | undefined;
+              if (failedWorkflow?.status !== "planned") return;
+              failedWorkflow.status = "dispatch-failed";
+              failedWorkflow.outcome = "unknown";
+              failedWorkflow.retry = { state: "retryable", attempt: 1, retryCommand: `herdr_dispatch ${workflowId} execute=true`, failedStage: "preflight", error: reason };
+              failedWorkflow.evidence.push({ at: use.now(), kind: "dispatch-error", text: `preflight: ${reason}` });
+            }).catch(() => undefined);
+          }
           // Slow process starts: the next attempt reuses this lane's pane.
           const failed = record.dispatching && record.lane?.workflowId === record.dispatching ? (record.lane as { workflowId: string; laneId: string }) : undefined;
           delete record.dispatching;
