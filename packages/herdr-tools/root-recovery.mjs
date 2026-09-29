@@ -7,6 +7,40 @@ const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const receipt = lane => typeof lane?.completionReceipt?.id === 'string' && lane.completionReceipt.id.trim() &&
   typeof lane.completionReceipt.summary === 'string' && lane.completionReceipt.summary.trim();
 
+/** Return only workflows routed to, or historically bound to, this exact project root. */
+export function rootOwnedWorkflowIds({ config, manifest, cwd, rootId }) {
+  const matches = config?.orchestrators?.filter(item => item.id === rootId) ?? [];
+  if (matches.length !== 1) throw new Error('Select exactly one existing root by its recorded ID');
+  const root = matches[0];
+  if (resolve(root.program.id) !== resolve(cwd) || resolve(root.program.parent_manifest_path ?? '') !== join(resolve(cwd), '.baa-ton/herdr-orchestrator/manifest.json'))
+    throw new Error('Selected root does not own this exact project manifest');
+  const routed = new Set((root.workflows ?? []).map(flow => flow.workflow_id));
+  return (manifest?.workflows ?? []).filter(flow => routed.has(flow.id) ||
+    (flow.taskBinding?.rootPaneId === root.root.pane_id && flow.taskBinding?.workspaceId === root.root.workspace_id))
+    .map(flow => flow.id);
+}
+
+/** Reconcile only durable evidence that a lane was already retired. */
+export function reconcileRetiredLaneRecords(manifest, workflowIds) {
+  const selected = new Set(workflowIds ?? []);
+  const provenDeadLanes = [];
+  const reconciledLaneIds = [];
+  for (const flow of manifest?.workflows ?? []) {
+    if (!selected.has(flow.id)) continue;
+    for (const lane of flow.lanes ?? []) {
+      if (lane.retirement?.status !== 'retired' || lane.retirement.tabClosed !== true || lane.sessionLog?.status !== 'retired') continue;
+      provenDeadLanes.push({ workflowId: flow.id, laneId: lane.id });
+      if (['running', 'working', 'blocked', 'starting', 'unknown'].includes(lane.status)) {
+        // Retirement proves the lane process ended; retain receipt semantics
+        // rather than inventing a successful receipt for legacy records.
+        lane.status = lane.completionReceipt ? 'completion-reported' : 'done';
+        reconciledLaneIds.push(`${flow.id}/${lane.id}`);
+      }
+    }
+  }
+  return { provenDeadLanes, reconciledLaneIds };
+}
+
 // Input is the raw validated document, so unrelated and forward-compatible
 // fields survive migration. Workflow taskBindings and receipts remain historical.
 // `restart`: a Herdr server restart renamed every pane, so the old root's
