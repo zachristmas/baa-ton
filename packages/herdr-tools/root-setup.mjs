@@ -3,7 +3,8 @@
  * Print (or explicitly write) the local MCP configuration for a harness that
  * will act as the Baa-ton root. The default path is intentionally stdout-only.
  */
-import { lstat, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +14,7 @@ const bridge = resolve(join(toolsDirectory, "mcp-server.mjs"));
 const extension = resolve(join(toolsDirectory, "index.ts"));
 const harnesses = new Set(["claude", "codex", "opencode", "pi"]);
 function usage() {
-  return `Usage: node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi [--write]\n\nDefault behavior prints commands and configuration only. --write writes only the selected harness' normal local configuration: .mcp.json for Claude, ~/.codex/config.toml for Codex (when it does not already exist), or opencode.json for OpenCode. Pi has no file write path; load the extension when starting Pi.`;
+  return `Usage: node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi [--write]\n       node ${join(toolsDirectory, "root-setup.mjs")} --harness claude --remove-project-scope --verified-live\n\nDefault behavior prints commands and configuration only. --write writes only the selected harness' configuration: a per-pane MCP config file next to the controller config for Claude (the root is launched with --mcp-config, so other sessions in the same folder never load the bridge), ~/.codex/config.toml for Codex (when it does not already exist), or opencode.json for OpenCode. Pi has no file write path; load the extension when starting Pi.\n\n--remove-project-scope (Claude) removes the herdr-orchestrator and playwright entries an earlier setup added to the project or local scope. It refuses without --verified-live: run it only after the root launched with --mcp-config has bootstrapped successfully.`;
 }
 
 function shellQuote(value) {
@@ -89,6 +90,63 @@ function opencodeConfig(identity) {
   );
 }
 
+
+/** The MCP servers a Claude root loads, named explicitly instead of through project or local scope. */
+export function claudeRootMcpConfig(identity, bridgePath = bridge) {
+  return { mcpServers: { "herdr-orchestrator": { command: "node", args: [bridgePath], env: identity } } };
+}
+
+/** Per-pane, next to the controller config: it survives a relaunch and is never read by another session. */
+export function claudeRootMcpConfigPath(identity) {
+  const pane = `${identity.HERDR_WORKSPACE_ID}-${identity.HERDR_PANE_ID}`.replace(/[^A-Za-z0-9_.-]/g, "_");
+  return join(identity.HERDR_PLUGIN_CONFIG_DIR, "root-mcp", `${pane}.json`);
+}
+
+/** No --strict-mcp-config: a root may need claude.ai connectors. */
+export function claudeRootLaunchCommand(identity) {
+  return `claude --mcp-config ${shellQuote(claudeRootMcpConfigPath(identity))}`;
+}
+
+export const PROJECT_SCOPE_SERVERS = ["herdr-orchestrator", "playwright"];
+
+/** Drop the named servers from a parsed .mcp.json; returns the removed names. */
+export function removeFromMcpJson(config, names = PROJECT_SCOPE_SERVERS) {
+  const removed = names.filter((name) => config?.mcpServers && Object.hasOwn(config.mcpServers, name));
+  for (const name of removed) delete config.mcpServers[name];
+  return removed;
+}
+
+async function removeProjectScope({ verifiedLive, identity }) {
+  if (!verifiedLive)
+    throw new Error("--remove-project-scope needs --verified-live: first launch the root with the printed --mcp-config command and confirm herdr_bootstrap_root works there.");
+  const configPath = claudeRootMcpConfigPath(identity);
+  try {
+    await lstat(configPath);
+  } catch {
+    throw new Error(`${configPath} does not exist; run this helper with --write and launch the root with it before removing the project-scope entries.`);
+  }
+  const removed = [];
+  const mcpJson = resolve(process.cwd(), ".mcp.json");
+  try {
+    const config = await readJsonObject(mcpJson);
+    const names = removeFromMcpJson(config);
+    if (names.length) {
+      await writeJsonConfig(mcpJson, config);
+      removed.push(...names.map((name) => `${name} (.mcp.json)`));
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  for (const name of PROJECT_SCOPE_SERVERS)
+    try {
+      execFileSync("claude", ["mcp", "remove", name, "-s", "local"], { stdio: "pipe" });
+      removed.push(`${name} (local scope)`);
+    } catch {
+      // Not present at that scope.
+    }
+  console.log(removed.length ? `Removed: ${removed.join(", ")}` : "No project-scope herdr-orchestrator or playwright entries were found.");
+}
+
 function printInstructions(harness, identity) {
   const harnessLabel = {
     claude: "Claude Code",
@@ -103,11 +161,10 @@ function printInstructions(harness, identity) {
   console.log(`Harness: ${harnessLabel}`);
   console.log("1. Apply this one-time integration:");
   if (harness === "claude") {
-    console.log([
-      `  claude mcp add --transport stdio herdr-orchestrator \\`,
-      `  ${explicitEnvFlags(identity)} \\`,
-      `  -- node ${shellQuote(bridge)}`,
-    ].join("\n"));
+    console.log(`Write this MCP config to ${claudeRootMcpConfigPath(identity)} (run this helper again with --write), then start the root with it:`);
+    console.log(JSON.stringify(claudeRootMcpConfig(identity), null, 2));
+    console.log(`  ${claudeRootLaunchCommand(identity)}`);
+    console.log("Only a session started with that flag loads the bridge; other Claude sessions in this folder do not pay for it.");
   } else if (harness === "codex") {
     console.log([
       `  codex mcp add herdr-orchestrator \\`,
@@ -128,7 +185,7 @@ function printInstructions(harness, identity) {
   if (harness === "pi")
     console.log("2. Call herdr_bootstrap_root in this session.");
   else {
-    console.log(`2. Restart ${harnessLabel} in this same Herdr pane so the connection loads.`);
+    console.log(`2. Restart ${harnessLabel} in this same Herdr pane${harness === "claude" ? " with the command above (add --resume <session> to keep the conversation)" : ""} so the connection loads.`);
     console.log("3. Call herdr_bootstrap_root in the restarted session.");
   }
   console.log("After bootstrap succeeds, report the root identity and wait for the user's task. Do not initialize a goal during setup.");
@@ -168,13 +225,9 @@ async function writeConfiguration(harness, identity) {
   if (!isAbsolute(identity.HERDR_PLUGIN_CONFIG_DIR))
     throw new Error("--write requires an absolute HERDR_PLUGIN_CONFIG_DIR.");
   if (harness === "claude") {
-    const path = resolve(process.cwd(), ".mcp.json");
-    const config = await readJsonObject(path);
-    config.mcpServers = {
-      ...(config.mcpServers ?? {}),
-      "herdr-orchestrator": { command: "node", args: [bridge], env: identity },
-    };
-    await writeJsonConfig(path, config);
+    const path = claudeRootMcpConfigPath(identity);
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await writeJsonConfig(path, claudeRootMcpConfig(identity));
     return;
   }
   if (harness === "opencode") {
@@ -221,6 +274,8 @@ async function writeConfiguration(harness, identity) {
 async function main() {
   let harness;
   let write = false;
+  let removeScope = false;
+  let verifiedLive = false;
   const args = process.argv.slice(2);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -232,6 +287,14 @@ async function main() {
       write = true;
       continue;
     }
+    if (arg === "--remove-project-scope") {
+      removeScope = true;
+      continue;
+    }
+    if (arg === "--verified-live") {
+      verifiedLive = true;
+      continue;
+    }
     if (arg === "--harness") {
       harness = args[++index];
       continue;
@@ -241,12 +304,18 @@ async function main() {
   if (!harness || !harnesses.has(harness))
     throw new Error("--harness must be one of claude, codex, opencode, or pi.");
   const identity = currentIdentity();
+  if (removeScope) {
+    if (harness !== "claude") throw new Error("--remove-project-scope applies to Claude only.");
+    await removeProjectScope({ verifiedLive, identity });
+    return;
+  }
   printInstructions(harness, identity);
   if (write) await writeConfiguration(harness, identity);
 }
 
-main().catch((error) => {
-  console.error(`root-setup: ${error instanceof Error ? error.message : String(error)}`);
-  console.error(usage());
-  process.exitCode = 2;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+  main().catch((error) => {
+    console.error(`root-setup: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(usage());
+    process.exitCode = 2;
+  });

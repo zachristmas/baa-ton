@@ -216,9 +216,14 @@ node packages/herdr-tools/root-setup.mjs --harness claude
 
 The helper is stdout-only unless `--write` is supplied; it prints an `export`
 line for the current pane identity as part of the setup commands. `--write` writes only
-the selected harness's normal config location: project `.mcp.json` for Claude,
-`~/.codex/config.toml` (only when absent) for Codex, or project
-`opencode.json` for OpenCode; it does not write a Pi config. Claude and
+the selected harness's config: for Claude a per-pane MCP config file under the
+controller config directory (`root-mcp/<pane>.json`), loaded only by a root
+started with `claude --mcp-config <file>` so other Claude sessions in the same
+folder do not pay for the bridge's tool names; `~/.codex/config.toml` (only when absent) for Codex, or project
+`opencode.json` for OpenCode; it does not write a Pi config. An earlier setup's
+project-scope Claude entries (herdr-orchestrator, playwright) are removed with
+`--harness claude --remove-project-scope --verified-live`, only after the root
+launched with `--mcp-config` has bootstrapped. Claude and
 OpenCode MCP processes inherit the current pane's `HERDR_*` identity, so keep
 the harness in that pane. Codex MCP children do **not** inherit it; the helper
 puts `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, and
