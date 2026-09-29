@@ -198,6 +198,35 @@ test("parent goal reset refuses active workflows unless force records a reason",
   }
 });
 
+test("forced root housekeeping reports a pass without archiving a synthetic running lane", async () => {
+  const fixture = await parentGoalFixture({ workflowStatus: "running", workflowOutcome: "running" });
+  try {
+    const before = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+    before.workflows[0].lanes.push({ id: "lane-live", status: "running", tabId: "w1:t2" });
+    await writeFile(fixture.manifestPath, JSON.stringify(before));
+
+    const result = await fixture.tools.get("herdr_housekeep").execute(
+      "end-housekeeping",
+      {},
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+
+    assert.equal(result.details.forced, true);
+    assert.deepEqual(result.details.archivedWorkflowIds, []);
+    assert.equal(result.details.error, undefined);
+    assert.match(result.content[0].text, /Forced housekeeping complete/);
+    const after = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+    assert.equal(after.workflows[0].status, "running");
+    assert.equal(after.workflows[0].lanes.length, 1);
+    assert.equal(after.workflows[0].lanes[0].status, "running");
+    assert.equal(after.workflows[0].lanes[0].tabId, "w1:t2");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("planning records a versioned scoped goal graph and per-lane profile", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-goals-"));
   const cwd = join(directory, "task");

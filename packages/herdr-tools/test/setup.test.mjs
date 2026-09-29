@@ -7,6 +7,8 @@ import {
   buildSetupConfig,
   configureSkillContent,
   configureSkillPath,
+  endSkillContent,
+  endSkillPath,
   installProjectSkills,
   replacedSkillsNotice,
   resetSkillContent,
@@ -25,6 +27,7 @@ import {
   updateManagedReference,
 } from "../setup.mjs";
 import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
+import { EXIT_COMMANDS } from "../root-relaunch.mjs";
 
 test("managed BAA references are idempotent and replace stale paths", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-setup-"));
@@ -89,8 +92,8 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(first.length, selected.length * 6);
-    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 6).fill(false));
+    assert.equal(first.length, selected.length * 7);
+    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 7).fill(false));
     for (const harness of selected) {
       const skills = [
         [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
@@ -99,6 +102,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
         [uninstallSkillPath(directory, harness), uninstallSkillContent(), "baa-ton-uninstall"],
         [sweepSkillPath(directory, harness), sweepSkillContent(), "baa-ton-sweep"],
         [resetSkillPath(directory, harness), resetSkillContent({ projectRoot: directory }), "baa-ton-reset"],
+        [endSkillPath(directory, harness), endSkillContent({ harness }), "baa-ton-end"],
       ];
       for (const [path, expected, name] of skills) {
         const content = await readFile(path, "utf8");
@@ -111,7 +115,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 6).fill(false));
+    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 7).fill(false));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -136,6 +140,45 @@ test("rerunning the wizard removes the owned legacy setup skill", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("baa-ton-end uses current supported discovery and invocation metadata for each harness", () => {
+  // Current docs checked 2026-09-30: https://code.claude.com/docs/en/skills,
+  // https://developers.openai.com/codex/skills/, https://opencode.ai/docs/skills/ and /docs/tui/;
+  // Pi's installed docs/skills.md. Codex project discovery is .agents/skills (not .codex/skills).
+  const directory = "/project";
+  const expectedPaths = {
+    claude: join(directory, ".claude", "skills", "baa-ton-end", "SKILL.md"),
+    codex: join(directory, ".agents", "skills", "baa-ton-end", "SKILL.md"),
+    opencode: join(directory, ".opencode", "skills", "baa-ton-end", "SKILL.md"),
+    pi: join(directory, ".pi", "skills", "baa-ton-end", "SKILL.md"),
+  };
+  for (const [harness, path] of Object.entries(expectedPaths)) {
+    const skill = endSkillContent({ harness });
+    assert.equal(endSkillPath(directory, harness), path);
+    assert.match(skill, /name: baa-ton-end/);
+    assert.ok(skill.includes(`herdr pane run "$HERDR_PANE_ID" '${EXIT_COMMANDS[harness]}'`));
+  }
+  assert.match(endSkillContent({ harness: "claude" }), /disable-model-invocation: true[\s\S]*`\/baa-ton-end`/);
+  assert.match(endSkillContent({ harness: "codex" }), /explicit `\$baa-ton-end`[\s\S]*`\/skills`/);
+  assert.doesNotMatch(endSkillContent({ harness: "codex" }), /disable-model-invocation/);
+  assert.match(endSkillContent({ harness: "opencode" }), /native `skill` tool[\s\S]*No named slash-invocation syntax is claimed/);
+  assert.doesNotMatch(endSkillContent({ harness: "opencode" }), /`\/baa-ton-end`/);
+  assert.match(endSkillContent({ harness: "pi" }), /disable-model-invocation: true[\s\S]*`\/skill:baa-ton-end`/);
+
+  const endFlow = endSkillContent({ harness: "pi" });
+  const ordered = [
+    `action: "status"`,
+    `action: "stop"`,
+    "herdr_retire",
+    "herdr_housekeep",
+    "herdr_sweep",
+    "Before exit, report",
+    "herdr pane run",
+  ].map((needle) => endFlow.indexOf(needle));
+  assert.ok(ordered.every((index) => index >= 0) && ordered.join() === [...ordered].sort((a, b) => a - b).join(), `end flow is out of order: ${ordered}`);
+  assert.match(endFlow, /Never set `paused`|only the operator can pause/);
+  assert.match(endFlow, /This end flow never executes a sweep/);
 });
 
 test("configured task profile resolves an exact launch profile", async () => {
@@ -209,13 +252,13 @@ test("harness skill directories that alias one another share one start skill", a
   const directory = await mkdtemp(join(tmpdir(), "baa-skill-alias-"));
   try {
     await mkdir(join(directory, ".claude"));
-    await symlink(".claude", join(directory, ".codex"));
+    await symlink(".claude", join(directory, ".agents"));
     const written = installProjectSkills({
       projectRoot: directory,
       selected: ["claude", "codex"],
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(written.length, 6);
+    assert.equal(written.length, 7);
     const start = await readFile(startSkillPath(directory, "claude"), "utf8");
     assert.match(start, /--harness <harness>/);
     assert.match(start, /`claude` or `codex`/);

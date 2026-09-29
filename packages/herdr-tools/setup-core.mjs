@@ -10,6 +10,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rename
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EXIT_COMMANDS } from "./root-relaunch.mjs";
 
 const toolsDirectory = dirname(fileURLToPath(import.meta.url));
 const checkoutDirectory = resolve(join(toolsDirectory, "../.."));
@@ -22,12 +23,13 @@ const START_SKILL_START = "<!-- baa-ton:start-skill:start -->";
 const START_SKILL_END = "<!-- baa-ton:start-skill:end -->";
 const LEGACY_SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
 const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
-const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall", "baa-ton-sweep", "baa-ton-reset"];
+const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall", "baa-ton-sweep", "baa-ton-reset", "baa-ton-end"];
 
 const START_SKILL_DIRECTORIES = {
   pi: [".pi", "skills"],
   claude: [".claude", "skills"],
-  codex: [".codex", "skills"],
+  // Codex's official repository discovery scans .agents/skills, not .codex/skills.
+  codex: [".agents", "skills"],
   opencode: [".opencode", "skills"],
 };
 
@@ -148,6 +150,10 @@ export function sweepSkillPath(projectRoot, harnessId) {
 
 export function resetSkillPath(projectRoot, harnessId) {
   return projectSkillPath(projectRoot, harnessId, "baa-ton-reset");
+}
+
+export function endSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-end");
 }
 
 // The root's ground rules and escalation policy, short enough to sit inline in
@@ -342,6 +348,54 @@ export function resetSkillContent({ projectRoot }) {
   ].join("\n");
 }
 
+const END_SKILL_INVOCATION = {
+  claude: "Invoke directly with `/baa-ton-end`; model invocation is disabled.",
+  codex: "Codex CLI supports explicit `$baa-ton-end` invocation or selecting it from `/skills`. No Codex CLI implicit-invocation opt-out is claimed here.",
+  opencode: "OpenCode discovers this skill for its native `skill` tool, which loads skills on demand. No named slash-invocation syntax is claimed.",
+  pi: "Invoke directly with `/skill:baa-ton-end`; model invocation is disabled.",
+};
+
+/** Generate an end-flow skill that keeps durable lifecycle work in root tools. */
+export function endSkillContent({ harness }) {
+  const harnesses = [harness].flat();
+  for (const id of harnesses)
+    if (!EXIT_COMMANDS[id] || !END_SKILL_INVOCATION[id])
+      throw new Error(`No verified Baa-ton end flow for harness ${JSON.stringify(id)}.`);
+  const invocation = harnesses.map((id) => `${id}: ${END_SKILL_INVOCATION[id]}`).join(" ");
+  const invocationMetadata = harnesses.length === 1 && (harnesses[0] === "claude" || harnesses[0] === "pi")
+    ? "disable-model-invocation: true\n"
+    : "";
+  const exitInstructions = harnesses.map((id) => `- ${id}: \`herdr pane run "$HERDR_PANE_ID" '${EXIT_COMMANDS[id]}'\``).join("; ");
+  return [
+    "---",
+    "name: baa-ton-end",
+    "description: Use only when the user explicitly asks to end this Baa-ton root session now; preserve truthful goal state, safely retire finished lanes, preview cleanup, report, and exit.",
+    invocationMetadata.trimEnd(),
+    "---",
+    START_SKILL_START,
+    "",
+    "# End this Baa-ton root session",
+    "",
+    "This is an explicit end-of-session operation. Proceed only when the user asked to end the current Baa-ton root now; do not trigger for discussion, planning, or a request to inspect shutdown steps. The end request is not approval to sweep or to pause the operator's run.",
+    "",
+    `Invocation: ${invocation}`,
+    "",
+    "Use root tools for goal, supervisor, lane-retirement and housekeeping state: they enforce this root's ownership and approval gates. Use the Herdr CLI only for the final native harness exit because no root tool terminates its invoking session. Do not use the Baa-ton run-state CLI or change the durable operator run state.",
+    "",
+    "1. Verify this is the current Herdr root: run `test \"${HERDR_ENV:-}\" = 1 && herdr status server`, then call `herdr_root_identity`. If either check fails, stop without changing anything. Do not initialize a missing goal.",
+    "2. Call `herdr_goal` with `action: \"status\"`. Read the current root's workflow/lane records in `.baa-ton/herdr-orchestrator/manifest.json` and use `herdr_observe` for workflows with nonterminal lanes. Record what is already running before cleanup.",
+    "3. Preserve the honest goal status. Change it only when evidence supports a real transition: `completed` only when the objective is complete; `blocked` only for an actual blocker; `waiting-for-event` only when the root has no safe action until a real external/lane event. Keep unfinished work active otherwise, and set a truthful `nextAction`. Never set `paused` or call `herdr_goal action: \"pause\"` or `herdr_operator_run action: \"pause\"`—only the operator can pause the run.",
+    "4. If the goal's supervisor is running, call `herdr_goal` with `action: \"stop\"` to stop it (not the operator run). If already stopped, do not change it; if absent, do not create one. Call `herdr_goal action: \"status\"` again and verify the running supervisor is now stopped. Report any failure; do not pretend it stopped.",
+    "5. For each workflow, preview `herdr_retire` first. Execute retirement only for lanes whose durable status/receipt proves they are finished; never retire a working, blocked, or otherwise running lane. Do not pass `confirm: true`; let native approval gates decide. If approval is unavailable or denied, leave the lane and report it.",
+    "6. Call `herdr_housekeep` to force one root-scoped housekeeping pass after retirement. It archives only eligible old finished workflows, prunes recorded stale files/scratch, and never closes live lanes or touches Git/worktrees. Report its result or error.",
+    "7. Recheck and report all lanes still running, blocked, or awaiting a decision; leave them and their workspaces untouched. Call `herdr_sweep` with no `execute` argument and show its exact dry-run inventory. This end flow never executes a sweep; use `baa-ton-sweep` separately if the user wants to approve cleanup.",
+    "8. Before exit, report the resulting goal/supervisor state, lanes retired and left running, housekeeping result, exact sweep preview, and anything blocked or awaiting approval. Do not report requested actions as completed unless the tools confirm them.",
+    `9. After delivering that report, gracefully exit only this invoking pane with the matching \`EXIT_COMMANDS\` entry: ${exitInstructions}. Use the actual running harness's command only; do not target another pane or interpret this command as an operator pause.`,
+    START_SKILL_END,
+    "",
+  ].join("\n");
+}
+
 /**
  * The notice for skill files setup took over. Baa-ton owns every baa-ton-*
  * skill, so a copy without the generated-file markers (hand-authored, or from
@@ -408,6 +462,7 @@ export function installProjectSkills({ projectRoot, selected, baaPath }) {
     "baa-ton-uninstall": () => uninstallSkillContent(),
     "baa-ton-sweep": () => sweepSkillContent(),
     "baa-ton-reset": () => resetSkillContent({ projectRoot }),
+    "baa-ton-end": (harnesses) => endSkillContent({ harness: harnesses }),
   };
   const groups = new Map();
   for (const harness of selected) {

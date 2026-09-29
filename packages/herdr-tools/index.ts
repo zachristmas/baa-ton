@@ -6436,11 +6436,12 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   /** Archive finished workflows out of the live manifest, delete the files they
    * left, and prune launch scratch no live process uses. Throttled; never throws
    * into the Pi lifecycle; touches no lane that can still run and no Git state. */
-  async function housekeepOrchestratorState(ctx: ExtensionContext, { force = false }: { force?: boolean } = {}): Promise<void> {
+  async function housekeepOrchestratorState(ctx: ExtensionContext, { force = false }: { force?: boolean } = {}) {
+    const empty = { forced: force, archivedWorkflowIds: [] as string[], removedWorkflowFiles: 0, removedScratchFiles: 0 };
     try {
-      if (process.env.BAA_TON_HOUSEKEEPING === "0") return;
-      if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
-      if (!force && Date.now() - lastHousekeeping < 30 * 60_000) return;
+      if (process.env.BAA_TON_HOUSEKEEPING === "0") return { ...empty, skipped: "disabled by BAA_TON_HOUSEKEEPING=0" };
+      if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return { ...empty, skipped: "not the verified root for this manifest" };
+      if (!force && Date.now() - lastHousekeeping < 30 * 60_000) return { ...empty, skipped: "throttled; force=true bypasses the interval" };
       lastHousekeeping = Date.now();
       const stateDir = dirname(manifestPath(ctx.cwd));
       let specState: unknown;
@@ -6461,13 +6462,19 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         manifest.workflows = manifest.workflows.filter((workflow) => !ids.has(workflow.id));
         removed = leaving;
       });
-      if (removed.length) removeFiles(removed.flatMap((workflow) => workflowFiles(workflow, stateDir)));
+      const removedWorkflowFiles = removed.length
+        ? removeFiles(removed.flatMap((workflow) => workflowFiles(workflow, stateDir)))
+        : 0;
       const table = await readProcessTable().catch(() => []);
-      removeFiles(
-        staleScratch({ names: scratchNames(stateDir), mtimeOf: mtimeIn(stateDir), liveCommandLines: table.map((row) => row.line) }).map((name) => join(stateDir, name)),
-      );
-    } catch {
-      // Best effort: the next pass retries.
+      const scratchCandidates = staleScratch({
+        names: scratchNames(stateDir),
+        mtimeOf: mtimeIn(stateDir),
+        liveCommandLines: table.map((row) => row.line),
+      }).map((name) => join(stateDir, name));
+      const removedScratchFiles = removeFiles(scratchCandidates);
+      return { ...empty, archivedWorkflowIds: removed.map((workflow) => workflow.id), removedWorkflowFiles, removedScratchFiles };
+    } catch (error) {
+      return { ...empty, error: clip(error instanceof Error ? error.message : String(error), 500) };
     }
   }
 
@@ -12052,6 +12059,28 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ],
         details: { goal: result.goal, goalHistoryCount: result.goalHistoryCount },
       };
+    },
+  });
+  pi.registerTool({
+    name: "herdr_housekeep",
+    label: "Herdr Housekeep",
+    description:
+      "Force one root-scoped local housekeeping pass: archive eligible old finished workflows and prune recorded stale files/scratch. It never retires live lanes or touches Git/worktrees.",
+    promptSnippet:
+      "Force safe local housekeeping from the verified root.",
+    promptGuidelines: [
+      "Use only from the verified controller-mapped root. This is a forced pass that bypasses the routine throttle; it archives only eligible old terminal workflows and prunes stale recorded files/scratch. It does not retire lanes, close tabs, or touch Git/worktrees.",
+    ],
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, _signal, _update, ctx) {
+      requireRootManifestExecutor(ctx.cwd);
+      const result = await housekeepOrchestratorState(ctx, { force: true });
+      const text = result.error
+        ? `Housekeeping failed: ${result.error}`
+        : result.skipped
+          ? `Housekeeping skipped: ${result.skipped}`
+          : `Forced housekeeping complete: archived ${result.archivedWorkflowIds.length} workflow(s), removed ${result.removedWorkflowFiles} recorded workflow file(s), pruned ${result.removedScratchFiles} stale scratch file(s).`;
+      return { content: [{ type: "text", text }], details: result };
     },
   });
   pi.registerTool({

@@ -8,6 +8,7 @@ Harness-neutral local workflow operations for Herdr. The local MCP bridge expose
 | --- | --- |
 | `herdr_reconcile_root` | Repair the current root pane's stale live harness identity without resetting controller state. |
 | `herdr_goal` | Manage the root-only durable parent goal. |
+| `herdr_housekeep` | Force a root-scoped local pass that archives eligible old finished workflows and prunes stale recorded files/scratch; never closes live lanes or touches Git/worktrees. |
 | `herdr_reparent` | Preview or root-confirm a controller-root handoff. |
 | `herdr_recover_root` | Preview or explicitly apply an audited migration of a stale project root whose workspace is gone. |
 | `herdr_plan` | Create a durable workflow and its lanes. |
