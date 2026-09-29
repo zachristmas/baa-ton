@@ -1006,3 +1006,28 @@ test("a sync run that failed with no suite verdict starts over after 10 minutes,
   const idle = advanceSpec({ spec: s, state: structuredClone(base), lane: lanes({ "wb/l1": view }), targetSha: SHA_T, now: at(50) });
   assert.equal(idle.state.baselineRun.attempts, 2, "without background work the timeout applies as before");
 });
+
+test("a lane still planned after its retry time never launched: the item retries instead of waiting on it for hours (D06/D07/D10/D14 sat 4 h on planned review lanes)", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a" } }]);
+  const planned = { status: "planned", workflowStatus: "planned" };
+  const state = () => ({ version: 1, items: { A: { state: "reviewing", attempts: 1, lane: { workflowId: "wr", laneId: "l1" }, infraFailures: 1, infraRetryAfter: at(5), declines: [{ at: at(4), stage: "review", kind: "infrastructure", reason: "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable" }] } } });
+  const run = (minute, view, st = state()) => advanceSpec({ spec: s, state: st, lane: lanes({ "wr/l1": view }), now: at(minute) });
+
+  // Before its retry time: left alone (a dispatch may be in flight).
+  assert.equal(run(4, planned).state.items.A.lane?.workflowId, "wr");
+  // A lane that really started is never touched.
+  assert.equal(run(30, { status: "running", workflowStatus: "running", agentStatus: "working" }).state.items.A.lane?.workflowId, "wr");
+  // Past its retry time and still planned: never launched. Infrastructure, not counted, retried after a longer wait.
+  const stuck = run(6, planned);
+  const record = stuck.state.items.A;
+  assert.equal(record.lane, undefined);
+  assert.equal(record.infraFailures, 2);
+  assert.ok(record.infraRetryAfter > at(6));
+  assert.equal(record.state, "reviewing");
+  assert.match(record.history.at(-1).note, /lane wr was planned but never launched: Capability discovery failed[\s\S]*infrastructure error, not counted/);
+  assert.equal(record.declines.at(-1).kind, "never started");
+  // No infra retry time recorded: a plain planned lane (one being dispatched) is not judged.
+  const fresh = state();
+  delete fresh.items.A.infraRetryAfter;
+  assert.equal(run(60, planned, fresh).state.items.A.lane?.workflowId, "wr");
+});

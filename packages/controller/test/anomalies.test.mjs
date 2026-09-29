@@ -143,3 +143,27 @@ test("operator messages that can not be delivered are an anomaly with a notifica
     await s.cleanup();
   }
 });
+
+test("lane launches that keep failing for one cause are an anomaly: at once for two items, after three tries for one (four review lanes could not start for four hours, retried silently)", () => {
+  const reason = "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable; refusing a static registry snapshot";
+  const item = (failures, stage = "review", state = "reviewing", extra = {}) => ({ state, infraFailures: failures, declines: [{ at: at(-60_000), stage, kind: "infrastructure", reason }], ...extra });
+  const detect = (items) => detectAnomalies({ entry: { alerts: [] }, specState: { items }, timestamp: at(0) }).filter((anomaly) => anomaly.kind === "launch-failing");
+
+  const two = detect({ D07: item(1), D14: item(1) });
+  assert.equal(two.length, 1);
+  assert.equal(two[0].decision, true, "the root decides (a profile or harness choice)");
+  assert.match(two[0].summary, /2 spec item\(s\) can not launch lanes for the same reason: Capability discovery failed/);
+  assert.match(two[0].evidence.join("\n"), /D07: review launch failed 1 time\(s\)[\s\S]*D14: review launch failed 1 time\(s\)[\s\S]*herdr_setup/);
+  assert.deepEqual(detect({ D07: item(1) }), [], "one item, one failure: ordinary infrastructure noise");
+  assert.equal(detect({ D07: item(3) }).length, 1, "one item failing three times in a row");
+  // Same cause spelled with different ids and numbers is one anomaly.
+  const other = { ...item(1), declines: [{ at: at(-60_000), stage: "build", kind: "never started", reason: "lane herdr-2a0e9fd3 was planned but never launched: " + reason }] };
+  const grouped = detect({ D07: item(1), D10: other });
+  assert.equal(grouped.length, 1, "grouped by cause, whatever the lane prefix");
+  assert.match(grouped[0].summary, /^2 spec item\(s\)/);
+  // Old, finished or successful launches do not count.
+  assert.deepEqual(detect({ D07: item(1, "review", "done"), D14: item(1, "review", "deferred") }), []);
+  assert.deepEqual(detect({ D07: { ...item(1), declines: [{ at: at(-REPEAT_WINDOW_MS - 60_000), stage: "review", kind: "infrastructure", reason }] }, D14: item(1) }), []);
+  // Signatures are per cause, so it is sent once and recurs only after a fix.
+  assert.equal(two[0].signature, detect({ D07: item(2), D14: item(5) })[0].signature);
+});

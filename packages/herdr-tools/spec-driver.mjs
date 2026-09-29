@@ -840,6 +840,22 @@ for (const item of spec.items) {
       retryStage(item, current, stage, "never started", `lane ${current.lane.workflowId} dispatch-failed`);
       continue;
     }
+    // A dispatch that failed before Herdr marked the workflow (the adapter's
+    // capability discovery or preflight refused it) left a workflow that is
+    // still planned: no pane, no agent. The item held that lane, past its retry
+    // time, for four hours: nothing retried it. A lane still planned once its
+    // retry time has passed never launched.
+    if (
+      view &&
+      !view.receipt &&
+      view.status === "planned" &&
+      view.workflowStatus === "planned" &&
+      typeof current.infraRetryAfter === "string" &&
+      Date.parse(now) >= Date.parse(current.infraRetryAfter)
+    ) {
+      retryStage(item, current, stage, "never started", `lane ${current.lane.workflowId} was planned but never launched: ${String(current.declines?.at(-1)?.reason ?? "its dispatch failed").slice(0, 200)}`);
+      continue;
+    }
     if (!view?.receipt) continue;
     // A lane that delivered a receipt started fine: the infrastructure is back.
     delete current.infraFailures;
