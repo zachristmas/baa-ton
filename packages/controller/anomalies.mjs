@@ -116,9 +116,19 @@ const STALL_FINISHED = new Set(["done", "resolved", "deferred"]);
  */
 export function stallBlockers(specState, { max = 5 } = {}) {
   const groups = new Map();
+  const lines = [];
+  // A target sync that failed its suite gate holds every push and integration
+  // behind it until the target moves; say so first.
+  const failedSync = specState?.syncRun?.failed;
+  if (failedSync) {
+    const fresh = (failedSync.fresh ?? []).map((failure) => `${failure.package} ${failure.task}`).slice(0, 4).join(", ");
+    lines.push(`target sync failed its suite gate${fresh ? ` (new failures: ${fresh})` : ""}: pushes and integrations wait until the target moves or the failures are fixed on spec-integration`);
+  }
   for (const [id, record] of Object.entries(specState?.items ?? {})) {
     if (!record || STALL_FINISHED.has(record.state)) continue;
-    const infra = [...(Array.isArray(record.declines) ? record.declines : [])].reverse().find((entry) => entry?.kind === "infrastructure" || entry?.kind === "never started");
+    // The decline that still holds the item (cleared when it moves on), not
+    // the newest one in its history: that one can be hours stale.
+    const infra = record.declined && (record.declined.kind === "infrastructure" || record.declined.kind === "never started") ? record.declined : undefined;
     const line = (text) => String(text ?? "").split("\n").map((part) => part.trim()).find(Boolean);
     const reason =
       line(record.note) ??
@@ -132,10 +142,10 @@ export function stallBlockers(specState, { max = 5 } = {}) {
     group.ids.push(id);
     groups.set(key, group);
   }
-  return [...groups.values()]
+  return [...lines, ...[...groups.values()]
     .sort((a, b) => b.ids.length - a.ids.length)
     .slice(0, max)
-    .map((group) => `${group.ids.length} item(s): ${group.reason} (${group.ids.slice(0, 4).join(", ")}${group.ids.length > 4 ? `, +${group.ids.length - 4}` : ""})`);
+    .map((group) => `${group.ids.length} item(s): ${group.reason} (${group.ids.slice(0, 4).join(", ")}${group.ids.length > 4 ? `, +${group.ids.length - 4}` : ""})`)];
 }
 
 /**
