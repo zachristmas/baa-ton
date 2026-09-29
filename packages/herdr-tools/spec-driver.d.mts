@@ -29,6 +29,8 @@ export const RECEIPT_REASK_BASE_MS: number;
 export const RECEIPT_ASK_INTERVAL_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
+  /** A spec(sync) merge commit on spec-integration (not on the target) that no sync verdict has judged. */
+  unvalidatedSync?: string;
   /** Failed or held items whose last INTEGRATED commit the target already contains -> that commit. */
   landed?: Map<string, string>;
   /** Whether the fetched target tip is an ancestor of spec-integration's head (false: it gained commits a push would not fast-forward over). */

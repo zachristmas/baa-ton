@@ -4847,6 +4847,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     fetchTarget?(input: { repo: string; remote: string; branch: string }): Promise<void>;
     /** Whether the target tip is an ancestor of spec-integration's head (undefined: no such branch yet). */
     targetInIntegration?(input: { repo: string; targetSha: string }): Promise<boolean | undefined>;
+    /** The newest spec(sync) merge commit on spec-integration that the target does not contain. */
+    unvalidatedSync?(input: { repo: string; targetRef: string }): Promise<string | undefined>;
     rollBackIntegration?(input: { worktree: string; sha: string }): Promise<boolean>;
     /** A lane pane's visible screen (to infer a receipt from its final report). */
     readScreen?(paneId: string): Promise<string>;
@@ -5267,6 +5269,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                 return exists ? gitAncestor(repoPath, tip, "refs/heads/spec-integration") : undefined;
               }))({ repo, targetSha }).catch(() => undefined)
           : undefined;
+      // A sync merge already on spec-integration that no verdict has judged
+      // (its lane was lost before its receipt) is judged before anything is
+      // pushed or integrated on top of it.
+      const unvalidatedSync = Object.values(state.items ?? {}).some((record) => (record as { state?: string }).state === "awaiting-push")
+        ? await (ports?.unvalidatedSync ??
+            (async ({ repo: repoPath, targetRef: ref }: { repo: string; targetRef: string }) => {
+              const log = (await execFile("git", ["-C", repoPath, "log", "--format=%H", "--grep=^spec(sync): merge", "-n", "1", `${ref}..refs/heads/spec-integration`], { timeout: 30_000 })).stdout.trim();
+              return log.split("\n").filter(Boolean)[0];
+            }))({ repo, targetRef }).catch(() => undefined)
+        : undefined;
       // An integration receipt's merge is checked for migration journal
       // entries that go back in time before it is kept.
       const journalProblems = new Map<string, string[]>();
@@ -5289,6 +5301,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         integrationLive,
         contained,
         landed,
+        ...(unvalidatedSync ? { unvalidatedSync } : {}),
         ...(targetInIntegration !== undefined ? { targetInIntegration } : {}),
         capacityWaiting,
         pushed,

@@ -914,3 +914,64 @@ test("a failed item whose integrated commit is already on the target is verified
   const none = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
   assert.equal(none.state.items.A.state, "failed");
 });
+
+test("a sync merge is never dropped unjudged: an idle lane with a suite running is not overdue, a timed-out lane keeps the run, and an unjudged merge on spec-integration gets a verdict before anything is integrated on it (the live sequence: D09 integrated on an unvalidated merge)", () => {
+  const SHA_T = "e".repeat(40);
+  const SHA_M = "f".repeat(40);
+  const s = spec([{ id: "A", acceptance: { text: "a" } }, { id: "B", acceptance: { text: "b" } }]);
+  const key = "ws/l1";
+  const running = () => ({
+    version: 1,
+    integrationCounter: 1,
+    syncRun: { targetSha: SHA_T, attempts: 1, requestedAt: at(0), lane: { workflowId: "ws", laneId: "l1" }, dispatched: true, askedAt: at(1) },
+    items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } }, B: { state: "integrating", attempts: 1 } },
+  });
+  const step = (state, minute, view, { background = new Map(), inSync = true, ...extra } = {}) =>
+    advanceSpec({ spec: s, state, lane: lanes({ [key]: view }), background, targetSha: SHA_T, targetInIntegration: inSync, now: at(minute), ...extra });
+  const idle = { status: "active", agentStatus: "done" };
+
+  // The lane is idle with its suite running in the background: not overdue, however long since the ask.
+  const busy = step(running(), 40, idle, { background: new Map([[key, "pnpm turbo run test"]]) });
+  assert.ok(busy.state.syncRun.lane, "kept while its suite runs");
+  assert.equal(busy.state.syncRun.attempts, 1);
+  assert.equal(busy.actions.some((action) => action.kind === "ask-sync-receipt"), false);
+  // The merge is committed (the target is in spec-integration) but unjudged: the queue waits.
+  assert.match(busy.waits.B, /merging origin\/feature\/release .* into spec-integration first/);
+  assert.equal(busy.actions.some((action) => action.kind === "integrate"), false);
+
+  // Its suite gone and the ask timed out: the lane is dropped, but the RUN stays (the merge is committed, unjudged) and a fresh lane validates it.
+  const timedOut = step(running(), 40, idle);
+  assert.equal(timedOut.state.syncRun.lane, undefined);
+  assert.equal(timedOut.state.syncRun.attempts, 2);
+  assert.ok(timedOut.state.syncRun, "not deleted although the target is now in spec-integration");
+  assert.equal(timedOut.actions.some((action) => action.kind === "integrate"), false, "nothing integrates on the unjudged merge");
+  assert.deepEqual(timedOut.actions.find((action) => action.kind === "sync-target"), { kind: "sync-target", itemId: "", attempt: 2, targetSha: SHA_T });
+  assert.match(syncObjective(s, { targetSha: SHA_T, integrationBranch: "spec-integration" }), /already holds, the merge is committed[\s\S]*run the suite on HEAD and report/);
+
+  // A judged merge: recorded, and the run ends.
+  const receipt = step(running(), 5, { status: "completed", agentStatus: "done", receipt: { summary: `INTEGRATED: ${SHA_M}\nSUITE: pass` } });
+  assert.equal(receipt.state.syncRun, undefined);
+  assert.deepEqual(receipt.state.syncValidated, [SHA_M]);
+  assert.equal(receipt.state.syncedHead.sha, SHA_M);
+
+  // A rejected merge holds the queue too, and is remembered so it is not re-judged in a loop.
+  const rejected = step(running(), 5, { status: "completed", agentStatus: "done", receipt: { summary: `INTEGRATED: ${SHA_M}\nSUITE: fail\nFAILED: @x/web test` } });
+  assert.deepEqual(rejected.state.syncRejected, [SHA_M]);
+  assert.match(rejected.waits.B, /did not pass; the root decides/);
+  assert.equal(rejected.actions.some((action) => action.kind === "integrate"), false);
+  const retried = advanceSpec({ spec: s, state: { ...rejected.state, syncRun: { ...rejected.state.syncRun, lane: undefined } }, lane: lanes({}), targetSha: SHA_T, targetInIntegration: false, now: "2026-09-24T11:30:00.000Z" });
+  assert.equal(retried.state.syncRun.failed, undefined, "an hour on, with the rejected merge gone from spec-integration, it is tried again");
+
+  // No run at all, but a sync merge on spec-integration nobody judged (its lane was lost): a validating run starts.
+  const lost = { version: 1, integrationCounter: 1, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } }, B: { state: "integrating", attempts: 1 } } };
+  const found = advanceSpec({ spec: s, state: structuredClone(lost), lane: lanes({}), targetSha: SHA_T, targetInIntegration: true, unvalidatedSync: SHA_M, now: at(0) });
+  assert.equal(found.state.syncRun.validateSha, SHA_M);
+  assert.deepEqual(found.actions.find((action) => action.kind === "sync-target"), { kind: "sync-target", itemId: "", attempt: 1, targetSha: SHA_T });
+  assert.equal(found.actions.some((action) => action.kind === "integrate"), false);
+  assert.equal(found.rootAsks.some((ask) => ask.kind === "push"), false, "not pushed before it is judged");
+  // Already judged (either way): left alone.
+  for (const key2 of ["syncValidated", "syncRejected"]) {
+    const done = advanceSpec({ spec: s, state: { ...structuredClone(lost), [key2]: [SHA_M] }, lane: lanes({}), targetSha: SHA_T, targetInIntegration: true, unvalidatedSync: SHA_M, now: at(0) });
+    assert.equal(done.state.syncRun, undefined, key2);
+  }
+});
