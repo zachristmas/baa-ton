@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { REPEAT_WINDOW_MS, STALL_ANOMALY_MS, detectAnomalies, detectUndeliverable, reportAnomaly } from "../anomalies.mjs";
+import { REPEAT_WINDOW_MS, STALL_ANOMALY_MS, detectAnomalies, detectUndeliverable, reportAnomaly, stallBlockers } from "../anomalies.mjs";
 
 async function store(agents = { "lane-admin": { paneId: "w2F:p2", agentKind: "claude" } }) {
   const directory = await mkdtemp(join(tmpdir(), "baa-anomaly-"));
@@ -166,4 +166,36 @@ test("lane launches that keep failing for one cause are an anomaly: at once for 
   assert.deepEqual(detect({ D07: { ...item(1), declines: [{ at: at(-REPEAT_WINDOW_MS - 60_000), stage: "review", kind: "infrastructure", reason }] }, D14: item(1) }), []);
   // Signatures are per cause, so it is sent once and recurs only after a fix.
   assert.equal(two[0].signature, detect({ D07: item(2), D14: item(5) })[0].signature);
+});
+
+test("a stall anomaly names why the spec is stalled, grouped by cause, not only how many items wait (a 17-hour stall said just '16 items are waiting')", () => {
+  const items = {
+    D01: { state: "done" },
+    D02: { state: "deferred", note: "ignored" },
+    D05: { state: "failed", note: "integrate D05 failed: Herdr worktree list response is missing source_workspace_id." },
+    D09: { state: "integrating", note: "integrate D09 failed: Herdr worktree list response is missing source_workspace_id." },
+    D11: { state: "integrating", note: "integrate D11 failed: Herdr worktree list response is missing source_workspace_id." },
+    D13: { state: "failed", declines: [{ kind: "infrastructure", reason: "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable\nsecond line" }] },
+    D14: { state: "reviewing", lane: { workflowId: "wr", laneId: "l1" } },
+    D15: { state: "blocked", blockedReason: "exhausted" },
+    D16: { state: "pending", history: [{ note: "waits on D05" }] },
+    D17: { state: "integrating" },
+  };
+  assert.deepEqual(stallBlockers({ items }), [
+    "3 item(s): integrate D05 failed: Herdr worktree list response is missing source_workspace_id. (D05, D09, D11)",
+    "1 item(s): Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable (D13)",
+    "1 item(s): a lane is assigned but not working (D14)",
+    "1 item(s): blocked (exhausted) (D15)",
+    "1 item(s): waits on D05 (D16)",
+  ], "D17 has nothing recorded; finished and deferred items never appear");
+  assert.equal(stallBlockers({ items }, { max: 2 }).length, 2);
+  assert.deepEqual(stallBlockers({}), []);
+  const entry = { alerts: [] };
+  const stalled = (specState) => detectAnomalies({ entry, specStall: true, specReason: "spec: 8 item(s) are waiting and no lane is working.", specState, timestamp: at(STALL_ANOMALY_MS + 60_000) });
+  detectAnomalies({ entry, specStall: true, specReason: "x", specState: { items }, timestamp: at(0) });
+  const found = stalled({ items });
+  assert.equal(found[0].kind, "stall");
+  assert.equal(found[0].evidence[0], "spec: 8 item(s) are waiting and no lane is working.");
+  assert.match(found[0].evidence[1], /^blocker: 3 item\(s\): integrate D05 failed: Herdr worktree list response is missing source_workspace_id\./);
+  assert.equal(found[0].evidence.length, 6);
 });
