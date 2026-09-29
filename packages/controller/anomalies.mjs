@@ -64,6 +64,11 @@ export async function reportAnomaly(anomaly, { timestamp, notify = async () => u
     anomalies[anomaly.signature] = next;
     return { status: entry ? "recurred" : messageId ? "new" : "unrouted", entry: next };
   });
+  // Some anomalies are about the channel itself (lane-admin, or the root,
+  // can not receive its messages): the user is told at once, once.
+  if (anomaly.notifyUser && (result.status === "new" || result.status === "unrouted")) {
+    await notify({ title: anomaly.notifyTitle ?? "Baa-ton anomaly", body: `${anomaly.summary}`.slice(0, 400) });
+  }
   // Back after two fixes: now the user hears about it, once, as a bug report.
   if (result.status === "recurred" && result.entry.fixes >= FIXES_BEFORE_USER && !result.entry.userNotifiedAt) {
     await notify({
@@ -75,6 +80,27 @@ export async function reportAnomaly(anomaly, { timestamp, notify = async () => u
     });
   }
   return result;
+}
+
+/**
+ * Operator messages that can not be delivered: pending for at least
+ * UNDELIVERABLE_MS for a persistent reason (no live agent in the pane, a bare
+ * shell, an unreachable pane), never merely a busy agent. One anomaly per
+ * target and reason; the message to lane-admin may itself be one of the
+ * undeliverable ones, so the user is notified directly.
+ */
+export async function detectUndeliverable({ store, timestamp }) {
+  const { undeliverableMessages } = await operator();
+  const now = Date.parse(timestamp);
+  return undeliverableMessages(store, { now }).map((group) => ({
+    kind: "operator-undeliverable",
+    decision: true,
+    notifyUser: true,
+    notifyTitle: "Baa-ton: operator messages are stuck",
+    signature: `undeliverable:${group.label}:${group.reason}`,
+    summary: `${group.ids.length} operator message(s) to ${group.label} have been undeliverable for ${Math.round((now - group.since) / 60_000)} min: ${group.reason}`,
+    evidence: [`messages: ${group.ids.slice(0, 8).join(", ")}${group.ids.length > 8 ? ` and ${group.ids.length - 8} more` : ""}`, `reason: ${group.reason}`, "check the target's registration (baa-ton operator agents) and the live pane (herdr agent get <pane>)"],
+  }));
 }
 
 /**

@@ -44,6 +44,8 @@ Roots and lanes come from the controller config (their pane and workspace IDs). 
 - Delivery is tried right away by the CLI or tool, then on every controller supervisor tick, which already runs. There is no new watcher.
 - Before typing, the target must pass the live-agent check (#72/#75): Herdr shows the expected agent, live and ready, and the pane's foreground is not just its shell.
 - Text goes out only while the agent is idle. A busy or unreachable agent keeps the message `pending`, with the reason recorded.
+- **Delivery follows the live pane.** Only the pane must match. The workspace and agent kind recorded at registration go stale (a root switched from Pi to Claude, a workspace was renumbered), so the live agent in the pane gets the message; the change is noted on the message (`delivery.followed`) and written back to the registry. A registered agent's message goes to the pane it is registered at now, not the one it was sent to. Every held message shows its reason, not only the first in the pane.
+- **Undeliverable messages are an anomaly.** A message held for a persistent reason (no live agent in the pane, a bare shell, an unreachable pane) for 10 minutes raises an `operator-undeliverable` anomaly to lane-admin and notifies the user once. A busy agent is expected to be busy and is not one.
 - If a send may have landed, the message becomes `uncertain` and is never retyped. Only `pending` messages are ever sent.
 - Each pane gets one message per pass, in order.
 

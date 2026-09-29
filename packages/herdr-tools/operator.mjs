@@ -22,6 +22,10 @@ const MESSAGES_KEPT = 500;
 const LOCK_WAIT_MS = 5_000;
 const LOCK_STALE_MS = 30_000;
 const BUSY = new Set(["working", "blocked"]);
+/** Reasons a message can not go out however long it waits (the target is not a live, ready agent). A busy agent is not one of them. */
+const PERSISTENT_BLOCK = /^(no_agent_in_pane|pane_shows_shell_prompt|agent_pane_mismatch|agent_unavailable|agent_check_failed|agent_name_mismatch|agent_not_interactive_ready)/;
+/** A message held for a persistent reason this long is an anomaly. */
+export const UNDELIVERABLE_MS = 10 * 60_000;
 
 /** The line every recipient's contract carries about operator messages. */
 export const OPERATOR_AUTHORITY =
@@ -215,14 +219,44 @@ export function operatorInbox(store, { all = false, unread = false, limit = 20 }
  * only when nothing can have reached the pane (then it stays pending).
  * Returns the ids whose delivery state changed.
  */
+/**
+ * The target as it is now. A registered agent's message follows the
+ * registry, not the pane it was resolved to when it was sent: the agent may
+ * have re-registered or moved since.
+ */
+function currentTarget(store, message) {
+  const resolved = message.resolved;
+  if (resolved?.kind !== "agent") return resolved;
+  const name = String(message.target ?? "").replace(/^agent:/, "") || String(resolved.label ?? "").replace(/^agent:/, "");
+  const agent = store.agents?.[name];
+  return agent?.paneId ? { ...resolved, paneId: agent.paneId, ...(agent.workspaceId ? { workspaceId: agent.workspaceId } : {}), ...(agent.agentKind ? { agentKind: agent.agentKind } : {}) } : resolved;
+}
+
+function holdMessage(message, reason, at, changed) {
+  const persistent = PERSISTENT_BLOCK.test(reason);
+  const blockedSince = persistent ? message.delivery.blockedSince ?? at : undefined;
+  if (message.delivery.reason === reason && message.delivery.blockedSince === blockedSince) return;
+  const { blockedSince: _dropped, ...rest } = message.delivery;
+  message.delivery = { ...rest, reason, updatedAt: at, ...(blockedSince ? { blockedSince } : {}) };
+  changed.push(message.id);
+}
+
 export async function deliverOperatorMessages(store, { ready, prompt, at = nowIso() }) {
   const changed = [];
-  const busy = new Set();
+  // pane -> why it was held this pass: every message behind the first shows the same reason.
+  const busy = new Map();
   for (const message of store.messages) {
     if (message.delivery?.status !== "pending") continue;
-    const target = message.resolved;
-    if (!target?.paneId || busy.has(target.paneId)) continue;
-    const expected = { pane_id: target.paneId, ...(target.workspaceId ? { workspace_id: target.workspaceId } : {}), ...(target.agentKind ? { agent_kind: target.agentKind } : {}) };
+    const target = currentTarget(store, message);
+    if (!target?.paneId) continue;
+    if (busy.has(target.paneId)) {
+      holdMessage(message, busy.get(target.paneId), at, changed);
+      continue;
+    }
+    // The pane is the identity. The workspace and agent kind recorded at
+    // registration go stale (a root switched from Pi to Claude, a workspace
+    // was renumbered): the live agent in the pane is what gets the message.
+    const expected = { pane_id: target.paneId };
     let check;
     try {
       check = await ready(target.paneId, expected);
@@ -231,27 +265,57 @@ export async function deliverOperatorMessages(store, { ready, prompt, at = nowIs
     }
     const status = check?.agent?.agent_status;
     if (!check?.ok || BUSY.has(status)) {
-      busy.add(target.paneId);
       const reason = check?.ok ? `agent is ${status}` : check?.reason ?? "agent not ready";
-      if (message.delivery.reason !== reason) {
-        message.delivery = { ...message.delivery, reason, updatedAt: at };
-        changed.push(message.id);
-      }
+      busy.set(target.paneId, reason);
+      holdMessage(message, reason, at, changed);
       continue;
+    }
+    // Follow the live agent: keep what it says about itself.
+    const live = check.agent;
+    const followed = [];
+    const kind = typeof live?.agent === "string" && live.agent ? live.agent : undefined;
+    const workspace = typeof live?.workspace_id === "string" && live.workspace_id ? live.workspace_id : undefined;
+    if (kind && target.agentKind && kind !== target.agentKind) followed.push(`agent kind ${target.agentKind} -> ${kind}`);
+    if (workspace && target.workspaceId && workspace !== target.workspaceId) followed.push(`workspace ${target.workspaceId} -> ${workspace}`);
+    if (followed.length) {
+      message.resolved = { ...message.resolved, ...(kind ? { agentKind: kind } : {}), ...(workspace ? { workspaceId: workspace } : {}) };
+      const name = message.resolved.kind === "agent" ? String(message.target ?? "").replace(/^agent:/, "") : undefined;
+      if (name && store.agents?.[name]) store.agents[name] = { ...store.agents[name], ...(kind ? { agentKind: kind } : {}), ...(workspace ? { workspaceId: workspace } : {}) };
     }
     const attempts = (message.delivery.attempts ?? 0) + 1;
     try {
       await prompt(target.paneId, operatorMessageText(message));
-      message.delivery = { status: "delivered", attempts, updatedAt: at };
+      message.delivery = { status: "delivered", attempts, updatedAt: at, ...(followed.length ? { followed: followed.join("; ") } : {}) };
     } catch (error) {
       // Uncertain unless the caller proves nothing was sent (sent: false).
       const sent = error?.sent !== false;
       message.delivery = { status: sent ? "uncertain" : "pending", attempts, updatedAt: at, reason: error instanceof Error ? error.message : String(error) };
     }
-    busy.add(target.paneId);
+    busy.set(target.paneId, "another message went out to this pane this pass");
     changed.push(message.id);
   }
   return changed;
+}
+
+/**
+ * Pending messages held for a persistent reason (not a busy agent) for at
+ * least `olderThanMs`: the target can not receive them, however long they
+ * wait. Grouped by target and reason.
+ */
+export function undeliverableMessages(store, { now = Date.now(), olderThanMs = UNDELIVERABLE_MS } = {}) {
+  const groups = new Map();
+  for (const message of store.messages ?? []) {
+    if (message.delivery?.status !== "pending") continue;
+    const since = Date.parse(message.delivery.blockedSince ?? "");
+    if (!Number.isFinite(since) || now - since < olderThanMs) continue;
+    const label = String(message.resolved?.label ?? message.target);
+    const key = `${label}|${message.delivery.reason}`;
+    const group = groups.get(key) ?? { label, reason: message.delivery.reason, since, ids: [] };
+    group.since = Math.min(group.since, since);
+    group.ids.push(message.id);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
 }
 
 /**

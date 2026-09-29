@@ -37,3 +37,5 @@ export function deliverOperatorMessages(
     at?: string;
   },
 ): Promise<string[]>;
+export const UNDELIVERABLE_MS: number;
+export function undeliverableMessages(store: { messages?: unknown[] }, options?: { now?: number; olderThanMs?: number }): Array<{ label: string; reason: string; since: number; ids: string[] }>;
