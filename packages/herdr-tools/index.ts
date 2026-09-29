@@ -11000,6 +11000,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const currentWorkspaceId = process.env.HERDR_WORKSPACE_ID;
       const isCurrentRoot = (root: ControllerRootMapping) =>
         root.pane_id === currentPaneId && root.workspace_id === currentWorkspaceId;
+      if (!controllerConfig.orchestrators.some(({ root }) => isCurrentRoot(root)))
+        findings.push(
+          `Current pane is unregistered as a root (workspace_id=${currentWorkspaceId ?? "<unset>"}, pane_id=${currentPaneId ?? "<unset>"}).`,
+        );
       const recordFinding = (root: ControllerRootMapping, detail: string) => {
         (isCurrentRoot(root) ? findings : warnings).push(detail);
       };

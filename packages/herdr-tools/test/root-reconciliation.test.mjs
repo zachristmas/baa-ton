@@ -297,6 +297,28 @@ test("reconcile preserves an attested Pi session-file binding alongside Herdr's 
   }
 });
 
+test("doctor blocks an unregistered pane from passing the end-skill root-identity gate", async () => {
+  const f = await fixture();
+  try {
+    const config = await f.config();
+    config.orchestrators[0].root.agent_kind = "pi";
+    await writeFile(join(f.configDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+    process.env.HERDR_PANE_ID = "w-unregistered:root";
+    process.env.HERDR_WORKSPACE_ID = "w-unregistered";
+
+    const report = await f.tools
+      .get("herdr_doctor")
+      .execute("doctor", { verbose: true }, undefined, undefined, f.context);
+    const check = report.details.checks.find((entry) => entry.id === "root-identity");
+    assert.equal(check.status, "fail");
+    assert.match(check.detail, /Current pane is unregistered as a root/);
+    assert.match(check.detail, /workspace_id=w-unregistered, pane_id=w-unregistered:root/);
+    assert.notEqual(check.status, "ok", "the generated end-skill gate must stop unless root-identity is ok");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("doctor makes stale and missing root panes blocking findings", async () => {
   const f = await fixture();
   try {
