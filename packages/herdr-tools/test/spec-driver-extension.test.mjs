@@ -2585,3 +2585,48 @@ test("a spec(sync) merge on spec-integration that nobody judged is validated by 
     await f.cleanup();
   }
 });
+
+test("a sync lane idle while its suite runs in the background is not replaced, and its run is not failed by three replacements (four sync lanes were lost with no verdict)", async () => {
+  const target = "7".repeat(40);
+  const f = await fixture({
+    grants: ["dispatch", "integrate"],
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D04", title: "B", acceptance: { text: "b" } }] },
+    seed: {
+      version: 1,
+      integrationCounter: 1,
+      // Asked 40 minutes ago (past the 30-minute limit), never answered.
+      syncRun: { targetSha: target, attempts: 1, requestedAt: "2026-09-24T10:00:00.000Z", lane: { workflowId: "herdr-sync1", laneId: "lane-1" }, dispatched: true, validateSha: "c".repeat(40), askedAt: "2026-09-24T11:20:00.000Z" },
+      items: { D04: { state: "awaiting-push", integration: { sha: "9".repeat(40), order: 1 } } },
+    },
+  });
+  try {
+    const manifest = await f.manifest();
+    manifest.workflows.push({ id: "herdr-sync1", status: "running", lanes: [{ id: "lane-1", status: "running", specStage: "integrate", paneId: "w-spec:p9" }], eventController: { events: [{ lane_id: "lane-1", source: { agent_status: "done" } }] }, evidence: [] });
+    await writeFile(join(f.stateDir, "manifest.json"), JSON.stringify(manifest));
+    f.ports.revParse = async () => target;
+    f.ports.targetInIntegration = async () => true;
+    f.ports.agentPresent = async () => true;
+    const told = [];
+    f.ports.tell = async (input) => (told.push(input), { message: { delivery: { status: "delivered" } } });
+    let work = "pnpm turbo run typecheck lint format:check";
+    const asked = [];
+    f.ports.backgroundWork = async (paneId) => (asked.push(paneId), work);
+
+    // Its suite is running: kept, not asked, not replaced.
+    await f.advance();
+    let state = await f.state();
+    assert.deepEqual(asked, ["w-spec:p9"], "the sync lane's pane is checked for background work");
+    assert.equal(state.syncRun.lane?.workflowId, "herdr-sync1", "not dropped");
+    assert.equal(state.syncRun.attempts, 1);
+    assert.equal(told.length, 0);
+
+    // Its suite gone and still no receipt: replaced (the timeout now applies).
+    work = undefined;
+    await f.advance();
+    state = await f.state();
+    assert.equal(state.syncRun.attempts, 2);
+    assert.ok(state.syncRun, "the run itself is kept: its merge is committed and unjudged");
+  } finally {
+    await f.cleanup();
+  }
+});

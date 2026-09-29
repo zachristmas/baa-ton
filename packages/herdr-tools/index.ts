@@ -5173,7 +5173,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // Lanes released for a queued sync are watched too: the sync starts once
       // their background processes are gone.
       const preemptedRefs = ((state as { syncRun?: { preempted?: Array<{ lane: { workflowId: string; laneId: string } }> } }).syncRun?.preempted ?? []).map((entry) => ({ lane: entry.lane }));
-      for (const record of [...(Object.values(state.items ?? {}) as Array<{ state?: string; lane?: { workflowId: string; laneId: string } }>), ...preemptedRefs]) {
+      // The suite baseline, demo and sync runs' lanes run suites in the
+      // background like an item's lane does: without them here, an idle sync
+      // lane waiting on its lint was counted overdue, replaced, and its run
+      // failed after three replacements (four lanes lost, no verdict).
+      const runLaneRefs = [(state as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane, (state as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane, (state as { syncRun?: { lane?: { workflowId: string; laneId: string } } }).syncRun?.lane]
+        .filter((ref): ref is { workflowId: string; laneId: string } => Boolean(ref))
+        .map((lane) => ({ lane }));
+      for (const record of [...(Object.values(state.items ?? {}) as Array<{ state?: string; lane?: { workflowId: string; laneId: string } }>), ...preemptedRefs, ...runLaneRefs]) {
         if (!record.lane) continue;
         const view = laneView(record.lane);
         const paneId = manifest.workflows.find((item) => item.id === record.lane!.workflowId)?.lanes.find((item) => item.id === record.lane!.laneId)?.paneId;

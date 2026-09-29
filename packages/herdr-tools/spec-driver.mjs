@@ -370,6 +370,17 @@ export function integrationResult(summary) {
  */
 export const BACKGROUND_STALE_MS = 60 * 60_000;
 
+/**
+ * Whether a baseline, demo or sync run's lane is busy with a suite in the
+ * background (its agent idle, its shell running): not overdue for its
+ * receipt, for up to BACKGROUND_STALE_MS.
+ */
+function runBusy(run, key, background, now) {
+  if (background.has(key)) run.backgroundSince ??= now;
+  else delete run.backgroundSince;
+  return background.has(key) && Date.parse(now) - Date.parse(run.backgroundSince) < BACKGROUND_STALE_MS;
+}
+
 /** Whether the item's lane has had background work for BACKGROUND_STALE_MS; notes it once. */
 function staleBackground(current, now) {
   // Records from before the clock existed: the start of the trailing run of
@@ -605,6 +616,7 @@ for (const item of spec.items) {
   if (useBaseline && next.baselineRun?.lane) {
     const run = next.baselineRun;
     const view = lane(run.lane);
+    const baselineBusy = runBusy(run, `${run.lane.workflowId}/${run.lane.laneId}`, background, now);
     const declined = view?.receipt ? declineReason(view.receipt.summary, "integrate") : undefined;
     if (declined && (run.declined?.count ?? 0) < 3) {
       // A declined baseline or fix lane is retried with its reason.
@@ -629,7 +641,7 @@ for (const item of spec.items) {
       delete next.baselineRun;
       const shas = Object.keys(next.baselines);
       for (const old of shas.slice(0, Math.max(0, shas.length - BASELINES_KEPT))) delete next.baselines[old];
-    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !LANE_ENDED.has(view.status ?? "")) {
+    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !baselineBusy && !LANE_ENDED.has(view.status ?? "")) {
       // Idle without its receipt: asked once, then replaced by a fresh lane.
       if (!run.askedAt) {
         run.askedAt = now;
@@ -680,10 +692,7 @@ for (const item of spec.items) {
     // not overdue for its receipt (as for an item's lane), for up to
     // BACKGROUND_STALE_MS. A hung suite counted as an overdue lane once,
     // and the merge it had committed was dropped unjudged.
-    const syncKey = `${run.lane.workflowId}/${run.lane.laneId}`;
-    if (background.has(syncKey)) run.backgroundSince ??= now;
-    else delete run.backgroundSince;
-    const syncBusy = background.has(syncKey) && Date.parse(now) - Date.parse(run.backgroundSince) < BACKGROUND_STALE_MS;
+    const syncBusy = runBusy(run, `${run.lane.workflowId}/${run.lane.laneId}`, background, now);
     const declined = view?.receipt ? declineReason(view.receipt.summary, "integrate") : undefined;
     if (declined && (run.declined?.count ?? 0) < 3) {
       run.declined = { reason: declined, count: (run.declined?.count ?? 0) + 1, at: now };
@@ -1048,6 +1057,17 @@ for (const item of spec.items) {
 
   // 1b2. Before a push: a target that gained commits spec-integration lacks
   // is merged in first (a sync run), never pushed over or forced.
+  // A run that failed with no suite verdict (its lanes ended without a
+  // receipt) is not a judgment of the merge: it starts over after 10 minutes,
+  // up to three times, instead of holding the queue for good.
+  {
+    const failedRun = next.syncRun;
+    if (failedRun?.failed && !failedRun.failed.suite && !failedRun.lane && (failedRun.resets ?? 0) < 3 && Date.parse(now) - Date.parse(failedRun.failed.at) > 10 * 60_000) {
+      failedRun.resets = (failedRun.resets ?? 0) + 1;
+      failedRun.attempts = 1;
+      for (const key of ["failed", "askedAt", "backgroundSince", "retryAfter", "declined", "waitingForBaseline"]) delete failedRun[key];
+    }
+  }
   const awaitingPush = spec.items.some((item) => next.items[item.id]?.state === "awaiting-push");
   if (next.syncedHead && next.syncedHead.targetSha !== targetSha && targetInIntegration === false) delete next.syncedHead;
   // A merge just recorded (this pass saw its receipt) is not redone: the ancestry
@@ -1287,7 +1307,7 @@ for (const item of spec.items) {
   if (runner && next.demoRun?.lane) {
     const run = next.demoRun;
     const view = lane(run.lane);
-    const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone") && !background.has(`${run.lane.workflowId}/${run.lane.laneId}`);
+    const idle = view && (view.agentStatus === "done" || view.agentStatus === "gone") && !runBusy(run, `${run.lane.workflowId}/${run.lane.laneId}`, background, now);
     // A lane not in the manifest yet is starting; one missing for 30 min is gone.
     const missing = !view && Date.parse(now) - Date.parse(run.requestedAt ?? now) > 30 * 60_000;
     const ended = missing || (view && (LANE_ENDED.has(view.status ?? "") || view.workflowStatus === "dispatch-failed"));
@@ -1567,6 +1587,7 @@ export function syncObjective(spec, { targetSha, integrationBranch, baseline }) 
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     LONG_COMMANDS,
     spec.target.suite.length ? LANE_DATABASE_RULE : "",
+    spec.target.suite.length ? SLOW_TASK_RULE : "",
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     `If git merge-base --is-ancestor ${targetSha} HEAD already holds, the merge is committed (an earlier lane did it): do not redo or amend it; run the suite on HEAD and report.`,
     `Commit the merge on ${integrationBranch} with the repository's hooks. Local only: never push, never force, and never touch any other branch.`,
