@@ -114,9 +114,10 @@ async function fixture({ dirty = false, failTab = false } = {}) {
         objective: "Worktree lane",
         readOnly: false,
         agentKind: "pi",
-        status: "completed",
+        status: "completion-reported",
         paneId: "worktree-pane",
         tabId: "worktree-tab",
+        retirement: { status: "retired" },
         persistenceHandle: { provider: "pi", sessionId: "worktree-session" },
         sessionLog: {
           kind: "lane",
@@ -310,6 +311,40 @@ async function sweep(fixtureData, execute, confirm = true) {
     context(fixtureData.cwd, confirm),
   );
 }
+
+test("forced end-flow housekeeping preserves an existing worktree record for the following sweep", async () => {
+  const f = await fixture();
+  try {
+    const manifest = JSON.parse(await readFile(f.manifestPath, "utf8"));
+    const worktreeWorkflow = manifest.workflows.find((workflow) => workflow.id === "workflow-worktree");
+    worktreeWorkflow.updatedAt = new Date(Date.now() - 5 * 24 * 60 * 60_000).toISOString();
+    const recentTerminalAt = new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString();
+    manifest.workflows.push(...Array.from({ length: 100 }, (_, index) => ({
+      id: `workflow-terminal-${index}`,
+      status: "completed",
+      updatedAt: recentTerminalAt,
+      lanes: [{ id: `lane-terminal-${index}`, status: "done" }],
+    })));
+    await writeFile(f.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const housekeep = await f.tools.get("herdr_housekeep").execute(
+      "end-flow-housekeeping",
+      {},
+      undefined,
+      undefined,
+      context(f.cwd, true),
+    );
+    assert.deepEqual(housekeep.details.archivedWorkflowIds, []);
+    const after = JSON.parse(await readFile(f.manifestPath, "utf8"));
+    assert.ok(after.workflows.some((workflow) => workflow.id === "workflow-worktree"));
+
+    const preview = await sweep(f, false);
+    assert.deepEqual(preview.details.worktrees.map((candidate) => candidate.workflowId), ["workflow-worktree"]);
+    assert.equal(preview.details.worktrees[0].path, f.worktree);
+  } finally {
+    await f.cleanup();
+  }
+});
 
 test("cleanup sweep dry-runs the root-scoped tabs and unopened worktree, then decline has no side effects", async () => {
   const f = await fixture();

@@ -166,6 +166,14 @@ test("baa-ton-end uses current supported discovery and invocation metadata for e
   assert.doesNotMatch(endSkillContent({ harness: "opencode" }), /`\/baa-ton-end`/);
   assert.match(endSkillContent({ harness: "pi" }), /disable-model-invocation: true[\s\S]*`\/skill:baa-ton-end`/);
 
+  for (const harness of ["claude", "codex", "opencode", "pi"]) {
+    const generated = endSkillContent({ harness });
+    const rootCheck = generated.split("\n").find((line) => line.startsWith("1."));
+    assert.match(rootCheck, /herdr_doctor/);
+    assert.match(rootCheck, /root-identity.*`ok`/);
+    if (harness !== "pi") assert.doesNotMatch(generated, /herdr_root_identity/, `${harness} must not invoke a Pi-only root tool`);
+  }
+
   const endFlow = endSkillContent({ harness: "pi" });
   const ordered = [
     `action: "status"`,
@@ -179,6 +187,7 @@ test("baa-ton-end uses current supported discovery and invocation metadata for e
   assert.ok(ordered.every((index) => index >= 0) && ordered.join() === [...ordered].sort((a, b) => a - b).join(), `end flow is out of order: ${ordered}`);
   assert.match(endFlow, /Never set `paused`|only the operator can pause/);
   assert.match(endFlow, /This end flow never executes a sweep/);
+  assert.match(endFlow, /preserves workflow records for any existing recorded worktree so the following sweep can still discover them/);
 });
 
 test("configured task profile resolves an exact launch profile", async () => {
