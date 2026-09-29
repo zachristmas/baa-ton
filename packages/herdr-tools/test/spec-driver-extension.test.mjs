@@ -2524,3 +2524,35 @@ test("a target with direct commits is fetched, merged into spec-integration by a
     await f.cleanup();
   }
 });
+
+test("items judged failed whose integrated commit the target already contains are verified from it (D05, D13, D15)", async () => {
+  const landedSha = "b".repeat(40);
+  const f = await fixture({
+    specDocument: {
+      version: 1,
+      target: { repo: ".", remote: "origin", branch: "feature/release" },
+      items: [{ id: "D05", title: "Groups", acceptance: { text: "d" } }, { id: "D06", title: "Nav", dependsOn: ["D05"], acceptance: { text: "n" } }, { id: "D10", title: "Review-failed", acceptance: { text: "r" } }],
+    },
+    seed: {
+      version: 1,
+      items: {
+        D05: { state: "failed", attempts: 3, findings: `Integration onto spec-integration failed its suite.\nINTEGRATED: ${landedSha}\nSUITE: fail\nFAILED: e2e typecheck:e2e` },
+        D06: { state: "pending", attempts: 2 },
+        D10: { state: "failed", attempts: 3, findings: "VERDICT: FAIL apps/gateway/x.ts wrong" },
+      },
+    },
+  });
+  try {
+    f.pushedShas.add(landedSha);
+    const result = await f.advance();
+    const state = await f.state();
+    // Nothing left to verify here (no tests, preview or evidence): the verifier passes it on the spot.
+    assert.equal(state.items.D05.state, "done");
+    assert.equal(state.items.D05.integratedSha, landedSha);
+    assert.equal(state.items.D10.state, "failed", "a review failure is not landed");
+    assert.notEqual(state.items.D06.state, "pending", "its dependency is integrated now");
+    assert.match(result.content[0].text, /D06 build|verify D05|build D06/);
+  } finally {
+    await f.cleanup();
+  }
+});

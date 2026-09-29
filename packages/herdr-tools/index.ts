@@ -5032,6 +5032,15 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; integration?: { sha?: string } }>)
         if (record.state === "awaiting-push" && record.integration?.sha)
           if (await (ports?.ancestor ?? gitAncestor)(repo, record.integration.sha, targetRef).catch(() => false)) pushed.add(record.integration.sha);
+      // Items judged failed (or held) whose last integrated commit is already on
+      // the target: their code is live, so they are verified from it.
+      const landed = new Map<string, string>();
+      for (const [id, record] of Object.entries(state.items ?? {}) as Array<[string, { state?: string; integratedSha?: string; findings?: string; note?: string }]>) {
+        if (!["failed", "blocked"].includes(record.state ?? "") || record.integratedSha) continue;
+        const shas = [...String(record.findings ?? "").matchAll(/^\s*INTEGRATED\s*:\s*([0-9a-f]{40})\b/gim)].map((match) => match[1]);
+        const sha = shas.at(-1);
+        if (sha && (await (ports?.ancestor ?? gitAncestor)(repo, sha, targetRef).catch(() => false))) landed.set(id, sha);
+      }
       // Which verifying items the preview already runs: one release check per pass.
       const released = new Map<string, string>();
       const waitingForDeploy = spec.items.filter((item) => {
@@ -5279,6 +5288,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         background,
         integrationLive,
         contained,
+        landed,
         ...(targetInIntegration !== undefined ? { targetInIntegration } : {}),
         capacityWaiting,
         pushed,

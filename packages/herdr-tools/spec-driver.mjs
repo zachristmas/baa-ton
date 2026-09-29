@@ -404,6 +404,7 @@ function staleBackground(current, now) {
  * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
  * @param {string} [input.targetSha] the target tip's SHA (the suite baseline is recorded per SHA)
  * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
+ * @param {Map<string, string>} [input.landed] failed or held items whose last INTEGRATED commit the target already contains -> that commit
  * @param {boolean} [input.targetInIntegration] whether the (freshly fetched) target tip is an ancestor of spec-integration's head; false: the target gained commits a push would not fast-forward over
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
@@ -422,6 +423,7 @@ export function advanceSpec({
   contained = new Map(),
   targetSha,
   targetInIntegration,
+  landed = new Map(),
   now,
 }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
@@ -489,6 +491,21 @@ export function advanceSpec({
     (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `${stage} lane${from ? ` ${from}` : ""} did not finish (${kind}, ${count}): ${String(reason).slice(0, 160)}; retrying${choice.profile ? ` with profile ${choice.profile}` : " with a fresh lane"}` });
     return true;
   };
+
+  // A00. An item whose integration was judged failed, or held, but whose
+  // integrated commit is already on the target (pushed by hand, or in a round
+  // its own suite verdict did not hold back) is integrated: it is verified
+  // from that commit, not left failed while its code is live and its
+  // dependents wait on it. The suite verdict was a judgment made before the
+  // baseline-relative gate; verification judges its tests from here.
+  for (const [id, sha] of landed) {
+    const current = next.items[id];
+    if (!current || !["failed", "blocked"].includes(current.state) || current.integratedSha) continue;
+    next.integrationCounter = (next.integrationCounter ?? 0) + 1;
+    move(id, "verifying", { integratedSha: sha, integration: { sha, order: next.integrationCounter, at: now, landed: true } }, `its integrated commit ${sha.slice(0, 12)} is already on the target; verified from there (its earlier integration verdict is superseded)`);
+    for (const key of ["findings", "note", "blockedReason", "blockedCause", "blockedByCode", "declined", "newFailures", "lane", "infraFailures", "infraRetryAfter", "infraAlertedAt", ...LANE_BOOKKEEPING]) delete current[key];
+    delete current.verified;
+  }
 
   // A0. Demos that failed only for want of a preview health check (lanes
   // assembled them from screenshots taken without one) get a fresh demo
