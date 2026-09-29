@@ -528,8 +528,8 @@ export function advanceSpec({
   // assembled them from screenshots taken without one) get a fresh demo
   // lane now, under the recorder that checks it, rather than after their backoff.
   // A re-armed item must actually get a fresh demo: any verified/evidence it
-  // still carries from the run that failed the check is cleared every pass
-  // until it is gone, so state an older driver re-armed without clearing it
+  // still carries from the run that failed the check is cleared
+  // (and only that) so state an older driver re-armed without clearing it
   // (verified stuck true, no lane, no evidenceRetryAfter) recovers too.
   for (const item of spec.items) {
     const current = next.items[item.id];
@@ -540,12 +540,22 @@ export function advanceSpec({
       delete current.evidenceRetryAfter;
       (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" });
     }
-    if (current.verified || current.evidence || current.verifyTestsOnly) {
+    // Only what predates the re-arm is cleared: a verification a fresh demo
+    // recorded afterwards is kept (evidenceProblem stays set after it, so
+    // this runs every pass). A verified with no readable timestamp (an older
+    // driver's `true`) predates it.
+    const rearmedAt = Date.parse(current.healthRuleRearmedAt);
+    const predates = (stamp) => !(Date.parse(stamp) >= rearmedAt);
+    const verifiedStale = Boolean(current.verified) && predates(current.verified);
+    const evidenceStamp = current.evidence && typeof current.evidence === "object" ? [current.evidence.reportAt, current.evidence.at, current.evidence.adoptedAt, current.evidence.verifiedAt].find((value) => typeof value === "string" && Number.isFinite(Date.parse(value))) : undefined;
+    const evidenceStale = Boolean(current.evidence) && (evidenceStamp ? predates(evidenceStamp) : verifiedStale);
+    if (!verifiedStale && !evidenceStale) continue;
+    if (verifiedStale) {
       delete current.verified;
-      delete current.evidence;
       delete current.verifyTestsOnly;
-      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "recovered: this item was re-armed for a fresh demo but still carried its old verification; cleared so the demo lane actually runs" });
     }
+    if (evidenceStale) delete current.evidence;
+    (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "recovered: this item was re-armed for a fresh demo but still carried its old verification; cleared so the demo lane actually runs" });
   }
 
   // A. Items an older driver held at the human gate for a mechanical reason
