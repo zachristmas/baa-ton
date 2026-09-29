@@ -146,7 +146,8 @@ const { readSpawnProbe, spawnThrottled } = (await freshImport("./inbox/spawn-loa
 // The root's (or spec host's) spawns join the per-minute count in supervisor.log;
 // a lane bridge installs its own first, and the first install wins.
 ((await import("./inbox/spawn-count.mjs")) as typeof import("./inbox/spawn-count.mjs")).installSpawnCounter(process.env.BAATON_SPEC_HOST === "1" ? "spec-host" : "root-extension");
-const { busyPorts, killLaneProcesses } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
+const { busyPorts, killLaneProcesses, readProcessTable } = (await freshImport("./inbox/lane-processes.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lane-processes.mjs");
+const { archivableWorkflows, liveSpecWorkflowIds, mentionedWorkflowIds, mtimeIn, removeFiles, scratchNames, staleScratch, workflowFiles, writeArchive, capList } = (await freshImport("./housekeeping.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./housekeeping.mjs");
 const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQuestionTimers, parseQuestions } = (await freshImport("./root-question.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-question.mjs");
 const { OPERATOR_AUTHORITY, runStateFromText, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
@@ -3040,6 +3041,21 @@ function specHostRootMapping(): ControllerRootMapping | undefined {
     (item) => item.root.pane_id === paneId && item.root.workspace_id === process.env.HERDR_WORKSPACE_ID,
   );
   return record?.root;
+}
+
+/** A dry-run sweep on a root with hundreds of stale records was ~200 lines of
+ * detail; cap each list and say how many were left out. */
+function compactSweepDetails(result: Record<string, unknown>): Record<string, unknown> {
+  const compact: Record<string, unknown> = { ...result };
+  const omitted: Record<string, number> = {};
+  for (const [key, value] of Object.entries(result)) {
+    if (!Array.isArray(value) || value.length <= 15) continue;
+    const capped = capList(value);
+    compact[key] = capped.items;
+    omitted[key] = capped.omitted;
+  }
+  if (Object.keys(omitted).length) compact.omitted = omitted;
+  return compact;
 }
 
 function isRootOrchestrator(): boolean {
@@ -6387,7 +6403,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     try {
       if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
       const manifest = await loadManifest(ctx.cwd);
-      if (laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire")) return;
+      // Without any approvalPolicy retire runs no stop command (those come only from a
+      // policy's runtime templates), so finished lanes are retired by default. A policy
+      // that exists but does not grant retire, or is not acknowledged, still blocks it.
+      const refusal = laneLeaseRefusal(ctx.cwd, manifest.approvalPolicyAck, "retire");
+      if (refusal && refusal !== "no approvalPolicy is configured") return;
       const candidates = retireCandidates(ctx.cwd, manifest, {
         auto: true,
         rootPaneId: process.env[HERDR_PANE_ID_ENV],
@@ -6409,6 +6429,45 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
     } catch {
       // Best effort: the next settled turn retries; herdr_retire is explicit.
+    }
+  }
+
+  let lastHousekeeping = 0;
+  /** Archive finished workflows out of the live manifest, delete the files they
+   * left, and prune launch scratch no live process uses. Throttled; never throws
+   * into the Pi lifecycle; touches no lane that can still run and no Git state. */
+  async function housekeepOrchestratorState(ctx: ExtensionContext, { force = false }: { force?: boolean } = {}): Promise<void> {
+    try {
+      if (process.env.BAA_TON_HOUSEKEEPING === "0") return;
+      if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
+      if (!force && Date.now() - lastHousekeeping < 30 * 60_000) return;
+      lastHousekeeping = Date.now();
+      const stateDir = dirname(manifestPath(ctx.cwd));
+      let specState: unknown;
+      try {
+        specState = JSON.parse(await readFile(join(stateDir, "spec-state.json"), "utf8"));
+      } catch {
+        specState = undefined;
+      }
+      let removed: Workflow[] = [];
+      await withManifestTransaction(ctx.cwd, (manifest) => {
+        const wide = manifest as unknown as Record<string, unknown>;
+        const protectedIds = mentionedWorkflowIds(Array.from(liveSpecWorkflowIds(specState)), wide.queue, wide.directives, wide.rootSupervision, activeLeases(manifest.leases));
+        const ids = archivableWorkflows(manifest, { protectedIds });
+        if (!ids.size) return;
+        const leaving = manifest.workflows.filter((workflow) => ids.has(workflow.id));
+        // Written before they leave the manifest; a failure throws and keeps them.
+        writeArchive(stateDir, leaving);
+        manifest.workflows = manifest.workflows.filter((workflow) => !ids.has(workflow.id));
+        removed = leaving;
+      });
+      if (removed.length) removeFiles(removed.flatMap((workflow) => workflowFiles(workflow, stateDir)));
+      const table = await readProcessTable().catch(() => []);
+      removeFiles(
+        staleScratch({ names: scratchNames(stateDir), mtimeOf: mtimeIn(stateDir), liveCommandLines: table.map((row) => row.line) }).map((name) => join(stateDir, name)),
+      );
+    } catch {
+      // Best effort: the next pass retries.
     }
   }
 
@@ -11498,8 +11557,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       // Older Pi without tool control: the tools are active by default.
     }
   };
+  // Idle roots get no agent event, so a slow unref'd interval keeps finished lanes
+  // retiring and old workflows archiving without anyone typing into the root.
+  let housekeepingTimer: ReturnType<typeof setInterval> | undefined;
+  function ensureHousekeepingTimer(ctx: ExtensionContext) {
+    if (housekeepingTimer || !isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
+    housekeepingTimer = setInterval(() => {
+      void autoRetireFinishedLanes(ctx).then(() => housekeepOrchestratorState(ctx));
+    }, 5 * 60_000);
+    housekeepingTimer.unref?.();
+  }
   pi.on("agent_start", async (_event, ctx) => {
     recordExtensionRuntime(ctx);
+    try {
+      ensureHousekeepingTimer(ctx);
+    } catch {
+      // Best effort; the settled-turn trigger remains.
+    }
     ensureOperatorTools();
     rootRunId = randomUUID();
     await persistRootTurn(ctx, "active");
@@ -11513,6 +11587,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     await persistRootTurn(ctx, "idle");
     await autoRetireFinishedLanes(ctx);
+    await housekeepOrchestratorState(ctx);
     try {
       if (isRootOrchestrator() && isRootForManifest(ctx.cwd)) {
         ensureSpecTimer(ctx);
@@ -11536,6 +11611,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       }
     });
   pi.on("session_shutdown", async (_event, ctx) => {
+    if (housekeepingTimer) clearInterval(housekeepingTimer);
+    housekeepingTimer = undefined;
     specTimer?.stop();
     specTimer = undefined;
     removeRuntimeRecord?.();
@@ -13145,7 +13222,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   : `Cleanup sweep completed: ${tabCount} lane tab(s), ${worktreeCount} worktree(s) considered.`,
           },
         ],
-        details: result,
+        details: details.dryRun ? compactSweepDetails(result as Record<string, unknown>) : result,
       };
     },
   });
