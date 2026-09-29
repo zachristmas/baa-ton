@@ -91,6 +91,12 @@ const ACTIONABLE_CLASSIFICATIONS = new Set([
   "blocked",
   "goal-paused",
 ]);
+// Only a blocking message signals the parent goal; informational messages
+// ride the digest once and operator messages go to the operator instead.
+const MESSAGE_KINDS = new Set(["informational", "operator", "blocking"]);
+const BLOCKING_MESSAGE_KINDS = new Set(["blocking"]);
+const DERIVED_NEXT_ACTION = "Run herdr_spec action=status to see what is next in the spec loop, then continue authorized safe local work.";
+const NUDGE_ESCALATE_AFTER = 2;
 const TERMINAL_PARENT_GOAL_STATES = new Set([
   "completed",
   "blocked",
@@ -1051,7 +1057,7 @@ function validateMessageRecord(value, label) {
       "requestedAt",
       "delivery",
     ],
-    ["details"],
+    ["details", "noRootAction", "resolvedAt"],
   );
   assert(message.version === 1, `${label}.version must be 1.`);
   for (const key of ["id", "workflowId", "laneId", "summary", "requestedAt"])
@@ -1060,7 +1066,10 @@ function validateMessageRecord(value, label) {
     message.summary.length <= MESSAGE_SUMMARY_MAX_LENGTH,
     `${label}.summary is too long.`,
   );
-  assert(message.kind === "informational", `${label}.kind must be informational.`);
+  assert(MESSAGE_KINDS.has(message.kind), `${label}.kind is invalid.`);
+  if ("noRootAction" in message)
+    assert(typeof message.noRootAction === "boolean", `${label}.noRootAction must be a boolean.`);
+  if ("resolvedAt" in message) assertString(message.resolvedAt, `${label}.resolvedAt`);
   if ("details" in message) {
     assert(
       typeof message.details === "string" &&
@@ -2905,6 +2914,7 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
   );
   const items = [];
   const open = [];
+  const escalations = [];
   let changed = false;
   for (const route of routes) {
     const stored = manifest.workflows.find(
@@ -2949,6 +2959,19 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
         continue;
       }
       if (status !== "pending") continue;
+      if (request.kind === "operator" || request.noRootAction) {
+        // Never wakes the root: operator messages go to Zach, and a lane can
+        // mark any message as needing no root action.
+        request.delivery = {
+          status: "delivered",
+          attempts: attempts + 1,
+          updatedAt: timestamp,
+          reason: request.kind === "operator" ? "operator-escalated" : "no-root-action",
+        };
+        if (request.kind === "operator") escalations.push(request);
+        changed = true;
+        continue;
+      }
       // A child message is a new review signal, including for terminal lanes
       // and goals. Signal once, when it is first seen, not on every deferral.
       if (attempts === 0 && !request.delivery?.reason) {
@@ -2988,7 +3011,7 @@ function collectDigestItems({ orchestrator, manifestPath, manifest, goal, timest
   }
   if (collectDirectiveItems({ orchestrator, manifest, goal, timestamp, items })) changed = true;
   if (collectAlertItems({ orchestrator, manifest, timestamp, items })) changed = true;
-  return { items, changed, open };
+  return { items, changed, open, escalations };
 }
 
 /**
@@ -3006,8 +3029,9 @@ export async function dispatchRootDigest({
   configDir,
   herdr,
   timestamp = now(),
+  notify = herdrNotification,
 }) {
-  const { items, changed, open } = collectDigestItems({
+  const { items, changed, open, escalations } = collectDigestItems({
     orchestrator,
     manifestPath,
     manifest,
@@ -3015,6 +3039,12 @@ export async function dispatchRootDigest({
     timestamp,
   });
   let dirty = changed;
+  if (dirty) await atomicWriteJson(manifestPath, manifest);
+  for (const message of escalations)
+    await notify({
+      title: "Baa-ton: a lane needs the operator",
+      body: clipText(`${message.workflowId}/${message.laneId}: ${message.summary}`, 300),
+    });
   if (items.length === 0) {
     if (dirty) await atomicWriteJson(manifestPath, manifest);
     return { status: "empty", count: 0 };
@@ -3267,10 +3297,50 @@ async function processQueueHeadWake({
 }
 
 function signalParentGoalForMessage(goal, message, timestamp = now()) {
-  if (!goal) return false;
+  if (!goal || !BLOCKING_MESSAGE_KINDS.has(message.kind)) return false;
   goal.status = "review-requested";
   goal.nextAction =
     `Review child message ${message.id} from ${message.workflowId}/${message.laneId}: ${message.summary}`;
+  goal.updatedAt = timestamp;
+  return true;
+}
+
+/**
+ * A message-derived nextAction must not outlive its message. Clear it (and
+ * restore the derived next action) once the message is delivered and the
+ * root has been nudged since, or resolved, or its workflow or lane is
+ * terminal, or the message is gone. Also repairs pointers stranded by older
+ * versions that never recorded a source.
+ */
+export function repairStaleMessagePointer(manifest, goal, timestamp = now()) {
+  if (!goal || TERMINAL_PARENT_GOAL_STATES.has(goal.status)) return false;
+  // The source is the message named in nextAction: goal objects are strictly
+  // validated by pre-upgrade bridges, so no extra pointer field is persisted.
+  const match = /^Review child message (message-[0-9a-f]+) from /.exec(goal.nextAction ?? "");
+  if (!match) return false;
+  const source = { kind: "message", id: match[1] };
+  let found;
+  for (const workflow of manifest.workflows ?? []) {
+    const message = (workflow?.messageRequests ?? []).find((candidate) => candidate?.id === source.id);
+    if (message) found = { workflow, message };
+  }
+  let stale = !found;
+  if (found) {
+    const { workflow, message } = found;
+    const delivered = message.delivery?.status === "delivered";
+    const lane = (workflow.lanes ?? []).find((candidate) => candidate.id === message.laneId);
+    const terminal =
+      TERMINAL_WORKFLOW_STATES.has(workflow.state ?? workflow.status) ||
+      (lane && TERMINAL_LANE_STATES.has(lane.state ?? lane.status));
+    const rootTurnEnded =
+      delivered &&
+      goal.supervisor?.lastNudgeAt &&
+      Date.parse(goal.supervisor.lastNudgeAt) > Date.parse(message.delivery.updatedAt);
+    stale = Boolean(message.resolvedAt) || (delivered && (terminal || rootTurnEnded));
+  }
+  if (!stale) return false;
+  goal.nextAction = DERIVED_NEXT_ACTION;
+  if (goal.status === "review-requested") goal.status = "active";
   goal.updatedAt = timestamp;
   return true;
 }
@@ -3372,6 +3442,10 @@ export async function routeChildMessage(options = {}) {
   } finally {
     await release();
   }
+}
+
+export function nudgeFingerprint(goal, reasons = []) {
+  return sha256(canonicalJson({ status: goal.status, reasons: [...reasons].sort(), nextAction: goal.nextAction ?? "" }));
 }
 
 function supervisorWakeText(goal, reasons = []) {
@@ -4016,6 +4090,8 @@ export async function runSupervisorTick({
       // Event-driven delivery point for everything the root has not seen:
       // a digest deferred while the root worked goes out on the first tick
       // after its turn settles, independent of parent-goal status.
+      // A pointer to a message the root already handled must not keep nudging.
+      if (repairStaleMessagePointer(manifest, goal, timestamp)) await persist();
       const digest = await dispatchRootDigest({
         orchestrator,
         manifestPath,
@@ -4024,6 +4100,7 @@ export async function runSupervisorTick({
         configDir,
         herdr: api,
         timestamp,
+        notify,
       });
       if (digest.count > 0) {
         pendingWakes.push({
@@ -4222,6 +4299,26 @@ export async function runSupervisorTick({
         results.push({ manifestPath, status: "root-not-idle" });
         continue;
       }
+      // Restart-proof dedupe: an identical nudge the root already got and did
+      // not act on is not re-sent. Escalate once to the operator, then stay
+      // quiet until the fingerprint (status + reasons + nextAction) changes.
+      const fingerprint = nudgeFingerprint(goal, decision.reasons);
+      const dedupe = supervisionFor(manifest, orchestrator, true);
+      const previous = dedupe.lastNudge;
+      if (previous?.fingerprint === fingerprint && previous.count >= NUDGE_ESCALATE_AFTER) {
+        if (!previous.escalatedAt) {
+          previous.escalatedAt = timestamp;
+          await notify({
+            title: "Baa-ton: the root is not acting on a nudge",
+            body: clipText(`${orchestrator.id}: the same nudge went unanswered ${previous.count} times (${goal.nextAction}). Further identical nudges are suppressed until the state changes.`, 300),
+          });
+        }
+        supervisor.nextNudgeAt = nextNudgeAt(timestamp, supervisor.intervalSeconds);
+        supervisor.updatedAt = timestamp;
+        await atomicWriteJson(manifestPath, manifest);
+        results.push({ manifestPath, status: "duplicate-suppressed" });
+        continue;
+      }
       const attemptedAt = timestamp;
       supervisor.lastAttemptAt = attemptedAt;
       supervisor.lastDelivery = { status: "sending", attemptedAt };
@@ -4274,6 +4371,12 @@ export async function runSupervisorTick({
       if (outcome.status === "delivered") {
         supervisor.nudgeCount += 1;
         supervisor.lastNudgeAt = supervisor.lastDelivery.deliveredAt;
+        dedupe.lastNudge = {
+          fingerprint,
+          count: previous?.fingerprint === fingerprint ? previous.count + 1 : 1,
+          at: timestamp,
+          ...(previous?.fingerprint === fingerprint && previous.escalatedAt ? { escalatedAt: previous.escalatedAt } : {}),
+        };
         // Two stall nudges the root did not act on: tell the user, once.
         if (decision.specStall) {
           const entry = supervisionFor(manifest, orchestrator, true);
