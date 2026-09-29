@@ -527,13 +527,25 @@ export function advanceSpec({
   // A0. Demos that failed only for want of a preview health check (lanes
   // assembled them from screenshots taken without one) get a fresh demo
   // lane now, under the recorder that checks it, rather than after their backoff.
+  // A re-armed item must actually get a fresh demo: any verified/evidence it
+  // still carries from the run that failed the check is cleared every pass
+  // until it is gone, so state an older driver re-armed without clearing it
+  // (verified stuck true, no lane, no evidenceRetryAfter) recovers too.
   for (const item of spec.items) {
     const current = next.items[item.id];
-    if (current?.state !== "verifying" || current.lane || current.healthRuleRearmedAt) continue;
+    if (current?.state !== "verifying" || current.lane) continue;
     if (!/no preview health check at capture/.test(current.evidenceProblem ?? "")) continue;
-    current.healthRuleRearmedAt = now;
-    delete current.evidenceRetryAfter;
-    (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" });
+    if (!current.healthRuleRearmedAt) {
+      current.healthRuleRearmedAt = now;
+      delete current.evidenceRetryAfter;
+      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" });
+    }
+    if (current.verified || current.evidence || current.verifyTestsOnly) {
+      delete current.verified;
+      delete current.evidence;
+      delete current.verifyTestsOnly;
+      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: "recovered: this item was re-armed for a fresh demo but still carried its old verification; cleared so the demo lane actually runs" });
+    }
   }
 
   // A. Items an older driver held at the human gate for a mechanical reason
@@ -1405,7 +1417,13 @@ for (const item of spec.items) {
     // waiting on a recording nothing will make.
     const untested = untestedAtIntegration(item, current);
     const testsOnly = Boolean(current.verified) && untested.length > 0;
-    if (current.verified && !testsOnly) continue;
+    if (current.verified && !testsOnly) {
+      // Nothing left for a lane to do: the verifier (outside this pure
+      // function) still has to confirm it. Named, not silent, so an item
+      // stuck here with no lane and nothing dispatching it is visible.
+      waits[item.id] ??= "verified: waiting for the verifier to confirm it";
+      continue;
+    }
     // A demo lane after an evidence failure waits out its backoff.
     if (typeof current.evidenceRetryAfter === "string" && Date.parse(now) < Date.parse(current.evidenceRetryAfter)) {
       waits[item.id] = `evidence: a demo lane after ${current.evidenceRetryAfter}`;

@@ -763,6 +763,70 @@ test("demos that failed only for want of a preview health check get a fresh demo
   assert.equal(advanceSpec({ spec: s, state: again, lane: lanes({}), now: at(1) }).state.items.D.evidenceRetryAfter, "2099-01-01T00:00:00.000Z", "only once");
 });
 
+test("a health-check re-arm clears the item's old verified and evidence, so a fresh demo actually dispatches", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", evidence: { report: "a/d.docx", onPreview: true } } }], {}, undefined, { url: "https://pv.example.test", health: "/healthz" });
+  const state = {
+    version: 1,
+    items: {
+      D: {
+        state: "verifying",
+        integratedSha: SHA_A,
+        verified: at(0),
+        evidence: { path: "/state/evidence/D/d.final.docx", sha256: "0".repeat(64), images: 2, reportAt: at(0) },
+        evidenceProblem: "step 1 of this preview demo has no preview health check at capture (record it with ...)",
+      },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(1) });
+  assert.equal(step.state.items.D.verified, undefined, "the old verification is gone: nothing has re-checked it since");
+  assert.equal(step.state.items.D.evidence, undefined);
+  assert.equal(step.state.items.D.healthRuleRearmedAt, at(1));
+  assert.deepEqual(step.actions.find((action) => action.itemId === "D"), { kind: "verify", itemId: "D", attempt: 1 }, "a fresh demo, not a tests-only receipt");
+});
+
+test("an item already stuck re-armed with its old verified and evidence still set (an older driver's bug) recovers on the next pass", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", evidence: { report: "a/d.docx", onPreview: true } } }], {}, undefined, { url: "https://pv.example.test", health: "/healthz" });
+  const state = {
+    version: 1,
+    items: {
+      D: {
+        state: "verifying",
+        integratedSha: SHA_A,
+        verified: at(0),
+        evidence: { path: "/state/evidence/D/d.final.docx", sha256: "0".repeat(64), images: 2, reportAt: at(0) },
+        evidenceProblem: "step 1 of this preview demo has no preview health check at capture (record it with ...)",
+        healthRuleRearmedAt: at(0),
+        history: [{ at: at(0), from: "verifying", to: "verifying", note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" }],
+      },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(2) });
+  assert.equal(step.state.items.D.verified, undefined, "the stuck verification is cleared even though it was already re-armed once");
+  assert.equal(step.state.items.D.evidence, undefined);
+  assert.ok(step.state.items.D.history.some((entry) => /recovered:.*re-armed.*still carried/.test(entry.note ?? "")));
+  assert.ok(step.actions.some((action) => action.kind === "verify" && action.itemId === "D"), "the demo lane it never got is dispatched now");
+});
+
+test("a genuinely verified item with no re-arm is never re-dispatched, and its stuck wait is named", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", evidence: { report: "a/d.docx", onPreview: true } } }], {}, undefined, { url: "https://pv.example.test", health: "/healthz" });
+  const state = {
+    version: 1,
+    items: {
+      D: {
+        state: "verifying",
+        integratedSha: SHA_A,
+        verified: at(0),
+        evidence: { path: "/state/evidence/D/d.final.docx", sha256: "0".repeat(64), images: 2, reportAt: at(0) },
+      },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(1) });
+  assert.equal(step.state.items.D.verified, at(0), "still verified: no re-arm signal at all");
+  assert.deepEqual(step.state.items.D.evidence, state.items.D.evidence);
+  assert.ok(!step.actions.some((action) => action.itemId === "D"), "no lane dispatched for an item nothing re-armed");
+  assert.match(step.waits.D, /verified: waiting for the verifier to confirm it/);
+});
+
 test("a target that gained direct commits is merged into spec-integration by a sync run before any push; the merged head is then pushed, never forced (the live non-fast-forward failures)", () => {
   const SHA_T = "e".repeat(40);
   const SHA_M = "f".repeat(40);
