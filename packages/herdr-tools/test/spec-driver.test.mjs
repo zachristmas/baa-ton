@@ -795,16 +795,43 @@ test("an item already stuck re-armed with its old verified and evidence still se
         verified: at(0),
         evidence: { path: "/state/evidence/D/d.final.docx", sha256: "0".repeat(64), images: 2, reportAt: at(0) },
         evidenceProblem: "step 1 of this preview demo has no preview health check at capture (record it with ...)",
-        healthRuleRearmedAt: at(0),
+        healthRuleRearmedAt: at(1),
         history: [{ at: at(0), from: "verifying", to: "verifying", note: "re-armed: its demo lacked the preview health check; a fresh demo lane records it with the checking recorder" }],
       },
     },
   };
-  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(2) });
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(3) });
   assert.equal(step.state.items.D.verified, undefined, "the stuck verification is cleared even though it was already re-armed once");
   assert.equal(step.state.items.D.evidence, undefined);
   assert.ok(step.state.items.D.history.some((entry) => /recovered:.*re-armed.*still carried/.test(entry.note ?? "")));
   assert.ok(step.actions.some((action) => action.kind === "verify" && action.itemId === "D"), "the demo lane it never got is dispatched now");
+});
+
+test("after the recovery, a verification a fresh demo records later survives every following pass: no new recovered note, no re-dispatch", () => {
+  const s = spec([{ id: "D", acceptance: { text: "d", evidence: { report: "a/d.docx", onPreview: true } } }], {}, undefined, { url: "https://pv.example.test", health: "/healthz" });
+  const problem = "step 1 of this preview demo has no preview health check at capture (record it with ...)";
+  const stuck = { version: 1, items: { D: { state: "verifying", integratedSha: SHA_A, verified: at(0), evidence: { path: "/e/d.docx", sha256: "0".repeat(64), images: 2, reportAt: at(0) }, evidenceProblem: problem, healthRuleRearmedAt: at(1) } } };
+  const recovered = advanceSpec({ spec: s, state: stuck, lane: lanes({}), now: at(2) }).state;
+  const recoveries = (state) => state.items.D.history.filter((entry) => /^recovered:/.test(entry.note ?? "")).length;
+  assert.equal(recoveries(recovered), 1);
+  // The fresh demo lane records its result; evidenceProblem is still set.
+  const fresh = structuredClone(recovered);
+  fresh.items.D.verified = at(5);
+  fresh.items.D.evidence = { path: "/e/d2.docx", sha256: "1".repeat(64), images: 3, reportAt: at(5) };
+  let state = fresh;
+  for (let minute = 6; minute < 12; minute += 1) {
+    const step = advanceSpec({ spec: s, state, lane: lanes({}), now: at(minute) });
+    state = step.state;
+    assert.equal(state.items.D.verified, at(5), `pass ${minute}: the new verification is kept`);
+    assert.equal(state.items.D.evidence.reportAt, at(5), `pass ${minute}: the new evidence is kept`);
+    assert.equal(recoveries(state), 1, `pass ${minute}: no new recovered note`);
+    assert.ok(!step.actions.some((action) => action.kind === "verify" && action.itemId === "D"), `pass ${minute}: not re-dispatched`);
+  }
+  // Evidence without a timestamp goes with a stale verified, and stays with a fresh one.
+  const untimed = { version: 1, items: { D: { state: "verifying", integratedSha: SHA_A, verified: at(0), evidence: { path: "/e/d.docx" }, evidenceProblem: problem, healthRuleRearmedAt: at(1) } } };
+  assert.equal(advanceSpec({ spec: s, state: untimed, lane: lanes({}), now: at(2) }).state.items.D.evidence, undefined);
+  const untimedFresh = { version: 1, items: { D: { state: "verifying", integratedSha: SHA_A, verified: at(5), evidence: { path: "/e/d.docx" }, evidenceProblem: problem, healthRuleRearmedAt: at(1) } } };
+  assert.deepEqual(advanceSpec({ spec: s, state: untimedFresh, lane: lanes({}), now: at(6) }).state.items.D.evidence, { path: "/e/d.docx" });
 });
 
 test("a genuinely verified item with no re-arm is never re-dispatched, and its stuck wait is named", () => {
