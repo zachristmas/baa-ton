@@ -975,3 +975,34 @@ test("a sync merge is never dropped unjudged: an idle lane with a suite running 
     assert.equal(done.state.syncRun, undefined, key2);
   }
 });
+
+test("a sync run that failed with no suite verdict starts over after 10 minutes, up to three times; a verdict failure stays; a baseline lane idle with its suite running is not replaced", () => {
+  const SHA_T = "e".repeat(40);
+  const SHA_M = "f".repeat(40);
+  const s = spec([{ id: "A", acceptance: { text: "a" } }]);
+  s.target.suite = ["npm test"];
+  const withRun = (run) => ({ version: 1, integrationCounter: 1, syncRun: { targetSha: SHA_T, attempts: 4, requestedAt: at(0), dispatched: true, ...run }, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } } } });
+  const run = (state, minute) => advanceSpec({ spec: s, state, lane: lanes({}), targetSha: SHA_T, targetInIntegration: true, now: at(minute) });
+
+  const early = run(withRun({ failed: { at: at(0), note: "sync lanes ended without a receipt three times" } }), 5);
+  assert.ok(early.state.syncRun.failed, "not before 10 minutes");
+  const later = run(withRun({ failed: { at: at(0), note: "sync lanes ended without a receipt three times" } }), 12);
+  assert.equal(later.state.syncRun.failed, undefined);
+  assert.equal(later.state.syncRun.attempts, 1);
+  assert.equal(later.state.syncRun.resets, 1);
+  assert.ok(later.actions.some((action) => action.kind === "sync-target"), "a fresh lane validates");
+  const spent = run(withRun({ resets: 3, failed: { at: at(0), note: "n" } }), 12);
+  assert.ok(spent.state.syncRun.failed, "three resets and the root decides");
+  const verdict = run(withRun({ failed: { at: at(0), sha: SHA_M, suite: "fail", fresh: [{ package: "@x/web", task: "test" }] } }), 12);
+  assert.ok(verdict.state.syncRun.failed, "a verdict failure is not retried");
+  assert.match(verdict.waits.A, /merging origin\/feature\/release into spec-integration failed; the root decides/);
+
+  // A baseline lane idle with its suite running in the background is not asked or replaced.
+  const base = { version: 1, baselineRun: { kind: "baseline", targetSha: SHA_T, attempts: 1, requestedAt: at(0), lane: { workflowId: "wb", laneId: "l1" }, askedAt: at(1) }, items: { A: { state: "integrating", attempts: 1 } } };
+  const view = { status: "active", agentStatus: "done" };
+  const busy = advanceSpec({ spec: s, state: structuredClone(base), lane: lanes({ "wb/l1": view }), background: new Map([["wb/l1", "pnpm turbo run test"]]), targetSha: SHA_T, now: at(50) });
+  assert.equal(busy.state.baselineRun.lane.workflowId, "wb");
+  assert.equal(busy.state.baselineRun.attempts, 1);
+  const idle = advanceSpec({ spec: s, state: structuredClone(base), lane: lanes({ "wb/l1": view }), targetSha: SHA_T, now: at(50) });
+  assert.equal(idle.state.baselineRun.attempts, 2, "without background work the timeout applies as before");
+});
