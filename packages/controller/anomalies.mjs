@@ -105,6 +105,39 @@ export async function detectUndeliverable({ store, timestamp }) {
   }));
 }
 
+const STALL_FINISHED = new Set(["done", "resolved", "deferred"]);
+
+/**
+ * Why a stalled spec is stalled, from what the state already records for
+ * each unfinished item: its current note (the driver's last error or hold),
+ * its blocked reason, its last infrastructure failure, else its last history
+ * line. Grouped by cause, biggest first, so the anomaly names what to fix
+ * (a 17-hour stall said only "16 items are waiting").
+ */
+export function stallBlockers(specState, { max = 5 } = {}) {
+  const groups = new Map();
+  for (const [id, record] of Object.entries(specState?.items ?? {})) {
+    if (!record || STALL_FINISHED.has(record.state)) continue;
+    const infra = [...(Array.isArray(record.declines) ? record.declines : [])].reverse().find((entry) => entry?.kind === "infrastructure" || entry?.kind === "never started");
+    const line = (text) => String(text ?? "").split("\n").map((part) => part.trim()).find(Boolean);
+    const reason =
+      line(record.note) ??
+      (record.blockedReason ? `blocked (${record.blockedReason})` : undefined) ??
+      line(infra?.reason) ??
+      (record.lane ? "a lane is assigned but not working" : undefined) ??
+      line(record.history?.at(-1)?.note);
+    if (!reason) continue;
+    const key = reason.replace(/\bherdr-[0-9a-f]+\b/gi, "").replace(/\bw\d*[A-Za-z]*:p[0-9A-Za-z]+\b/g, "").replace(/\b[A-Z]\d{2}\b/g, "").replace(/[0-9a-f]{12,}/g, "").replace(/\d+/g, "#").replace(/\s+/g, " ").trim().slice(0, 100);
+    const group = groups.get(key) ?? { reason: reason.slice(0, 160), ids: [] };
+    group.ids.push(id);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.ids.length - a.ids.length)
+    .slice(0, max)
+    .map((group) => `${group.ids.length} item(s): ${group.reason} (${group.ids.slice(0, 4).join(", ")}${group.ids.length > 4 ? `, +${group.ids.length - 4}` : ""})`);
+}
+
 /**
  * Anomalies visible in one root's manifest and spec state on a supervisor
  * tick: a stall of STALL_ANOMALY_MS or more, a root alert repeated three or
@@ -118,7 +151,7 @@ export function detectAnomalies({ entry, specStall, specReason, specState, times
   if (specStall) {
     entry.stallSince ??= timestamp;
     if (now - Date.parse(entry.stallSince) >= STALL_ANOMALY_MS)
-      found.push({ kind: "stall", signature: `stall:${entry.stallSince}`, summary: `no lane has worked for ${Math.round((now - Date.parse(entry.stallSince)) / 60_000)} min while spec items remain`, evidence: [specReason] });
+      found.push({ kind: "stall", signature: `stall:${entry.stallSince}`, summary: `no lane has worked for ${Math.round((now - Date.parse(entry.stallSince)) / 60_000)} min while spec items remain`, evidence: [specReason, ...stallBlockers(specState).map((line) => `blocker: ${line}`)] });
   } else delete entry.stallSince;
   // A repeat is current: raised within REPEAT_WINDOW_MS, and, for an alert
   // about a spec item ("D02: ..."), only while that item is still blocked.
