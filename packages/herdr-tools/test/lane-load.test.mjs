@@ -61,6 +61,8 @@ test("ports are checked free after retire", async () => {
 test("orphaned shells older than a day are reported, live terminal shells are not", () => {
   const found = orphanShells(parseProcessTable(TABLE));
   assert.deepEqual(found.map((item) => item.pid), [100, 500]);
+  assert.ok(found.every((item) => item.laneOwned === false), "unmarked shells are not lane-owned");
+  assert.equal(orphanShells([{ pid: 9, ppid: 1, ageMs: 2 * 86_400_000, line: "-zsh BAA_STARTUP_INTENT=/x" }])[0].laneOwned, true);
 });
 
 test("startup waits scale with the process-start probe; over 2 s dispatch is throttled", async () => {

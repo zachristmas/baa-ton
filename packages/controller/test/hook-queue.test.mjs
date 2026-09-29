@@ -79,7 +79,10 @@ test("the spawn watch records the probe, logs throttle changes and reports orpha
     log: (message) => logs.push(message),
     measure: async () => ms,
     record: (probe) => recorded.push(probe),
-    table: async () => [{ pid: 42, ppid: 1, ageMs: 3 * 86_400_000, line: "-zsh HOME=/u" }],
+    table: async () => [
+      { pid: 42, ppid: 1, ageMs: 3 * 86_400_000, line: "-zsh HOME=/u BAA_STARTUP_INTENT=/w/intent.json" },
+      { pid: 43, ppid: 1, ageMs: 3 * 86_400_000, line: "-zsh HOME=/u" },
+    ],
     anomaly: async (value) => anomalies.push(value),
     clock: () => clock,
   });
@@ -88,6 +91,7 @@ test("the spawn watch records the probe, logs throttle changes and reports orpha
   assert.match(logs[0], /^spawn probe: 4000 ms; dispatch throttled: one lane at a time$/);
   assert.match(logs[1], /orphaned shells older than a day: -zsh 42 \(3 d\)/);
   assert.equal(anomalies[0].kind, "orphan-shells");
+  assert.equal(anomalies[0].signature, "orphan-shells:42", "the user's own login shell (43) is logged, not reported");
   clock = 60_000;
   ms = 300;
   await watch.tick();
