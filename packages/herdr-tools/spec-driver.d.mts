@@ -4,7 +4,7 @@ export const ACTIVE_STATES: Set<string>;
 export function globsOverlap(left: string, right: string): boolean;
 export function reviewVerdict(summary: unknown): "pass" | "fail" | undefined;
 export type SpecAction = {
-  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt" | "infer-receipt" | "demo-run" | "ask-demo-receipt";
+  kind: "decide" | "build" | "review" | "integrate" | "verify" | "ask-receipt" | "baseline" | "fix-baseline" | "ask-baseline-receipt" | "infer-receipt" | "demo-run" | "ask-demo-receipt" | "sync-target" | "ask-sync-receipt";
   /** ask-receipt: the pointed second ask. infer-receipt: when the first ask went out. */
   pointed?: boolean;
   since?: string;
@@ -29,6 +29,8 @@ export const RECEIPT_REASK_BASE_MS: number;
 export const RECEIPT_ASK_INTERVAL_MS: number;
 export function advanceSpec(input: {
   spec: Spec;
+  /** Whether the fetched target tip is an ancestor of spec-integration's head (false: it gained commits a push would not fast-forward over). */
+  targetInIntegration?: boolean;
   /** Items whose integration merge has migration journal entries out of order. */
   journalProblems?: Map<string, string[]>;
   state: SpecState | undefined;
@@ -73,6 +75,7 @@ export function integrateObjective(
   },
 ): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; tests: Array<{ command: string; result: string }>; report?: string };
+export function syncObjective(spec: Spec, input: { targetSha: string; integrationBranch: string; baseline?: { sha: string; failures: Array<{ package: string; task: string }> } }): string;
 export function demoRunResult(summary: unknown): { items: Map<string, { result: "written" | "blocked"; reason: string }>; stackBlocked?: string };
 export function demoRunObjective(spec: Spec, items: SpecItem[], options: { worktree?: string; sha: string; reports: Record<string, { path: string; preview?: { health?: string; wakePattern?: string } }>; pins?: string[] }): string;
 export function untestedAtIntegration(item: SpecItem, current: { integratedSha?: string; tests?: unknown } | undefined): string[];

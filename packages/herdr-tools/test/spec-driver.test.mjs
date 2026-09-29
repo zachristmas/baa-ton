@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { validateSpec } from "../spec.mjs";
-import { advanceSpec, demoRunObjective, demoRunResult, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict, verifyObjective, verifyResult } from "../spec-driver.mjs";
+import { advanceSpec, syncObjective, demoRunObjective, demoRunResult, buildObjective, decideObjective, decideResult, globsOverlap, integrateObjective, integrationResult, reviewObjective, reviewVerdict, verifyObjective, verifyResult } from "../spec-driver.mjs";
 
 const spec = (items, defaults = {}, stages, preview) =>
   validateSpec({
@@ -761,4 +761,71 @@ test("demos that failed only for want of a preview health check get a fresh demo
   const again = structuredClone(step.state);
   again.items.D.evidenceRetryAfter = "2099-01-01T00:00:00.000Z";
   assert.equal(advanceSpec({ spec: s, state: again, lane: lanes({}), now: at(1) }).state.items.D.evidenceRetryAfter, "2099-01-01T00:00:00.000Z", "only once");
+});
+
+test("a target that gained direct commits is merged into spec-integration by a sync run before any push; the merged head is then pushed, never forced (the live non-fast-forward failures)", () => {
+  const SHA_T = "e".repeat(40);
+  const SHA_M = "f".repeat(40);
+  const s = spec([{ id: "A", acceptance: { text: "a" } }, { id: "B", acceptance: { text: "b" } }], { pushGate: "round" });
+  s.target.suite = ["npm test"];
+  const state = { version: 1, integrationCounter: 1, baselines: { [SHA_T]: { suite: "fail", failures: [{ package: "@x/db", task: "test" }], at: at(0) } }, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } }, B: { state: "integrating", attempts: 1 } } };
+  const run = (st, extra = {}) => advanceSpec({ spec: s, state: st, lane: lanes({}), targetSha: SHA_T, now: at(1), ...extra });
+
+  // In sync: nothing to do, the push is asked as before.
+  const inSync = run(structuredClone(state), { targetInIntegration: true });
+  assert.equal(inSync.state.syncRun, undefined);
+  assert.equal(inSync.rootAsks.find((ask) => ask.kind === "push").sha, SHA_A);
+
+  // Out of sync: no push asked, a sync run starts, and the queue waits behind it.
+  const behind = run(structuredClone(state), { targetInIntegration: false });
+  assert.equal(behind.rootAsks.some((ask) => ask.kind === "push"), false, "no push over a target it does not contain");
+  assert.deepEqual(behind.actions.find((action) => action.kind === "sync-target"), { kind: "sync-target", itemId: "", attempt: 1, targetSha: SHA_T });
+  assert.equal(behind.actions.some((action) => action.kind === "integrate"), false);
+  assert.match(behind.waits.A, /merging fork\/feature\/release into spec-integration first|has commits spec-integration lacks/);
+  assert.match(behind.waits.B, /merging origin\/feature\/release .* into spec-integration first/);
+  const objective = syncObjective(s, { targetSha: SHA_T, integrationBranch: "spec-integration", baseline: { sha: SHA_T, failures: [{ package: "@x/db", task: "test" }] } });
+  assert.match(objective, /git merge --no-ff -m "spec\(sync\): merge feature\/release" e{40}[\s\S]*never push, never force[\s\S]*INTEGRATED: <full 40-character SHA of the merge commit>/);
+  assert.match(objective, /leased database/);
+
+  // The lane's receipt: a green merge (or one failing only where the baseline does) is pushed.
+  const running = structuredClone(behind.state);
+  running.syncRun.lane = { workflowId: "ws", laneId: "l1" };
+  const receipt = (summary) => run(structuredClone(running), { targetInIntegration: false, lane: lanes({ "ws/l1": { status: "completed", receipt: { summary } } }) });
+  const passed = receipt(`INTEGRATED: ${SHA_M}\nSUITE: pass`);
+  assert.equal(passed.state.syncRun, undefined);
+  assert.equal(passed.state.syncedHead.sha, SHA_M);
+  assert.equal(passed.rootAsks.find((ask) => ask.kind === "push").sha, SHA_M, "the merged head is what is pushed, in the pass that saw the receipt");
+  const after = run(structuredClone(passed.state), { targetInIntegration: true });
+  assert.equal(after.rootAsks.some((ask) => ask.kind === "push"), false, "asked once");
+  const relative = receipt(`INTEGRATED: ${SHA_M}\nSUITE: fail\nFAILED: @x/db test`);
+  assert.deepEqual(relative.state.syncedHead.baselineFailures, [{ package: "@x/db", task: "test" }], "judged against the baseline like an integration");
+
+  // A merge that fails where the target does not: nothing is pushed, the root is told.
+  const failed = receipt(`INTEGRATED: ${SHA_M}\nSUITE: fail\nFAILED: @x/web test`);
+  assert.equal(failed.state.syncedHead, undefined);
+  assert.ok(failed.state.syncRun.failed);
+  assert.match(failed.rootAsks.find((ask) => ask.itemId === "push").reason, /did not pass[\s\S]*@x\/web test[\s\S]*Nothing was pushed/);
+  assert.equal(failed.actions.some((action) => action.kind === "sync-target"), false, "no retry loop on a failed merge");
+  assert.equal(failed.rootAsks.some((ask) => ask.kind === "push"), false);
+
+  // A later item integrated on top of the merged head is pushed instead (it contains it).
+  const later = structuredClone(passed.state);
+  later.integrationCounter = 3;
+  later.items.B = { state: "awaiting-push", integration: { sha: SHA_B, order: 3, at: at(2) } };
+  assert.equal(run(later, { targetInIntegration: true }).rootAsks.find((ask) => ask.kind === "push").sha, SHA_B);
+
+  // The target moving again while a run is in flight is handled after it; a moved target drops a stale merged head.
+  const moved = advanceSpec({ spec: s, state: structuredClone(passed.state), lane: lanes({}), targetSha: "9".repeat(40), targetInIntegration: false, now: at(3) });
+  assert.equal(moved.state.syncedHead, undefined);
+  assert.equal(moved.state.syncRun.targetSha, "9".repeat(40));
+});
+
+test("a failed push is asked again after its wait, once the target has been looked at again", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a" } }]);
+  const state = { version: 1, integrationCounter: 1, pushGate: { askedSha: SHA_A, items: ["A"], at: at(0) }, pushFailure: { sha: SHA_A, items: ["A"], error: "rejected", at: at(0), count: 1, retryAfter: at(5) }, items: { A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } } } };
+  const early = advanceSpec({ spec: s, state: structuredClone(state), lane: lanes({}), targetSha: SHA_B, now: at(2) });
+  assert.equal(early.rootAsks.some((ask) => ask.kind === "push"), false, "not before its wait");
+  const due = advanceSpec({ spec: s, state: structuredClone(state), lane: lanes({}), targetSha: SHA_B, now: at(6) });
+  assert.equal(due.rootAsks.find((ask) => ask.kind === "push").sha, SHA_A);
+  assert.equal(due.state.pushFailure.retryAfter, undefined);
 });

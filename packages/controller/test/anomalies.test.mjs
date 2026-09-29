@@ -83,3 +83,20 @@ test("a decision anomaly also goes to the root; with no lane-admin registered it
     await bare.cleanup();
   }
 });
+
+test("a spec push that keeps failing is an anomaly with the full git error, not a truncated root ask", async () => {
+  const error = ["! [rejected] 999999999999 -> feature/release (non-fast-forward)", "error: failed to push some refs to 'origin'", "hint: Updates were rejected because the tip of your current branch is behind"].join("\n");
+  const specState = {
+    items: { D03: { state: "awaiting-push" }, D04: { state: "awaiting-push" } },
+    pushFailure: { sha: "9".repeat(40), items: ["D03", "D04"], error, at: at(0), count: 2 },
+  };
+  const found = detectAnomalies({ entry: { alerts: [] }, specState, timestamp: at(60_000) });
+  assert.deepEqual(found.map((anomaly) => [anomaly.kind, anomaly.signature]), [["push-failed", "push-failed:999999999999:2"]]);
+  assert.match(found[0].summary, /push of 999999999999 \(D03, D04\) failed 2 time\(s\)/);
+  assert.deepEqual(found[0].evidence, error.split("\n"), "every line of the git error");
+  // Once nothing waits to be pushed, it is history.
+  assert.deepEqual(detectAnomalies({ entry: { alerts: [] }, specState: { ...specState, items: { D03: { state: "verifying" } } }, timestamp: at(60_000) }), []);
+  // Each further failure is a new signature, so it recurs after a fix.
+  const again = detectAnomalies({ entry: { alerts: [] }, specState: { ...specState, pushFailure: { ...specState.pushFailure, count: 3 } }, timestamp: at(60_000) });
+  assert.equal(again[0].signature, "push-failed:999999999999:3");
+});
