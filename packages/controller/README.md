@@ -104,3 +104,11 @@ npm test
 ```
 
 Tests use a temporary mocked JSON-line socket and cover strict configuration and payload validation, concurrent event serialization, event deduplication, root identity checks, parent-goal scheduling, concurrent one-shot delivery, legacy/interrupted-send suppression, authoritative root-run gating, unavailable-root recovery, generic multi-harness events, and optional paused-goal classification. They do not contact a live Herdr server or alter a workspace.
+
+## Root watch
+
+Beside its tick, the supervisor checks every root's pane every 30 seconds (root-watch.mjs). A root that stops its own supervision while the spec has unfinished items is restarted (only an operator pauses a run). If the pane's live agent is another kind than the registered `agent_kind`, the supervisor adopts the live kind in this config after 5 minutes and tells the root to attach its tools (invoke `baa-ton-start`). If the pane has no agent, or shows a bare shell, it types the root's optional `resume_command` into the pane (in the project directory, at most 3 an hour, 10 minutes apart). Each case raises an anomaly to lane-admin and a Herdr notification.
+
+```json
+"root": { "target": "w2J:p1", "target_kind": "pane_id", "pane_id": "w2J:p1", "workspace_id": "w2J", "agent_kind": "pi", "resume_command": "pi --session <session file>" }
+```

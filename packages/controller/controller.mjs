@@ -71,6 +71,9 @@ const MIN_NUDGE_INTERVAL_SECONDS = 5;
 const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const MAX_DIGEST_WINDOW_SECONDS = 3_600;
 const MAX_ESCALATE_MINUTES = 1_440;
+const ROOT_WATCH_INTERVAL_MS = 30_000;
+import { SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "./root-watch.mjs";
+
 const execFileAsync = promisify(execFile);
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
 const MESSAGE_DETAILS_MAX_LENGTH = 6_000;
@@ -147,7 +150,7 @@ export class ControllerError extends Error {
   }
 }
 
-class HerdrApiError extends Error {
+export class HerdrApiError extends Error {
   constructor(code, message) {
     super(message);
     this.name = "HerdrApiError";
@@ -282,9 +285,12 @@ function validateRoot(root) {
     root,
     "config.root",
     ["target", "target_kind", "pane_id", "workspace_id"],
-    ["agent_kind"],
+    ["agent_kind", "resume_command"],
   );
   const paneId = assertString(value.pane_id, "config.root.pane_id");
+  // The shell line that relaunches this root's harness with its session when
+  // its pane is left with no agent (run in the project directory).
+  const resumeCommand = "resume_command" in value ? assertString(value.resume_command, "config.root.resume_command") : undefined;
   const target = validateTarget(value, "config.root", paneId);
   const agentKind =
     "agent_kind" in value
@@ -295,9 +301,11 @@ function validateRoot(root) {
     pane_id: paneId,
     workspace_id: assertString(value.workspace_id, "config.root.workspace_id"),
   };
-  return agentKind === undefined
-    ? normalized
-    : { ...normalized, agent_kind: agentKind };
+  return {
+    ...normalized,
+    ...(agentKind === undefined ? {} : { agent_kind: agentKind }),
+    ...(resumeCommand === undefined ? {} : { resume_command: resumeCommand }),
+  };
 }
 
 function validateLane(lane, index) {
@@ -3652,6 +3660,188 @@ export async function deliverOperatorQueue({ herdr, storePath, timestamp = now()
   );
 }
 
+/**
+ * Rewrite one root's registered agent kind in the controller config, only if
+ * it still holds the kind the caller saw (a person bootstrapping the root at
+ * the same time wins). Returns whether it wrote.
+ */
+async function adoptRootKind(configDir, orchestratorId, from, to) {
+  const path = join(resolve(configDir), CONFIG_NAME);
+  const document = parseJson(await readRegularFile(path, "Controller config"), "Controller config");
+  const target = Array.isArray(document.orchestrators) ? document.orchestrators.find((item) => item?.id === orchestratorId) : undefined;
+  if (!target || target.root?.agent_kind !== from) return false;
+  target.root.agent_kind = to;
+  validateConfig(document);
+  await atomicWriteJson(path, document);
+  return true;
+}
+
+/**
+ * A root that parked its own supervision (herdr_goal action=stop, or a pause)
+ * while the spec still has unfinished items is put back on the nudge loop, and
+ * lane-admin hears about it. A goal recorded as completed with work left is
+ * escalated, not reopened. Returns whether supervision now runs.
+ */
+async function superviseUnfinishedSpec({ manifest, manifestPath, orchestrator, goal, supervisor, run, timestamp, notify, persist }) {
+  if (run?.state === "paused") return false;
+  const progress = specProgress(manifestPath);
+  if (!progress || progress.open === 0) return false;
+  const entry = supervisionFor(manifest, orchestrator, true);
+  const { reportAnomaly } = await import("./anomalies.mjs");
+  const summary = `the spec has ${progress.open} of ${progress.total} item(s) unfinished (${progress.done} done, ${progress.deferred} deferred)`;
+  if (goal.status === "completed") {
+    if (entry.completedWithWork?.goalId === goal.id) return false;
+    entry.completedWithWork = { goalId: goal.id, at: timestamp, open: progress.open };
+    await persist();
+    await reportAnomaly(
+      { kind: "goal-completed-with-work", signature: `goal-completed-with-work:${goal.id}`, summary: `parent goal ${goal.id} is recorded as completed, but ${summary}`, evidence: ["nothing nudges a completed goal: the root must reopen it (herdr_goal action=update status=active) or the remaining items be deferred"], decision: true, notifyUser: true, notifyTitle: "Baa-ton: goal completed with work left" },
+      { timestamp, notify },
+    ).catch(() => undefined);
+    return false;
+  }
+  const last = Date.parse(entry.specRestart?.at ?? "");
+  if (Number.isFinite(last) && Date.parse(timestamp) - last < SPEC_RESTART_MIN_MS) return false;
+  const from = supervisor.state;
+  supervisor.state = "running";
+  delete supervisor.pauseReason;
+  supervisor.nextNudgeAt = timestamp;
+  if (goal.status === "paused") goal.status = "active";
+  entry.specRestart = { at: timestamp, from, count: (entry.specRestart?.count ?? 0) + 1, open: progress.open };
+  queueRootAlert(entry, "supervision-restarted", `Supervision was ${from} while ${summary}. Only an operator pauses the run, so nudges resume now: keep working the spec.`, timestamp);
+  await persist();
+  await reportAnomaly(
+    { kind: "supervision-stopped-with-work", signature: `supervision-restarted:${goal.id}:${entry.specRestart.count}`, summary: `the root's supervision was ${from} while ${summary}; the supervisor restarted it`, evidence: [`goal ${goal.id} (${goal.status})`, `restart ${entry.specRestart.count} at ${timestamp}`] },
+    { timestamp, notify },
+  ).catch(() => undefined);
+  return true;
+}
+
+/**
+ * Watch the root pane's harness. A live agent of another kind than the
+ * registered one (a Pi root exited and a plain Claude session took its pane)
+ * is followed: after ROOT_DRIFT_ADOPT_MS the live kind is written to the
+ * config so nudges and messages reach it, the root is told to attach its
+ * tools (baa-ton-start), and lane-admin and the user are told. A pane with no
+ * agent or a bare shell is relaunched with the root's configured
+ * resume_command (rate limited), and flagged.
+ */
+async function watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun }) {
+  if (run?.state === "paused") return false;
+  const root = orchestrator.root;
+  const shell = await paneProcessInfo(api, root.pane_id).then(paneShowsShell, () => undefined);
+  let info;
+  try {
+    info = await api.request("agent.get", { target: root.pane_id });
+  } catch (error) {
+    // No agent in the pane is a verdict; an unreachable Herdr or a pane that is gone is not.
+    if (!(error instanceof HerdrApiError && ["agent_not_found", "agent_not_running"].includes(error.code))) return false;
+    info = undefined;
+  }
+  const observation = classifyRootPane({ shell, info, root });
+  const entry = supervisionFor(manifest, orchestrator, true);
+  const before = JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null]);
+  const command = rootRelaunchCommand(root, orchestrator.program?.id);
+  const actions = advanceRootHealth(entry, observation, { timestamp, resumable: Boolean(command) });
+  const episode = entry.rootHealth;
+  const { reportAnomaly } = await import("./anomalies.mjs");
+  let adopted;
+  if (actions.adopt && (await adoptRootKind(configDir, orchestrator.id, root.agent_kind, actions.adopt).catch(() => false))) {
+    adopted = { from: root.agent_kind, to: actions.adopt };
+    root.agent_kind = actions.adopt;
+    queueRootAlert(
+      entry,
+      "root-harness-adopted",
+      `This pane runs ${adopted.to} (the root was registered as ${adopted.from}). Baa-ton now follows it: nudges and messages reach you. If your herdr_* tools are missing, invoke the baa-ton-start skill (or run root-setup.mjs --harness ${adopted.to} --write and restart with the printed MCP configuration) to attach them, then call herdr_bootstrap_root.`,
+      timestamp,
+    );
+    delete entry.rootHealth;
+  }
+  let relaunched = false;
+  if (actions.relaunch && command && relaunchAllowed(entry, timestamp)) {
+    try {
+      await paneRun(root.pane_id, command);
+      recordRelaunch(entry, timestamp);
+      relaunched = true;
+    } catch (error) {
+      supervisorLog(configDir, `root relaunch failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (actions.anomaly && episode) {
+    const minutes = Math.max(1, Math.round((Date.parse(timestamp) - Date.parse(episode.since)) / 60_000));
+    const anomaly =
+      actions.anomaly === "root-harness-drift"
+        ? {
+            kind: "root-harness-drift",
+            signature: `root-drift:${orchestrator.id}:${episode.since}`,
+            summary: `the root pane ${root.pane_id} runs ${episode.live?.kind} but was registered as ${episode.registered}: nudges and messages were going nowhere for ${minutes} min`,
+            evidence: [`registered agent_kind: ${episode.registered}`, `live agent: ${episode.live?.kind}${episode.live?.session ? ` session ${episode.live.session}` : ""}`, adopted ? `adopted ${adopted.to} in the controller config; the root was told to attach its tools (baa-ton-start)` : "adoption did not apply (the config changed under it)"],
+            notifyUser: true,
+            notifyTitle: "Baa-ton: the root's harness changed",
+          }
+        : {
+            kind: "root-dead",
+            signature: `root-dead:${orchestrator.id}:${episode.since}`,
+            summary: `the root pane ${root.pane_id} has had no agent (${episode.reason}) for ${minutes} min`,
+            evidence: [
+              !command
+                ? "no resume_command is configured for this root (config.root.resume_command), so it can not be relaunched from here"
+                : (entry.rootRelaunches ?? []).length
+                  ? `relaunched ${(entry.rootRelaunches ?? []).length} time(s) with the configured resume_command; the pane still has no agent (3 an hour, 10 min apart)`
+                  : "a relaunch is due",
+            ],
+            notifyUser: true,
+            notifyTitle: "Baa-ton: the root has stopped",
+          };
+    await reportAnomaly(anomaly, { timestamp, notify }).catch(() => undefined);
+  }
+  if (JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null]) !== before || adopted) await atomicWriteJson(manifestPath, manifest);
+  return true;
+}
+
+/**
+ * One pass of the root watch: every root with a parent goal has its pane's
+ * harness checked (watchRootHealth), under the manifest lock. It runs beside
+ * the tick from the supervisor loop, whatever the supervisor's own state.
+ */
+export async function runRootWatch({
+  stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
+  configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
+  herdr,
+  notify = herdrNotification,
+  paneRun = (paneId, command) => execFileAsync("herdr", ["pane", "run", paneId, command], { timeout: 10_000 }),
+  timestamp = now(),
+} = {}) {
+  requireStateDir(stateDir);
+  const config = await loadConfig(configDir);
+  const api = herdr ?? new JsonLineHerdrClient();
+  const run = await operatorRunState();
+  const results = [];
+  const seen = new Set();
+  for (const { orchestrator, manifestPath } of configuredParentManifests(config)) {
+    const key = `${orchestrator.id}:${manifestPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let release;
+    try {
+      release = await acquireManifestLock(manifestPath);
+    } catch {
+      continue;
+    }
+    try {
+      const manifest = parseJson(await readRegularFile(manifestPath, "Parent manifest"), "Parent manifest");
+      const goal = parentGoalFor(manifest, orchestrator, manifestHasMultipleRoots(config, manifestPath));
+      if (!goal) continue;
+      const watched = await watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun });
+      results.push({ root: orchestrator.id, watched });
+    } catch (error) {
+      supervisorLog(configDir, `root watch failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await release?.();
+    }
+  }
+  return results;
+}
+
 export async function runSupervisorTick({
   stateDir = process.env.HERDR_PLUGIN_STATE_DIR,
   configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? stateDir,
@@ -3891,8 +4081,13 @@ export async function runSupervisorTick({
         await persist();
       }
       if (supervisor.state !== "running") {
-        results.push({ manifestPath, status: "not-running" });
-        continue;
+        // Only an operator pauses the run. A root that parked its own
+        // supervision while the spec has unfinished work is brought back.
+        const restarted = await superviseUnfinishedSpec({ manifest, manifestPath, orchestrator, goal, supervisor, run, timestamp, notify, persist });
+        if (!restarted) {
+          results.push({ manifestPath, status: "not-running" });
+          continue;
+        }
       }
       // An interrupted send may have reached the root: it is never replayed,
       // and the next nudge waits a full interval.
@@ -3973,12 +4168,16 @@ export async function runSupervisorTick({
         continue;
       }
       const turn = supervisor.rootTurn;
+      // Only the Pi extension reports turn boundaries, so only a Pi root needs
+      // the settled proof. Any other root (Claude, Codex) is judged by Herdr's
+      // live status alone, checked below, as operator messages are: without
+      // this, switching a root's harness silently ended every nudge.
       if (
-        !turn ||
-        turn.state !== "idle" ||
-        turn.paneId !== orchestrator.root.pane_id ||
-        turn.workspaceId !== orchestrator.root.workspace_id ||
-        orchestrator.root.agent_kind !== "pi"
+        orchestrator.root.agent_kind === "pi" &&
+        (!turn ||
+          turn.state !== "idle" ||
+          turn.paneId !== orchestrator.root.pane_id ||
+          turn.workspaceId !== orchestrator.root.workspace_id)
       ) {
         results.push({ manifestPath, status: "root-turn-not-idle" });
         continue;
@@ -4010,8 +4209,8 @@ export async function runSupervisorTick({
         status: activity.status,
         observedAt: activity.observedAt,
       };
-      // Herdr's done is an unseen completion, also ready for input. The Pi
-      // settled proof above is still mandatory for either ready state.
+      // Herdr's done is an unseen completion, also ready for input. For a Pi
+      // root the settled proof above is still mandatory for either ready state.
       if (activity.status !== "idle" && activity.status !== "done") {
         supervisor.nextNudgeAt = nextNudgeAt(
           timestamp,
@@ -4631,6 +4830,11 @@ export async function runSupervisorLoop({
   // Dead-pane relaunch of registered agents (agent-revive.mjs); tests pass a
   // fake, false turns it off.
   revive,
+  // The root watch (root-watch.mjs): a root whose pane holds another agent
+  // kind, or none, is followed or relaunched and flagged. The real
+  // supervisor runs it every ROOT_WATCH_INTERVAL_MS; tests pass a fake,
+  // false turns it off.
+  rootWatch,
   // The hook queue (hook.sh): drained apart from the tick, so a long tick
   // never delays an event. The real runner turns it on.
   hookQueue = false,
@@ -4776,6 +4980,17 @@ export async function runSupervisorLoop({
       supervisorLog(resolvedConfigDir, `agent relaunch disabled: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  let rootWatcher = rootWatch;
+  if (rootWatcher === undefined && onCodeChange && code) {
+    let lastAt = 0;
+    rootWatcher = {
+      async tick() {
+        if (Date.now() - lastAt < ROOT_WATCH_INTERVAL_MS) return;
+        lastAt = Date.now();
+        await runRootWatch({ stateDir: resolvedStateDir, configDir: resolvedConfigDir, herdr });
+      },
+    };
+  }
   let stopping = false;
   let ticking = false;
   let timer;
@@ -4851,7 +5066,7 @@ export async function runSupervisorLoop({
             supervisorLog(resolvedConfigDir, `relaunch check failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        for (const [label, part] of [["spec hosts", specHosts], ["root turn watch", rootTurns]]) {
+        for (const [label, part] of [["spec hosts", specHosts], ["root turn watch", rootTurns], ["root watch", rootWatcher || undefined]]) {
           if (!part || stopping) continue;
           try {
             await part.tick();
