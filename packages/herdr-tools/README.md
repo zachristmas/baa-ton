@@ -214,6 +214,23 @@ node packages/herdr-tools/root-setup.mjs --harness claude
 # or: codex | opencode | pi
 ```
 
+`--check` reports whether the pane already runs the bridge (exit 0 attached, 3
+not): a `mcp-server.mjs` process in the pane, or for Pi the installed
+`herdr-orchestrator` extension. `--relaunch` is a no-op when attached; otherwise
+it writes the config and a detached worker types the harness's exit command
+(Claude `/exit`, Pi `/quit`, preceded by Escape), waits for the agent to leave,
+falls back to SIGTERM only when the pid is known (Claude), then types the resume
+command into the same pane with a first prompt that bootstraps and continues.
+The session comes from `herdr agent list`; Codex has none there, so the worker
+reads the `codex resume <id>` hint Codex prints on exit (the last one in the
+pane). With no session, or if the agent will not exit, nothing is typed and the helper prints the manual restart (exit 4). Pi
+never needs a relaunch (its bridge is an extension). Verified live: Claude
+and Codex (exit, resume, same pane, history kept) and Pi (check, `/quit`). The
+OpenCode resume command is implemented from its CLI help but untested. Codex
+may show a hooks-review dialog on start when hooks changed; that blocks an
+unattended resume until someone answers it. The `baa-ton-start`
+skill runs check, then relaunch, then bootstrap, with no prompts.
+
 The helper is stdout-only unless `--write` is supplied; it prints an `export`
 line for the current pane identity as part of the setup commands. `--write` writes only
 the selected harness's config: for Claude a per-pane MCP config file under the

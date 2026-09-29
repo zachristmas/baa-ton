@@ -244,3 +244,12 @@ test("the start skill carries a condensed core inline instead of sending the roo
   assert.doesNotMatch(skill, /1\. Read `\/install\/BAA\.md`/);
   assert.match(skill, /read the section you need/);
 });
+
+test("the start skill evaluates first, remediates only when detached, then starts without waiting", async () => {
+  const { startSkillContent } = await import("../setup-core.mjs");
+  const skill = startSkillContent({ harness: "claude", baaPath: "/install/BAA.md", projectRoot: "/project" });
+  const order = ["--check", "--relaunch", "herdr_bootstrap_root", "continue the task already in this conversation"].map((needle) => skill.indexOf(needle));
+  assert.ok(order.every((index) => index > 0) && [...order].sort((a, b) => a - b).join() === order.join(), `steps out of order: ${order}`);
+  assert.match(skill, /Do not restart a session that is already attached/);
+  assert.doesNotMatch(skill, /wait for the user's task\. Do not initialize/);
+});
