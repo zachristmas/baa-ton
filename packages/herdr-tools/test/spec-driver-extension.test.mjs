@@ -121,6 +121,8 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     // The target is in sync with spec-integration unless a test says so.
     fetchTarget: async () => undefined,
     targetInIntegration: async () => true,
+    // No unjudged sync merge on spec-integration unless a test says so.
+    unvalidatedSync: async () => undefined,
     async detachedWorktree(input) {
       calls.detached = [...(calls.detached ?? []), input];
     },
@@ -2552,6 +2554,33 @@ test("items judged failed whose integrated commit the target already contains ar
     assert.equal(state.items.D10.state, "failed", "a review failure is not landed");
     assert.notEqual(state.items.D06.state, "pending", "its dependency is integrated now");
     assert.match(result.content[0].text, /D06 build|verify D05|build D06/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a spec(sync) merge on spec-integration that nobody judged is validated by a sync lane before anything is pushed or integrated on it", async () => {
+  const target = "7".repeat(40);
+  const merge = "c".repeat(40);
+  const f = await fixture({
+    grants: ["dispatch", "integrate", "spec-push"],
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D04", title: "B", acceptance: { text: "b" } }, { id: "D09", title: "Q", acceptance: { text: "q" } }] },
+    seed: { version: 1, integrationCounter: 1, items: { D04: { state: "awaiting-push", integration: { sha: "9".repeat(40), order: 1 } }, D09: { state: "integrating", attempts: 1 } } },
+  });
+  try {
+    f.ports.revParse = async () => target;
+    f.ports.targetInIntegration = async () => true;
+    const asked = [];
+    f.ports.unvalidatedSync = async (input) => (asked.push(input.targetRef), merge);
+    f.ports.push = async () => assert.fail("nothing is pushed before the merge is judged");
+    const result = await f.advance();
+    assert.deepEqual(asked, ["refs/remotes/origin/feature/release"]);
+    assert.match(result.content[0].text, /sync-target 777777777777 -> herdr-spec1/);
+    assert.equal(f.calls.plan.some((call) => /integrate D09/.test(call.objective ?? "")), false, "D09 does not integrate on the unjudged merge");
+    assert.match(f.calls.plan[0].laneObjective, /already holds, the merge is committed[\s\S]*run the suite on HEAD/);
+    const state = await f.state();
+    assert.equal(state.syncRun.validateSha, merge);
+    assert.equal(state.items.D09.lane, undefined);
   } finally {
     await f.cleanup();
   }

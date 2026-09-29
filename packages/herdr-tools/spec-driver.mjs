@@ -404,6 +404,7 @@ function staleBackground(current, now) {
  * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
  * @param {string} [input.targetSha] the target tip's SHA (the suite baseline is recorded per SHA)
  * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
+ * @param {string} [input.unvalidatedSync] a spec(sync) merge commit on spec-integration (not on the target) that no sync verdict has judged yet
  * @param {Map<string, string>} [input.landed] failed or held items whose last INTEGRATED commit the target already contains -> that commit
  * @param {boolean} [input.targetInIntegration] whether the (freshly fetched) target tip is an ancestor of spec-integration's head; false: the target gained commits a push would not fast-forward over
  * @param {string} input.now        ISO timestamp
@@ -424,6 +425,7 @@ export function advanceSpec({
   targetSha,
   targetInIntegration,
   landed = new Map(),
+  unvalidatedSync,
   now,
 }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
@@ -670,7 +672,18 @@ for (const item of spec.items) {
   // the merged head. Never a force push.
   if (next.syncRun?.lane) {
     const run = next.syncRun;
+    // Once a lane has been dispatched the run is never dropped without a
+    // verdict: its merge may already be committed on spec-integration.
+    run.dispatched = true;
     const view = lane(run.lane);
+    // A lane idle with a suite still running in the background is working,
+    // not overdue for its receipt (as for an item's lane), for up to
+    // BACKGROUND_STALE_MS. A hung suite counted as an overdue lane once,
+    // and the merge it had committed was dropped unjudged.
+    const syncKey = `${run.lane.workflowId}/${run.lane.laneId}`;
+    if (background.has(syncKey)) run.backgroundSince ??= now;
+    else delete run.backgroundSince;
+    const syncBusy = background.has(syncKey) && Date.parse(now) - Date.parse(run.backgroundSince) < BACKGROUND_STALE_MS;
     const declined = view?.receipt ? declineReason(view.receipt.summary, "integrate") : undefined;
     if (declined && (run.declined?.count ?? 0) < 3) {
       run.declined = { reason: declined, count: (run.declined?.count ?? 0) + 1, at: now };
@@ -690,16 +703,18 @@ for (const item of spec.items) {
       if (result.sha && (result.suite === "pass" || relative)) {
         next.integrationCounter = (next.integrationCounter ?? 0) + 1;
         next.syncedHead = { sha: result.sha, targetSha: run.targetSha, order: next.integrationCounter, at: now, lane: run.lane, ...(relative ? { baselineFailures: relative } : {}) };
+        next.syncValidated = [...(next.syncValidated ?? []), result.sha].slice(-20);
         delete next.syncRun;
       } else if (run.waitingForBaseline && !baseline) {
         // Judged once the baseline at the target tip is recorded.
       } else {
         run.failed = { at: now, sha: result.sha, suite: result.suite, ...(fresh ? { fresh } : {}) };
+        if (result.sha) next.syncRejected = [...(next.syncRejected ?? []), result.sha].slice(-20);
         const why = !result.sha || !result.suite ? "its receipt has no INTEGRATED: <sha> and SUITE: lines" : `the merged head fails the suite where the target does not${fresh?.length ? `: ${formatFailures(fresh)}` : ""}`;
         rootAsks.push({ itemId: "push", reason: `Merging ${spec.target.remote}/${spec.target.branch} (${String(run.targetSha).slice(0, 12)}, commits pushed to it directly) into spec-integration did not pass: ${why}. Nothing was pushed. Decide how to reconcile them (fix the conflict or the failures on spec-integration, or revert the direct commits); the driver retries once the target moves.\n${String(view.receipt.summary).slice(0, 3000)}` });
         delete run.lane;
       }
-    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !LANE_ENDED.has(view.status ?? "")) {
+    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !syncBusy && !LANE_ENDED.has(view.status ?? "")) {
       if (!run.askedAt) {
         run.askedAt = now;
         actions.push({ kind: "ask-sync-receipt", itemId: "", attempt: run.attempts ?? 1, lane: run.lane, targetSha: run.targetSha });
@@ -1038,8 +1053,16 @@ for (const item of spec.items) {
   // A merge just recorded (this pass saw its receipt) is not redone: the ancestry
   // check that predates the receipt still reads the old integration head.
   if (awaitingPush && targetInIntegration === false && typeof targetSha === "string" && next.syncedHead?.targetSha !== targetSha) {
-    if (!next.syncRun || (next.syncRun.targetSha !== targetSha && !next.syncRun.lane)) next.syncRun = { targetSha, attempts: 1, requestedAt: now };
-  } else if (next.syncRun && !next.syncRun.lane && (targetInIntegration !== false || !awaitingPush)) delete next.syncRun;
+    // A failed run is retried when the target moved, or an hour later once the
+    // rejected merge is gone from spec-integration (the root reset it).
+    const retryFailed = next.syncRun?.failed && !next.syncRun.lane && Date.parse(now) - Date.parse(next.syncRun.failed.at) > 60 * 60_000;
+    if (!next.syncRun || (next.syncRun.targetSha !== targetSha && !next.syncRun.lane) || retryFailed) next.syncRun = { targetSha, attempts: 1, requestedAt: now };
+  } else if (awaitingPush && !next.syncRun && typeof unvalidatedSync === "string" && typeof targetSha === "string" && !(next.syncValidated ?? []).includes(unvalidatedSync) && !(next.syncRejected ?? []).includes(unvalidatedSync)) {
+    // A sync merge is on spec-integration with no suite verdict (its lane was
+    // lost before its receipt): it is judged before anything is pushed or
+    // integrated on top of it.
+    next.syncRun = { targetSha, attempts: 1, requestedAt: now, validateSha: unvalidatedSync };
+  } else if (next.syncRun && !next.syncRun.lane && (!awaitingPush || (targetInIntegration !== false && !next.syncRun.dispatched && !next.syncRun.validateSha))) delete next.syncRun;
   const syncing = Boolean(next.syncRun && !next.syncRun.failed);
   // A sync that has waited behind an idle lane's background work takes over:
   // that lane is released (its item stays queued, no attempt counted; the
@@ -1155,10 +1178,13 @@ for (const item of spec.items) {
   const fixing = next.baselineRun?.kind === "fix-baseline";
   if (syncing && !next.syncRun.lane && !syncBlockedBy && !reservedBy && !capacityWaiting && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane) && !(typeof next.syncRun.retryAfter === "string" && Date.parse(now) < Date.parse(next.syncRun.retryAfter)))
     actions.push({ kind: "sync-target", itemId: "", attempt: next.syncRun.attempts ?? 1, targetSha: next.syncRun.targetSha });
-  if (syncing) {
+  if (next.syncRun) {
+    // Nothing is integrated on top of a sync merge that has no passing verdict.
     for (const item of spec.items)
       if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
-        waits[item.id] = `integration queue: merging ${spec.target.remote}/${spec.target.branch} (commits pushed to it directly) into spec-integration first`;
+        waits[item.id] = next.syncRun.failed
+          ? `integration queue: the merge of ${spec.target.remote}/${spec.target.branch} into spec-integration did not pass; the root decides`
+          : `integration queue: merging ${spec.target.remote}/${spec.target.branch} (commits pushed to it directly) into spec-integration first`;
   } else if (fixing) {
     for (const item of spec.items)
       if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
@@ -1542,6 +1568,7 @@ export function syncObjective(spec, { targetSha, integrationBranch, baseline }) 
     LONG_COMMANDS,
     spec.target.suite.length ? LANE_DATABASE_RULE : "",
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
+    `If git merge-base --is-ancestor ${targetSha} HEAD already holds, the merge is committed (an earlier lane did it): do not redo or amend it; run the suite on HEAD and report.`,
     `Commit the merge on ${integrationBranch} with the repository's hooks. Local only: never push, never force, and never touch any other branch.`,
     `Never leave ${integrationBranch} half-merged or staged: if you stop before committing, run git merge --abort so the worktree is clean.`,
     "Never use git stash (it is shared by every worktree of the repository).",
