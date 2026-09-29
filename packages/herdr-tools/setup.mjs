@@ -34,6 +34,7 @@ export {
   resetSkillContent,
   endSkillContent,
   installProjectSkills,
+  planProjectSkills,
   replacedSkillsNotice,
   ensureProjectBaa,
   instructionCandidates,

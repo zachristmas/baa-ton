@@ -478,6 +478,24 @@ function resolveThroughSymlinks(path) {
   return join(realpathSync(current), ...suffix);
 }
 
+// Plan and validate every shared skill directory without writing anything.
+// Setup entrypoints run this before touching BAA.md, instruction references, or
+// config; installProjectSkills repeats the check for direct callers.
+export function planProjectSkills({ projectRoot, selected }) {
+  const groups = new Map();
+  for (const harness of selected) {
+    const directory = START_SKILL_DIRECTORIES[harness];
+    if (!directory) throw new Error(`Unknown harness ${JSON.stringify(harness)}.`);
+    const key = resolveThroughSymlinks(join(projectRoot, ...directory));
+    const group = groups.get(key) ?? { directory: key, harnesses: [] };
+    group.harnesses.push(harness);
+    groups.set(key, group);
+  }
+  for (const { directory, harnesses } of groups.values())
+    assertSharedEndSkillCompatibility(harnesses, directory);
+  return [...groups.values()];
+}
+
 export function installProjectSkills({ projectRoot, selected, baaPath }) {
   const content = {
     "baa-ton-start": (harnesses) => startSkillContent({ harness: harnesses, baaPath, projectRoot }),
@@ -488,18 +506,10 @@ export function installProjectSkills({ projectRoot, selected, baaPath }) {
     "baa-ton-reset": () => resetSkillContent({ projectRoot }),
     "baa-ton-end": (harnesses) => endSkillContent({ harness: harnesses }),
   };
-  const groups = new Map();
-  for (const harness of selected) {
-    const key = resolveThroughSymlinks(join(projectRoot, ...START_SKILL_DIRECTORIES[harness]));
-    const group = groups.get(key) ?? { harness, harnesses: [] };
-    group.harnesses.push(harness);
-    groups.set(key, group);
-  }
-  for (const [directory, { harnesses }] of groups)
-    assertSharedEndSkillCompatibility(harnesses, directory);
+  const groups = planProjectSkills({ projectRoot, selected });
   for (const harness of Object.keys(START_SKILL_DIRECTORIES)) removeLegacySetupSkill(projectRoot, harness);
-  return [...groups.values()].flatMap(({ harness, harnesses }) => PROJECT_SKILLS.map((skillName) => installStartSkill(
-    projectSkillPath(projectRoot, harness, skillName),
+  return groups.flatMap(({ harnesses }) => PROJECT_SKILLS.map((skillName) => installStartSkill(
+    projectSkillPath(projectRoot, harnesses[0], skillName),
     content[skillName](harnesses.length === 1 ? harnesses[0] : harnesses),
   )));
 }

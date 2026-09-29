@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, readlink, lstat, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildSetupConfig,
   configureSkillContent,
@@ -10,6 +12,7 @@ import {
   endSkillContent,
   endSkillPath,
   installProjectSkills,
+  planProjectSkills,
   replacedSkillsNotice,
   resetSkillContent,
   resetSkillPath,
@@ -28,6 +31,25 @@ import {
 } from "../setup.mjs";
 import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
 import { EXIT_COMMANDS } from "../root-relaunch.mjs";
+
+async function snapshotProject(root) {
+  const entries = [];
+  async function visit(directory, prefix = "") {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = join(prefix, entry.name);
+      const stat = await lstat(path);
+      if (stat.isSymbolicLink()) entries.push({ path: relativePath, type: "symlink", target: await readlink(path) });
+      else if (stat.isDirectory()) {
+        entries.push({ path: relativePath, type: "directory" });
+        await visit(path, relativePath);
+      } else if (stat.isFile()) entries.push({ path: relativePath, type: "file", content: (await readFile(path)).toString("base64") });
+      else entries.push({ path: relativePath, type: "other" });
+    }
+  }
+  await visit(root);
+  return entries.sort((left, right) => left.path.localeCompare(right.path));
+}
 
 function generatedScalarFrontmatter(content) {
   const match = content.match(/^---\n([\s\S]*?)\n---\n/);
@@ -359,6 +381,47 @@ test("incompatible Claude and Codex skill paths fail before any writes or replac
     assert.equal(await readFile(unmanagedPath, "utf8"), unmanaged, "preflight preserves unmanaged skills");
     await assert.rejects(() => readFile(`${unmanagedPath}.pre-baa-ton`, "utf8"), { code: "ENOENT" });
     await assert.rejects(() => readFile(startSkillPath(directory, "pi"), "utf8"), { code: "ENOENT" }, "preflight precedes writes to unrelated harnesses");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("outer setup rejects incompatible aliased skill directories before any project mutation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-setup-atomicity-"));
+  const setupPath = fileURLToPath(new URL("../setup.mjs", import.meta.url));
+  const files = {
+    "BAA.md": "sentinel BAA contract\n",
+    "docs/AGENTS.md": "sentinel agent instructions\n",
+    "docs/CLAUDE.md": "sentinel Claude instructions\n",
+    ".baa-ton/config.json": '{"version":1,"sentinel":"config"}\n',
+    ".claude/skills/baa-ton-setup/SKILL.md": "<!-- baa-ton:setup-skill:start -->\nlegacy sentinel\n<!-- baa-ton:setup-skill:end -->\n",
+    ".claude/skills/baa-ton-end/SKILL.md": "unmanaged skill sentinel\n",
+  };
+  try {
+    for (const [path, content] of Object.entries(files)) {
+      const fullPath = join(directory, path);
+      await mkdir(join(fullPath, ".."), { recursive: true });
+      await writeFile(fullPath, content);
+    }
+    await mkdir(join(directory, ".agents"));
+    await symlink("../.claude/skills", join(directory, ".agents", "skills"));
+    const before = await snapshotProject(directory);
+    const result = spawnSync(process.execPath, [
+      setupPath,
+      "--project-root", directory,
+      "--non-interactive",
+      "--harness", "claude",
+      "--harness", "codex",
+      "--harness", "pi",
+      "--instructions-path", join(directory, "docs/AGENTS.md"),
+      "--instructions-path", join(directory, "docs/CLAUDE.md"),
+    ], { encoding: "utf8", timeout: 10000 });
+    assert.equal(result.status, 2, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /Cannot install skills for claude and codex in shared directory/);
+    assert.match(result.stderr, /Codex's skill frontmatter validator rejects that field/);
+    assert.match(result.stderr, /Split these skill directories/);
+    assert.deepEqual(await snapshotProject(directory), before, "setup must preserve every existing file and create nothing");
+    assert.throws(() => planProjectSkills({ projectRoot: directory, selected: ["claude", "codex"] }), /Split these skill directories/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

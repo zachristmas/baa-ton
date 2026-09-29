@@ -35,6 +35,7 @@ import {
   ensureProjectBaa,
   instructionCandidates,
   installProjectSkills,
+  planProjectSkills,
   replacedSkillsNotice,
   updateManagedReference,
   buildSetupConfig,
@@ -171,6 +172,7 @@ function unconfiguredProfiles(defaults, computed) {
  * Delegates every side effect to setup-core.mjs; never reimplements it here.
  */
 function performWrites({ projectRoot, detected, selected, instructionFiles, defaults, resolvedProfiles }) {
+  planProjectSkills({ projectRoot, selected });
   const installedBaaPath = resolve(process.env.BAA_TON_BAA_PATH ?? join(checkoutDirectory, "BAA.md"));
   const baaPath = ensureProjectBaa(projectRoot, installedBaaPath);
   for (const path of instructionFiles) updateManagedReference(path, baaPath);
@@ -240,6 +242,7 @@ async function runNonInteractive(options) {
 
   const detected = detectHarnesses();
   const selected = selectedHarnessIds(options, detected);
+  planProjectSkills({ projectRoot, selected });
   const installedBaaPath = resolve(process.env.BAA_TON_BAA_PATH ?? join(checkoutDirectory, "BAA.md"));
   const baaPath = ensureProjectBaa(projectRoot, installedBaaPath);
   const instructionFiles = options.instructionPaths.length ? options.instructionPaths : instructionCandidates(projectRoot, selected);
