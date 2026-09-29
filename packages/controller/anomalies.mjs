@@ -34,6 +34,9 @@ function messageText(anomaly, id) {
  * (deduplicated), recurred (after a fix), or unrouted (no lane-admin).
  */
 export async function reportAnomaly(anomaly, { timestamp, notify = async () => undefined, rootTarget, env = process.env } = {}) {
+  // A test run without its own store (`node --test` outside the hermetic
+  // runner) must not page the real lane-admin with fixture anomalies.
+  if (env.NODE_TEST_CONTEXT && !env.BAATON_OPERATOR_STORE) return { status: "skipped", reason: "test run without BAATON_OPERATOR_STORE" };
   const { operatorStorePath, withOperatorStore, addOperatorMessage, resolveOperatorTarget } = await operator();
   const storePath = operatorStorePath(env);
   const result = await withOperatorStore(storePath, (store) => {

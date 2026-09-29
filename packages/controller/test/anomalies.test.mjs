@@ -35,6 +35,12 @@ test("a repeated alert counts only while current: recent, and its item still blo
   assert.deepEqual(kinds({ alerts: [1, 2, 3].map(() => ({ text: "memory pressure: free 1 GB", createdAt: at(-60_000) })) }, {}), ["repeated-alert"], "an alert about no item counts by time alone");
 });
 
+test("a test run without its own operator store never reports an anomaly to the real one", async () => {
+  const anomaly = { kind: "unhandled-blocked", signature: "blocked:w/l:none", summary: "fixture", evidence: [] };
+  const result = await reportAnomaly(anomaly, { timestamp: at(0), env: { NODE_TEST_CONTEXT: "child-v8", HOME: "/nonexistent-baa-home" } });
+  assert.equal(result.status, "skipped");
+});
+
 test("each anomaly reaches lane-admin once per signature; after two fixes it recurs, the user gets one bug report", async () => {
   const s = await store();
   try {
