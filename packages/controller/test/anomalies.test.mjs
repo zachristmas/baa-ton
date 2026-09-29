@@ -175,7 +175,7 @@ test("a stall anomaly names why the spec is stalled, grouped by cause, not only 
     D05: { state: "failed", note: "integrate D05 failed: Herdr worktree list response is missing source_workspace_id." },
     D09: { state: "integrating", note: "integrate D09 failed: Herdr worktree list response is missing source_workspace_id." },
     D11: { state: "integrating", note: "integrate D11 failed: Herdr worktree list response is missing source_workspace_id." },
-    D13: { state: "failed", declines: [{ kind: "infrastructure", reason: "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable\nsecond line" }] },
+    D13: { state: "failed", declined: { kind: "infrastructure", reason: "Capability discovery failed for openai-codex/gpt-6-luna: the live model registry refresh operation is unavailable\nsecond line" } },
     D14: { state: "reviewing", lane: { workflowId: "wr", laneId: "l1" } },
     D15: { state: "blocked", blockedReason: "exhausted" },
     D16: { state: "pending", history: [{ note: "waits on D05" }] },
@@ -190,6 +190,12 @@ test("a stall anomaly names why the spec is stalled, grouped by cause, not only 
   ], "D17 has nothing recorded; finished and deferred items never appear");
   assert.equal(stallBlockers({ items }, { max: 2 }).length, 2);
   assert.deepEqual(stallBlockers({}), []);
+  // An old decline in the history no longer holds the item: it is not a blocker.
+  assert.deepEqual(stallBlockers({ items: { D06: { state: "integrating", declines: [{ kind: "infrastructure", reason: "Capability discovery failed" }], history: [{ note: "review passed" }] } } }), ["1 item(s): review passed (D06)"]);
+  // A failed target sync is named first, with its new failures.
+  const synced = stallBlockers({ items: { D03: { state: "awaiting-push", note: "waits on the sync" } }, syncRun: { failed: { fresh: [{ package: "@x/audit", task: "test" }] } } });
+  assert.match(synced[0], /^target sync failed its suite gate \(new failures: @x\/audit test\)/);
+  assert.equal(synced.length, 2);
   const entry = { alerts: [] };
   const stalled = (specState) => detectAnomalies({ entry, specStall: true, specReason: "spec: 8 item(s) are waiting and no lane is working.", specState, timestamp: at(STALL_ANOMALY_MS + 60_000) });
   detectAnomalies({ entry, specStall: true, specReason: "x", specState: { items }, timestamp: at(0) });
