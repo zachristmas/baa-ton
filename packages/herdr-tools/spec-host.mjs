@@ -79,7 +79,13 @@ export async function rootSession(pi, { paneId = process.env.HERDR_PANE_ID, work
   } catch {
     return {};
   }
-  if (!agent || agent.agent !== "pi") return { gone: true };
+  if (!agent) return { gone: true };
+  // A root of another harness has no Pi session to prove, so the host drives
+  // for it (gone); its live session value identifies it to the planner.
+  if (agent.agent !== "pi") {
+    const value = agent.agent_session?.value;
+    return typeof value === "string" && value ? { gone: true, file: value, id: value } : { gone: true };
+  }
   if (agent.pane_id !== paneId || agent.workspace_id !== workspaceId || agent.agent_session?.kind !== "path") return {};
   const file = agent.agent_session.value;
   try {

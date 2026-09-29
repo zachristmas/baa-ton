@@ -26,10 +26,10 @@ export const ROOT_TURN_LIMIT_MS = 30 * 60_000;
 export const ROOT_TURN_NOTICE = (minutes) =>
   `[Baa-ton supervisor] Your turn ran ${minutes} min, so it was interrupted. The spec driver runs the loop on its own timer: your job is to answer its rootAsks and decisions, dispatch a lane for any work (never debug or run a lane's work yourself), and end your turn. Keep turns short; one over 30 min is interrupted.`;
 
-/** The roots that get a spec host: Pi roots whose project has a spec. */
+/** The roots that get a spec host: any harness, when the project has a spec. */
 export function specRoots(config, exists = existsSync) {
   return (config?.orchestrators ?? []).filter(
-    (orchestrator) => (orchestrator.root?.agent_kind ?? "pi") === "pi" && orchestrator.program?.id && orchestrator.root?.pane_id && exists(join(orchestrator.program.id, SPEC_FILE)),
+    (orchestrator) => orchestrator.program?.id && orchestrator.root?.pane_id && exists(join(orchestrator.program.id, SPEC_FILE)),
   );
 }
 
