@@ -141,3 +141,9 @@ test("a root of another harness is gone for the host, which still learns its ses
   const bare = { exec: async () => agent({ agent: "codex" }) };
   assert.deepEqual(await rootSession(bare, env), { gone: true });
 });
+
+test("the headless context carries the installed model registry Pi launches discover through", () => {
+  const registry = { refresh: async () => ({}) };
+  assert.equal(headlessContext("/p", {}, registry).modelRegistry, registry);
+  assert.equal(headlessContext("/p", {}).modelRegistry, undefined);
+});

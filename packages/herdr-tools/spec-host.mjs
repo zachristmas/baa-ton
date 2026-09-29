@@ -18,8 +18,9 @@ import { execFile } from "node:child_process";
 import { watch as watchPath } from "node:fs";
 import { appendFile, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createPiModelRegistry } from "./pi-model-registry.mjs";
 import { HEARTBEAT_MS, readHostLease, renewHostLease } from "./spec-handover.mjs";
 import { specDriverTimer } from "./spec-timer.mjs";
 
@@ -56,10 +57,10 @@ export function headlessPi({ tools = new Map(), log = () => {} } = {}) {
  * and UUID Herdr records for the root pane). The host has no session of its
  * own, so `session` supplies the root's, read from Herdr before each pass.
  */
-export function headlessContext(cwd, session = {}) {
+export function headlessContext(cwd, session = {}, modelRegistry = undefined) {
   const ui = new Proxy({}, { get: () => () => undefined });
   const sessionManager = { getSessionFile: () => session.file, getSessionId: () => session.id };
-  return { cwd, hasUI: false, mode: "json", ui, sessionManager, isIdle: () => true, hasPendingMessages: () => false, abort() {}, signal: undefined };
+  return { cwd, hasUI: false, mode: "json", ui, sessionManager, modelRegistry, isIdle: () => true, hasPendingMessages: () => false, abort() {}, signal: undefined };
 }
 
 /**
@@ -96,7 +97,7 @@ export async function rootSession(pi, { paneId = process.env.HERDR_PANE_ID, work
   }
 }
 
-export async function runSpecHost({ cwd = process.cwd(), loadExtension, readSession, now = () => Date.now(), exit = (code) => process.exit(code), timerOptions = {} } = {}) {
+export async function runSpecHost({ cwd = process.cwd(), loadExtension, loadRegistry, readSession, now = () => Date.now(), exit = (code) => process.exit(code), timerOptions = {} } = {}) {
   const stateDir = join(cwd, MANIFEST_DIR);
   const logPath = join(stateDir, "spec-driver.log");
   const write = (entry) => appendFile(logPath, `${JSON.stringify({ at: new Date(now()).toISOString(), host: process.pid, ...entry })}\n`, { mode: 0o600 }).catch(() => undefined);
@@ -121,7 +122,14 @@ export async function runSpecHost({ cwd = process.cwd(), loadExtension, readSess
   extension(pi);
   const tool = pi.tools.get("herdr_spec");
   if (!tool) throw new Error("the extension registered no herdr_spec tool");
-  const ctx = headlessContext(cwd, session);
+  // Pi lane launches discover the live provider catalog through the registry;
+  // a host that is no Pi runtime supplies the installed one (absent, discovery
+  // fails closed and the lane retries).
+  const modelRegistry = await (loadRegistry ?? (() => createPiModelRegistry(dirname(fileURLToPath(import.meta.url)))))().catch((error) => {
+    void write({ error: `no model registry: ${error?.message ?? error}` });
+    return undefined;
+  });
+  const ctx = headlessContext(cwd, session, modelRegistry);
   let passStartedAt;
   const watchdog = setInterval(() => {
     if (passStartedAt !== undefined && now() - passStartedAt > PASS_LIMIT_MS) {

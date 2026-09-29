@@ -59,6 +59,7 @@ import {
   spawnHerdrProcess,
 } from "./live-herdr.mjs";
 import { liveProcessParentPid } from "./live-process.mjs";
+import { createPiModelRegistry } from "./pi-model-registry.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -70,36 +71,9 @@ const extension = await jiti.import(join(root, "index.ts"));
 
 // The bridge must expose the same installed model registry the interactive
 // runtime uses. Discovery refreshes the requested provider immediately before
-// preflight; keeping this bridge-start registry snapshot out of preflight is
-// important because a stale catalog must never authorize a launch. The package
-// exports map does not expose internals, so resolve them by absolute file path.
-let packageRoot = null;
-for (let dir = root; dir !== dirname(dir); dir = dirname(dir)) {
-  const candidate = join(
-    dir,
-    "node_modules",
-    "@earendil-works",
-    "pi-coding-agent",
-  );
-  if (existsSync(join(candidate, "package.json"))) {
-    packageRoot = candidate;
-    break;
-  }
-}
-if (!packageRoot)
-  throw new Error(
-    "pi-coding-agent package not found for the MCP bridge model registry.",
-  );
-const importDist = (name) =>
-  import(pathToFileURL(join(packageRoot, "dist", name)).href);
-const { ModelRuntime } = await importDist("core/model-runtime.js");
-const { ModelRegistry } = await importDist("core/model-registry.js");
-// Do not refresh at bridge startup. The registry is intentionally only a
-// runtime handle here; pi-launch-adapter's discoverCatalog performs a
-// provider-scoped live refresh and fails closed on any refresh error. This
-// prevents a frozen bridge-start snapshot from becoming a preflight fallback.
-const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
-const modelRegistry = new ModelRegistry(modelRuntime);
+// preflight; the registry is created without a refresh so a bridge-start
+// snapshot never authorizes a launch.
+const modelRegistry = await createPiModelRegistry(root);
 const tools = new Map();
 const lifecycleHandlers = new Map();
 const activeRequests = new Map();
