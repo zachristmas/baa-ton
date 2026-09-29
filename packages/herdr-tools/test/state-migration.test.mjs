@@ -257,7 +257,7 @@ test("doctor reports unmigrated legacy state and the migrated archive", async ()
       (
         await tools
           .get("herdr_doctor")
-          .execute("doctor", {}, undefined, undefined, { cwd: f.project, hasUI: false, mode: "json" })
+          .execute("doctor", { verbose: true }, undefined, undefined, { cwd: f.project, hasUI: false, mode: "json" })
       ).details.checks.find((entry) => entry.id === "state-location");
     const before = await stateCheck();
     assert.equal(before.status, "fail");

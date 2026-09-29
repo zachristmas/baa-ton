@@ -409,6 +409,15 @@ type ParentGoalActionResult =
 const now = () => new Date().toISOString();
 const manifestPath = (cwd: string) => join(cwd, MANIFEST_DIR, MANIFEST_NAME);
 const jsonText = (value: unknown) => JSON.stringify(value, null, 2);
+/** Default doctor output: only warn/fail checks, one line each, capped. */
+export function compactDoctorText(report: { ok: boolean; checks: Array<{ id: string; status: string; detail?: string }> }, cap = 1500): string {
+  const problems = report.checks.filter((entry) => entry.status !== "ok");
+  if (!problems.length) return `healthy (${report.checks.length} checks ok)`;
+  const lines = problems.map((entry) => `${entry.id} ${entry.status}: ${String(entry.detail ?? "").replace(/\s+/g, " ")}`);
+  const text = `${report.ok ? "healthy" : "attention required"}\n${lines.join("\n")}`;
+  return text.length <= cap ? text : `${text.slice(0, cap - 40)}\n... (herdr_doctor verbose:true for all)`;
+}
+
 const clip = (text: string, limit = 6000) =>
   text.length > limit ? `${text.slice(0, limit)}\n[truncated]` : text;
 
@@ -10840,6 +10849,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     cwd: string,
     ctx: ExtensionContext,
     signal?: AbortSignal,
+    verbose = true,
   ): Promise<{ ok: boolean; checks: DoctorCheck[] }> {
     const checks: DoctorCheck[] = [];
     const check = (id: string, run: () => Promise<Omit<DoctorCheck, "id">>) =>
@@ -11066,6 +11076,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
               unknown += 1;
               lines.push(`lane ${workflow.workflow_id}/${lane.lane_id} pane ${lane.pane_id}: no version record (started before version reporting or not running); reload it to be safe`);
             }
+      }
+      if (!verbose) {
+        // The caller only needs counts and its own remediation, not a line per
+        // pid and pane of everyone else's.
+        const self = pieces.find((piece) => piece.self)!;
+        const staleRoles = new Map<string, number>();
+        for (const piece of pieces)
+          if (piece.fingerprint !== installedFor(String(piece.checkout ?? LOADED_CODE.checkout)).fingerprint)
+            staleRoles.set(String(piece.role), (staleRoles.get(String(piece.role)) ?? 0) + 1);
+        const selfStale = self.fingerprint !== installedFor(String(self.checkout ?? LOADED_CODE.checkout)).fingerprint;
+        const parts = [...staleRoles].map(([role, count]) => `${count} ${role}`);
+        if (unknown) parts.push(`${unknown} unknown`);
+        return {
+          status: stale || unknown ? "warn" : "ok",
+          detail: `${stale + unknown} stale piece(s) (${parts.join(", ")}); ${selfStale ? `this root: ${reload(self)}` : "this root is current"}`,
+        };
       }
       return {
         status: stale || unknown ? "warn" : "ok",
@@ -13192,20 +13218,26 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       "Idempotent, read-only preflight: extension source, native Herdr connectivity, plugin/routing registration, manifest store version, and the adapter capability matrix. Never mutates anything.",
     promptSnippet:
       "Run a read-only Herdr installation/health preflight before relying on dispatch, goals, or messaging.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, signal, _update, ctx) {
-      const report = await doctor(ctx.cwd, ctx, signal);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `${report.ok ? "healthy" : "attention required"}: ${report.checks
-              .map((entry) => `${entry.id}=${entry.status}`)
-              .join(", ")}`,
-          },
-        ],
-        details: report,
-      };
+    parameters: Type.Object({
+      verbose: Type.Optional(Type.Boolean({ description: "Return every check and the full per-piece detail (default: only warn/fail checks, compact)." })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      const verbose = params?.verbose === true;
+      const report = await doctor(ctx.cwd, ctx, signal, verbose);
+      if (verbose)
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${report.ok ? "healthy" : "attention required"}: ${report.checks
+                .map((entry) => `${entry.id}=${entry.status}`)
+                .join(", ")}`,
+            },
+          ],
+          details: report,
+        };
+      const text = compactDoctorText(report);
+      return { content: [{ type: "text", text }], details: { ok: report.ok } };
     },
   });
 

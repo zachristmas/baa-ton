@@ -195,7 +195,7 @@ test("herdr_doctor reports version skew and a split install after an update", as
         throw new Error(`unexpected ${command} ${args.join(" ")}`);
       },
     });
-    const report = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, {
+    const report = await tools.get("herdr_doctor").execute("doctor", { verbose: true }, undefined, undefined, {
       cwd: f.project,
       hasUI: false,
       mode: "json",
@@ -212,6 +212,19 @@ test("herdr_doctor reports version skew and a split install after an update", as
     const split = byId["controller-plugin-install"];
     assert.equal(split.status, "warn");
     assert.match(split.detail, /Split install: the controller plugin runs from \/Users\/someone\/baa-ton\/packages\/controller, but this extension runs from/);
+    // Default output is compact: warn/fail only, capped, counts plus this root's own remediation.
+    const compact = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, {
+      cwd: f.project,
+      hasUI: false,
+      mode: "json",
+      modelRegistry: { find: () => ({ reasoning: true, thinkingLevelMap: {} }), hasConfiguredAuth: () => true, isUsingOAuth: () => true },
+    });
+    const text = compact.content[0].text;
+    assert.ok(text.length <= 1500, `compact doctor is ${text.length} chars`);
+    assert.match(text, /^runtime-version-skew warn: \d+ stale piece\(s\) \(.*\d+ unknown\); this root is current/m);
+    assert.doesNotMatch(text, /pid \d+/, "no per-pid lists");
+    assert.doesNotMatch(text, /extension-source/, "ok checks are omitted");
+    assert.deepEqual(compact.details, { ok: false });
   } finally {
     lane.kill();
     for (const [key, value] of Object.entries(saved))

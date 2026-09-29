@@ -234,3 +234,13 @@ test("a hand-authored sweep skill without Baa-ton markers is preserved", async (
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("the start skill carries a condensed core inline instead of sending the root to read BAA.md at boot", async () => {
+  const { BAA_CORE, startSkillContent } = await import("../setup-core.mjs");
+  assert.ok(BAA_CORE.length < 1500, `core is ${BAA_CORE.length} chars`);
+  assert.match(BAA_CORE, /Escalation policy: ask the user only about unclear requirements/);
+  const skill = startSkillContent({ harness: "claude", baaPath: "/install/BAA.md", projectRoot: "/project" });
+  assert.ok(skill.includes(BAA_CORE));
+  assert.doesNotMatch(skill, /1\. Read `\/install\/BAA\.md`/);
+  assert.match(skill, /read the section you need/);
+});

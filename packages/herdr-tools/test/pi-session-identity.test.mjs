@@ -100,10 +100,10 @@ test("native tool, doctor, bridge and planning share UUID proof without changing
     // Invoke just the bridge's context capture, without unrelated startup writes.
     hooks.get("session_switch")[0]({}, ctx);
     assert.deepEqual(await new Promise(resolve => handler({ respond: resolve })), proof);
-    let report = await call("herdr_doctor");
+    let report = await call("herdr_doctor", { verbose: true });
     assert.equal(report.details.checks.find(c => c.id === "root-identity").status, "ok");
     f.agent.agent_session.value = "wrong";
-    report = await call("herdr_doctor");
+    report = await call("herdr_doctor", { verbose: true });
     assert.equal(report.details.checks.find(c => c.id === "root-identity").status, "fail");
     await assert.rejects(call("herdr_root_identity"), /UUID differs/);
     assert.equal(await readFile(manifestPath, "utf8"), before);

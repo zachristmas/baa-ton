@@ -303,7 +303,7 @@ test("doctor makes stale and missing root panes blocking findings", async () => 
     f.missing.add(f.otherRoot.pane_id);
     const report = await f.tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, f.context);
+      .execute("doctor", { verbose: true }, undefined, undefined, f.context);
     const check = report.details.checks.find((entry) => entry.id === "root-identity");
     assert.equal(check.status, "fail");
     assert.match(check.detail, /root-a: agent_kind stored=claude live=pi/);
@@ -324,7 +324,7 @@ test("doctor warns without blocking the current root when only another root is s
     f.missing.add(f.otherRoot.pane_id);
     const report = await f.tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, f.context);
+      .execute("doctor", { verbose: true }, undefined, undefined, f.context);
     const check = report.details.checks.find((entry) => entry.id === "root-identity");
     assert.equal(check.status, "warn");
     assert.match(check.detail, /Current root identity matches/);

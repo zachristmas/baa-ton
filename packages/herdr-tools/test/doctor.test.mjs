@@ -61,7 +61,7 @@ test("herdr_doctor reports a healthy installation and never mutates the manifest
     };
     const report = await tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, ctx);
+      .execute("doctor", { verbose: true }, undefined, undefined, ctx);
     const checkIds = report.details.checks.map((entry) => entry.id).sort();
     assert.deepEqual(checkIds, [
       "adapter-registry-capability-matrix",
@@ -147,7 +147,7 @@ test("herdr_doctor warns when a live parent goal has a stopped supervisor", asyn
     };
     const report = await tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, ctx);
+      .execute("doctor", { verbose: true }, undefined, undefined, ctx);
     const goalCheck = report.details.checks.find((entry) => entry.id === "parent-goal-supervisor");
     assert.equal(goalCheck.status, "warn");
     assert.match(goalCheck.detail, /parent-goal-73132480 is active but its supervisor is stopped, so the root gets no nudges\. Run herdr_goal action=start/);
@@ -222,7 +222,7 @@ test("doctor refreshes a stale config-dir snapshot before synchronous root routi
     });
     const report = await tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, {
+      .execute("doctor", { verbose: true }, undefined, undefined, {
         cwd,
         hasUI: false,
         mode: "json",
@@ -285,7 +285,7 @@ test("herdr_doctor fails closed when native Herdr connectivity is unavailable", 
     const ctx = { cwd, hasUI: false, mode: "json", modelRegistry: {} };
     const report = await tools
       .get("herdr_doctor")
-      .execute("doctor", {}, undefined, undefined, ctx);
+      .execute("doctor", { verbose: true }, undefined, undefined, ctx);
     assert.equal(report.details.ok, false);
     const connectivity = report.details.checks.find(
       (entry) => entry.id === "native-herdr-connectivity",
@@ -333,7 +333,7 @@ test("doctor reads the routed manifest and normalizes identity-bound Pi tool att
     const ready = { nonce: "nonce-a", paneId: "w1:p2", workspaceId: "w1", sessionPath: "/tmp/session-a", tools: ["herdr_plan", "herdr_dispatch", "herdr_complete"] };
     async function check(attestation) {
       await writeFile(`${startup}.ready`, JSON.stringify(attestation));
-      const report = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, ctx);
+      const report = await tools.get("herdr_doctor").execute("doctor", { verbose: true }, undefined, undefined, ctx);
       return report.details.checks.find(check => check.id === "lane-bridge-liveness");
     }
     assert.equal((await check(ready)).status, "ok");
@@ -383,7 +383,7 @@ test("lane-bridge-liveness tolerates gone panes only with durable completion rec
         { id: "lane-live", startupIntentPath: startup, startupNonce: "nonce-a" },
         goneLane,
       ] }] }));
-      const report = await tools.get("herdr_doctor").execute("doctor", {}, undefined, undefined, ctx);
+      const report = await tools.get("herdr_doctor").execute("doctor", { verbose: true }, undefined, undefined, ctx);
       return report.details.checks.find(entry => entry.id === "lane-bridge-liveness");
     }
 

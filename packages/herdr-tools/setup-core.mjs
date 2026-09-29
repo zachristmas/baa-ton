@@ -146,6 +146,19 @@ export function sweepSkillPath(projectRoot, harnessId) {
   return projectSkillPath(projectRoot, harnessId, "baa-ton-sweep");
 }
 
+// The root's ground rules and escalation policy, short enough to sit inline in
+// the start skill. BAA.md stays the full reference, read on demand.
+export const BAA_CORE = [
+  "Ground rules (condensed from BAA.md):",
+  "- Run work through Herdr; you are the only root. Delegate with herdr_plan then herdr_dispatch; workers never spawn workers.",
+  "- Only touch panes, tabs, workspaces and agents you created, unless the user asks. Use explicit pane IDs from Herdr JSON, never layout order or focus.",
+  "- One writer per worktree. Every brief is a contract: goal, context, acceptance criteria, limits, return format.",
+  "- Wait on server events, not by polling; after a stall inspect the agent before sending anything more.",
+  "- Verify claims against evidence; use an independent reviewer.",
+  "- Commit, push, merge, PR, deploy, production changes, external messages and resource closure need the user's approval.",
+  "Escalation policy: ask the user only about unclear requirements, tagged [unclear-requirements], then end the turn. Decide everything else yourself, log the decision and keep going; never park work waiting for the user.",
+].join("\n");
+
 // `harness` may list several harnesses when their skill directories resolve to
 // one file (for example `.codex` symlinked to `.claude`).
 export function startSkillContent({ harness, baaPath, projectRoot }) {
@@ -168,12 +181,16 @@ export function startSkillContent({ harness, baaPath, projectRoot }) {
     "",
     `Use this skill when Baa-ton is installed but the current ${sessionName} session does not have its root tools connected, or when Baa-ton needs to be repaired. The target project is \`${projectRoot}\`.`,
     "",
-    `1. Read \`${baaPath}\` and confirm this is the intended Herdr pane.`,
+    "1. Confirm this is the intended Herdr pane. The operating rules are below; do not read the whole reference file at boot.",
     `2. Run: \`node "${rootSetupPath}" --harness ${harnessArgument}\`.${harnessChoice}`,
     "3. Follow the helper's one-time integration instruction and restart this harness in the same pane if it requests a restart.",
     "4. Call `herdr_bootstrap_root` with no arguments first. If it succeeds or reports `alreadyRegistered`, skip to step 5.",
     "5. If it fails with an existing-state error naming a different pane/workspace, that is not this pane's problem to fix: call it again with `add=true` to register a concurrent root without touching any other root or manifest state. Only consider `reset=true` if the user explicitly asks to retire every other root; it wipes the shared parent manifest for this cwd, including other roots' workflows.",
     "6. Verify the returned workspace and pane identity, report that the root is ready, and wait for the user's task. Do not initialize a goal until the user gives the objective.",
+    "",
+    BAA_CORE,
+    "",
+    `The full operating contract is \`${baaPath}\`; read the section you need (dispatch loop, safety and coordination, task profiles) when you need it, not up front.`,
     "",
     `If project configuration must be changed, rerun the project wizard with \`node "${setupPath}" --project-root "${projectRoot}"\`; do not guess model, auth, or thinking settings.`,
     START_SKILL_END,
