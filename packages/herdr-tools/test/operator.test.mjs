@@ -249,6 +249,27 @@ test("a registered agent's message goes to the pane it is registered at now, not
   assert.equal(message.delivery.status, "delivered");
 });
 
+test("a message that was answered before it was sent is never typed into the pane (20 answered anomalies were still queued behind their replies)", async () => {
+  const store = { version: 1, agents: {}, messages: [] };
+  const target = { kind: "agent", label: "agent:lane-admin", paneId: "w2K:p1" };
+  const answered = addOperatorMessage(store, { target: "lane-admin", resolved: target, text: "Anomaly: stale." });
+  const open = addOperatorMessage(store, { target: "lane-admin", resolved: target, text: "Anomaly: current." });
+  answered.replies.push({ at: "2026-09-29T08:04:27.000Z", text: "Stale, fixed in #128.", read: false });
+  answered.delivery = { ...answered.delivery, reason: "agent is working", blockedSince: "2026-09-29T07:00:00.000Z" };
+  const prompts = [];
+  const changed = await deliverOperatorMessages(store, { ready: async () => ({ ok: true, agent: { agent_status: "idle" } }), prompt: async (paneId, text) => prompts.push(text), at: "2026-09-29T08:07:00.000Z" });
+  assert.equal(prompts.length, 1, "only the open one goes out");
+  assert.match(prompts[0], new RegExp(open.id));
+  assert.deepEqual(changed.sort(), [answered.id, open.id].sort());
+  assert.equal(answered.delivery.status, "answered");
+  assert.equal(answered.delivery.reason, "answered before it was sent");
+  assert.equal(answered.delivery.blockedSince, undefined);
+  assert.equal(answered.replies.length, 1, "its reply is kept");
+  assert.equal(open.delivery.status, "delivered");
+  // It never counts as undeliverable, and stays visible in the inbox through its reply.
+  assert.deepEqual(undeliverableMessages(store, { now: Date.parse("2026-09-29T12:00:00.000Z") }), []);
+});
+
 test("every held message shows why, and a persistent reason starts a clock that ends at delivery", async () => {
   const store = { version: 1, agents: {}, messages: [] };
   const target = { kind: "root", label: "root:cic", paneId: "w2J:p1" };

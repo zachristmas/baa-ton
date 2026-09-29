@@ -10,7 +10,7 @@ export type OperatorMessage = {
   text: string;
   createdAt: string;
   notify?: boolean;
-  delivery: { status: "pending" | "delivered" | "uncertain"; attempts: number; updatedAt: string; reason?: string };
+  delivery: { status: "pending" | "delivered" | "uncertain" | "answered"; attempts: number; updatedAt: string; reason?: string };
   replies: OperatorReply[];
 };
 export type OperatorStore = { version: number; agents: Record<string, { paneId: string; workspaceId?: string; agentKind?: string; cwd?: string; registeredAt: string }>; messages: OperatorMessage[]; prompts?: Array<Record<string, unknown>>; decisions?: Array<Record<string, unknown>> };
