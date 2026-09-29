@@ -35,6 +35,7 @@ import {
   ensureProjectBaa,
   instructionCandidates,
   installProjectSkills,
+  replacedSkillsNotice,
   updateManagedReference,
   buildSetupConfig,
   writeJsonAtomic,
@@ -273,9 +274,9 @@ async function runNonInteractive(options) {
     else console.log("No AGENTS.md or CLAUDE.md selected; pass --instructions-path to add the managed reference.");
     if (skills.length) {
       const installed = skills.filter((skill) => !skill.skipped).map((skill) => skill.path);
-      const skipped = skills.filter((skill) => skill.skipped).map((skill) => skill.path);
       if (installed.length) console.log(`Installed Baa-ton skills: ${installed.join(", ")}`);
-      if (skipped.length) console.log(`Preserved existing skill files: ${skipped.join(", ")}`);
+      const notice = replacedSkillsNotice(skills);
+      if (notice) console.log(notice);
     }
     console.log("\nTask profiles:");
     for (const [name, profile] of Object.entries(defaults.profiles)) {
