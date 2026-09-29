@@ -22,7 +22,7 @@ const START_SKILL_START = "<!-- baa-ton:start-skill:start -->";
 const START_SKILL_END = "<!-- baa-ton:start-skill:end -->";
 const LEGACY_SETUP_SKILL_START = "<!-- baa-ton:setup-skill:start -->";
 const LEGACY_SETUP_SKILL_END = "<!-- baa-ton:setup-skill:end -->";
-const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall", "baa-ton-sweep"];
+const PROJECT_SKILLS = ["baa-ton-start", "baa-ton-configure", "baa-ton-update", "baa-ton-uninstall", "baa-ton-sweep", "baa-ton-reset"];
 
 const START_SKILL_DIRECTORIES = {
   pi: [".pi", "skills"],
@@ -144,6 +144,10 @@ export function uninstallSkillPath(projectRoot, harnessId) {
 
 export function sweepSkillPath(projectRoot, harnessId) {
   return projectSkillPath(projectRoot, harnessId, "baa-ton-sweep");
+}
+
+export function resetSkillPath(projectRoot, harnessId) {
+  return projectSkillPath(projectRoot, harnessId, "baa-ton-reset");
 }
 
 // The root's ground rules and escalation policy, short enough to sit inline in
@@ -315,16 +319,60 @@ export function sweepSkillContent() {
   ].join("\n");
 }
 
+export function resetSkillContent({ projectRoot }) {
+  const cli = join(checkoutDirectory, "packages", "herdr-tools", "operator-cli.mjs");
+  return [
+    "---",
+    "name: baa-ton-reset",
+    "description: Preview or run a Baa-ton clean-slate reset that closes every lane tab, archives and empties the orchestrator manifest, and deletes old lane files. Use when the user asks to reset Baa-ton, start clean, or clear out all old lanes and workflows.",
+    "---",
+    START_SKILL_START,
+    "",
+    "# Baa-ton reset",
+    "",
+    "Clean slate for this project's orchestrator state. Always preview first, and never run it unattended.",
+    "",
+    "1. Confirm this is the Herdr root session: `test \"${HERDR_ENV:-}\" = 1 && herdr status server`. If that fails, say so and stop.",
+    `2. Preview: \`node "${cli}" reset --project-root "${projectRoot}"\`. Show the plan as printed: lane tabs to close, leases, workflows to archive, what is kept.`,
+    "3. Ask the user to approve that exact plan. Say plainly that every lane tab closes, including any still running, and that Git and worktrees are never touched. The old manifest is archived under `.baa-ton/herdr-orchestrator/archive/` first; the spec, its progress, config and approval policy are kept.",
+    "4. On approval, rerun the same command with `--yes`. Add `--include-spec` only if the user asked to clear spec progress too (it is archived first).",
+    "5. Report the command's output, including any \"Not fully clean\" lines. Then tell the user the root's goals and queue are empty, so the next goal must be set again.",
+    START_SKILL_END,
+    "",
+  ].join("\n");
+}
+
+/**
+ * The notice for skill files setup took over. Baa-ton owns every baa-ton-*
+ * skill, so a copy without the generated-file markers (hand-authored, or from
+ * an older Baa-ton) is replaced rather than left to go stale; the original is
+ * kept beside it once.
+ */
+export function replacedSkillsNotice(skills) {
+  const replaced = skills.filter((skill) => skill.replaced);
+  if (!replaced.length) return undefined;
+  return [
+    `Replaced ${replaced.length} unmanaged Baa-ton skill file(s) with Baa-ton-managed copies; the originals are kept beside them:`,
+    ...replaced.map((skill) => `  ${skill.path} (was saved as ${skill.replaced})`),
+  ].join("\n");
+}
+
 function installStartSkill(path, content) {
+  let replaced;
   if (existsSync(path)) {
     const existing = readFileSync(path, "utf8");
-    if (!existing.includes(START_SKILL_START) || !existing.includes(START_SKILL_END))
-      return { path, changed: false, skipped: true };
-    if (existing === content) return { path, changed: false, skipped: false };
+    const managed = existing.includes(START_SKILL_START) && existing.includes(START_SKILL_END);
+    if (managed && existing === content) return { path, changed: false, skipped: false };
+    if (!managed) {
+      // Baa-ton manages every baa-ton-* skill; keep what was there once, beside it.
+      const backup = `${path}.pre-baa-ton`;
+      if (!existsSync(backup)) writeFileSync(backup, existing, { mode: 0o600 });
+      replaced = backup;
+    }
   }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, content, { mode: 0o600 });
-  return { path, changed: true, skipped: false };
+  return { path, changed: true, skipped: false, ...(replaced ? { replaced } : {}) };
 }
 
 function removeLegacySetupSkill(projectRoot, harness) {
@@ -359,6 +407,7 @@ export function installProjectSkills({ projectRoot, selected, baaPath }) {
     "baa-ton-update": () => updateSkillContent({ projectRoot }),
     "baa-ton-uninstall": () => uninstallSkillContent(),
     "baa-ton-sweep": () => sweepSkillContent(),
+    "baa-ton-reset": () => resetSkillContent({ projectRoot }),
   };
   const groups = new Map();
   for (const harness of selected) {

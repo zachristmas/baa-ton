@@ -8,6 +8,9 @@ import {
   configureSkillContent,
   configureSkillPath,
   installProjectSkills,
+  replacedSkillsNotice,
+  resetSkillContent,
+  resetSkillPath,
   instructionCandidates,
   managedReferenceBlock,
   portableBaaReference,
@@ -86,8 +89,8 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(first.length, selected.length * 5);
-    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 5).fill(false));
+    assert.equal(first.length, selected.length * 6);
+    assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 6).fill(false));
     for (const harness of selected) {
       const skills = [
         [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
@@ -95,6 +98,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
         [updateSkillPath(directory, harness), updateSkillContent({ projectRoot: directory }), "baa-ton-update"],
         [uninstallSkillPath(directory, harness), uninstallSkillContent(), "baa-ton-uninstall"],
         [sweepSkillPath(directory, harness), sweepSkillContent(), "baa-ton-sweep"],
+        [resetSkillPath(directory, harness), resetSkillContent({ projectRoot: directory }), "baa-ton-reset"],
       ];
       for (const [path, expected, name] of skills) {
         const content = await readFile(path, "utf8");
@@ -107,7 +111,7 @@ test("selected harnesses receive idempotent project-local start skills", async (
       selected,
       baaPath: join(directory, "BAA.md"),
     });
-    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 5).fill(false));
+    assert.deepEqual(second.map((skill) => skill.changed), Array(selected.length * 6).fill(false));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -211,7 +215,7 @@ test("harness skill directories that alias one another share one start skill", a
       selected: ["claude", "codex"],
       baaPath: join(directory, "BAA.md"),
     });
-    assert.equal(written.length, 5);
+    assert.equal(written.length, 6);
     const start = await readFile(startSkillPath(directory, "claude"), "utf8");
     assert.match(start, /--harness <harness>/);
     assert.match(start, /`claude` or `codex`/);
@@ -221,15 +225,25 @@ test("harness skill directories that alias one another share one start skill", a
   }
 });
 
-test("a hand-authored sweep skill without Baa-ton markers is preserved", async () => {
+test("an unmanaged baa-ton skill file is replaced by the managed copy and the original is kept", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-sweep-owned-"));
   try {
     const path = sweepSkillPath(directory, "claude");
     await mkdir(join(directory, ".claude", "skills", "baa-ton-sweep"), { recursive: true });
     await writeFile(path, "---\nname: baa-ton-sweep\n---\nmine\n");
     const written = installProjectSkills({ projectRoot: directory, selected: ["claude"], baaPath: join(directory, "BAA.md") });
-    assert.equal(written.find((skill) => skill.path === path).skipped, true);
-    assert.equal(await readFile(path, "utf8"), "---\nname: baa-ton-sweep\n---\nmine\n");
+    // Baa-ton manages every baa-ton-* skill: the copy is replaced, the original kept beside it.
+    assert.equal(await readFile(path, "utf8"), sweepSkillContent());
+    assert.equal(await readFile(`${path}.pre-baa-ton`, "utf8"), "---\nname: baa-ton-sweep\n---\nmine\n");
+    assert.equal(written.find((skill) => skill.path === path).replaced, `${path}.pre-baa-ton`);
+    const notice = replacedSkillsNotice(written);
+    assert.match(notice, /^Replaced 1 unmanaged Baa-ton skill file\(s\)/);
+    assert.ok(notice.includes(path));
+    // A rerun changes nothing and keeps the first backup.
+    const again = installProjectSkills({ projectRoot: directory, selected: ["claude"], baaPath: join(directory, "BAA.md") });
+    assert.equal(again.some((skill) => skill.changed || skill.replaced), false);
+    assert.equal(replacedSkillsNotice(again), undefined);
+    assert.equal(await readFile(`${path}.pre-baa-ton`, "utf8"), "---\nname: baa-ton-sweep\n---\nmine\n");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
