@@ -25,6 +25,14 @@ import { demoOnPreview, previewHealthUrl } from "./spec.mjs";
 const LONG_COMMANDS =
   "Run long suites synchronously with a long timeout, or with your harness's own tracked background mode (Claude: the Bash tool's run_in_background; Pi: its equivalent), and wait for the result. Never use &, disown, nohup or setsid: a detached job is invisible to Herdr and Baa-ton.";
 
+/**
+ * A queued sync (the target gained commits spec-integration lacks) that has
+ * waited this long takes the integration worktree from an integrate lane
+ * that is idle with only background work running: five pushes waited an hour
+ * on one lane's stuck lint while the sync sat queued behind it.
+ */
+export const SYNC_PREEMPT_MS = 10 * 60_000;
+
 /** States that hold a lane (and a maxParallel slot). */
 export const ACTIVE_STATES = new Set(["building", "reviewing", "integrating", "verifying"]);
 const AFTER_INTEGRATION = new Set(["integrating", "awaiting-push", "verifying", "done", "resolved"]);
@@ -194,6 +202,15 @@ export function demoRunObjective(spec, items, { worktree, sha, reports, pins }) 
     "Finish with herdr_complete. In the summary, one line per item: DEMO: <id> written, or DEMO: <id> blocked <why>. If the stack could not be started at all, a line DEMO-STACK: blocked <why>.",
   ].filter(Boolean).join("\n");
 }
+
+/**
+ * A lint or typecheck that runs far longer than the rest of the suite is
+ * almost always a broken cross-package import or a tsconfig that no longer
+ * covers the files (typed linting then builds a fallback TypeScript program
+ * per file): report it, do not wait it out.
+ */
+export const SLOW_TASK_RULE =
+  "Watch the suite's progress: when every other package's lint and typecheck has finished and one is still running 10 minutes later (no output, high CPU), do not wait for it. It is almost always a broken import across packages or a tsconfig change that leaves files outside every project. Stop that task, run that package's typecheck on its own, name the package and the first errors in your receipt (SUITE: fail, FAILED: <package> <task>), and finish.";
 
 /** Env-dependent suites run against the lane's own leased database, never fail for want of one. */
 export const LANE_DATABASE_RULE =
@@ -1007,6 +1024,34 @@ for (const item of spec.items) {
     if (!next.syncRun || (next.syncRun.targetSha !== targetSha && !next.syncRun.lane)) next.syncRun = { targetSha, attempts: 1, requestedAt: now };
   } else if (next.syncRun && !next.syncRun.lane && (targetInIntegration !== false || !awaitingPush)) delete next.syncRun;
   const syncing = Boolean(next.syncRun && !next.syncRun.failed);
+  // A sync that has waited behind an idle lane's background work takes over:
+  // that lane is released (its item stays queued, no attempt counted; the
+  // retire loop then ends its processes), and the sync starts once they are
+  // gone. A lane whose agent is working is never touched.
+  if (syncing && !next.syncRun.lane && Date.parse(now) - Date.parse(next.syncRun.requestedAt ?? now) >= SYNC_PREEMPT_MS) {
+    for (const item of spec.items) {
+      const current = next.items[item.id];
+      if (current?.state !== "integrating" || !current.lane) continue;
+      const key = `${current.lane.workflowId}/${current.lane.laneId}`;
+      const view = lane(current.lane);
+      const idle = view && !view.receipt && (view.agentStatus === "done" || view.agentStatus === "gone") && !LANE_ENDED.has(view.status ?? "");
+      if (!idle || !background.has(key)) continue;
+      const since = Date.parse(current.backgroundSince ?? now);
+      if (Date.parse(now) - since < SYNC_PREEMPT_MS) continue;
+      const minutes = Math.round((Date.parse(now) - since) / 60_000);
+      (next.syncRun.preempted ??= []).push({ itemId: item.id, lane: current.lane, at: now });
+      (current.history ??= []).push({ at: now, from: current.state, to: current.state, note: `released its integrate lane ${current.lane.workflowId}: idle for ${minutes} min with only background work running (${current.backgroundWork ?? background.get(key)}), while merging ${spec.target.remote}/${spec.target.branch} into spec-integration is queued; it integrates again after the sync` });
+      for (const bookkeeping of [...LANE_BOOKKEEPING, "backgroundSince", "backgroundWork", "backgroundStaleAt"]) delete current[bookkeeping];
+      delete current.lane;
+      rootAsks.push({ itemId: item.id, reason: `${item.id}: its integrate lane was idle ${minutes} min with only background work running (${background.get(key)}), and the queued merge of ${spec.target.remote}/${spec.target.branch} into spec-integration was waiting behind it. The lane is released and its processes are ended; ${item.id} integrates again after the sync (no attempt counted). If its suite was the slow part, look at why (a lint or typecheck that runs far longer than the others usually means a broken cross-package import or a tsconfig that no longer covers the files).` });
+    }
+  }
+  // The preempted lanes' processes must be gone before the sync starts in the same worktree.
+  if (next.syncRun?.preempted?.length) {
+    const busy = next.syncRun.preempted.filter((entry) => background.has(`${entry.lane.workflowId}/${entry.lane.laneId}`));
+    if (!busy.length) delete next.syncRun.preempted;
+  }
+  const syncBlockedBy = next.syncRun?.preempted?.length ? "the released integrate lane's processes are still running" : undefined;
 
   // 1c. One serial integration queue, in dependency order. The integration
   // worktree stays reserved by any integrate or verify lane whose workflow
@@ -1091,7 +1136,7 @@ for (const item of spec.items) {
       ...(next.baselineRun.kind === "fix-baseline" ? { failures: known ?? [] } : {}),
     });
   const fixing = next.baselineRun?.kind === "fix-baseline";
-  if (syncing && !next.syncRun.lane && !reservedBy && !capacityWaiting && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane) && !(typeof next.syncRun.retryAfter === "string" && Date.parse(now) < Date.parse(next.syncRun.retryAfter)))
+  if (syncing && !next.syncRun.lane && !syncBlockedBy && !reservedBy && !capacityWaiting && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane) && !(typeof next.syncRun.retryAfter === "string" && Date.parse(now) < Date.parse(next.syncRun.retryAfter)))
     actions.push({ kind: "sync-target", itemId: "", attempt: next.syncRun.attempts ?? 1, targetSha: next.syncRun.targetSha });
   if (syncing) {
     for (const item of spec.items)
@@ -1507,6 +1552,7 @@ export function integrateObjective(spec, item, { integrationBranch, itemBranch, 
     spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
     spec.target.suite.length || item.acceptance.tests.length ? LANE_DATABASE_RULE : "",
     LONG_COMMANDS,
+    spec.target.suite.length ? SLOW_TASK_RULE : "",
     spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
     item.acceptance.tests.length ? `Run the item's tests: ${item.acceptance.tests.join("; ")}.` : "",
     `Commit the result on ${integrationBranch} with conventional headers of 72 characters or fewer (for example ${specCommitMessage(item.id, "renumber migrations")}); the repository's commit hooks run and must pass. Local only: never push, and never touch any other branch.`,

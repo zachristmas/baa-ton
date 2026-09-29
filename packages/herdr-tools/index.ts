@@ -4964,6 +4964,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           (state as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane,
           (state as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane,
           (state as { syncRun?: { lane?: { workflowId: string; laneId: string } } }).syncRun?.lane,
+          ...((state as { syncRun?: { preempted?: Array<{ lane: { workflowId: string; laneId: string } }> } }).syncRun?.preempted ?? []).map((entry) => entry.lane),
         ].filter((ref): ref is { workflowId: string; laneId: string } => Boolean(ref));
         const readLive =
           ports?.liveStatus ??
@@ -5158,7 +5159,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           return laneBackgroundWork(shellPid, parseProcessTable(stdout));
         });
       const background = new Map<string, string>();
-      for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; lane?: { workflowId: string; laneId: string } }>) {
+      // Lanes released for a queued sync are watched too: the sync starts once
+      // their background processes are gone.
+      const preemptedRefs = ((state as { syncRun?: { preempted?: Array<{ lane: { workflowId: string; laneId: string } }> } }).syncRun?.preempted ?? []).map((entry) => ({ lane: entry.lane }));
+      for (const record of [...(Object.values(state.items ?? {}) as Array<{ state?: string; lane?: { workflowId: string; laneId: string } }>), ...preemptedRefs]) {
         if (!record.lane) continue;
         const view = laneView(record.lane);
         const paneId = manifest.workflows.find((item) => item.id === record.lane!.workflowId)?.lanes.find((item) => item.id === record.lane!.laneId)?.paneId;

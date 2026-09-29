@@ -829,3 +829,62 @@ test("a failed push is asked again after its wait, once the target has been look
   assert.equal(due.rootAsks.find((ask) => ask.kind === "push").sha, SHA_A);
   assert.equal(due.state.pushFailure.retryAfter, undefined);
 });
+
+test("a queued sync takes the integration worktree from an integrate lane idle with only background work, after 10 minutes; a working lane is never touched (D19's stuck lint held five pushes)", () => {
+  const SHA_T = "e".repeat(40);
+  const s = spec([{ id: "A", acceptance: { text: "a" } }, { id: "B", acceptance: { text: "b" } }]);
+  const key = "wi/l1";
+  const base = () => ({
+    version: 1,
+    integrationCounter: 1,
+    syncRun: { targetSha: SHA_T, attempts: 1, requestedAt: at(0) },
+    items: {
+      A: { state: "awaiting-push", integration: { sha: SHA_A, order: 1, at: at(0) } },
+      B: { state: "integrating", attempts: 1, lane: { workflowId: "wi", laneId: "l1" }, backgroundSince: at(0), backgroundWork: "pnpm turbo run lint" },
+    },
+  });
+  const step = (minute, view, background = new Map([[key, "pnpm turbo run lint"]]), state = base()) =>
+    advanceSpec({ spec: s, state, lane: lanes({ [key]: view }), background, targetSha: SHA_T, targetInIntegration: false, now: at(minute) });
+  const idle = { status: "active", agentStatus: "done" };
+
+  // Before the wait: left alone, the sync waits behind it.
+  const early = step(5, idle);
+  assert.equal(early.state.items.B.lane.workflowId, "wi");
+  assert.equal(early.actions.some((action) => action.kind === "sync-target"), false);
+
+  // A lane whose agent is working is never released, however long the sync waited.
+  const working = step(30, { status: "active", agentStatus: "working" });
+  assert.equal(working.state.items.B.lane.workflowId, "wi");
+  assert.equal(working.state.syncRun.preempted, undefined);
+
+  // Idle with background work for 10+ minutes, sync queued 10+ minutes: released, not counted, root told.
+  const released = step(12, idle);
+  assert.equal(released.state.items.B.lane, undefined);
+  assert.equal(released.state.items.B.state, "integrating");
+  assert.equal(released.state.items.B.attempts, 1, "no attempt counted");
+  assert.equal(released.state.items.B.backgroundSince, undefined);
+  assert.deepEqual(released.state.syncRun.preempted.map((entry) => [entry.itemId, entry.lane.workflowId]), [["B", "wi"]]);
+  assert.match(released.state.items.B.history.at(-1).note, /released its integrate lane wi: idle for 12 min with only background work running \(pnpm turbo run lint\)/);
+  assert.match(released.rootAsks.find((ask) => ask.itemId === "B").reason, /integrates again after the sync[\s\S]*broken cross-package import or a tsconfig/);
+  assert.equal(released.actions.some((action) => action.kind === "sync-target"), false, "not while its processes still run");
+
+  // Its processes gone (the retire ended them): the sync starts, and the item waits behind it.
+  const gone = advanceSpec({ spec: s, state: released.state, lane: lanes({ [key]: idle }), background: new Map(), targetSha: SHA_T, targetInIntegration: false, now: at(13) });
+  assert.equal(gone.state.syncRun.preempted, undefined);
+  assert.deepEqual(gone.actions.find((action) => action.kind === "sync-target"), { kind: "sync-target", itemId: "", attempt: 1, targetSha: SHA_T });
+  assert.equal(gone.actions.some((action) => action.kind === "integrate"), false);
+  const stillBusy = advanceSpec({ spec: s, state: structuredClone(released.state), lane: lanes({ [key]: idle }), background: new Map([[key, "pnpm turbo run lint"]]), targetSha: SHA_T, targetInIntegration: false, now: at(13) });
+  assert.equal(stillBusy.actions.some((action) => action.kind === "sync-target"), false);
+  assert.ok(stillBusy.state.syncRun.preempted);
+
+  // A lane with a receipt is consumed, not released.
+  const receipt = step(12, { status: "completed", agentStatus: "done", receipt: { summary: `INTEGRATED: ${SHA_B}\nSUITE: pass` } });
+  assert.equal(receipt.state.syncRun.preempted, undefined);
+});
+
+test("integrate lanes are told to stop waiting on a lint or typecheck that outlasts the rest of the suite and to name the package", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a" } }]);
+  s.target.suite = ["pnpm turbo run typecheck lint format:check --force"];
+  const objective = integrateObjective(s, s.items[0], { integrationBranch: "spec-integration", itemBranch: "spec/A" });
+  assert.match(objective, /every other package's lint and typecheck has finished and one is still running 10 minutes later[\s\S]*broken import across packages or a tsconfig change[\s\S]*FAILED: <package> <task>/);
+});
