@@ -104,7 +104,7 @@ export function claudeRootMcpConfigPath(identity) {
 
 /** No --strict-mcp-config: a root may need claude.ai connectors. */
 export function claudeRootLaunchCommand(identity) {
-  return `claude --mcp-config ${shellQuote(claudeRootMcpConfigPath(identity))}`;
+  return `claude --mcp-config ${shellQuote(claudeRootMcpConfigPath(identity))} --disallowedTools Artifact,ArtifactComments,ArtifactData`;
 }
 
 export const PROJECT_SCOPE_SERVERS = ["herdr-orchestrator", "playwright"];

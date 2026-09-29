@@ -855,6 +855,7 @@ export async function dispatchTask(
                 extraMcpServers: lane.mcpServers,
                 allowLocalMerge: lane.specStage === "integrate",
                 ...(lane.permissionMode ? { permissionMode: lane.permissionMode } : {}),
+                ...(lane.allowArtifact ? { allowArtifact: true } : {}),
               }),
             ], signal);
           } catch (error) {
@@ -1410,7 +1411,7 @@ export async function resumeTask(
           profile,
           info.session,
           port.source,
-          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers, allowLocalMerge: lane.specStage === "integrate", ...(lane.permissionMode ? { permissionMode: lane.permissionMode } : {}) },
+          { startupIntentPath: lane.startupIntentPath, extraMcpServers: lane.mcpServers, allowLocalMerge: lane.specStage === "integrate", ...(lane.permissionMode ? { permissionMode: lane.permissionMode } : {}), ...(lane.allowArtifact ? { allowArtifact: true } : {}) },
         );
         await startWhenShellReady(port, lane.paneId!,
           [

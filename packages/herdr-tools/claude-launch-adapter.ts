@@ -15,6 +15,10 @@ import {
 } from "./harness-adapter.js";
 
 export const CLAUDE_PROVIDER = "claude-code";
+/** Keeps the Artifact tools out of a Baa-ton-launched Claude session: in
+ * interactive Claude Code the definition is not deferred and costs about 11k
+ * tokens on every request. A profile or lane sets allowArtifact to keep them. */
+export const CLAUDE_ARTIFACT_TOOLS = ["Artifact", "ArtifactComments", "ArtifactData"];
 export const CLAUDE_PERMISSION_PROMPT_TOOL =
   "mcp__herdr-orchestrator__herdr_permission_prompt";
 
@@ -378,6 +382,7 @@ function buildClaudeLaunchArguments(
     // guard above are the limits (a task profile may name another mode).
     "--permission-mode",
     lanePermissionMode(context?.permissionMode),
+    ...(context?.allowArtifact === true ? [] : ["--disallowedTools", CLAUDE_ARTIFACT_TOOLS.join(",")]),
   ];
   const permissionPromptTool =
     paths.permissionPromptTool === undefined

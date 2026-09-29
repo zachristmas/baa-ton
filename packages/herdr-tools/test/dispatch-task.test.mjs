@@ -796,6 +796,7 @@ test("claude adapter dispatches through unchanged sequencing with its own attest
     const start = f.calls.find((c) => c[1] === "start");
     assert.equal(start[start.indexOf("--model") + 1], "claude-sonnet-5");
     assert.equal(start[start.indexOf("--effort") + 1], "high");
+    assert.equal(start[start.indexOf("--disallowedTools") + 1], "Artifact,ArtifactComments,ArtifactData", "dispatched lanes deny the Artifact tools by default");
     const settings = JSON.parse(
       await readFile(start[start.indexOf("--settings") + 1], "utf8"),
     );
