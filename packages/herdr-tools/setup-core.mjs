@@ -355,14 +355,39 @@ const END_SKILL_INVOCATION = {
   pi: "Invoke directly with `/skill:baa-ton-end`; model invocation is disabled.",
 };
 
+// A shared skill that includes Claude or Pi must carry disable-model-invocation.
+// Pi's installed skills docs document the field; OpenCode 1.18.31's pure skill
+// loader discovers a synthetic skill carrying it. Codex's installed official
+// quick_validate.py rejects it, so unknown/unverified consumers fail closed.
+const VERIFIED_DISABLE_MODEL_INVOCATION_HARNESSES = new Set(["claude", "opencode", "pi"]);
+const REQUIRES_DISABLED_MODEL_INVOCATION = new Set(["claude", "pi"]);
+
+function assertSharedEndSkillCompatibility(harnesses, directory = "the selected shared directory") {
+  if (!harnesses.some((id) => REQUIRES_DISABLED_MODEL_INVOCATION.has(id))) return;
+  const unsupported = harnesses.filter((id) => !VERIFIED_DISABLE_MODEL_INVOCATION_HARNESSES.has(id));
+  if (!unsupported.length) return;
+  const why = unsupported.map((id) => id === "codex"
+    ? "Codex's skill frontmatter validator rejects that field"
+    : `frontmatter compatibility for ${id} is unverified`);
+  const selectedDirectories = harnesses
+    .map((id) => START_SKILL_DIRECTORIES[id]?.join("/"))
+    .filter(Boolean)
+    .map((path) => `.${path}`)
+    .join(", ");
+  throw new Error(
+    `Cannot install skills for ${harnesses.join(" and ")} in shared directory ${directory}: Claude/Pi require the top-level disable-model-invocation opt-out, but ${why.join("; ")}. Split these skill directories so they resolve to different paths (${selectedDirectories}), then rerun setup.`,
+  );
+}
+
 /** Generate an end-flow skill that keeps durable lifecycle work in root tools. */
 export function endSkillContent({ harness }) {
   const harnesses = [harness].flat();
   for (const id of harnesses)
     if (!EXIT_COMMANDS[id] || !END_SKILL_INVOCATION[id])
       throw new Error(`No verified Baa-ton end flow for harness ${JSON.stringify(id)}.`);
+  assertSharedEndSkillCompatibility(harnesses);
   const invocation = harnesses.map((id) => `${id}: ${END_SKILL_INVOCATION[id]}`).join(" ");
-  const invocationMetadata = harnesses.length === 1 && (harnesses[0] === "claude" || harnesses[0] === "pi")
+  const invocationMetadata = harnesses.some((id) => id === "claude" || id === "pi")
     ? "disable-model-invocation: true\n"
     : "";
   const exitInstructions = harnesses.map((id) => `- ${id}: \`herdr pane run "$HERDR_PANE_ID" '${EXIT_COMMANDS[id]}'\``).join("; ");
@@ -382,7 +407,7 @@ export function endSkillContent({ harness }) {
     "",
     "Use root tools for goal, supervisor, lane-retirement and housekeeping state: they enforce this root's ownership and approval gates. Use the Herdr CLI only for the final native harness exit because no root tool terminates its invoking session. Do not use the Baa-ton run-state CLI or change the durable operator run state.",
     "",
-    "1. Verify this is the current registered Herdr root: run `test \"${HERDR_ENV:-}\" = 1 && herdr status server`, then call `herdr_doctor` and confirm its `root-identity` check is `ok`. If either check fails or the root identity is not `ok`, stop without changing anything. Do not initialize a missing goal.",
+    "1. Verify this is the current registered Herdr root: run `test \"${HERDR_ENV:-}\" = 1 && herdr status server`, then call `herdr_doctor`. Continue only if `root-identity` is exactly `ok`, or if its status is `warn` and its detail begins `Current root identity matches.` (that warning means this root matches; other registered roots still need separate attention). Stop on every other status or detail, including an unregistered current pane, without changing anything. Do not initialize a missing goal.",
     "2. Call `herdr_goal` with `action: \"status\"`. Read the current root's workflow/lane records in `.baa-ton/herdr-orchestrator/manifest.json` and use `herdr_observe` for workflows with nonterminal lanes. Record what is already running before cleanup.",
     "3. Preserve the honest goal status. Change it only when evidence supports a real transition: `completed` only when the objective is complete; `blocked` only for an actual blocker; `waiting-for-event` only when the root has no safe action until a real external/lane event. Keep unfinished work active otherwise, and set a truthful `nextAction`. Never set `paused` or call `herdr_goal action: \"pause\"` or `herdr_operator_run action: \"pause\"`—only the operator can pause the run.",
     "4. If the goal's supervisor is running, call `herdr_goal` with `action: \"stop\"` to stop it (not the operator run). If already stopped, do not change it; if absent, do not create one. Call `herdr_goal action: \"status\"` again and verify the running supervisor is now stopped. Report any failure; do not pretend it stopped.",
@@ -454,7 +479,6 @@ function resolveThroughSymlinks(path) {
 }
 
 export function installProjectSkills({ projectRoot, selected, baaPath }) {
-  for (const harness of Object.keys(START_SKILL_DIRECTORIES)) removeLegacySetupSkill(projectRoot, harness);
   const content = {
     "baa-ton-start": (harnesses) => startSkillContent({ harness: harnesses, baaPath, projectRoot }),
     "baa-ton-configure": () => configureSkillContent({ baaPath, projectRoot }),
@@ -471,6 +495,9 @@ export function installProjectSkills({ projectRoot, selected, baaPath }) {
     group.harnesses.push(harness);
     groups.set(key, group);
   }
+  for (const [directory, { harnesses }] of groups)
+    assertSharedEndSkillCompatibility(harnesses, directory);
+  for (const harness of Object.keys(START_SKILL_DIRECTORIES)) removeLegacySetupSkill(projectRoot, harness);
   return [...groups.values()].flatMap(({ harness, harnesses }) => PROJECT_SKILLS.map((skillName) => installStartSkill(
     projectSkillPath(projectRoot, harness, skillName),
     content[skillName](harnesses.length === 1 ? harnesses[0] : harnesses),

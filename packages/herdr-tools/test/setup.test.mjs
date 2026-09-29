@@ -29,6 +29,19 @@ import {
 import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
 import { EXIT_COMMANDS } from "../root-relaunch.mjs";
 
+function generatedScalarFrontmatter(content) {
+  const match = content.match(/^---\n([\s\S]*?)\n---\n/);
+  assert.ok(match, "generated skill has delimited YAML frontmatter");
+  const fields = {};
+  for (const line of match[1].split("\n").filter(Boolean)) {
+    const field = line.match(/^([a-z][a-z-]*): (.+)$/);
+    assert.ok(field, `generated frontmatter uses a supported simple scalar: ${line}`);
+    assert.equal(Object.hasOwn(fields, field[1]), false, `frontmatter field ${field[1]} is unique`);
+    fields[field[1]] = field[2];
+  }
+  return fields;
+}
+
 test("managed BAA references are idempotent and replace stale paths", async () => {
   const directory = await mkdtemp(join(tmpdir(), "baa-setup-"));
   try {
@@ -94,6 +107,8 @@ test("selected harnesses receive idempotent project-local start skills", async (
     });
     assert.equal(first.length, selected.length * 7);
     assert.deepEqual(first.map((skill) => skill.skipped), Array(selected.length * 7).fill(false));
+    assert.equal(generatedScalarFrontmatter(await readFile(endSkillPath(directory, "claude"), "utf8"))["disable-model-invocation"], "true");
+    assert.equal(generatedScalarFrontmatter(await readFile(endSkillPath(directory, "codex"), "utf8"))["disable-model-invocation"], undefined);
     for (const harness of selected) {
       const skills = [
         [startSkillPath(directory, harness), startSkillContent({ harness, baaPath: join(directory, "BAA.md"), projectRoot: directory }), "baa-ton-start"],
@@ -146,6 +161,10 @@ test("baa-ton-end uses current supported discovery and invocation metadata for e
   // Current docs checked 2026-09-30: https://code.claude.com/docs/en/skills,
   // https://developers.openai.com/codex/skills/, https://opencode.ai/docs/skills/ and /docs/tui/;
   // Pi's installed docs/skills.md. Codex project discovery is .agents/skills (not .codex/skills).
+  // Codex's local skill-creator quick validator rejects Claude's
+  // disable-model-invocation key, so installation fails closed on that alias.
+  // Pi's docs/skills.md support the field; OpenCode 1.18.31's `debug skill --pure`
+  // discovered a synthetic Claude+OpenCode grouped skill carrying it.
   const directory = "/project";
   const expectedPaths = {
     claude: join(directory, ".claude", "skills", "baa-ton-end", "SKILL.md"),
@@ -166,11 +185,26 @@ test("baa-ton-end uses current supported discovery and invocation metadata for e
   assert.doesNotMatch(endSkillContent({ harness: "opencode" }), /`\/baa-ton-end`/);
   assert.match(endSkillContent({ harness: "pi" }), /disable-model-invocation: true[\s\S]*`\/skill:baa-ton-end`/);
 
+  assert.throws(
+    () => endSkillContent({ harness: ["claude", "codex"] }),
+    /Codex's skill frontmatter validator rejects that field[\s\S]*Split these skill directories/,
+    "the content generator must never emit a Codex-invalid shared skill",
+  );
+  assert.throws(
+    () => endSkillContent({ harness: ["pi", "codex"] }),
+    /Codex's skill frontmatter validator rejects that field[\s\S]*Split these skill directories/,
+  );
+  const claudePi = endSkillContent({ harness: ["claude", "pi"] });
+  assert.equal(generatedScalarFrontmatter(claudePi)["disable-model-invocation"], "true", "Claude and Pi share the supported opt-out");
+  assert.equal(generatedScalarFrontmatter(endSkillContent({ harness: "codex" }))["disable-model-invocation"], undefined);
+
   for (const harness of ["claude", "codex", "opencode", "pi"]) {
     const generated = endSkillContent({ harness });
     const rootCheck = generated.split("\n").find((line) => line.startsWith("1."));
     assert.match(rootCheck, /herdr_doctor/);
-    assert.match(rootCheck, /root-identity.*`ok`/);
+    assert.match(rootCheck, /root-identity.*exactly `ok`/);
+    assert.match(rootCheck, /status is `warn` and its detail begins `Current root identity matches\.`/);
+    assert.match(rootCheck, /Stop on every other status or detail/);
     if (harness !== "pi") assert.doesNotMatch(generated, /herdr_root_identity/, `${harness} must not invoke a Pi-only root tool`);
   }
 
@@ -257,21 +291,74 @@ test("a CLAUDE.md that imports AGENTS.md does not get a second managed reference
   }
 });
 
-test("harness skill directories that alias one another share one start skill", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "baa-skill-alias-"));
+test("Claude and OpenCode can share skill paths with OpenCode's loader", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-skill-opencode-alias-"));
   try {
-    await mkdir(join(directory, ".claude"));
-    await symlink(".claude", join(directory, ".agents"));
+    await mkdir(join(directory, ".claude", "skills"), { recursive: true });
+    await mkdir(join(directory, ".opencode"));
+    await symlink("../.claude/skills", join(directory, ".opencode", "skills"));
     const written = installProjectSkills({
       projectRoot: directory,
-      selected: ["claude", "codex"],
+      selected: ["claude", "opencode"],
       baaPath: join(directory, "BAA.md"),
     });
     assert.equal(written.length, 7);
-    const start = await readFile(startSkillPath(directory, "claude"), "utf8");
-    assert.match(start, /--harness <harness>/);
-    assert.match(start, /`claude` or `codex`/);
-    assert.match(start, /current claude or codex session/);
+    const end = await readFile(endSkillPath(directory, "claude"), "utf8");
+    assert.equal(await readFile(endSkillPath(directory, "opencode"), "utf8"), end);
+    assert.equal(generatedScalarFrontmatter(end)["disable-model-invocation"], "true");
+    assert.match(end, /opencode: OpenCode discovers this skill for its native `skill` tool/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Claude and Pi can share skill paths with their verified user-only frontmatter", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-skill-pi-alias-"));
+  try {
+    await mkdir(join(directory, ".claude", "skills"), { recursive: true });
+    await mkdir(join(directory, ".pi"));
+    await symlink("../.claude/skills", join(directory, ".pi", "skills"));
+    const written = installProjectSkills({
+      projectRoot: directory,
+      selected: ["claude", "pi"],
+      baaPath: join(directory, "BAA.md"),
+    });
+    assert.equal(written.length, 7);
+    const end = await readFile(endSkillPath(directory, "claude"), "utf8");
+    assert.equal(await readFile(endSkillPath(directory, "pi"), "utf8"), end);
+    assert.equal(generatedScalarFrontmatter(end)["disable-model-invocation"], "true");
+    assert.match(end, /claude: Invoke directly with `\/baa-ton-end`/);
+    assert.match(end, /pi: Invoke directly with `\/skill:baa-ton-end`/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("incompatible Claude and Codex skill paths fail before any writes or replacements", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-skill-alias-"));
+  const legacyPath = join(directory, ".claude", "skills", "baa-ton-setup", "SKILL.md");
+  const unmanagedPath = endSkillPath(directory, "claude");
+  const legacy = "<!-- baa-ton:setup-skill:start -->\nlegacy\n<!-- baa-ton:setup-skill:end -->\n";
+  const unmanaged = "---\nname: baa-ton-end\ndescription: Keep this file\n---\nuser-owned\n";
+  try {
+    await mkdir(join(directory, ".claude", "skills", "baa-ton-setup"), { recursive: true });
+    await mkdir(join(directory, ".claude", "skills", "baa-ton-end"), { recursive: true });
+    await mkdir(join(directory, ".agents"));
+    await symlink("../.claude/skills", join(directory, ".agents", "skills"));
+    await writeFile(legacyPath, legacy);
+    await writeFile(unmanagedPath, unmanaged);
+    assert.throws(
+      () => installProjectSkills({
+        projectRoot: directory,
+        selected: ["pi", "claude", "codex"],
+        baaPath: join(directory, "BAA.md"),
+      }),
+      /disable-model-invocation[\s\S]*Codex's skill frontmatter validator rejects that field[\s\S]*Split these skill directories/,
+    );
+    assert.equal(await readFile(legacyPath, "utf8"), legacy, "preflight precedes legacy-skill deletion");
+    assert.equal(await readFile(unmanagedPath, "utf8"), unmanaged, "preflight preserves unmanaged skills");
+    await assert.rejects(() => readFile(`${unmanagedPath}.pre-baa-ton`, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(startSkillPath(directory, "pi"), "utf8"), { code: "ENOENT" }, "preflight precedes writes to unrelated harnesses");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
