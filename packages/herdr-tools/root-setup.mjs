@@ -8,13 +8,14 @@ import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { agentArgv, agentCwd, bridgeAttached, carriedClaudeFlags, paneAgent, paneProcessInfo, piExtensionInstalled, relaunchCommand, relaunchLogPath, startDetachedRelaunch } from "./root-relaunch.mjs";
 
 const toolsDirectory = dirname(fileURLToPath(import.meta.url));
 const bridge = resolve(join(toolsDirectory, "mcp-server.mjs"));
 const extension = resolve(join(toolsDirectory, "index.ts"));
 const harnesses = new Set(["claude", "codex", "opencode", "pi"]);
 function usage() {
-  return `Usage: node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi [--write]\n       node ${join(toolsDirectory, "root-setup.mjs")} --harness claude --remove-project-scope --verified-live\n\nDefault behavior prints commands and configuration only. --write writes only the selected harness' configuration: a per-pane MCP config file next to the controller config for Claude (the root is launched with --mcp-config, so other sessions in the same folder never load the bridge), ~/.codex/config.toml for Codex (when it does not already exist), or opencode.json for OpenCode. Pi has no file write path; load the extension when starting Pi.\n\n--remove-project-scope (Claude) removes the herdr-orchestrator and playwright entries an earlier setup added to the project or local scope. It refuses without --verified-live: run it only after the root launched with --mcp-config has bootstrapped successfully.`;
+  return `Usage: node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi [--write]\n       node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi --check\n       node ${join(toolsDirectory, "root-setup.mjs")} --harness claude|codex|opencode|pi --relaunch\n       node ${join(toolsDirectory, "root-setup.mjs")} --harness claude --remove-project-scope --verified-live\n\nDefault behavior prints commands and configuration only. --write writes only the selected harness' configuration: a per-pane MCP config file next to the controller config for Claude (the root is launched with --mcp-config, so other sessions in the same folder never load the bridge), ~/.codex/config.toml for Codex (when it does not already exist), or opencode.json for OpenCode. Pi has no file write path; load the extension when starting Pi.\n\n--check reports whether this pane already runs the herdr-orchestrator bridge (exit 0 attached, 3 not attached). --relaunch does nothing when it is attached; otherwise it writes the configuration and, for Claude, ends the agent from a detached worker and types the relaunch command (same session, bridge loaded, no further input) once the pane's shell is back. Other harnesses print the manual restart.\n\n--remove-project-scope (Claude) removes the herdr-orchestrator and playwright entries an earlier setup added to the project or local scope. It refuses without --verified-live: run it only after the root launched with --mcp-config has bootstrapped successfully.`;
 }
 
 function shellQuote(value) {
@@ -276,6 +277,8 @@ async function main() {
   let write = false;
   let removeScope = false;
   let verifiedLive = false;
+  let check = false;
+  let relaunch = false;
   const args = process.argv.slice(2);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -284,6 +287,15 @@ async function main() {
       return;
     }
     if (arg === "--write") {
+      write = true;
+      continue;
+    }
+    if (arg === "--check") {
+      check = true;
+      continue;
+    }
+    if (arg === "--relaunch") {
+      relaunch = true;
       write = true;
       continue;
     }
@@ -309,8 +321,54 @@ async function main() {
     await removeProjectScope({ verifiedLive, identity });
     return;
   }
+  if (check || relaunch) {
+    const info = currentPaneInfo(identity);
+    const attached = harness === "pi" ? piExtensionInstalled() : bridgeAttached(info);
+    console.log(attached
+      ? `attached: ${harness === "pi" ? "the Pi herdr-orchestrator extension is installed" : `the herdr-orchestrator bridge is running in ${identity.HERDR_PANE_ID}`}; call herdr_bootstrap_root to confirm the identity`
+      : `not attached: ${harness === "pi" ? "the Pi herdr-orchestrator extension is not installed" : `no herdr-orchestrator bridge in ${identity.HERDR_PANE_ID}`}`);
+    if (check) {
+      process.exitCode = attached ? 0 : 3;
+      return;
+    }
+    if (attached) return;
+    await writeConfiguration(harness, identity);
+    startRelaunch(harness, identity, info);
+    return;
+  }
   printInstructions(harness, identity);
   if (write) await writeConfiguration(harness, identity);
+}
+
+function currentPaneInfo(identity) {
+  if (process.env.HERDR_ENV !== "1" || identity.HERDR_PANE_ID.startsWith("<"))
+    throw new Error("--check and --relaunch need a HERDR_ENV=1 pane with HERDR_PANE_ID.");
+  return paneProcessInfo(identity.HERDR_PANE_ID);
+}
+
+function startRelaunch(harness, identity, info) {
+  const agentPid = harness === "claude" && Number.isSafeInteger(Number(process.env.CLAUDE_PID)) && Number(process.env.CLAUDE_PID) > 0 ? Number(process.env.CLAUDE_PID) : undefined;
+  const agent = paneAgent(identity.HERDR_PANE_ID);
+  const planned = agent?.agent !== harness
+    ? { error: `Herdr reports ${agent?.agent ?? "no agent"} in ${identity.HERDR_PANE_ID}, not ${harness}.` }
+    : relaunchCommand({
+        harness,
+        mcpConfigPath: claudeRootMcpConfigPath(identity),
+        disallowedTools: "Artifact,ArtifactComments,ArtifactData",
+        session: agent.agent_session ?? (agentPid && process.env.CLAUDE_CODE_SESSION_ID ? { value: process.env.CLAUDE_CODE_SESSION_ID } : undefined),
+        carriedFlags: agentPid ? carriedClaudeFlags(agentArgv(info, agentPid)) : [],
+        cwd: (agentPid && agentCwd(info, agentPid)) || agent.cwd || process.cwd(),
+        sessionFromExitOutput: !agent.agent_session && !(agentPid && process.env.CLAUDE_CODE_SESSION_ID),
+      });
+  if (!planned.command) {
+    console.log(`Not relaunching automatically: ${planned.error}`);
+    printInstructions(harness, identity);
+    process.exitCode = 4;
+    return;
+  }
+  const logPath = relaunchLogPath(identity.HERDR_PLUGIN_CONFIG_DIR);
+  startDetachedRelaunch({ paneId: identity.HERDR_PANE_ID, agentPid, harness, command: planned.command, logPath });
+  console.log(`Relaunching in ${identity.HERDR_PANE_ID}: this session ends in a moment and resumes with the bridge loaded. Progress: ${logPath}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
