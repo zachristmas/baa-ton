@@ -79,6 +79,7 @@ export function integrateObjective(
   },
 ): string;
 export function verifyResult(summary: unknown): { previews: Array<{ spec: string; result: string }>; tests: Array<{ command: string; result: string }>; report?: string };
+export const SUITE_LOCK_TOOL: string;
 export function syncObjective(spec: Spec, input: { targetSha: string; integrationBranch: string; baseline?: { sha: string; failures: Array<{ package: string; task: string }> } }): string;
 export function demoRunResult(summary: unknown): { items: Map<string, { result: "written" | "blocked"; reason: string }>; stackBlocked?: string };
 export function demoRunObjective(spec: Spec, items: SpecItem[], options: { worktree?: string; sha: string; reports: Record<string, { path: string; preview?: { health?: string; wakePattern?: string } }>; pins?: string[] }): string;
