@@ -247,6 +247,15 @@ export async function deliverOperatorMessages(store, { ready, prompt, at = nowIs
   const busy = new Map();
   for (const message of store.messages) {
     if (message.delivery?.status !== "pending") continue;
+    // Answered before it was sent (a queued anomaly its recipient had already
+    // handled and replied to): never typed into the pane. Twenty such
+    // messages were still queued behind a reply that had closed them.
+    if (Array.isArray(message.replies) && message.replies.length) {
+      message.delivery = { ...message.delivery, status: "answered", reason: "answered before it was sent", updatedAt: at };
+      delete message.delivery.blockedSince;
+      changed.push(message.id);
+      continue;
+    }
     const target = currentTarget(store, message);
     if (!target?.paneId) continue;
     if (busy.has(target.paneId)) {
