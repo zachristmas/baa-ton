@@ -20,7 +20,7 @@ function throwingExec() {
 
 test("readClaudeDefaults resolves an alias to a concrete model via settings.json", () => {
   const result = readClaudeDefaults({ settingsPath: join(fixtures, "claude-settings.json") });
-  assert.equal(result.defaultModel, "claude-sonnet-5");
+  assert.equal(result.defaultModel, "claude-sonnet-5-5");
   assert.equal(result.defaultThinking, "high");
   assert.equal(result.source, "file");
   assert.ok(result.catalog.length > 0);
