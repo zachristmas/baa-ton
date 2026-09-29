@@ -1800,6 +1800,7 @@ function normalizedLanes(
         : {}),
       ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
       ...(configuredProfile?.permissionMode ? { permissionMode: configuredProfile.permissionMode } : {}),
+      ...((input.allowArtifact ?? configuredProfile?.allowArtifact) === true ? { allowArtifact: true } : {}),
       ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
       ...((input as { demoPins?: unknown }).demoPins ? { demoPins: (input as { demoPins?: unknown }).demoPins } : {}),
     };
@@ -12260,6 +12261,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
                   dependencies: Type.Optional(Type.Array(Type.String())),
                   dependsOn: Type.Optional(Type.Array(Type.String())),
                   mcpServers: Type.Optional(Type.Record(Type.String(), Type.Any())),
+                  allowArtifact: Type.Optional(Type.Boolean()),
                   launchProfile: Type.Optional(
                     Type.Object(
                       {

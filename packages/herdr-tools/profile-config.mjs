@@ -86,6 +86,9 @@ export function resolveTaskProfile(cwd, name) {
   const permissionMode = configured.permissionMode ?? configured.launchProfile?.permissionMode;
   if (permissionMode !== undefined && !["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].includes(permissionMode))
     throw new Error(`Task profile ${name} has an invalid permissionMode ${JSON.stringify(permissionMode)}.`);
+  const allowArtifact = configured.allowArtifact;
+  if (allowArtifact !== undefined && typeof allowArtifact !== "boolean")
+    throw new Error(`Task profile ${name} has an invalid allowArtifact; use true or false.`);
   return {
     name,
     description: typeof configured.description === "string" ? configured.description : defaultsForName.description,
@@ -96,6 +99,7 @@ export function resolveTaskProfile(cwd, name) {
     preferredHarnesses: [...defaultsForName.preferredHarnesses],
     ...(agentKind ? { agentKind } : {}),
     permissionMode: permissionMode ?? "bypassPermissions",
+    ...(allowArtifact === true ? { allowArtifact: true } : {}),
     launchProfile,
   };
 }

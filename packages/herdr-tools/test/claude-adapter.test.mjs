@@ -482,3 +482,23 @@ test("a fresh lane gets its contract as operator configuration, so it starts its
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("a Claude lane denies the Artifact tools unless the lane or its profile opts in", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-artifact-"));
+  try {
+    const adapter = claudeLaunchAdapter({
+      bridge: "/bridge/mcp-server.mjs",
+      attestHelper: "/helper/claude-startup-attest.mjs",
+      scratchDirectory: directory,
+    });
+    const base = { startupIntentPath: "/intents/lane.json" };
+    const denied = (args) => args[args.indexOf("--disallowedTools") + 1];
+    assert.equal(denied(adapter.launchArguments(profile, "/source/index.ts", base)), "Artifact,ArtifactComments,ArtifactData");
+    assert.equal(denied(adapter.launchArguments(profile, "/source/index.ts", { ...base, allowArtifact: false })), "Artifact,ArtifactComments,ArtifactData");
+    assert.equal(adapter.launchArguments(profile, "/source/index.ts", { ...base, allowArtifact: true }).includes("--disallowedTools"), false);
+    const resumed = adapter.resumeArguments(profile, { nativeHandle: { kind: "id", value: "s-1" } }, "/source/index.ts", base);
+    assert.equal(denied(resumed), "Artifact,ArtifactComments,ArtifactData", "a resumed lane keeps the default too");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

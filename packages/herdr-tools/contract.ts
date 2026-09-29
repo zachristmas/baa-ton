@@ -336,6 +336,8 @@ export type LaneInput =
       /** Extra MCP servers (raw --mcp-config entries) this lane needs beyond
        * herdr-orchestrator. Only an authorized root may grant these. */
       mcpServers?: Record<string, unknown>;
+      /** Keep Claude's Artifact tools in this lane (denied by default). */
+      allowArtifact?: boolean;
       dependencies?: string[];
       dependsOn?: string[];
       /** Set only by the spec loop's driver (not the herdr_plan schema):
@@ -401,6 +403,7 @@ export type Lane = {
   /** Extra MCP servers (raw --mcp-config entries) this lane needs beyond
    * herdr-orchestrator. Only an authorized root may grant these. */
   mcpServers?: Record<string, unknown>;
+  allowArtifact?: boolean;
   incarnationId?: string;
   incarnationRevision?: number;
   incarnationStartedAt?: string;

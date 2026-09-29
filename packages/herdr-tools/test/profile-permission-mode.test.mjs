@@ -33,3 +33,26 @@ test("a task profile's lanes run in bypassPermissions unless it names another pe
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("a task profile keeps Claude's Artifact tools only when it says allowArtifact: true", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "baa-allow-artifact-"));
+  try {
+    await mkdir(join(cwd, ".baa-ton"));
+    await writeFile(
+      join(cwd, ".baa-ton", "config.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          implementation: { agentKind: "claude", launchProfile },
+          review: { agentKind: "claude", allowArtifact: true, launchProfile },
+          planning: { agentKind: "claude", allowArtifact: "yes", launchProfile },
+        },
+      }),
+    );
+    assert.equal(resolveTaskProfile(cwd, "implementation").allowArtifact, undefined);
+    assert.equal(resolveTaskProfile(cwd, "review").allowArtifact, true);
+    assert.throws(() => resolveTaskProfile(cwd, "planning"), /invalid allowArtifact/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

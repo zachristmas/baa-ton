@@ -152,6 +152,8 @@ export type LaunchContext = {
   allowLocalMerge?: boolean;
   /** The task profile's permission mode for harnesses that have one (Claude: bypassPermissions unless named). */
   permissionMode?: string;
+  /** Keep the harness's Artifact tools (Claude denies them by default: their definition costs about 11k tokens a request). */
+  allowArtifact?: boolean;
 };
 
 export type RequiredAdapterCapability =

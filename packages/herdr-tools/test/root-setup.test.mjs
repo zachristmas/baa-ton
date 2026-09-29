@@ -16,7 +16,7 @@ test("a Claude root's MCP servers come from a per-pane file passed with --mcp-co
   assert.deepEqual(Object.keys(claudeRootMcpConfig(id).mcpServers), ["herdr-orchestrator"]);
   assert.equal(claudeRootMcpConfig(id).mcpServers["herdr-orchestrator"].env.HERDR_PANE_ID, "w1:p1");
   const command = claudeRootLaunchCommand(id);
-  assert.match(command, /^claude --mcp-config '\/cfg\/root-mcp\/w1-w1_p1\.json'$/);
+  assert.match(command, /^claude --mcp-config '\/cfg\/root-mcp\/w1-w1_p1\.json' --disallowedTools Artifact,ArtifactComments,ArtifactData$/);
   assert.doesNotMatch(command, /strict-mcp-config/, "a root may need claude.ai connectors");
 });
 
