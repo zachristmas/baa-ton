@@ -5321,7 +5321,7 @@ function spawnSupervisorRunner() {
  * startup waits scale with it, and above 2 s the spec driver starts one lane
  * at a time. The probe and throttle state are logged when the state changes
  * and every 10 min. Once an hour, shells reparented to pid 1 and older than
- * a day are reported once (they cost nothing but hold terminals and memory).
+ * a day are logged, and reported once only when a lane marker ties them to Baa-ton (they cost nothing but hold terminals and memory).
  */
 export function createSpawnWatch({
   log,
@@ -5362,11 +5362,14 @@ export function createSpawnWatch({
         if (orphans.length) {
           const days = (item) => `${item.command.split("/").pop()} ${item.pid} (${Math.floor((item.ageMs ?? 0) / 86_400_000)} d)`;
           log(`orphaned shells older than a day: ${orphans.map(days).join(", ")}`);
-          await anomaly({
+          // Only shells that carry a lane marker are Baa-ton's leak; the
+          // user's own login shells are logged, never raised as an anomaly.
+          const owned = orphans.filter((item) => item.laneOwned);
+          if (owned.length) await anomaly({
             kind: "orphan-shells",
-            signature: `orphan-shells:${orphans.map((item) => item.pid).sort((a, b) => a - b).join(",")}`,
-            summary: `${orphans.length} shell process(es) reparented to pid 1 and older than a day: ${orphans.slice(0, 10).map(days).join(", ")}`,
-            evidence: orphans.slice(0, 20).map((item) => `pid ${item.pid}: ${item.command}`),
+            signature: `orphan-shells:${owned.map((item) => item.pid).sort((a, b) => a - b).join(",")}`,
+            summary: `${owned.length} shell process(es) reparented to pid 1 and older than a day: ${owned.slice(0, 10).map(days).join(", ")}`,
+            evidence: owned.slice(0, 20).map((item) => `pid ${item.pid}: ${item.command}`),
           }).catch(() => undefined);
         }
       }

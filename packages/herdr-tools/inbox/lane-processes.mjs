@@ -122,9 +122,14 @@ export async function busyPorts(ports, listening = portListening) {
 
 const SHELL = /^(?:-|\S*\/)?(?:zsh|bash|sh|fish|gitstatusd\S*)(?:\s|$)/;
 
-/** Shells reparented to pid 1 (their terminal and parent gone) older than a day. */
+/**
+ * Shells reparented to pid 1 (their terminal and parent gone) older than a
+ * day. `laneOwned` marks the ones that inherited a lane tab's marker: only
+ * those are Baa-ton's to report. Login shells from the user's own terminals
+ * are theirs.
+ */
 export function orphanShells(rows, { minAgeMs = ORPHAN_SHELL_AGE_MS } = {}) {
   return rows
     .filter((row) => row.ppid === 1 && SHELL.test(row.line) && (row.ageMs ?? 0) >= minAgeMs)
-    .map((row) => ({ pid: row.pid, ageMs: row.ageMs, command: row.line.split(/\s+/)[0] }));
+    .map((row) => ({ pid: row.pid, ageMs: row.ageMs, command: row.line.split(/\s+/)[0], laneOwned: row.line.includes(` ${LANE_MARKER}=`) }));
 }
