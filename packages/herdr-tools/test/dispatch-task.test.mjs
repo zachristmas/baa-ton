@@ -668,7 +668,10 @@ test("unqualified harnesses and unsupported exact profiles never launch", async 
     f.state.launchProfile = { ...profile, model: "made-up" };
     await assert.rejects(f.run(), /Exact installed model not found/);
     f.state.launchProfile = { ...profile, provider: "openai" };
-    await assert.rejects(f.run(), /subscription launch adapter/);
+    await assert.rejects(
+      f.run(),
+      /Only the openai-codex OAuth or zai Coding Plan Pi launch adapter is qualified\./,
+    );
     assert.equal(f.calls.length, 0);
   } finally {
     await f.close();

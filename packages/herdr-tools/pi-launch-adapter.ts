@@ -9,6 +9,9 @@ import {
   type StartupProof,
 } from "./harness-adapter.js";
 
+export const PI_CODEX_PROVIDER = "openai-codex";
+export const PI_ZAI_PROVIDER = "zai";
+
 const PI_TOOL_TO_PROTOCOL_OPERATION: Readonly<
   Record<string, ProtocolOperation>
 > = {
@@ -91,9 +94,12 @@ async function discoverPiCatalog(
   profile: LaunchProfile,
   ctx: ExtensionContext,
 ): Promise<DiscoveryResult> {
-  if (profile.provider !== "openai-codex")
+  if (
+    profile.provider !== PI_CODEX_PROVIDER &&
+    profile.provider !== PI_ZAI_PROVIDER
+  )
     throw new Error(
-      "Only the openai-codex subscription launch adapter is qualified in this prerequisite.",
+      "Only the openai-codex OAuth or zai Coding Plan Pi launch adapter is qualified.",
     );
   const registry = ctx.modelRegistry as ModelRegistryLike | undefined;
   if (!registry || typeof registry.refresh !== "function")
@@ -203,9 +209,20 @@ function validateCatalog(
     throw new Error(
       `Thinking level ${profile.thinking} is unsupported by ${profile.model}.`,
     );
-  if (!catalog.auth.subscriptionConfigured || !catalog.auth.usingOAuth)
+  const authAccepted =
+    catalog.auth.subscriptionConfigured &&
+    (profile.provider === PI_CODEX_PROVIDER
+      ? catalog.auth.usingOAuth
+      : profile.provider === PI_ZAI_PROVIDER
+        ? !catalog.auth.usingOAuth
+        : false);
+  if (!authAccepted)
     throw new Error(
-      "Requested subscription authentication is not configured; API-key fallback is forbidden.",
+      profile.provider === PI_ZAI_PROVIDER
+        ? catalog.auth.subscriptionConfigured
+          ? "ZAI Coding Plan requires configured non-OAuth authentication; OAuth is forbidden."
+          : "Requested ZAI Coding Plan authentication is not configured; OAuth is forbidden."
+        : "Requested subscription authentication is not configured; API-key fallback is forbidden.",
     );
 }
 

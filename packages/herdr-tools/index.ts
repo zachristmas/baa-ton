@@ -3964,7 +3964,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function laneLeaseRefusal(
     cwd: string,
     ack: ApprovalPolicyAck | undefined,
-    grant: "lease" | "runtime-launch" | "retire" | "local-validation" | "dispatch" | "integrate" | "spec-push" = "lease",
+    grant: "lease" | "runtime-launch" | "retire" | "local-validation" | "dispatch" | "integrate" | "spec-push" | "retry" = "lease",
   ) {
     const raw = loadTaskProfileConfig(cwd)?.approvalPolicy;
     if (raw === undefined) return "no approvalPolicy is configured";
@@ -10973,7 +10973,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             );
           if (mismatches.length > 0)
             recordFinding(root, `${orchestrator.id}: ${mismatches.join(", ")}`);
-          else if (live.kind === "pi" && isCurrentRoot(root) && ctx.sessionManager?.getSessionId) {
+          else if (live.kind === "pi" && isCurrentRoot(root) && ctx.sessionManager) {
             await inspectPiRootIdentity(ctx, signal);
           }
         } catch (error) {
@@ -11527,14 +11527,18 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   // A reloaded instance mid-turn gets no session or agent event until the
   // turn ends; every turn boundary hands it a fresh context and starts its
   // driver if none runs.
-  for (const boundary of ["turn_start", "turn_end"] as const)
-    pi.on(boundary, async (_event, ctx) => {
-      try {
-        ensureSpecTimer(ctx);
-      } catch {
-        // Best effort, as on every lifecycle event.
-      }
-    });
+  const ensureSpecTimerAtTurnBoundary = async (
+    _event: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    try {
+      ensureSpecTimer(ctx);
+    } catch {
+      // Best effort, as on every lifecycle event.
+    }
+  };
+  pi.on("turn_start", ensureSpecTimerAtTurnBoundary);
+  pi.on("turn_end", ensureSpecTimerAtTurnBoundary);
   pi.on("session_shutdown", async (_event, ctx) => {
     specTimer?.stop();
     specTimer = undefined;
@@ -11736,7 +11740,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const at = now();
         await withManifestTransaction(cwd, (stored) => {
           const log = ((stored as ManifestWithQueue).unattendedDecisions ??= []);
-          log.push({ at, kind: "root-question", toolCallId: id, answers: plan.answers, reason: plan.answers.some((item: { declinedRecommended?: string }) => item.declinedRecommended) ? "no answer; took the first option that keeps work moving (a default never pauses or stops work)" : "no answer; took the Recommended option", reviewed: false });
+          log.push({ at, kind: "root-question", toolCallId: id, answers: plan.answers, reason: plan.answers.some((item) => item.declinedRecommended) ? "no answer; took the first option that keeps work moving (a default never pauses or stops work)" : "no answer; took the Recommended option", reviewed: false });
           if (log.length > 200) log.splice(0, log.length - 200);
         }).catch(() => undefined);
         await runHerdr(

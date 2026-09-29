@@ -6,6 +6,8 @@ const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url);
 const {
   capabilityCatalogCacheKey,
+  PI_CODEX_PROVIDER,
+  PI_ZAI_PROVIDER,
   piLaunchAdapter,
   verifyAvailableProfile,
 } = await jiti.import("../pi-launch-adapter.ts");
@@ -17,7 +19,7 @@ const profile = {
   auth: "subscription",
 };
 
-function context({ thinkingLevelMap, oauth = true, refresh } = {}) {
+function context({ thinkingLevelMap, oauth = true, configured = true, refresh } = {}) {
   const model = {
     reasoning: true,
     thinkingLevelMap: thinkingLevelMap ?? {
@@ -30,7 +32,7 @@ function context({ thinkingLevelMap, oauth = true, refresh } = {}) {
     modelRegistry: {
       refresh: refresh ?? (async () => ({ errors: new Map() })),
       find: () => model,
-      hasConfiguredAuth: () => true,
+      hasConfiguredAuth: () => configured,
       isUsingOAuth: () => oauth,
     },
   };
@@ -77,6 +79,51 @@ test("explicit null rejects while an absent thinking level remains trusted to ru
         thinkingLevelMap: { minimal: "minimal", xhigh: "xhigh", max: "max" },
       }),
     ),
+  );
+});
+
+const zaiProfile = {
+  provider: PI_ZAI_PROVIDER,
+  model: "glm-5.3-flash",
+  thinking: "low",
+  auth: "subscription",
+};
+
+test("ZAI Coding Plan accepts configured non-OAuth auth only", async () => {
+  const catalog = await piLaunchAdapter(
+    context({ oauth: false }),
+    "/native/pi.ts",
+  ).discoverCatalog(zaiProfile);
+  assert.equal(catalog.provider, PI_ZAI_PROVIDER);
+  assert.equal(catalog.auth.subscriptionConfigured, true);
+  assert.equal(catalog.auth.usingOAuth, false);
+  await assert.doesNotReject(
+    verifyAvailableProfile(zaiProfile, context({ oauth: false })),
+  );
+  await assert.rejects(
+    verifyAvailableProfile(zaiProfile, context({ oauth: true })),
+    /ZAI Coding Plan.*OAuth is forbidden/,
+  );
+  await assert.rejects(
+    verifyAvailableProfile(
+      zaiProfile,
+      context({ oauth: false, configured: false }),
+    ),
+    /ZAI Coding Plan authentication is not configured/,
+  );
+});
+
+test("OpenAI Codex still requires OAuth and unknown Pi providers remain unsupported", async () => {
+  await assert.rejects(
+    verifyAvailableProfile(profile, context({ oauth: false })),
+    /Requested subscription authentication.*API-key fallback is forbidden/,
+  );
+  await assert.rejects(
+    verifyAvailableProfile(
+      { ...profile, provider: "unregistered-provider" },
+      context(),
+    ),
+    /Only the openai-codex OAuth or zai Coding Plan Pi launch adapter is qualified/,
   );
 });
 

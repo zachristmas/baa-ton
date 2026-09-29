@@ -400,6 +400,8 @@ export type Lane = {
   taskProfile?: string;
   launchProfile?: LaunchProfile;
   launchProfileVersion?: LaunchProfileVersion;
+  /** Harness-specific permission mode selected from the task profile. */
+  permissionMode?: string;
   /** Extra MCP servers (raw --mcp-config entries) this lane needs beyond
    * herdr-orchestrator. Only an authorized root may grant these. */
   mcpServers?: Record<string, unknown>;

@@ -1,8 +1,14 @@
 export const ROOT_QUESTION_AUTO_ANSWER_MS: number;
 export type ParsedQuestion = { question: string; options: Array<{ label: string; recommended: boolean }> };
+export type AutoAnswer = {
+  question: string;
+  answer: string;
+  byDefault?: boolean;
+  declinedRecommended?: string;
+};
 export type AutoAnswerPlan =
-  | { eligible: true; answers: Array<{ question: string; answer: string }> }
-  | { eligible: false; reason: string };
+  | { eligible: true; answers: AutoAnswer[] }
+  | { eligible: false; reason: string; stopsWork?: true };
 export function parseQuestions(input: unknown): ParsedQuestion[];
 export function autoAnswerPlan(input: unknown): AutoAnswerPlan;
 export function autoAnswerText(plan: { answers: Array<{ question: string; answer: string }> }, minutes?: number): string;

@@ -7,6 +7,8 @@ export type ResolvedTaskProfile = {
   contextPreference: string;
   preferredHarnesses: string[];
   agentKind?: string;
+  permissionMode?: "default" | "acceptEdits" | "plan" | "auto" | "dontAsk" | "bypassPermissions";
+  allowArtifact?: boolean;
   launchProfile: {
     provider: string;
     model: string;
