@@ -366,7 +366,7 @@ test("mapped root bridge exposes root-role parity and returns non-Pi root ground
     await withMcpServer({ ...env, HERDR_PANE_ID: "w-root:child" }, async (rpc) => {
       const doctor = await rpc("tools/call", {
         name: "herdr_doctor",
-        arguments: {},
+        arguments: { verbose: true },
       });
       assert.equal(doctor.result.isError, undefined);
       const routing = doctor.result.structuredContent.checks.find(
@@ -506,7 +506,7 @@ test("one project-scoped MCP registration resolves concurrent Claude panes by li
 
       const doctor = await rpc("tools/call", {
         name: "herdr_doctor",
-        arguments: {},
+        arguments: { verbose: true },
       });
       assert.equal(doctor.result.isError, undefined);
       const routing = doctor.result.structuredContent.checks.find(
@@ -625,7 +625,7 @@ test("MCP falls back to a registered static root when process and session hints 
       async (rpc) => {
         const doctor = await rpc("tools/call", {
           name: "herdr_doctor",
-          arguments: {},
+          arguments: { verbose: true },
         });
         assert.equal(doctor.result.isError, undefined);
         const routing = doctor.result.structuredContent.checks.find(
@@ -662,7 +662,7 @@ test("MCP identity failures include the live server PID diagnostics", async () =
       async (rpc) => {
         const doctor = await rpc("tools/call", {
           name: "herdr_doctor",
-          arguments: {},
+          arguments: { verbose: true },
         });
         assert.equal(doctor.result.isError, true);
         const message = doctor.result.content[0].text;

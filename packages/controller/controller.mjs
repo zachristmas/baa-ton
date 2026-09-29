@@ -3449,14 +3449,25 @@ export function nudgeFingerprint(goal, reasons = []) {
 }
 
 function supervisorWakeText(goal, reasons = []) {
+  // Counts, the top reasons and the next action; the objective and the rules
+  // are already in the root's goal and briefing, so they are not re-sent.
+  const shown = [];
+  let used = 0;
+  for (const reason of reasons) {
+    const line = `${shown.length + 1}) ${clipText(reason, shown.length ? 100 : 180)}`;
+    if (shown.length && used + line.length > 260) break;
+    shown.push(line);
+    used += line.length;
+  }
+  const more = reasons.length > shown.length ? [`(+${reasons.length - shown.length} more: herdr_status)`] : [];
   return [
-    `[Baa-ton supervisor] Parent goal ${goal.id} is ${goal.status} and work is waiting on you:`,
-    ...reasons.map((reason, index) => `${index + 1}) ${reason}`),
-    `Objective: ${goal.objective}`,
-    `Next action: ${goal.nextAction}`,
+    `[Baa-ton supervisor] Goal ${goal.id} ${goal.status}, ${reasons.length} item(s) waiting on you:`,
+    ...shown,
+    ...more,
+    ...(goal.nextAction ? [`Next: ${clipText(goal.nextAction, 90)}`] : []),
     // Never an invitation to park: a root that waited in its turn for Zach's
     // answer ran into the 30-minute interrupt.
-    "Handle these now through safe local actions: answer each request, decide, dispatch, then end the turn. Never pause, park or wait in your turn for Zach: decide under the escalation policy (only unclear requirements go to him, tagged [unclear-requirements], and you end the turn after asking). Record a truthful goal state only when the goal is completed; only Zach pauses the run. Do not push, merge, create a PR, deploy, or mutate production without explicit user approval.",
+    "Act now, then end the turn; never wait on Zach (unclear requirements only, tagged [unclear-requirements]); no push/merge/deploy without approval.",
   ].join("\n");
 }
 

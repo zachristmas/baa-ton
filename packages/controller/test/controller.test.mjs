@@ -1573,10 +1573,11 @@ test("the Herdr-owned supervisor nudges a due running parent goal, names why, an
       assert.equal(Object.hasOwn(request.params, "wait"), false);
       assert.match(
         request.params.text,
-        /Parent goal parent-bb029 is active and work is waiting on you:\n1\) lane herdr-bb029\/lane-child \(status unknown\) waits on request request-waiting: runtime launch: npm run dev/,
+        /Goal parent-bb029 active, 1 item\(s\) waiting on you:\n1\) lane herdr-bb029\/lane-child \(status unknown\) waits on request request-waiting/,
       );
-      assert.match(request.params.text, /Record a truthful goal state only when the goal is completed/);
-      assert.match(request.params.text, /Never pause, park or wait in your turn for Zach/);
+      assert.ok(request.params.text.length < 450, `nudge is ${request.params.text.length} chars`);
+      assert.doesNotMatch(request.params.text, /Objective:/, "the objective is not re-sent every wake");
+      assert.match(request.params.text, /never wait on Zach/);
       assert.doesNotMatch(request.params.text, /paused, or action-required/);
       assert.doesNotMatch(request.params.text, /observational only/);
       assert.doesNotMatch(
@@ -2424,11 +2425,10 @@ test("a nudge names each waiting item: lane requests, lease asks, unread message
     await runSupervisorTick({ stateDir: fixture.stateDir, herdr: capture, timestamp: "2026-09-14T00:00:00.000Z" });
     const nudge = texts.find((text) => text.startsWith("[Baa-ton supervisor]"));
     assert.ok(nudge);
-    assert.match(nudge, /is waiting-for-event and work is waiting on you/);
-    assert.match(nudge, /lane herdr-bb029\/lane-child \(status unknown\) waits on lease ask request-lease: lease app/);
-    assert.match(nudge, /child message message-uncertain from herdr-bb029\/lane-child is possibly unseen: Port 3610 busy\./);
-    assert.match(nudge, /workflow herdr-next is planned but not dispatched/);
-    assert.match(nudge, /directive directive-sweep from zach is open: Sweep finished lanes\./);
+    assert.match(nudge, /^\[Baa-ton supervisor\] Goal parent-bb029 waiting-for-event, \d+ item\(s\) waiting on you:/);
+    assert.match(nudge, /1\) lane herdr-bb029\/lane-child \(status unknown\) waits on/);
+    assert.match(nudge, /\(\+\d+ more: herdr_status\)/, "the items past the budget are counted, not listed");
+    assert.ok(nudge.length < 600, `nudge is ${nudge.length} chars`);
     assert.doesNotMatch(nudge, /observational only/);
   } finally {
     await fixture.cleanup();
