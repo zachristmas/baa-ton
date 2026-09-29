@@ -3474,6 +3474,7 @@ async function persistParentMessage(
   workflowId: string,
   summary: string,
   details?: string,
+  options: { kind?: "informational" | "operator"; noRootAction?: boolean } = {},
 ): Promise<{ request: MessageRecord; created: boolean }> {
   requireHerdr();
   if (isRootOrchestrator())
@@ -3532,7 +3533,8 @@ async function persistParentMessage(
       laneId: assignment.lane.lane_id,
       summary: normalizedSummary,
       ...(normalizedDetails ? { details: normalizedDetails } : {}),
-      kind: "informational",
+      kind: options.kind ?? "informational",
+      ...(options.noRootAction ? { noRootAction: true } : {}),
       requestedAt,
       delivery: {
         status: "pending",
@@ -3696,12 +3698,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     summary: string,
     details: string | undefined,
     signal?: AbortSignal,
+    options: { kind?: "informational" | "operator"; noRootAction?: boolean } = {},
   ) {
     const persisted = await persistParentMessage(
       cwd,
       workflowId,
       summary,
       details,
+      options,
     );
     const request = persisted.request;
     if (!persisted.created && request.delivery.status !== "pending")
@@ -11986,7 +11990,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     promptSnippet:
       "Send a durable informational message to the mapped Herdr parent.",
     promptGuidelines: [
-      "Use herdr_message for information the root should review, herdr_question_answer flow for a decision needed from Zach, and herdr_complete for the lane's one completion receipt. A message is informational and never requests approval.",
+      "Use herdr_message for information the root should review, herdr_question_answer flow for a decision needed from Zach, and herdr_complete for the lane's one completion receipt. A message is informational and never requests approval or wakes the root on its own. Use kind=operator for something only the operator can act on (it goes straight to the operator and does not wake the root), and noRootAction=true when the root need not act at all.",
       "A registered child may use this after herdr_complete when a late fact still needs to reach the parent; the root itself has no parent to message.",
     ],
     parameters: Type.Object(
@@ -11999,6 +12003,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         details: Type.Optional(
           Type.String({ maxLength: MESSAGE_DETAILS_MAX_LENGTH }),
         ),
+        kind: Type.Optional(
+          Type.Union([Type.Literal("informational"), Type.Literal("operator")]),
+        ),
+        noRootAction: Type.Optional(Type.Boolean()),
       },
       { additionalProperties: false },
     ),
@@ -12009,6 +12017,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         params.summary,
         params.details,
         signal,
+        { kind: params.kind, noRootAction: params.noRootAction },
       );
       return {
         content: [

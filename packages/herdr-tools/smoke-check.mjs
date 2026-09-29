@@ -937,8 +937,12 @@ try {
     "idempotent state/start calls do not reschedule the nudge",
   );
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
-  assert.equal((await tick(11)).results[0].status, "delivered");
-  assert.equal(supervisorPrompts, 3);
+  assert.equal(
+    (await tick(11)).results[0].status,
+    "duplicate-suppressed",
+    "a third identical nudge is suppressed until the goal's state changes",
+  );
+  assert.equal(supervisorPrompts, 2);
   // A reload while Pi is busy cannot manufacture a settled run.
   rootIdle = false;
   await eventHandlers.get("session_shutdown")(
@@ -956,7 +960,7 @@ try {
     "a busy reload cannot manufacture a settled run",
   );
   assert.equal((await tick(12)).results[0].status, "root-turn-not-idle");
-  assert.equal(supervisorPrompts, 3, "a busy reload never counts as a settled turn");
+  assert.equal(supervisorPrompts, 2, "a busy reload never counts as a settled turn");
   // A reload while Pi is idle (a deploy's /reload between turns) is idle, so
   // the supervisor can still nudge a root that just reloaded.
   rootIdle = true;
@@ -1004,7 +1008,7 @@ try {
   rootIdle = true;
   await eventHandlers.get("agent_settled")({}, headlessRootCtx);
   assert.equal((await tick(15)).results[0].status, "delivered");
-  assert.equal(supervisorPrompts, 4);
+  assert.equal(supervisorPrompts, 3);
   const rootBeforeChild = await persistedGoal();
   process.env.HERDR_PANE_ID = "w-child:p1";
   await eventHandlers.get("agent_start")({}, headlessRootCtx);
@@ -1035,7 +1039,7 @@ try {
     assert.equal((await tick(step)).results[0].status, "not-running");
   assert.equal(
     supervisorPrompts,
-    4,
+    3,
     "pause disarms all future nudges despite lifecycle activity",
   );
   assert.equal((await persistedGoal()).supervisor.nextNudgeAt, null);

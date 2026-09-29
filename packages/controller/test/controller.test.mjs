@@ -24,6 +24,7 @@ import {
   deliverLaneQueue,
   digestText,
   specDigestLine,
+  repairStaleMessagePointer,
 } from "../controller.mjs";
 import { codeChangeWatcher, codeFingerprint, codeStamp, listRuntime, loadedCode, recordRuntime } from "../code-version.mjs";
 import { configureSidebar } from "../sidebar-configure.mjs";
@@ -987,7 +988,7 @@ test("durable child messages wake the root after lane completion in one digest a
     assert.match(prompts[0].params.text, /herdr-bb029\/lane-child \(message-late-worktree\): The user asked for more work/);
     assert.match(prompts[0].params.text, /\(message-late-distinct\): A distinct late fact/);
     const manifest = await fixture.manifest();
-    assert.equal(manifest.parentGoal.status, "review-requested");
+    assert.notEqual(manifest.parentGoal.status, "review-requested", "informational messages never request review");
     assert.doesNotMatch(manifest.parentGoal.nextAction, /action-required/);
     assert.deepEqual(
       manifest.workflows[0].messageRequests.map((request) => request.delivery.status),
@@ -4572,6 +4573,117 @@ test("a stall is judged by the spec's own lanes: a stale working event in an old
     const nudge = texts.find((text) => text.startsWith("[Baa-ton supervisor]"));
     assert.ok(nudge, "nudged");
     assert.match(nudge, /spec: 2 item\(s\) are waiting \((?=.*ready: 1)(?=.*in flight without a receipt: 1)/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an informational child message never changes the parent goal status or next action", async () => {
+  const messageRequests = [pendingMessage("message-fyi", "Typecheck clean.", "2026-09-14T00:01:00.000Z")];
+  const fixture = await createFixture({ parentGoal: dueParentGoal(), messageRequests });
+  const api = digestApi();
+  try {
+    await routeChildMessage({
+      configDir: fixture.stateDir,
+      workflowId: "herdr-bb029",
+      laneId: CHILD.lane_id,
+      messageId: "message-fyi",
+      herdr: api,
+    });
+    const goal = (await fixture.manifest()).parentGoal;
+    assert.equal(goal.status, "active");
+    assert.equal(goal.nextAction, "Perform authorized work.");
+    assert.equal(goal.nextActionSource, undefined, "no extra field on the strictly validated goal");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a stale message pointer is repaired once its source workflow is terminal", async () => {
+  const delivered = {
+    ...pendingMessage("message-abc123", "old news", "2026-09-14T00:01:00.000Z"),
+    delivery: { status: "delivered", attempts: 1, updatedAt: "2026-09-14T00:02:00.000Z" },
+  };
+  const goal = {
+    ...dueParentGoal(),
+    status: "review-requested",
+    nextAction: "Review child message message-abc123 from lane-child: old news",
+  };
+  const manifest = { workflows: [{ id: "herdr-bb029", status: "running", messageRequests: [delivered] }] };
+  assert.equal(repairStaleMessagePointer(manifest, goal, "2026-09-14T00:03:00.000Z"), false, "a live workflow keeps the pointer");
+  manifest.workflows[0].status = "completed";
+  assert.equal(repairStaleMessagePointer(manifest, goal, "2026-09-14T00:04:00.000Z"), true);
+  assert.equal(goal.status, "active");
+  assert.doesNotMatch(goal.nextAction, /Review child message/);
+  // One-time repair also handles legacy pointers that never recorded a source.
+  const legacy = { ...goal, status: "review-requested", nextAction: "Review child message message-abc123 from lane-child: old news" };
+  assert.equal(repairStaleMessagePointer(manifest, legacy), true);
+  assert.equal(legacy.status, "active");
+});
+
+test("an identical nudge is not re-sent across restarts and escalates once after two", async () => {
+  const fixture = await createFixture({ parentGoal: dueParentGoal() });
+  const api = recoveryApi();
+  const notes = [];
+  const notify = async (note) => {
+    notes.push(note.title);
+    return { status: "sent" };
+  };
+  const statuses = [];
+  try {
+    for (let i = 0; i < 4; i += 1) {
+      // Every tick reloads the manifest from disk: a simulated supervisor restart.
+      await patchSupervisor(fixture, { nextNudgeAt: "2026-09-14T00:00:00.000Z" });
+      const result = await runSupervisorTick({
+        stateDir: fixture.stateDir,
+        herdr: api,
+        notify,
+        timestamp: `2026-09-14T00:0${i + 1}:30.000Z`,
+      });
+      statuses.push(result.results[0].status);
+    }
+    assert.deepEqual(statuses, ["delivered", "delivered", "duplicate-suppressed", "duplicate-suppressed"]);
+    assert.equal(api.prompts, 2, "the third and fourth identical nudges are not sent");
+    assert.equal(notes.filter((title) => /not acting on a nudge/.test(title)).length, 1, "escalation fires once");
+    const after = await fixture.manifest();
+    const { lastNudge } = after.rootSupervision.find((entry) => entry.lastNudge);
+    assert.equal(lastNudge.count, 2);
+    assert.ok(lastNudge.escalatedAt);
+    assert.equal(after.parentGoal.supervisor.lastNudge, undefined, "dedupe state stays out of the goal");
+    // A changed fingerprint (new nextAction) is nudged again.
+    const manifest = await fixture.manifest();
+    manifest.parentGoal.nextAction = "Something new to do.";
+    manifest.parentGoal.supervisor.nextNudgeAt = "2026-09-14T00:00:00.000Z";
+    await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+    const changed = await runSupervisorTick({ stateDir: fixture.stateDir, herdr: api, notify, timestamp: "2026-09-14T00:10:00.000Z" });
+    assert.equal(changed.results[0].status, "delivered");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a kind=operator message escalates to the operator and does not wake the root", async () => {
+  const message = { ...pendingMessage("message-op", "Need a human decision.", "2026-09-14T00:01:00.000Z"), kind: "operator" };
+  const fixture = await createFixture({ parentGoal: dueParentGoal(), messageRequests: [message] });
+  const api = digestApi();
+  const notes = [];
+  try {
+    await runSupervisorTick({
+      stateDir: fixture.stateDir,
+      herdr: api,
+      notify: async (note) => {
+        notes.push(note.title);
+        return { status: "sent" };
+      },
+      timestamp: "2026-09-14T00:02:00.000Z",
+    });
+    assert.ok(
+      api.prompts.every((prompt) => !/digest|message-op|human decision/i.test(prompt.text)),
+      "no prompt to the root carries the operator message",
+    );
+    assert.deepEqual(notes, ["Baa-ton: a lane needs the operator"]);
+    const stored = (await fixture.manifest()).workflows[0].messageRequests[0];
+    assert.equal(stored.delivery.status, "delivered");
   } finally {
     await fixture.cleanup();
   }

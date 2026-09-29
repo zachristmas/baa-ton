@@ -146,7 +146,10 @@ export type MessageRecord = {
   laneId: string;
   summary: string;
   details?: string;
-  kind: "informational";
+  kind: "informational" | "operator" | "blocking";
+  /** The root is never woken for this message. */
+  noRootAction?: boolean;
+  resolvedAt?: string;
   requestedAt: string;
   delivery: {
     status: "pending" | "sending" | "delivered" | "uncertain";

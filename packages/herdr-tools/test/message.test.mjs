@@ -154,7 +154,7 @@ test("registered children can send distinct and deduplicated messages after comp
     assert.match(prompts[0], /message from workflow-message\/lane-message/);
     assert.match(prompts[0], /The completed lane has a late fact/);
     const stored = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(stored.parentGoal.status, "review-requested");
+    assert.equal(stored.parentGoal.status, "completed", "informational messages leave goal status alone");
     assert.equal(stored.workflows[0].messageRequests.length, 2);
 
     const uncertain = await message.execute("message-4", {
