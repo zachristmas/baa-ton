@@ -54,8 +54,9 @@ export function carriedClaudeFlags(argv = []) {
   return kept;
 }
 
-// Exit commands were confirmed live for Claude (/exit) and Pi (/quit; /exit does nothing there).
-// Codex and OpenCode are assumed to accept /exit and are untested: Codex would not start here.
+// Claude (/exit) and Pi (/quit; /exit is not Pi's command) were live-confirmed.
+// Current official docs also list /exit for Codex CLI and OpenCode TUI:
+// https://developers.openai.com/codex/cli/interactive/ and https://opencode.ai/docs/tui/#exit.
 export const EXIT_COMMANDS = { claude: "/exit", pi: "/quit", codex: "/exit", opencode: "/exit" };
 
 /**

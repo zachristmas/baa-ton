@@ -5,7 +5,7 @@
  * Git, worktrees or a live lane. Pure selection lives here so it is testable;
  * the root applies it inside a manifest transaction (index.ts).
  */
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const HOUR = 60 * 60_000;
@@ -53,11 +53,24 @@ export function liveSpecWorkflowIds(specState) {
  * and every lane that had a tab retired or gone. `protectedIds` are the ones
  * something else still points at (the spec driver, the queue, directives).
  */
-export function archivableWorkflows(manifest, { now = Date.now(), protectedIds = new Set(), ...overrides } = {}) {
+function recordedWorktreeExists(path) {
+  if (typeof path !== "string" || !path) return false;
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    // Permission and other inspection failures fail closed: keep the record so
+    // cleanup sweep can inspect it rather than orphaning a possibly live path.
+    return !["ENOENT", "ENOTDIR"].includes(error?.code);
+  }
+}
+
+export function archivableWorkflows(manifest, { now = Date.now(), protectedIds = new Set(), worktreeExists = recordedWorktreeExists, ...overrides } = {}) {
   const { archiveMinAgeMs, keepRecent } = { ...HOUSEKEEPING_DEFAULTS, ...overrides };
   const finished = [];
   for (const workflow of manifest?.workflows ?? []) {
     if (!FINISHED_WORKFLOW_STATUSES.has(workflow.status) || protectedIds.has(workflow.id)) continue;
+    if (worktreeExists(workflow.worktree)) continue;
     const updated = Date.parse(workflow.updatedAt ?? workflow.createdAt ?? "");
     if (!Number.isFinite(updated) || now - updated < archiveMinAgeMs) continue;
     const settled = (workflow.lanes ?? []).every((lane) => {
