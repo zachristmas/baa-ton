@@ -22,8 +22,12 @@ import { BASELINES_KEPT, baselineNote, baselineResult, compareToBaseline, format
 import { demoOnPreview, previewHealthUrl } from "./spec.mjs";
 
 /** How build and integration lanes run a suite that outlasts a normal command timeout. */
+/** The wrapper lanes run long suite commands through: one suite at a time per worktree (suite-lock.mjs). */
+export const SUITE_LOCK_TOOL = fileURLToPath(new URL("./suite-lock.mjs", import.meta.url));
+
 const LONG_COMMANDS =
-  "Run long suites synchronously with a long timeout, or with your harness's own tracked background mode (Claude: the Bash tool's run_in_background; Pi: its equivalent), and wait for the result. Never use &, disown, nohup or setsid: a detached job is invisible to Herdr and Baa-ton.";
+  "Run long suites synchronously with a long timeout, or with your harness's own tracked background mode (Claude: the Bash tool's run_in_background; Pi: its equivalent), and wait for the result. Never use &, disown, nohup or setsid: a detached job is invisible to Herdr and Baa-ton." +
+  ` Run each long suite command (lint, typecheck, build, test) through this worktree's suite lock, so lanes that share the worktree take turns instead of running the same suites at once and starving each other: node ${JSON.stringify(SUITE_LOCK_TOOL)} -- <command> (for example node ${JSON.stringify(SUITE_LOCK_TOOL)} -- pnpm turbo run typecheck lint format:check --force; put environment assignments such as DATABASE_URL=... before node). Waiting on the lock is normal: never remove it, and never stop another lane's suite.`;
 
 /**
  * A queued sync (the target gained commits spec-integration lacks) that has
