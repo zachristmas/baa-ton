@@ -8,13 +8,14 @@
       { "id": "claude-opus-4-8", "tier": "frontier" },
       { "id": "claude-opus-4-7", "tier": "frontier" },
       { "id": "claude-opus-4-6", "tier": "frontier" },
+      { "id": "claude-sonnet-5-5", "tier": "build" },
       { "id": "claude-sonnet-5", "tier": "build" },
       { "id": "claude-sonnet-4-6", "tier": "build" },
       { "id": "claude-sonnet-4-5", "tier": "build" },
       { "id": "claude-haiku-4-5", "tier": "cheap" }
     ],
     "aliases": {
-      "sonnet": "claude-sonnet-5",
+      "sonnet": "claude-sonnet-5-5",
       "opus": "claude-opus-5-5",
       "haiku": "claude-haiku-4-5",
       "fable": "claude-fable-5-1",

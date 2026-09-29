@@ -54,7 +54,7 @@ Why PermissionRequest and not PreToolUse: per the Claude Code hooks and permissi
 | Missing-capability adapter | Registry regression rejects missing `supportsSessionPersistence` before topology mutation | Not launch-qualified |
 | Codex / openai-codex subscription | Implemented in `codex-launch-adapter.ts` (+ `codex-startup-attest.mjs` notify hook with thread-id attestation, explicit `startupHandshake` proof turn, per-invocation `-c` config incl. MCP env wiring, workspace-write sandbox): effort ladder maps 1:1. Root planning accepts Herdr's verified native Codex session identity as either a path or an id; live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`): Codex exposes no stable authoritative catalog API at this adapter boundary, so static config is not used as a substitute | Qualified live (`herdr-44fa8053`, items 3+6+broker, 17/17 serial, committed d3816c8; re-verified live 2026-09-16 `herdr-9bbb9d23`: handshake, exact profile, and normalized operations confirmed, findings relayed via `herdr_message`). Known limitations: codex does not respawn dead MCP servers (a killed bridge orphans the lane tools for the session); the workspace-write sandbox cannot write linked worktree git metadata (parent-proxy commit + operator reconciliation apply); and a host `approval_policy = "never"` denies the lane's own mutating bridge tools (`herdr_complete`/`herdr_observe`/`herdr_doctor`) — non-mutating tools like `herdr_message` pass. codex-cli 0.154 has no per-server tool-approval knob (`--strict-config` rejects `tool_approval`), so unattended never-policy hosts cannot file codex receipts; attended lanes may run with `approval_policy = "on-request"` and approve at the pane |
 | OpenCode / openai-codex subscription | Implemented in `opencode-launch-adapter.ts` (+ generated attest plugin and project `opencode.json`): model mapped `openai/gpt-5.6-luna`, reasoningEffort option, conservative bash permissions (push/merge/PR denied). The adapter declares the exact `Reply with exactly: READY` startup handshake so lazy session creation is automatic; the bridge merges operations independently. Live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`): the adapter has no authoritative live provider catalog API | Qualified live (`herdr-c5795503`): manual READY handshake previously matched native session/plugin attestation and delivered assignment; source-level follow-up now fences and dispatches that handshake automatically |
-| Claude Code / claude-code subscription | Implemented in `claude-launch-adapter.ts` (+ `claude-startup-attest.mjs` SessionStart hook, `mcp-server.mjs` operations merge, `attest-merge.mjs`): exact model + `--effort` (identical ladder), generated settings/mcp config, conservative lane permissions (push/merge/PR denied), session attestation matched against native identity. SessionStart is the startup proof, so `supportsStartupHandshake: false`; live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`) because no stable authoritative catalog API is exposed at this adapter boundary | Qualified live with a durable receipt (2026-09-16 `herdr-27cde2e4`, read-only proof lane on claude-sonnet-5/high: env identity, native pane/tab/session match, exact profile across cmdline + intent + SessionStart sidecar, nonce-matched attestation declaring plan/dispatch/complete, doctor capability matrix confirmed). Earlier live lanes also receipted: durable-core batch (`herdr-092aa4f8`), cross-vendor review (`herdr-33ff206c`, including a post-completion focused re-review), README humanizer (`herdr-473dbe0a`) |
+| Claude Code / claude-code subscription | Implemented in `claude-launch-adapter.ts` (+ `claude-startup-attest.mjs` SessionStart hook, `mcp-server.mjs` operations merge, `attest-merge.mjs`): exact model + `--effort` (identical ladder), generated settings/mcp config, conservative lane permissions (push/merge/PR denied), session attestation matched against native identity. SessionStart is the startup proof, so `supportsStartupHandshake: false`; live catalog discovery is explicitly unsupported (`supportsLiveCapabilityDiscovery: false`) because no stable authoritative catalog API is exposed at this adapter boundary | Qualified live with a durable receipt (2026-09-16 `herdr-27cde2e4`, read-only proof lane on claude-sonnet-5-5/high: env identity, native pane/tab/session match, exact profile across cmdline + intent + SessionStart sidecar, nonce-matched attestation declaring plan/dispatch/complete, doctor capability matrix confirmed). Earlier live lanes also receipted: durable-core batch (`herdr-092aa4f8`), cross-vendor review (`herdr-33ff206c`, including a post-completion focused re-review), README humanizer (`herdr-473dbe0a`) |
 
 **Claude lane permissions.** A dispatched Claude lane runs in whatever permission mode the user's Claude settings default to; the adapter does not force one. Its generated `--settings` file:
 - allows the lane's own Baa-ton MCP tools (`mcp__herdr-orchestrator__herdr_message`, `herdr_complete`, `herdr_lease`, `herdr_request`), so they never prompt;
@@ -78,7 +78,7 @@ commit, push, merge, create a PR, deploy, delegate, or close resources.
 The checked-in Codex qualification evidence uses `openai-codex/gpt-5.6-luna`;
 that is the qualified equivalent to `openai-codex/gpt-5.2-codex` when the latter
 is not installed. Use `high` for this parity proof (the adapter maps it
-one-to-one). Claude uses the exact `claude-code/claude-sonnet-5/high` profile.
+one-to-one). Claude uses the exact `claude-code/claude-sonnet-5-5/high` profile.
 OpenCode uses the same `openai-codex/gpt-5.6-luna/high` profile and maps it to
 OpenCode's `openai/gpt-5.6-luna` model.
 
@@ -117,7 +117,7 @@ await herdr_dispatch({ workflowId: plan.details.workflow.id, execute: true });
 ```
 
 ```js
-// Claude: claude-code / claude-sonnet-5 / high / subscription
+// Claude: claude-code / claude-sonnet-5-5 / high / subscription
 const plan = await herdr_plan({
   objective: "Live-qualify the claude adapter only: one read-only startup/protocol/receipt proof; no edits or resource closure.",
   worktreeCwd: "<existing-clean-checkout>",
@@ -127,7 +127,7 @@ const plan = await herdr_plan({
     agentKind: "claude",
     launchProfile: {
       provider: "claude-code",
-      model: "claude-sonnet-5",
+      model: "claude-sonnet-5-5",
       thinking: "high",
       auth: "subscription"
     }
@@ -199,7 +199,7 @@ not be described as live-qualified.
 **Claude cell wording after success:**
 
 > Live qualified (`<workflow-id>`): exact
-> `claude-code/claude-sonnet-5/high/subscription` startup proof from SessionStart
+> `claude-code/claude-sonnet-5-5/high/subscription` startup proof from SessionStart
 > matched native Claude session identity, workspace/pane, nonce, source, and
 > normalized protocol operations; a durable receipt was observed. No startup
 > handshake is sent (`supportsStartupHandshake: false`); live catalog discovery
