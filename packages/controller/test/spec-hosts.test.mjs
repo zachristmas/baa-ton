@@ -16,10 +16,10 @@ function fakeChild(pid) {
   return child;
 }
 
-test("spec roots are Pi roots whose project has a spec", () => {
+test("spec roots are roots of any harness whose project has a spec", () => {
   const withSpec = new Set(["/p/a/.baa-ton/spec.json", "/p/c/.baa-ton/spec.json"]);
   const config = { orchestrators: [root("a"), root("b"), root("c", { kind: "claude" })] };
-  assert.deepEqual(specRoots(config, (path) => withSpec.has(path)).map((o) => o.id), ["a"]);
+  assert.deepEqual(specRoots(config, (path) => withSpec.has(path)).map((o) => o.id), ["a", "c"]);
 });
 
 test("one spec host per spec root: started, restarted with backoff, stopped with the supervisor", async () => {

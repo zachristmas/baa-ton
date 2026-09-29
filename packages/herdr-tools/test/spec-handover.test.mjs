@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DEFER_FILE, FRESH_MS, HOST_LEASE_FILE, RESTART_GRACE_MS, renewHostLease, specHandover } from "../spec-handover.mjs";
-import { headlessContext, headlessPi, runSpecHost } from "../spec-host.mjs";
+import { headlessContext, headlessPi, rootSession, runSpecHost } from "../spec-host.mjs";
 // A child process start can take minutes on a loaded machine (run-hermetic.mjs).
 const CHILD_TIMEOUT_MS = Number(process.env.BAATON_HERDR_COMMAND_TIMEOUT_MS) || 120_000;
 
@@ -131,4 +131,13 @@ test("a host that just died is given a restart grace before the root drives on i
   } finally {
     await d.cleanup();
   }
+});
+
+test("a root of another harness is gone for the host, which still learns its session value", async () => {
+  const agent = (extra) => ({ code: 0, stdout: JSON.stringify({ result: { agent: { pane_id: "p", workspace_id: "w", ...extra } } }), stderr: "" });
+  const env = { paneId: "p", workspaceId: "w" };
+  const claude = { exec: async () => agent({ agent: "claude", agent_session: { kind: "id", value: "sess-1" } }) };
+  assert.deepEqual(await rootSession(claude, env), { gone: true, file: "sess-1", id: "sess-1" });
+  const bare = { exec: async () => agent({ agent: "codex" }) };
+  assert.deepEqual(await rootSession(bare, env), { gone: true });
 });
