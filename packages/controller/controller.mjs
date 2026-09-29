@@ -4135,6 +4135,16 @@ export async function runSupervisorTick({
   } catch {
     operator = [];
   }
+  // Messages that can not be delivered (the target is not a live, ready agent)
+  // surface as an anomaly and a notification, not as silent pending rows.
+  try {
+    const { operatorStorePath, readOperatorStore } = await import("../herdr-tools/operator.mjs");
+    const { detectUndeliverable, reportAnomaly } = await import("./anomalies.mjs");
+    const store = await readOperatorStore(operatorStorePath());
+    for (const anomaly of await detectUndeliverable({ store, timestamp })) await reportAnomaly(anomaly, { timestamp, notify });
+  } catch {
+    // Best effort: never blocks the tick.
+  }
   // Every skip is visible: a root's tick status is logged when it changes
   // (quiet, not-due, root-turn-not-idle, pending, root-not-idle, sent).
   for (const result of results) {

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { REPEAT_WINDOW_MS, STALL_ANOMALY_MS, detectAnomalies, reportAnomaly } from "../anomalies.mjs";
+import { REPEAT_WINDOW_MS, STALL_ANOMALY_MS, detectAnomalies, detectUndeliverable, reportAnomaly } from "../anomalies.mjs";
 
 async function store(agents = { "lane-admin": { paneId: "w2F:p2", agentKind: "claude" } }) {
   const directory = await mkdtemp(join(tmpdir(), "baa-anomaly-"));
@@ -99,4 +99,47 @@ test("a spec push that keeps failing is an anomaly with the full git error, not 
   // Each further failure is a new signature, so it recurs after a fix.
   const again = detectAnomalies({ entry: { alerts: [] }, specState: { ...specState, pushFailure: { ...specState.pushFailure, count: 3 } }, timestamp: at(60_000) });
   assert.equal(again[0].signature, "push-failed:999999999999:3");
+});
+
+test("operator messages that can not be delivered are an anomaly with a notification to the user, once (op-fb9634f3 sat pending for hours with no alert)", async () => {
+  const s = await store();
+  try {
+    const messages = [
+      { id: "op-1", target: "root:cic", resolved: { label: "root:cic" }, delivery: { status: "pending", attempts: 0, reason: "no_agent_in_pane", blockedSince: at(-30 * 60_000) } },
+      { id: "op-2", target: "root:cic", resolved: { label: "root:cic" }, delivery: { status: "pending", attempts: 0, reason: "no_agent_in_pane", blockedSince: at(-29 * 60_000) } },
+      // Busy is expected, a fresh block has not waited long enough, delivered is done.
+      { id: "op-3", target: "lane-admin", resolved: { label: "agent:lane-admin" }, delivery: { status: "pending", attempts: 0, reason: "agent is working" } },
+      { id: "op-4", target: "lane-admin", resolved: { label: "agent:lane-admin" }, delivery: { status: "pending", attempts: 0, reason: "pane_shows_shell_prompt", blockedSince: at(-2 * 60_000) } },
+      { id: "op-5", target: "lane-admin", resolved: { label: "agent:lane-admin" }, delivery: { status: "delivered", attempts: 1 } },
+    ];
+    const found = await detectUndeliverable({ store: { messages }, timestamp: at(0) });
+    assert.equal(found.length, 1);
+    assert.equal(found[0].kind, "operator-undeliverable");
+    assert.equal(found[0].signature, "undeliverable:root:cic:no_agent_in_pane");
+    assert.match(found[0].summary, /2 operator message\(s\) to root:cic have been undeliverable for 30 min: no_agent_in_pane/);
+    assert.match(found[0].evidence[0], /op-1, op-2/);
+    assert.deepEqual(await detectUndeliverable({ store: { messages: [] }, timestamp: at(0) }), []);
+
+    const notices = [];
+    const notify = async (notice) => notices.push(notice);
+    const first = await reportAnomaly(found[0], { timestamp: at(0), notify, env: s.env });
+    assert.equal(first.status, "new");
+    assert.equal(notices.length, 1, "the user hears about it at once");
+    assert.equal(notices[0].title, "Baa-ton: operator messages are stuck");
+    assert.match(notices[0].body, /undeliverable for 30 min/);
+    await reportAnomaly(found[0], { timestamp: at(60_000), notify, env: s.env });
+    assert.equal(notices.length, 1, "once per signature");
+    // lane-admin unregistered: nothing to route to, the notification still goes out.
+    const noAdmin = await store({});
+    try {
+      const other = [];
+      const result = await reportAnomaly(found[0], { timestamp: at(0), notify: async (notice) => other.push(notice), env: noAdmin.env });
+      assert.equal(result.status, "unrouted");
+      assert.equal(other.length, 1);
+    } finally {
+      await noAdmin.cleanup();
+    }
+  } finally {
+    await s.cleanup();
+  }
 });

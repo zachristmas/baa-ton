@@ -11,6 +11,7 @@ import {
   operatorStorePath,
   readOperatorStore,
   resolveOperatorTarget,
+  undeliverableMessages,
   withOperatorStore,
 } from "../operator.mjs";
 import { readOperatorInbox, replyToOperator, sendOperatorMessage } from "../operator-api.mjs";
@@ -55,7 +56,7 @@ test("delivery: only into a live, idle agent, one per pane, never retyping an un
   const prompts = [];
   const effects = {
     ready: async (paneId, expected) => {
-      assert.deepEqual(expected, { pane_id: "w9:p2", agent_kind: "claude" });
+      assert.deepEqual(expected, { pane_id: "w9:p2" }, "only the pane must match; the live agent is followed");
       return { ok: true, agent: { agent_status: status } };
     },
     prompt: async (paneId, text) => prompts.push({ paneId, text }),
@@ -211,4 +212,67 @@ test("the run state is durable: operator STOP/RESUME to a root and baa-ton run s
   } finally {
     await cleanup();
   }
+});
+
+test("delivery follows the live pane: a root that switched agent kind and an agent registered in a stale workspace still get their messages (op-fb9634f3, op-bf424bda)", async () => {
+  const store = { version: 1, agents: { "lane-admin": { paneId: "w2K:p1", workspaceId: "w2H", agentKind: "claude" } }, messages: [] };
+  const root = { kind: "root", label: "root:cic", paneId: "w2J:p1", workspaceId: "w2J", agentKind: "pi" };
+  const admin = resolveOperatorTarget("lane-admin", { agents: store.agents });
+  const toRoot = addOperatorMessage(store, { target: "root:cic", resolved: root, text: "Requeue D10." });
+  const toAdmin = addOperatorMessage(store, { target: "lane-admin", resolved: admin, text: "Status?" });
+  const prompts = [];
+  const seen = [];
+  // The live panes: Claude in the root pane, and lane-admin in workspace w2K, not the registered w2H.
+  const live = { "w2J:p1": { agent: "claude", workspace_id: "w2J", agent_status: "done" }, "w2K:p1": { agent: "claude", workspace_id: "w2K", agent_status: "idle" } };
+  const effects = {
+    ready: async (paneId, expected) => (seen.push([paneId, expected]), { ok: true, agent: live[paneId] }),
+    prompt: async (paneId, text) => prompts.push({ paneId, text }),
+  };
+  await deliverOperatorMessages(store, effects);
+  assert.deepEqual(prompts.map((prompt) => prompt.paneId), ["w2J:p1", "w2K:p1"]);
+  assert.deepEqual(seen.map(([, expected]) => expected), [{ pane_id: "w2J:p1" }, { pane_id: "w2K:p1" }], "only the pane is required to match");
+  assert.equal(toRoot.delivery.status, "delivered");
+  assert.equal(toRoot.delivery.followed, "agent kind pi -> claude");
+  assert.equal(toAdmin.delivery.followed, "workspace w2H -> w2K");
+  // What the live pane says is remembered for the next message.
+  assert.equal(toRoot.resolved.agentKind, "claude");
+  assert.deepEqual(store.agents["lane-admin"], { paneId: "w2K:p1", workspaceId: "w2K", agentKind: "claude" });
+});
+
+test("a registered agent's message goes to the pane it is registered at now, not the pane it was sent to", async () => {
+  const store = { version: 1, agents: { "lane-admin": { paneId: "w2K:p1", agentKind: "claude" } }, messages: [] };
+  const message = addOperatorMessage(store, { target: "lane-admin", resolved: resolveOperatorTarget("lane-admin", { agents: store.agents }), text: "Status?" });
+  store.agents["lane-admin"] = { paneId: "w9:p4", agentKind: "claude" };
+  const prompts = [];
+  await deliverOperatorMessages(store, { ready: async () => ({ ok: true, agent: { agent: "claude", agent_status: "idle" } }), prompt: async (paneId) => prompts.push(paneId), at: "2026-09-29T08:00:00.000Z" });
+  assert.deepEqual(prompts, ["w9:p4"]);
+  assert.equal(message.delivery.status, "delivered");
+});
+
+test("every held message shows why, and a persistent reason starts a clock that ends at delivery", async () => {
+  const store = { version: 1, agents: {}, messages: [] };
+  const target = { kind: "root", label: "root:cic", paneId: "w2J:p1" };
+  const first = addOperatorMessage(store, { target: "root:cic", resolved: target, text: "One." });
+  const second = addOperatorMessage(store, { target: "root:cic", resolved: target, text: "Two." });
+  const T0 = Date.parse("2026-09-29T08:00:00.000Z");
+  const at = (minutes) => new Date(T0 + minutes * 60_000).toISOString();
+  const noAgent = { ready: async () => ({ ok: false, reason: "no_agent_in_pane" }), prompt: async () => assert.fail("nothing is sent") };
+  await deliverOperatorMessages(store, { ...noAgent, at: at(0) });
+  assert.equal(first.delivery.reason, "no_agent_in_pane");
+  assert.equal(second.delivery.reason, "no_agent_in_pane", "the message behind the first shows the reason too");
+  assert.equal(first.delivery.blockedSince, at(0));
+  await deliverOperatorMessages(store, { ...noAgent, at: at(20) });
+  assert.equal(first.delivery.blockedSince, at(0), "the clock keeps its start");
+  assert.deepEqual(undeliverableMessages(store, { now: T0 + 5 * 60_000 }), [], "not yet");
+  const stuck = undeliverableMessages(store, { now: T0 + 20 * 60_000 });
+  assert.deepEqual(stuck.map((group) => [group.label, group.reason, group.ids]), [["root:cic", "no_agent_in_pane", [first.id, second.id]]]);
+  // A busy agent is expected to be busy: no clock.
+  await deliverOperatorMessages(store, { ready: async () => ({ ok: true, agent: { agent_status: "working" } }), prompt: async () => assert.fail("busy"), at: at(30) });
+  assert.equal(first.delivery.reason, "agent is working");
+  assert.equal(first.delivery.blockedSince, undefined);
+  assert.deepEqual(undeliverableMessages(store, { now: T0 + 90 * 60_000 }), []);
+  // Delivered: gone from the list.
+  await deliverOperatorMessages(store, { ready: async () => ({ ok: true, agent: { agent_status: "idle" } }), prompt: async () => undefined, at: at(40) });
+  assert.equal(first.delivery.status, "delivered");
+  assert.equal(first.delivery.blockedSince, undefined);
 });
