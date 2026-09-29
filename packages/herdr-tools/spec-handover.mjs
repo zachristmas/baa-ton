@@ -25,6 +25,13 @@ export const HOST_LEASE_FILE = "spec-driver-host.json";
 export const DEFER_FILE = "spec-driver-defer.json";
 export const HEARTBEAT_MS = 15_000;
 export const FRESH_MS = 90_000;
+/**
+ * A host whose process just died but whose lease is this fresh is most likely
+ * restarting (a deploy): the root waits for the new host instead of driving
+ * one pass on its own, older in-memory code (which dispatched an integration
+ * onto an unjudged sync merge in that gap).
+ */
+export const RESTART_GRACE_MS = 60_000;
 
 function read(path) {
   try {
@@ -87,6 +94,8 @@ export function specHandover(stateDir, { host = process.env.BAATON_SPEC_HOST ===
     if (lease && defer && Date.parse(defer.at) >= Date.parse(lease.startedAt)) return undefined;
     return "waiting for the root's extension to hand the driver over (a root on older code keeps driving until it reloads)";
   }
+  if (lease && lease.pid !== pid && !alive(lease.pid) && Number.isFinite(Date.parse(lease.at)) && now - Date.parse(lease.at) < RESTART_GRACE_MS)
+    return `the supervisor's spec host (pid ${lease.pid}) has just stopped and is probably restarting; the root waits up to ${RESTART_GRACE_MS / 1000} s for it`;
   if (!fresh(lease, now, alive) || lease.pid === pid) return undefined;
   try {
     write(join(stateDir, DEFER_FILE), { pid, at: new Date(now).toISOString() });
