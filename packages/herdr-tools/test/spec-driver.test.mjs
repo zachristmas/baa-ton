@@ -888,3 +888,29 @@ test("integrate lanes are told to stop waiting on a lint or typecheck that outla
   const objective = integrateObjective(s, s.items[0], { integrationBranch: "spec-integration", itemBranch: "spec/A" });
   assert.match(objective, /every other package's lint and typecheck has finished and one is still running 10 minutes later[\s\S]*broken import across packages or a tsconfig change[\s\S]*FAILED: <package> <task>/);
 });
+
+test("a failed item whose integrated commit is already on the target is verified from it, and its dependents are released (D05/D13/D15 sat failed with their code live; D06/D07 waited on D05)", () => {
+  const s = spec([{ id: "A", acceptance: { text: "a", tests: ["npm test"] } }, { id: "B", dependsOn: ["A"], acceptance: { text: "b" } }, { id: "C", acceptance: { text: "c" } }]);
+  const state = {
+    version: 1,
+    items: {
+      A: { state: "failed", attempts: 3, findings: `Integration onto spec-integration failed its suite. Rebase and fix:\nINTEGRATED: ${SHA_A}\nSUITE: fail\nFAILED: @x/db test`, history: [] },
+      B: { state: "pending", attempts: 2 },
+      // Failed at review, no integrated commit: not landed, stays failed.
+      C: { state: "failed", attempts: 3, findings: "VERDICT: FAIL a.ts:1 wrong" },
+    },
+  };
+  const step = advanceSpec({ spec: s, state, lane: lanes({}), landed: new Map([["A", SHA_A]]), now: at(0) });
+  const a = step.state.items.A;
+  assert.equal(a.state, "verifying");
+  assert.equal(a.integratedSha, SHA_A);
+  assert.equal(a.integration.landed, true);
+  assert.equal(a.findings, undefined);
+  assert.match(a.history.at(-1).note, /already on the target; verified from there/);
+  assert.deepEqual(step.actions.find((action) => action.itemId === "A"), { kind: "verify", itemId: "A", attempt: 1, tests: ["npm test"] }, "a verify lane runs its tests at that commit");
+  assert.equal(step.state.items.C.state, "failed");
+  assert.notEqual(step.state.items.B.state, "pending", "released: A is integrated now");
+  // Not landed: nothing changes.
+  const none = advanceSpec({ spec: s, state, lane: lanes({}), now: at(0) });
+  assert.equal(none.state.items.A.state, "failed");
+});
