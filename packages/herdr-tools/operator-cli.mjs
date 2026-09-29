@@ -36,10 +36,13 @@ const USAGE = `Usage:
   baa-ton operator unregister <name>
   baa-ton operator agents
   baa-ton deliver
-  baa-ton run status|pause|resume [--reason <text>] [--from <name>]`;
+  baa-ton run status|pause|resume [--reason <text>] [--from <name>]
+  baa-ton reset [--project-root <folder>] [--include-spec] [--yes]
+      clean slate: close all lane tabs, release leases, archive then empty the manifest, delete old lane files.
+      Dry run unless --yes. Keeps config, approval policy, spec, operator registry and the root pane. Never touches Git or worktrees.`;
 
 /** Split argv into positionals and --flags (a flag takes the next word unless boolean). */
-export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread", "resume"])) {
+export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread", "resume", "yes", "include-spec"])) {
   const positional = [];
   const flags = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -93,6 +96,13 @@ export async function runOperatorCli(argv, { env = process.env, out = (text) => 
         return state;
       }
       throw new Error(USAGE);
+    }
+    case "reset": {
+      const { runReset, formatPlan } = await import("./reset.mjs");
+      const result = await runReset({ projectRoot: flags["project-root"] ?? process.cwd(), apply: Boolean(flags.yes), includeSpec: Boolean(flags["include-spec"]), env });
+      out(result.note ?? formatPlan(result.plan, { applied: result.applied }));
+      if (result.failures?.length) out(`Not fully clean:\n  ${result.failures.join("\n  ")}`);
+      return result;
     }
     case "deliver": {
       const changed = await deliverOperatorNow({ env });
