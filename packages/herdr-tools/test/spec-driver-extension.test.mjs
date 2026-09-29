@@ -118,6 +118,9 @@ async function fixture({ grants = ["dispatch", "integrate"], reviewModel = "mode
     aheadOf: async () => 1,
     // No target SHA (no suite baseline) unless a test says so.
     revParse: async () => undefined,
+    // The target is in sync with spec-integration unless a test says so.
+    fetchTarget: async () => undefined,
+    targetInIntegration: async () => true,
     async detachedWorktree(input) {
       calls.detached = [...(calls.detached ?? []), input];
     },
@@ -2456,6 +2459,67 @@ test("a pre-commit hook failure (lint-staged, eslint) sends the item back to bui
     assert.deepEqual(setAside.map((input) => [input.worktree, input.paths]), [["/work/wt-c", ["src/c/y.ts", "src/c/new.ts"]]]);
     const ask = (await f.manifest()).rootSupervision[0].alerts.map((alert) => alert.text).join("\n");
     assert.match(ask, /went back to build with the errors[\s\S]*1:5  error  'x0'/, "the root sees the errors, not the first line");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a target with direct commits is fetched, merged into spec-integration by a sync lane, and only then pushed; a failed push keeps its full git error and is retried (the live non-fast-forward failures)", async () => {
+  const target = "7".repeat(40);
+  const head = "9".repeat(40);
+  const merged = "a".repeat(40);
+  const f = await fixture({
+    grants: ["dispatch", "integrate", "spec-push"],
+    specDocument: { version: 1, target: { repo: ".", remote: "origin", branch: "feature/release" }, items: [{ id: "D04", title: "B", acceptance: { text: "b" } }] },
+    seed: { version: 1, integrationCounter: 1, items: { D04: { state: "awaiting-push", integration: { sha: head, order: 1 } } } },
+  });
+  try {
+    const fetches = [];
+    f.ports.fetchTarget = async (input) => void fetches.push(input);
+    f.ports.revParse = async () => target;
+    let inSync = false;
+    f.ports.targetInIntegration = async () => inSync;
+    const pushes = [];
+    f.ports.push = async (input) => void pushes.push(input);
+
+    // Pass 1: the target has commits spec-integration lacks: nothing is pushed, a sync lane starts.
+    let result = await f.advance();
+    assert.deepEqual(fetches, [{ repo: fetches[0].repo, remote: "origin", branch: "feature/release" }], "the target is fetched before it is judged");
+    assert.equal(pushes.length, 0, "no push over a target it does not contain");
+    assert.match(result.content[0].text, /sync-target 777777777777 -> herdr-spec1/);
+    const sync = f.calls.plan[0];
+    assert.equal(sync.specStage, "integrate");
+    assert.match(sync.worktree, /spec-integration$/);
+    assert.match(sync.laneObjective, /git merge --no-ff -m "spec\(sync\): merge feature\/release" 7{40}[\s\S]*never push, never force/);
+
+    // The lane's receipt: green. The merged head is pushed in the same pass.
+    inSync = false;
+    await f.laneReceipt("herdr-spec1", `INTEGRATED: ${merged}\nSUITE: pass`);
+    f.ports.push = async (input) => {
+      pushes.push(input);
+      throw Object.assign(new Error("Command failed: git push"), { stderr: " ! [rejected]        aaaa -> feature/release (non-fast-forward)\nerror: failed to push some refs to 'origin'\nhint: Updates were rejected because the tip of your current branch is behind" });
+    };
+    result = await f.advance();
+    assert.deepEqual(pushes.map((push) => push.sha), [merged], "the merged head, not the old one");
+    let state = await f.state();
+    assert.equal(state.syncedHead.sha, merged);
+    assert.equal(state.pushFailure.sha, merged);
+    assert.match(state.pushFailure.error, /non-fast-forward[\s\S]*failed to push some refs[\s\S]*behind/, "the whole git error, kept");
+    assert.equal(state.pushFailure.count, 1);
+
+    // Retried once its wait is over, and goes through.
+    inSync = true;
+    f.ports.push = async (input) => {
+      pushes.push(input);
+      f.pushedShas.add(merged);
+      f.pushedShas.add(head);
+    };
+    f.ports.now = () => "2026-09-24T12:10:00.000Z";
+    await f.advance();
+    assert.equal(pushes.length, 2);
+    assert.equal(pushes[1].sha, merged);
+    state = await f.state();
+    assert.equal(state.pushFailure, undefined, "cleared by the success");
   } finally {
     await f.cleanup();
   }

@@ -108,6 +108,16 @@ export function detectAnomalies({ entry, specStall, specReason, specState, times
   }
   for (const [text, count] of counts)
     if (count >= 3) found.push({ kind: "repeated-alert", decision: true, signature: `alert:${text.slice(0, 120)}`, summary: `the same root alert was raised ${count} times`, evidence: [text] });
+  // A push the driver could not make: the full git error, not a truncated
+  // ask. One anomaly per commit pushed; it recurs (after a fix) by count.
+  const failure = specState?.pushFailure;
+  if (failure?.sha && failure.error && specState.items && Object.values(specState.items).some((record) => record?.state === "awaiting-push"))
+    found.push({
+      kind: "push-failed",
+      signature: `push-failed:${String(failure.sha).slice(0, 12)}:${failure.count ?? 1}`,
+      summary: `the spec driver's push of ${String(failure.sha).slice(0, 12)} (${(failure.items ?? []).join(", ")}) failed ${failure.count ?? 1} time(s) since ${failure.at}; items wait in awaiting-push`,
+      evidence: String(failure.error).split("\n").filter(Boolean).slice(-12),
+    });
   for (const [id, record] of Object.entries(specState?.items ?? {})) {
     if (!record?.lane || !record.receiptPointedAt) continue;
     // A failed, done or held item waits on no receipt.

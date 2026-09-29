@@ -151,7 +151,7 @@ const { ROOT_QUESTION_AUTO_ANSWER_MS, autoAnswerPlan, autoAnswerText, createQues
 const { OPERATOR_AUTHORITY, runStateFromText, runStateLine } = (await freshImport("./operator.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator.mjs");
 const { formatInbox, readOperatorInbox, replyToOperator, sendOperatorMessage, readRunState, changeRunState } = (await freshImport("./operator-api.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./operator-api.mjs");
 const { SPEC_PATH, SPEC_STATE_PATH, demoOnPreview, finalReportPath, gitAncestor, loadSpec, previewHealthUrl, releaseShaFrom, reportImageCount, verifyItem, loadSpecState, specStatusTable, targetRepo, validateSpecState, verifySpec } = (await freshImport("./spec.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec.mjs");
-const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, demoRunObjective, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
+const { DECLINE_RULE, RECEIPT_RULE, INFRA_KINDS, LANE_BOOKKEEPING, infraBackoffMs, integrationCommitFor, advanceSpec, demoRunObjective, syncObjective, integrationResult, profileAfterDeclines, buildObjective, decideObjective, integrateObjective, reviewObjective, verifyObjective } = (await freshImport("./spec-driver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-driver.mjs");
 const { baselineObjective, fixBaselineObjective, knownFailures } = (await freshImport("./spec-baseline.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-baseline.mjs");
 const { adoptSpec, adoptionTable, failureOutput, fullFailureOutput, globToRegExp, hookErrors, itemOwnedChanges, specCommitMessage } = (await freshImport("./spec-adopt.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-adopt.mjs");
 const { specDriverTimer } = (await freshImport("./spec-timer.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./spec-timer.mjs");
@@ -246,6 +246,20 @@ export async function cleanIntegrationWorktree({ worktree, patchPath }: { worktr
   await writeFile(patchPath, diff);
   await execFile("git", ["-C", worktree, "reset", "--hard", "--quiet", "HEAD"], { timeout: 60_000 });
   return { merging, files: porcelain.split("\n").filter(Boolean).length };
+}
+/**
+ * Push `sha` to `remote`/`branch`, fast-forward only and never forced. The
+ * target is fetched first: a branch that moved since the last look (operator
+ * commits pushed to it directly) holds commits `sha` lacks, and the push is
+ * refused here with that reason instead of being sent to fail at the remote.
+ */
+export async function pushFastForward({ repo, worktree, remote, sha, branch }: { repo: string; worktree: string; remote: string; sha: string; branch: string }) {
+  await execFile("git", ["-C", repo, "fetch", "-q", remote, branch], { timeout: 180_000 });
+  const tip = (await execFile("git", ["-C", repo, "rev-parse", `refs/remotes/${remote}/${branch}`], { timeout: 30_000 })).stdout.trim();
+  if (!(await gitAncestor(repo, tip, sha)))
+    throw new Error(`not a fast-forward: ${remote}/${branch} is at ${tip}, which ${sha} does not contain (commits were pushed to it directly); it is merged into spec-integration first`);
+  await execFile("git", ["-C", worktree, "push", "-q", remote, `${sha}:refs/heads/${branch}`], { timeout: 180_000 });
+  await execFile("git", ["-C", repo, "fetch", "-q", remote, branch], { timeout: 180_000 });
 }
 const RECENT_AGENT_OUTPUT_LINES = 120;
 const GOAL_PAUSE_OUTPUT_LIMIT = 6000;
@@ -4829,6 +4843,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     /** Save and abort a half-done merge or staged changes left in the integration worktree; undefined when clean. */
     cleanIntegration?(input: { worktree: string; patchPath: string }): Promise<{ merging: boolean; files: number } | undefined>;
     journalProblems?(repo: string, sha: string, base: string): Promise<string[]>;
+    /** Fetch the target branch from its remote (the driver's view of it goes stale when someone pushes to it directly). */
+    fetchTarget?(input: { repo: string; remote: string; branch: string }): Promise<void>;
+    /** Whether the target tip is an ancestor of spec-integration's head (undefined: no such branch yet). */
+    targetInIntegration?(input: { repo: string; targetSha: string }): Promise<boolean | undefined>;
     rollBackIntegration?(input: { worktree: string; sha: string }): Promise<boolean>;
     /** A lane pane's visible screen (to infer a receipt from its final report). */
     readScreen?(paneId: string): Promise<string>;
@@ -4945,6 +4963,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           ...(Object.values(state.items ?? {}) as Array<{ lane?: { workflowId: string; laneId: string } }>).map((record) => record.lane),
           (state as { baselineRun?: { lane?: { workflowId: string; laneId: string } } }).baselineRun?.lane,
           (state as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane,
+          (state as { syncRun?: { lane?: { workflowId: string; laneId: string } } }).syncRun?.lane,
         ].filter((ref): ref is { workflowId: string; laneId: string } => Boolean(ref));
         const readLive =
           ports?.liveStatus ??
@@ -4997,6 +5016,17 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       };
       const supervision = manifest.rootSupervision?.find((item) => item.rootId === scope.rootId);
       const targetRef = `refs/remotes/${spec.target.remote}/${spec.target.branch}`;
+      // A push is fast-forward only, so the driver must see what is on the
+      // target now: operator commits pushed to it directly are not in the
+      // integration branch, and a stale view made every push fail.
+      let fetchError: string | undefined;
+      if (Object.values(state.items ?? {}).some((record) => ["awaiting-push", "integrating"].includes((record as { state?: string }).state ?? "")))
+        await (ports?.fetchTarget ??
+          (async ({ repo: repoPath, remote, branch }: { repo: string; remote: string; branch: string }) => {
+            await execFile("git", ["-C", repoPath, "fetch", "-q", remote, branch], { signal, timeout: 180_000 });
+          }))({ repo, remote: spec.target.remote, branch: spec.target.branch }).catch((error) => {
+          fetchError = clip(failureOutput(error), 300);
+        });
       const pushed = new Set<string>();
       for (const record of Object.values(state.items ?? {}) as Array<{ state?: string; integration?: { sha?: string } }>)
         if (record.state === "awaiting-push" && record.integration?.sha)
@@ -5214,6 +5244,16 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         ports?.revParse ??
         (async (repoPath: string, ref: string) => (await execFile("git", ["-C", repoPath, "rev-parse", "--verify", "-q", ref], { timeout: 30_000 })).stdout.trim() || undefined)
       )(repo, targetRef).catch(() => undefined);
+      // Whether a push of spec-integration could fast-forward the target: its
+      // tip must already be in spec-integration.
+      const targetInIntegration =
+        targetSha && Object.values(state.items ?? {}).some((record) => (record as { state?: string }).state === "awaiting-push") && !fetchError
+          ? await (ports?.targetInIntegration ??
+              (async ({ repo: repoPath, targetSha: tip }: { repo: string; targetSha: string }) => {
+                const exists = await execFile("git", ["-C", repoPath, "rev-parse", "--verify", "-q", "refs/heads/spec-integration"], { timeout: 30_000 }).then(() => true, () => false);
+                return exists ? gitAncestor(repoPath, tip, "refs/heads/spec-integration") : undefined;
+              }))({ repo, targetSha }).catch(() => undefined)
+          : undefined;
       // An integration receipt's merge is checked for migration journal
       // entries that go back in time before it is kept.
       const journalProblems = new Map<string, string[]>();
@@ -5235,6 +5275,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         background,
         integrationLive,
         contained,
+        ...(targetInIntegration !== undefined ? { targetInIntegration } : {}),
         capacityWaiting,
         pushed,
         released,
@@ -5481,6 +5522,54 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         });
       type DemoRun = { items: string[]; sha: string; lane?: { workflowId: string; laneId: string }; worktree?: string; startedAt?: string; note?: string };
       for (const action of step.actions) {
+        if (action.kind === "ask-sync-receipt") {
+          const text = `Your spec sync lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now; the summary must start with INTEGRATED: <full SHA of the merge commit> and SUITE: pass or SUITE: fail, then one FAILED: <package> <task> line per failing task.`;
+          try {
+            const told = await (ports?.tell ?? ((input: { workflowId: string; laneId: string; text: string }) => tellLane(ctx.cwd, input, signal)))({ ...action.lane!, text });
+            done.push(`asked the sync lane for its receipt (${told.message.delivery.status})`);
+          } catch (error) {
+            done.push(`sync receipt ask failed: ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
+        if (action.kind === "sync-target") {
+          if (shellTimeout || laneStarts <= 0) continue;
+          const run = (next as { syncRun?: { lane?: { workflowId: string; laneId: string }; note?: string; targetSha: string; infraFailures?: number; retryAfter?: string; declined?: { reason: string; count: number } } }).syncRun;
+          if (!run || run.lane) continue;
+          try {
+            await use.worktree({ repo, path: integrationWorktree, branch: "spec-integration", base: targetRef }, signal);
+            const leftover = await (ports?.cleanIntegration ?? cleanIntegrationWorktree)({ worktree: integrationWorktree, patchPath: join(ctx.cwd, ".baa-ton", "herdr-orchestrator", "aborted-integrations", `sync-${use.now().replace(/[:.]/g, "-")}.patch`) });
+            if (leftover) done.push(`cleaned spec-integration before syncing the target`);
+            await restoreGeneratedIn(integrationWorktree, "integration");
+            const knownBaseline = targetSha ? knownFailures((next as { baselines?: Record<string, any> }).baselines?.[targetSha]) : undefined;
+            const workflow = await use.plan({
+              objective: `spec sync: merge ${spec.target.remote}/${spec.target.branch} at ${run.targetSha.slice(0, 12)} into spec-integration`,
+              laneObjective: [
+                run.declined ? `An earlier lane declined this (${run.declined.count} time(s)), saying: "${clip(run.declined.reason, 400)}". The task is unchanged and stays within your contract.` : "",
+                syncObjective(spec, { targetSha: run.targetSha, integrationBranch: "spec-integration", ...(knownBaseline?.length ? { baseline: { sha: targetSha!, failures: knownBaseline } } : {}) }),
+                RECEIPT_RULE,
+                DECLINE_RULE,
+              ].filter(Boolean).join("\n"),
+              readOnly: false,
+              taskProfile: spec.stages.integrate?.profile ?? "balanced",
+              worktree: integrationWorktree,
+              specStage: "integrate",
+            });
+            run.lane = { workflowId: workflow.id, laneId: workflow.lanes[0].id };
+            delete run.note;
+            const result = await dispatchLane(workflow.id);
+            if (!result.dispatched) run.note = `planned as ${workflow.id} but not dispatched${result.cancelled ? " (cancelled)" : ""}`;
+            done.push(`sync-target ${run.targetSha.slice(0, 12)} -> ${workflow.id}`);
+          } catch (error) {
+            const failures = (run.infraFailures ?? 0) + 1;
+            const retryAfter = new Date(Date.parse(use.now()) + infraBackoffMs(failures)).toISOString();
+            Object.assign(run, { infraFailures: failures, retryAfter });
+            delete run.lane;
+            run.note = `sync-target failed: ${clip((error as Error).message, 300)}`;
+            done.push(`sync-target failed (infrastructure; a fresh lane after ${retryAfter}): ${clip((error as Error).message, 120)}`);
+          }
+          continue;
+        }
         if (action.kind === "ask-demo-receipt") {
           const text = `Your spec demo run lane is idle without its completion receipt. Call herdr_complete for workflow ${action.lane!.workflowId} now: one line per item, DEMO: <id> written or DEMO: <id> blocked <why> (DEMO-STACK: blocked <why> if the stack never started). A plain-text report is not a receipt.`;
           try {
@@ -5986,6 +6075,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         if (baselineLane) current.add(`${baselineLane.workflowId}/${baselineLane.laneId}`);
         const demoLane = (next as { demoRun?: { lane?: { workflowId: string; laneId: string } } }).demoRun?.lane;
         if (demoLane) current.add(`${demoLane.workflowId}/${demoLane.laneId}`);
+        const syncLane = (next as { syncRun?: { lane?: { workflowId: string; laneId: string } } }).syncRun?.lane;
+        if (syncLane) current.add(`${syncLane.workflowId}/${syncLane.laneId}`);
         // A lane kept for a same-pane retry after a slow start.
         for (const record of Object.values(next.items as Record<string, { sameSlot?: { workflowId: string; laneId: string } }>))
           if (record.sameSlot) current.add(`${record.sameSlot.workflowId}/${record.sameSlot.laneId}`);
@@ -6037,11 +6128,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         for (const ask of [...step.rootAsks]) {
           if (ask.kind !== "push" || !ask.sha) continue;
           try {
-            await (ports?.push ??
-              (async ({ worktree, remote, sha, branch }: { worktree: string; remote: string; sha: string; branch: string }) => {
-                await execFile("git", ["-C", worktree, "push", "-q", remote, `${sha}:refs/heads/${branch}`], { timeout: 180_000 });
-                await execFile("git", ["-C", repo, "fetch", "-q", remote, branch], { timeout: 180_000 });
-              }))({ worktree: integrationWorktree, remote: spec.target.remote, sha: ask.sha, branch: spec.target.branch });
+            await (ports?.push ?? ((input: { worktree: string; remote: string; sha: string; branch: string }) => pushFastForward({ repo, ...input })))({ worktree: integrationWorktree, remote: spec.target.remote, sha: ask.sha, branch: spec.target.branch });
+            delete (next as { pushFailure?: unknown }).pushFailure;
             step.rootAsks.splice(step.rootAsks.indexOf(ask), 1);
             for (const id of ask.items ?? []) {
               const record = next.items[id];
@@ -6051,8 +6139,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             done.push(`pushed ${(ask.items ?? []).join(", ")} to ${spec.target.remote}/${spec.target.branch} (${ask.sha.slice(0, 12)})`);
             await runHerdr(["notification", "show", "Baa-ton: spec round pushed", "--body", clip(`${(ask.items ?? []).length} item(s) pushed to ${spec.target.branch} at ${ask.sha.slice(0, 12)}: ${(ask.items ?? []).join(", ")}`, 400)], signal).catch(() => undefined);
           } catch (error) {
+            // The whole git error is kept in the state (the supervisor raises it
+            // as an anomaly) and the round is asked again after a wait, once the
+            // target has been fetched and, if it moved, merged in.
+            const full = clip(fullFailureOutput(error), 4000);
+            const previous = (next as { pushFailure?: { sha?: string; count?: number } }).pushFailure;
+            (next as { pushFailure?: unknown }).pushFailure = {
+              sha: ask.sha,
+              items: ask.items ?? [],
+              error: full,
+              at: use.now(),
+              count: previous?.sha === ask.sha ? (previous.count ?? 0) + 1 : 1,
+              retryAfter: new Date(Date.parse(use.now()) + 5 * 60_000).toISOString(),
+            };
             ask.reason = `${ask.reason ?? "push"}; the pre-approved push failed: ${clip(failureOutput(error), 300)}`;
-            done.push(`push of ${ask.sha.slice(0, 12)} failed: ${clip((error as Error).message, 120)}`);
+            done.push(`push of ${ask.sha.slice(0, 12)} failed: ${clip(full.split("\n").filter(Boolean).slice(-2).join(" | "), 240)}`);
           }
         }
       }

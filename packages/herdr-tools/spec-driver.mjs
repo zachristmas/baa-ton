@@ -387,6 +387,7 @@ function staleBackground(current, now) {
  * @param {string} [input.integrationLive] a live integrate/verify lane found in Herdr (it reserves the integration worktree)
  * @param {string} [input.targetSha] the target tip's SHA (the suite baseline is recorded per SHA)
  * @param {Map<string, string>} [input.contained] queued items whose branch is already on the integration branch -> containing commit
+ * @param {boolean} [input.targetInIntegration] whether the (freshly fetched) target tip is an ancestor of spec-integration's head; false: the target gained commits a push would not fast-forward over
  * @param {string} input.now        ISO timestamp
  * @returns {{ state: object, actions: Array<{kind: "build"|"review", itemId: string, attempt: number, findings?: string}>, rootAsks: Array<{itemId: string, reason: string}>, waits: Record<string, string> }}
  */
@@ -403,6 +404,7 @@ export function advanceSpec({
   integrationLive,
   contained = new Map(),
   targetSha,
+  targetInIntegration,
   now,
 }) {
   const next = structuredClone(state ?? { version: 1, items: {} });
@@ -626,6 +628,65 @@ for (const item of spec.items) {
   }
   const baseline = useBaseline ? next.baselines?.[targetSha] : undefined;
   const known = knownFailures(baseline);
+
+  // B3. A sync run: the target gained commits spec-integration lacks
+  // (operator commits pushed to it directly), so no push can fast-forward.
+  // One lane merges the target into spec-integration and runs the suite,
+  // judged against the baseline like an integration; the round then pushes
+  // the merged head. Never a force push.
+  if (next.syncRun?.lane) {
+    const run = next.syncRun;
+    const view = lane(run.lane);
+    const declined = view?.receipt ? declineReason(view.receipt.summary, "integrate") : undefined;
+    if (declined && (run.declined?.count ?? 0) < 3) {
+      run.declined = { reason: declined, count: (run.declined?.count ?? 0) + 1, at: now };
+      delete run.lane;
+    } else if (view?.receipt) {
+      const result = integrationResult(view.receipt.summary);
+      let relative;
+      let fresh;
+      if (result.sha && result.suite === "fail" && useBaseline) {
+        const failures = suiteFailures(view.receipt.summary);
+        if (failures.length && known) {
+          const verdict = compareToBaseline(failures, known);
+          if (verdict.pass) relative = verdict.known;
+          else fresh = verdict.fresh;
+        } else if (failures.length && !baseline) run.waitingForBaseline = true;
+      }
+      if (result.sha && (result.suite === "pass" || relative)) {
+        next.integrationCounter = (next.integrationCounter ?? 0) + 1;
+        next.syncedHead = { sha: result.sha, targetSha: run.targetSha, order: next.integrationCounter, at: now, lane: run.lane, ...(relative ? { baselineFailures: relative } : {}) };
+        delete next.syncRun;
+      } else if (run.waitingForBaseline && !baseline) {
+        // Judged once the baseline at the target tip is recorded.
+      } else {
+        run.failed = { at: now, sha: result.sha, suite: result.suite, ...(fresh ? { fresh } : {}) };
+        const why = !result.sha || !result.suite ? "its receipt has no INTEGRATED: <sha> and SUITE: lines" : `the merged head fails the suite where the target does not${fresh?.length ? `: ${formatFailures(fresh)}` : ""}`;
+        rootAsks.push({ itemId: "push", reason: `Merging ${spec.target.remote}/${spec.target.branch} (${String(run.targetSha).slice(0, 12)}, commits pushed to it directly) into spec-integration did not pass: ${why}. Nothing was pushed. Decide how to reconcile them (fix the conflict or the failures on spec-integration, or revert the direct commits); the driver retries once the target moves.\n${String(view.receipt.summary).slice(0, 3000)}` });
+        delete run.lane;
+      }
+    } else if (view && (view.agentStatus === "done" || view.agentStatus === "gone") && !LANE_ENDED.has(view.status ?? "")) {
+      if (!run.askedAt) {
+        run.askedAt = now;
+        actions.push({ kind: "ask-sync-receipt", itemId: "", attempt: run.attempts ?? 1, lane: run.lane, targetSha: run.targetSha });
+      } else if (Date.parse(now) - Date.parse(run.askedAt) > RECEIPT_ASK_TIMEOUT_MS) {
+        run.attempts = (run.attempts ?? 1) + 1;
+        delete run.lane;
+        delete run.askedAt;
+      }
+    } else if (view && (view.status === "dispatch-failed" || view.workflowStatus === "dispatch-failed")) {
+      run.infraFailures = (run.infraFailures ?? 0) + 1;
+      run.retryAfter = new Date(Date.parse(now) + infraBackoffMs(run.infraFailures)).toISOString();
+      delete run.lane;
+    } else if (view && LANE_ENDED.has(view.status)) {
+      run.attempts = (run.attempts ?? 1) + 1;
+      delete run.lane;
+    }
+    if (next.syncRun && (next.syncRun.attempts ?? 1) > 3 && !next.syncRun.failed) {
+      next.syncRun.failed = { at: now, note: "sync lanes ended without a receipt three times" };
+      rootAsks.push({ itemId: "push", reason: `Merging ${spec.target.remote}/${spec.target.branch} into spec-integration: three sync lanes ended without a receipt. Nothing was pushed.` });
+    }
+  }
 
   // 0. A lane that went idle (done) without its receipt is asked once for
   // it, then handed to the root; a lane whose pane is gone is retried.
@@ -936,6 +997,17 @@ for (const item of spec.items) {
       move(item.id, "verifying", { integratedSha: current.integration.sha }, "pushed to the target branch");
   }
 
+  // 1b2. Before a push: a target that gained commits spec-integration lacks
+  // is merged in first (a sync run), never pushed over or forced.
+  const awaitingPush = spec.items.some((item) => next.items[item.id]?.state === "awaiting-push");
+  if (next.syncedHead && next.syncedHead.targetSha !== targetSha && targetInIntegration === false) delete next.syncedHead;
+  // A merge just recorded (this pass saw its receipt) is not redone: the ancestry
+  // check that predates the receipt still reads the old integration head.
+  if (awaitingPush && targetInIntegration === false && typeof targetSha === "string" && next.syncedHead?.targetSha !== targetSha) {
+    if (!next.syncRun || (next.syncRun.targetSha !== targetSha && !next.syncRun.lane)) next.syncRun = { targetSha, attempts: 1, requestedAt: now };
+  } else if (next.syncRun && !next.syncRun.lane && (targetInIntegration !== false || !awaitingPush)) delete next.syncRun;
+  const syncing = Boolean(next.syncRun && !next.syncRun.failed);
+
   // 1c. One serial integration queue, in dependency order. The integration
   // worktree stays reserved by any integrate or verify lane whose workflow
   // is still open, even when its item was blocked or the lane went idle
@@ -1002,7 +1074,7 @@ for (const item of spec.items) {
   // B2. Record the baseline once per target SHA when an item is queued for
   // integration; with defaults.fixBaseline, one lane fixes its failures on
   // the integration branch before any item is merged there.
-  const queued = spec.items.some((item) => next.items[item.id]?.state === "integrating");
+  const queued = spec.items.some((item) => next.items[item.id]?.state === "integrating") || Boolean(next.syncRun?.waitingForBaseline);
   if (useBaseline && queued && !next.baselineRun) {
     if (!baseline) next.baselineRun = { kind: "baseline", targetSha, attempts: 1, requestedAt: now };
     else if (spec.defaults.fixBaseline && known?.length && !baseline.fix && !reservedBy && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane))
@@ -1019,7 +1091,13 @@ for (const item of spec.items) {
       ...(next.baselineRun.kind === "fix-baseline" ? { failures: known ?? [] } : {}),
     });
   const fixing = next.baselineRun?.kind === "fix-baseline";
-  if (fixing) {
+  if (syncing && !next.syncRun.lane && !reservedBy && !capacityWaiting && !spec.items.some((item) => next.items[item.id]?.state === "integrating" && next.items[item.id].lane) && !(typeof next.syncRun.retryAfter === "string" && Date.parse(now) < Date.parse(next.syncRun.retryAfter)))
+    actions.push({ kind: "sync-target", itemId: "", attempt: next.syncRun.attempts ?? 1, targetSha: next.syncRun.targetSha });
+  if (syncing) {
+    for (const item of spec.items)
+      if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
+        waits[item.id] = `integration queue: merging ${spec.target.remote}/${spec.target.branch} (commits pushed to it directly) into spec-integration first`;
+  } else if (fixing) {
     for (const item of spec.items)
       if (next.items[item.id]?.state === "integrating" && !next.items[item.id].lane)
         waits[item.id] = `integration queue: fixing the target's baseline failures first (${formatFailures(known ?? [])})`;
@@ -1053,18 +1131,38 @@ for (const item of spec.items) {
         if (!failures.some((other) => other.package === failure.package && other.task === failure.task)) failures.push(failure);
     return failures.length ? { baselineFailures: failures } : {};
   };
-  if (awaiting.length) {
+  // A push that failed is asked again after a short wait (a fresh fetch and
+  // the sync check come first); the failure itself is kept for the
+  // supervisor, which raises it as an anomaly.
+  if (next.pushFailure?.retryAfter && Date.parse(now) >= Date.parse(next.pushFailure.retryAfter)) {
+    if (next.pushGate?.askedSha === next.pushFailure.sha) delete next.pushGate.askedSha;
+    for (const item of awaiting) if (next.items[item.id].integration?.sha === next.pushFailure.sha) delete next.items[item.id].pushAskedAt;
+    delete next.pushFailure.retryAfter;
+  }
+  // The head to push: after a sync, the merged head, unless a later item
+  // integrated on top of it (then that item's commit contains it).
+  const pushHead = (items) => {
+    const last = next.items[items.at(-1).id].integration;
+    const synced = next.syncedHead?.targetSha === targetSha ? next.syncedHead : undefined;
+    return synced && synced.order > (last?.order ?? 0) ? synced.sha : last.sha;
+  };
+  if (awaiting.length && (syncing || next.syncRun?.failed)) {
+    for (const item of awaiting)
+      waits[item.id] = next.syncRun?.failed
+        ? `push: merging ${spec.target.remote}/${spec.target.branch} into spec-integration failed; the root decides`
+        : `push: ${spec.target.remote}/${spec.target.branch} has commits spec-integration lacks; merging them in first`;
+  } else if (awaiting.length) {
     if (spec.defaults.pushGate === "item") {
       for (const item of awaiting)
         if (!next.items[item.id].pushAskedAt) {
           next.items[item.id].pushAskedAt = now;
-          rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: next.items[item.id].integration.sha, reason: `push ${item.id}`, ...knownAt([item]) });
+          rootAsks.push({ itemId: item.id, kind: "push", items: [item.id], sha: pushHead([item]), reason: `push ${item.id}`, ...knownAt([item]) });
         }
     } else {
       // Push what is ready, without waiting for the rest of the queue: the
       // push goes to the last ready item's integration commit, so items still
       // integrating (or stuck) never ride along or hold the others back.
-      const head = next.items[awaiting.at(-1).id].integration.sha;
+      const head = pushHead(awaiting);
       if (next.pushGate?.askedSha !== head) {
         next.pushGate = { askedSha: head, items: awaiting.map((item) => item.id), at: now };
         rootAsks.push({ itemId: awaiting.at(-1).id, kind: "push", items: awaiting.map((item) => item.id), sha: head, reason: `push round of ${awaiting.length}`, ...knownAt(awaiting) });
@@ -1370,6 +1468,22 @@ export function verifyObjective(spec, item, { worktree, releaseSha, reportPath, 
     testLines,
     "Do not change code or Git state; this stage only verifies.",
     `Finish with herdr_complete. In the summary, put one line per spec, PREVIEW: <spec path> pass or PREVIEW: <spec path> fail, ${tests.length ? "one TEST: line per test, " : ""}and REPORT: <path of the report you wrote>. If the app or its services could not be started at all, write PREVIEW: <spec path> blocked and say why: that is retried as infrastructure, not recorded as a failure.`,
+  ].filter(Boolean).join("\n");
+}
+
+/** The sync lane's objective: merge the target's new commits into spec-integration, run the suite, never push. */
+export function syncObjective(spec, { targetSha, integrationBranch, baseline }) {
+  const targetRef = `${spec.target.remote}/${spec.target.branch}`;
+  return [
+    `${targetRef} gained commits that ${integrationBranch} lacks (pushed to it directly), so the next push can not fast-forward. Merge them in: this worktree is on ${integrationBranch}; run git merge --no-ff -m "${specCommitMessage("sync", `merge ${spec.target.branch}`)}" ${targetSha} and resolve any conflicts, keeping both sides' intent (the integrated spec items and the direct commits).`,
+    spec.target.suite.length ? `Run the full suite: ${spec.target.suite.join("; ")}.` : "",
+    LONG_COMMANDS,
+    spec.target.suite.length ? LANE_DATABASE_RULE : "",
+    spec.target.suite.length ? baselineNote(baseline?.failures, baseline?.sha ?? "") : "",
+    `Commit the merge on ${integrationBranch} with the repository's hooks. Local only: never push, never force, and never touch any other branch.`,
+    `Never leave ${integrationBranch} half-merged or staged: if you stop before committing, run git merge --abort so the worktree is clean.`,
+    "Never use git stash (it is shared by every worktree of the repository).",
+    "Finish with herdr_complete. The summary starts with two lines, INTEGRATED: <full 40-character SHA of the merge commit> and SUITE: pass or SUITE: fail, then the FAILED lines, the conflicts you resolved and how.",
   ].filter(Boolean).join("\n");
 }
 
