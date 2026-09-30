@@ -3728,7 +3728,7 @@ function specWaiting(manifestPath, manifest, liveStatus) {
  * Operator messages (docs/OPERATOR-MESSAGES.md) waiting for their target:
  * the same live, idle, never-retype rules as root-to-lane delivery.
  */
-export async function deliverOperatorQueue({ herdr, storePath, timestamp = now() } = {}) {
+export async function deliverOperatorQueue({ herdr, storePath, timestamp = now(), deferRootPanes = new Set() } = {}) {
   // Loaded on use: the supervisor starts and runs without it.
   const { deliverOperatorMessages, operatorStorePath, withOperatorStore } = await import("../herdr-tools/operator.mjs");
   storePath ??= operatorStorePath();
@@ -3737,6 +3737,7 @@ export async function deliverOperatorQueue({ herdr, storePath, timestamp = now()
   return withOperatorStore(storePath, (store) =>
     deliverOperatorMessages(store, {
       at: timestamp,
+      defer: (target) => target?.kind === "root" && deferRootPanes.has(target.paneId),
       ready: (paneId, expected) => agentReadyForSend(herdr, paneId, expected),
       prompt: async (paneId, text) => {
         try {
@@ -3835,7 +3836,7 @@ function rootAgentIdentityMatches(raw, root) {
 async function watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun, goal }) {
   const root = orchestrator.root;
   const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
-  if (parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt")) {
+  if (goal.status === "parked" || (parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"))) {
     let changed = false;
     if (goal.status !== "completed" && goal.status !== "parked") {
       goal.status = "parked";
@@ -3862,8 +3863,10 @@ async function watchRootHealth({ api, orchestrator, manifest, manifestPath, conf
     if (!rootAgentIdentityMatches(info, root)) return false;
   } catch (error) {
     if (!(error instanceof HerdrApiError)) return false;
-    if (["pane_not_found", "agent_pane_not_found"].includes(error.code)) paneGone = true;
-    else if (["agent_not_found", "agent_not_running"].includes(error.code)) {
+    if (["pane_not_found", "agent_pane_not_found", "agent_not_found", "agent_not_running"].includes(error.code)) {
+      // agent.get can be stale or scoped to the wrong registry. Its not-found
+      // response is only a candidate; the exact configured pane/workspace must
+      // independently confirm absence before the root can be considered gone.
       const exists = await rootPaneProbe(api, root);
       if (exists === false) paneGone = true;
       else if (exists !== true) return false;
@@ -4021,6 +4024,7 @@ export async function runSupervisorTick({
   const api = herdr ?? new JsonLineHerdrClient();
   const results = [];
   const pendingWakes = [];
+  const parkedRootPanes = new Set();
   const seenManifests = new Set();
   for (const entry of configuredParentManifests(config)) {
     const { orchestrator, manifestPath, workflows } = entry;
@@ -4048,6 +4052,7 @@ export async function runSupervisorTick({
       const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
       const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
       if (goal?.status === "parked" || hasParkedRootMarker) {
+        if (typeof orchestrator.root?.pane_id === "string") parkedRootPanes.add(orchestrator.root.pane_id);
         let changed = false;
         if (hasParkedRootMarker && goal && goal.status !== "completed" && goal.status !== "parked") {
           goal.status = "parked";
@@ -4562,8 +4567,8 @@ export async function runSupervisorTick({
     const { operatorStorePath } = await import("../herdr-tools/operator.mjs");
     const { resolveAgentPrompts } = await import("./blocked-lane.mjs");
     // Registered agents' due prompt defaults first; their messages then go out.
-    await resolveAgentPrompts({ herdr: api, storePath: operatorStorePath(), timestamp });
-    operator = await deliverOperatorQueue({ herdr: api, timestamp });
+    await resolveAgentPrompts({ herdr: api, storePath: operatorStorePath(), timestamp, deferPaneIds: parkedRootPanes });
+    operator = await deliverOperatorQueue({ herdr: api, timestamp, deferRootPanes: parkedRootPanes });
   } catch {
     operator = [];
   }

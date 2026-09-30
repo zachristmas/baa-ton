@@ -298,7 +298,9 @@ function hasOwnedProcess(workflow, processRows) {
 
 /** Archive only this root's unreferenced, settled workflows after the parked grace. */
 export async function archiveParkedWorkflows({ manifest, orchestrator, manifestPath, parkedAt, timestamp, persist = async () => {}, processTable = readProcessTable, keepRecent = 100 } = {}) {
-  if (!parkedAt || Date.parse(timestamp) - Date.parse(parkedAt) < ROOT_PARK_ARCHIVE_DELAY_MS) return [];
+  const parkedAtMs = typeof parkedAt === "string" && parkedAt.trim() ? Date.parse(parkedAt) : Number.NaN;
+  const timestampMs = typeof timestamp === "string" && timestamp.trim() ? Date.parse(timestamp) : Number.NaN;
+  if (!Number.isFinite(parkedAtMs) || !Number.isFinite(timestampMs) || timestampMs - parkedAtMs < ROOT_PARK_ARCHIVE_DELAY_MS) return [];
   const ids = rootWorkflowIds(manifest, orchestrator);
   const scope = { ...manifest, workflows: (manifest.workflows ?? []).filter((workflow) => ids.has(workflow.id)) };
   const stateDir = dirname(manifestPath);

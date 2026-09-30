@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { HerdrApiError, runRootWatch, runSupervisorTick } from "../controller.mjs";
 import { ROOT_DEAD_CONFIRM_MS, ROOT_DRIFT_ADOPT_MS, ROOT_GONE_GRACE_MS, ROOT_PARK_ARCHIVE_DELAY_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "../root-watch.mjs";
+import { classifyScreen } from "../blocked-lane.mjs";
 import { archiveParkedWorkflows, parkedFinishedLanes, retireParkedFinishedLanes } from "../parked-maintenance.mjs";
 
 const T0 = Date.parse("2026-09-29T08:00:00.000Z");
@@ -48,6 +49,7 @@ async function project({ root = ROOT, parentGoal = goal(), items = { D01: "done"
     stateDir,
     projectDir,
     manifestPath,
+    storePath,
     id,
     manifest: async () => JSON.parse(await readFile(manifestPath, "utf8")),
     config: async () => JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")),
@@ -443,6 +445,110 @@ test("a recovered and re-parked root starts a fresh archive grace period instead
   }
 });
 
+test("agent.get not-found is only a candidate: exact pane/workspace corroboration decides gone versus present or unknown", async () => {
+  const matchingPane = async (_method, params) => {
+    assert.equal(params.target, ROOT.pane_id);
+    return { type: "pane_info", pane: { pane_id: ROOT.pane_id, workspace_id: ROOT.workspace_id } };
+  };
+  const present = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
+  try {
+    const api = herdr();
+    api.request = async (method, params = {}) => {
+      if (method === "agent.get") throw new HerdrApiError("pane_not_found", "agent lookup was stale");
+      if (method === "pane.get") return matchingPane(method, params);
+      throw new Error(`Unexpected Herdr method ${method}`);
+    };
+    await runRootWatch({ stateDir: present.stateDir, herdr: api, timestamp: at(0), notify: async () => undefined });
+    assert.equal((await present.manifest()).rootSupervision[0].rootHealth.status, "dead", "a corroborated-present pane with a stale not-found agent lookup is treated as agentless, not gone");
+    await runRootWatch({ stateDir: present.stateDir, herdr: api, timestamp: at(ROOT_GONE_GRACE_MS), notify: async () => undefined });
+    assert.equal((await present.manifest()).parentGoal.status, "active", "a present pane never parks as vanished");
+  } finally {
+    await present.cleanup();
+  }
+
+  for (const [name, paneLookup] of [
+    ["mismatched workspace", async (_method, params) => ({ type: "pane_info", pane: { pane_id: params.target, workspace_id: "w-other" } })],
+    ["unknown probe", async () => { throw new Error("pane probe unavailable"); }],
+  ]) {
+    const p = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
+    try {
+      const api = herdr();
+      api.request = async (method, params = {}) => {
+        if (method === "agent.get") throw new HerdrApiError("agent_pane_not_found", "candidate only");
+        if (method === "pane.get") return paneLookup(method, params);
+        throw new Error(`Unexpected Herdr method ${method}`);
+      };
+      await runRootWatch({ stateDir: p.stateDir, herdr: api, timestamp: at(10 * ROOT_GONE_GRACE_MS), notify: async () => undefined });
+      assert.equal((await p.manifest()).rootSupervision, undefined, `${name} fails closed instead of creating a gone episode`);
+    } finally {
+      await p.cleanup();
+    }
+  }
+
+  const gone = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
+  try {
+    const api = herdr();
+    api.request = async (method) => {
+      if (method === "agent.get") throw new HerdrApiError("pane_not_found", "candidate only");
+      if (method === "pane.get") throw new HerdrApiError("pane_not_found", "confirmed pane absence");
+      throw new Error(`Unexpected Herdr method ${method}`);
+    };
+    await runRootWatch({ stateDir: gone.stateDir, herdr: api, timestamp: at(0), notify: async () => undefined });
+    assert.equal((await gone.manifest()).rootSupervision[0].rootHealth.status, "gone", "matching structured pane absence corroborates the candidate");
+  } finally {
+    await gone.cleanup();
+  }
+});
+
+test("a status-only parked goal skips root probes and defers its global prompts and operator messages without blocking a live lane", async () => {
+  const p = await project({ parentGoal: goal({ status: "parked", supervisor: "running" }) });
+  const screen = `\n Which checks should run before the merge?\n\n ❯ 1. Unit tests (Recommended)\n   2. Skip checks\n\n Enter to select · Esc to cancel\n`;
+  const promptRecord = (id, agent, paneId, agentKind) => ({ id, agent, paneId, agentKind, kind: "question", fingerprint: classifyScreen(screen).fingerprint, summary: "synthetic question", options: [], approveKeys: ["1"], denyKeys: ["esc"], at: at(-20_000), defaultAt: at(-10_000), default: { decision: "granted", keys: ["1"], reason: "synthetic default" } });
+  const pendingMessage = (id, target, resolved) => ({ id, from: "operator", target, resolved, text: "Continue.", createdAt: at(-20_000), delivery: { status: "pending", attempts: 0, updatedAt: at(-20_000) }, replies: [] });
+  const store = {
+    version: 1,
+    agents: { "lane-admin": { paneId: "w9:p9", workspaceId: "w9", agentKind: "claude" } },
+    prompts: [promptRecord("prompt-root", "parked-root", ROOT.pane_id, "pi"), promptRecord("prompt-lane", "lane-admin", "w9:p9", "claude")],
+    messages: [
+      pendingMessage("op-root", "root:cic", { kind: "root", label: "root:cic", paneId: ROOT.pane_id, workspaceId: ROOT.workspace_id, agentKind: "pi" }),
+      pendingMessage("op-lane", "lane-admin", { kind: "agent", label: "agent:lane-admin", paneId: "w9:p9", workspaceId: "w9", agentKind: "claude" }),
+    ],
+  };
+  await writeFile(p.storePath, JSON.stringify(store));
+  const requests = [];
+  const sent = [];
+  const keys = [];
+  const api = {
+    async request(method, params = {}) {
+      requests.push([method, params.target]);
+      assert.notEqual(params.target, ROOT.pane_id, "parked roots receive no global prompt or queue probes");
+      if (method === "agent.get") return { type: "agent_info", agent: { pane_id: "w9:p9", workspace_id: "w9", agent: "claude", agent_status: "idle", interactive_ready: true } };
+      if (method === "agent.read") return { type: "pane_read", read: { pane_id: "w9:p9", text: screen } };
+      if (method === "agent.prompt") { sent.push(params); return {}; }
+      throw new Error(`Unexpected Herdr method ${method}`);
+    },
+    async processInfo() { return { result: { process_info: { shell_pid: 1, foreground_processes: [{ pid: 99 }] } } }; },
+    async sendKeys(paneId, pressed) { keys.push({ paneId, keys: pressed }); },
+  };
+  try {
+    await runRootWatch({ stateDir: p.stateDir, herdr: api, timestamp: at(0), notify: async () => assert.fail("parked goal must not be probed") });
+    assert.deepEqual(requests, [], "status alone makes the root watch skip probes even without rootParkedAt");
+    assert.equal((await p.manifest()).rootSupervision, undefined, "watching a status-only parked root creates no marker");
+
+    await runSupervisorTick({ stateDir: p.stateDir, herdr: api, timestamp: at(0) });
+    const saved = await p.store();
+    assert.equal(saved.prompts.find((item) => item.id === "prompt-root").applied, undefined, "the due root prompt remains queued");
+    assert.ok(saved.prompts.find((item) => item.id === "prompt-lane").applied, "a live lane's due prompt still resolves");
+    assert.deepEqual(keys, [{ paneId: "w9:p9", keys: ["1"] }]);
+    assert.equal(saved.messages.find((item) => item.id === "op-root").delivery.status, "pending", "the parked root message remains pending without a changed reason or timestamp");
+    assert.equal(saved.messages.find((item) => item.id === "op-root").delivery.updatedAt, at(-20_000));
+    assert.equal(saved.messages.find((item) => item.id === "op-lane").delivery.status, "delivered", "other live targets still receive messages");
+    assert.deepEqual(sent.map((item) => item.target), ["w9:p9"]);
+  } finally {
+    await p.cleanup();
+  }
+});
+
 test("stale-but-live roots and ambiguous pane identities fail closed instead of being parked", async () => {
   const p = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
   const live = herdr({ agent: { agent: "pi", name: "w2J:p1", agent_status: "working" } });
@@ -459,6 +565,31 @@ test("stale-but-live roots and ambiguous pane identities fail closed instead of 
     };
     await runRootWatch({ stateDir: p.stateDir, herdr: absentAgent, timestamp: at(10 * ROOT_GONE_GRACE_MS), notify: async () => undefined });
     assert.equal((await p.manifest()).rootSupervision, undefined, "mismatched pane identity gives no authority to park");
+  } finally {
+    await p.cleanup();
+  }
+});
+
+test("parked archival rejects missing, malformed, and future parked timestamps and malformed current timestamps", async () => {
+  const p = await project();
+  const workflowId = "herdr-timeguard1";
+  const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS), lanes: [] };
+  const manifest = { workflows: [workflow], rootSupervision: [{ rootId: p.id, rootParkedAt: at(0) }] };
+  const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: workflowId }] };
+  const archivePath = join(dirname(p.manifestPath), "archive", `workflows-${at(2 * ROOT_PARK_ARCHIVE_DELAY_MS).slice(0, 7)}.jsonl`);
+  const archive = (parkedAt, timestamp) => archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt, timestamp, persist: async () => undefined, processTable: async () => [], keepRecent: 0 });
+  try {
+    for (const [label, parkedAt, timestamp] of [
+      ["missing parked timestamp", undefined, at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["empty parked timestamp", "", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["malformed parked timestamp", "not-a-date", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["future parked timestamp", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS + 1), at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["malformed current timestamp", at(0), "not-a-date"],
+    ]) {
+      assert.deepEqual(await archive(parkedAt, timestamp), [], `${label} fails closed`);
+      assert.deepEqual(manifest.workflows.map((item) => item.id), [workflowId]);
+    }
+    await assert.rejects(readFile(archivePath), { code: "ENOENT" }, "invalid timestamps never create an archive");
   } finally {
     await p.cleanup();
   }
