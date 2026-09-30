@@ -167,6 +167,32 @@ test("generated Windows inventory normalizes raw CIM timezone fixtures invariant
   assert.deepEqual(outputs[0], outputs[1]);
 });
 
+test("duplicate Windows CIM PID identities fail preflight before the stop script can signal", async (t) => {
+  let inventory;
+  await readProcessTable({ platform: "win32", runPowerShell: async (script) => { inventory = script; return "[]"; } });
+  const fixtures = [
+    { ProcessId: 990, ParentProcessId: 1, CreationDate: "20260927031530.123456+000", CommandLine: `node BAA_STARTUP_INTENT=${INTENT}` },
+    { ProcessId: 990, ParentProcessId: 1, CreationDate: "20260927031630.123456+000", CommandLine: "reused pid fixture" },
+  ];
+  const encodedFixtures = Buffer.from(JSON.stringify(fixtures)).toString("base64");
+  const prelude = `[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('de-DE'); ` +
+    `$script:fixtureRows = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedFixtures}')) | ConvertFrom-Json; ` +
+    `function Get-CimInstance { param([string]$ClassName); $script:fixtureRows }; `;
+  const result = runPowerShellFixture(`${prelude}\n${inventory}`, { timezone: "America/Los_Angeles" });
+  if (!requirePowerShell(t, result)) return;
+  assert.equal(result.status, 0, result.stderr);
+  const rows = parseWindowsProcessTable(result.stdout);
+  assert.deepEqual(rows.map(({ pid }) => pid), [990, 990], "the actual inventory script preserves both duplicate PID rows for safety preflight");
+  assert.notEqual(rows[0].createdAt, rows[1].createdAt);
+  let signals = 0;
+  await assert.rejects(killLaneProcesses({
+    platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 990, createdAt: rows[0].createdAt }],
+    table: async () => rows,
+    runPowerShell: async () => { signals += 1; },
+  }), /recorded process PID 990 is ambiguous/);
+  assert.equal(signals, 0, "ambiguous duplicate PID identities must block before any stop/signal script executes");
+});
+
 test("generated Windows stop script holds and verifies all fake handles before any signal", async (t) => {
   const rows = [
     { pid: 700, ppid: 1, createdAt: "2026-09-27T03:15:30.1234560Z", line: "claude" },
