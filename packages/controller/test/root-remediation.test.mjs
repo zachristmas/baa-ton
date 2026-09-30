@@ -348,13 +348,56 @@ test("only a structurally missing pane parks a root after grace; parked goals st
     const tick = await runSupervisorTick({ stateDir: p.stateDir, herdr: api, timestamp: at(ROOT_GONE_GRACE_MS + 10 * 60_000) });
     assert.equal(tick.results[0].status, "goal-parked");
     assert.equal(api.prompts.length, 0, "there is no nudge or digest prompt after parking");
-    assert.equal((await p.manifest()).parentGoal.status, "parked");
+    manifest = await p.manifest();
+    assert.equal(manifest.parentGoal.status, "parked");
+    assert.equal(manifest.parentGoal.supervisor.state, "stopped", "a stopped parked supervisor cannot auto-resume");
+    assert.equal(manifest.parentGoal.supervisor.nextNudgeAt, null);
+    assert.equal(manifest.rootSupervision[0].rootParkedAt, at(ROOT_GONE_GRACE_MS));
 
     api.agent = { agent: "pi", name: "w2J:p1", agent_status: "idle" };
     await watch(ROOT_GONE_GRACE_MS + 20 * 60_000);
     manifest = await p.manifest();
     assert.equal(manifest.parentGoal.status, "parked", "a live-looking return does not bypass bootstrap/start");
+    assert.equal(manifest.parentGoal.supervisor.state, "stopped", "recovery proof is required before supervision restarts");
+    assert.equal(manifest.parentGoal.supervisor.nextNudgeAt, null);
     assert.equal(manifest.rootSupervision[0].rootParkedAt, at(ROOT_GONE_GRACE_MS));
+  } finally {
+    await p.cleanup();
+  }
+});
+
+test("a recovered and re-parked root starts a fresh archive grace period instead of inheriting its old parkedAt", async () => {
+  const recoveryOffset = 3 * ROOT_PARK_ARCHIVE_DELAY_MS;
+  const repParkAt = at(recoveryOffset + ROOT_GONE_GRACE_MS);
+  const workflowId = "herdr-b2c3d4e5";
+  const p = await project({ parentGoal: goal({ status: "parked", supervisor: "stopped" }) });
+  const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS - 60_000), lanes: [] };
+  const manifest = await p.manifest();
+  manifest.workflows = [workflow];
+  manifest.rootSupervision = [{ rootId: p.id, rootParkedAt: at(0), rootHealth: { status: "gone", since: at(0) } }];
+  // Synthetic post-start snapshot: start is the authorized path that clears both parked markers.
+  manifest.parentGoal.status = "active";
+  manifest.parentGoal.supervisor.state = "running";
+  manifest.parentGoal.supervisor.nextNudgeAt = at(recoveryOffset + 60_000);
+  delete manifest.rootSupervision[0].rootParkedAt;
+  delete manifest.rootSupervision[0].rootHealth;
+  await writeFile(p.manifestPath, JSON.stringify(manifest));
+  const api = herdr({ agent: null, paneExists: false });
+  const watch = (ms) => runRootWatch({ stateDir: p.stateDir, herdr: api, timestamp: at(ms), notify: async () => undefined, paneRun: async () => assert.fail("a missing pane is never relaunched") });
+  const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: workflowId }] };
+  try {
+    await watch(recoveryOffset);
+    assert.equal((await p.manifest()).rootSupervision[0].rootParkedAt, undefined, "the second gone episode gets its own confirmation grace");
+    await watch(recoveryOffset + ROOT_GONE_GRACE_MS - 1);
+    assert.equal((await p.manifest()).parentGoal.status, "active");
+    await watch(recoveryOffset + ROOT_GONE_GRACE_MS);
+    const parkedAgain = await p.manifest();
+    assert.equal(parkedAgain.parentGoal.status, "parked");
+    assert.equal(parkedAgain.rootSupervision[0].rootParkedAt, repParkAt, "re-parking timestamps the new episode");
+    const archive = (timestampOffset) => archiveParkedWorkflows({ manifest: parkedAgain, orchestrator, manifestPath: p.manifestPath, parkedAt: parkedAgain.rootSupervision[0].rootParkedAt, timestamp: at(timestampOffset), persist: async () => undefined, processTable: async () => [], keepRecent: 0 });
+    assert.deepEqual(await archive(recoveryOffset + ROOT_GONE_GRACE_MS + ROOT_PARK_ARCHIVE_DELAY_MS - 1), [], "the old timestamp cannot expire this episode's archive grace");
+    assert.deepEqual(parkedAgain.workflows.map((item) => item.id), [workflowId]);
+    assert.deepEqual(await archive(recoveryOffset + ROOT_GONE_GRACE_MS + ROOT_PARK_ARCHIVE_DELAY_MS), [workflowId]);
   } finally {
     await p.cleanup();
   }
@@ -386,11 +429,13 @@ test("parked archival fails closed on corrupt, unreadable, or malformed spec sta
   const archivePath = (p) => join(dirname(p.manifestPath), "archive", `workflows-${at(2 * ROOT_PARK_ARCHIVE_DELAY_MS).slice(0, 7)}.jsonl`);
   const makeEligible = async () => {
     const p = await project();
-    const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS - 60_000), lanes: [] };
+    const recordedFile = join(dirname(p.manifestPath), "synthetic.intent");
+    await writeFile(recordedFile, "synthetic launch record");
+    const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS - 60_000), lanes: [{ id: "lane-gone", status: "gone", startupIntentPath: recordedFile }] };
     const manifest = { workflows: [workflow], leases: [], queue: [], directives: [], rootSupervision: [{ rootId: p.id, rootParkedAt: at(0) }] };
     await writeFile(p.manifestPath, JSON.stringify(manifest));
     const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: workflowId }] };
-    return { p, manifest, orchestrator, specStatePath: join(dirname(p.manifestPath), "spec-state.json"), alternateSpecStatePath: join(dirname(dirname(p.manifestPath)), "spec-state.json"),
+    return { p, manifest, orchestrator, recordedFile, specStatePath: join(dirname(p.manifestPath), "spec-state.json"), alternateSpecStatePath: join(dirname(dirname(p.manifestPath)), "spec-state.json"),
       archive: () => archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt: at(0), timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS), persist: async () => undefined, processTable: async () => [], keepRecent: 0 }) };
   };
   for (const [kind, prepare] of [
@@ -403,6 +448,7 @@ test("parked archival fails closed on corrupt, unreadable, or malformed spec sta
       await prepare(setup);
       assert.deepEqual(await setup.archive(), [], `${kind} spec state makes selection fail closed`);
       assert.deepEqual(setup.manifest.workflows.map((workflow) => workflow.id), [workflowId], `${kind} spec state keeps its live manifest record`);
+      assert.equal(await readFile(setup.recordedFile, "utf8"), "synthetic launch record", `${kind} spec state cannot delete a recorded workflow file`);
       await assert.rejects(readFile(archivePath(setup.p)), { code: "ENOENT" }, `${kind} spec state writes no archive record`);
     } finally {
       await setup.p.cleanup();
@@ -414,6 +460,7 @@ test("parked archival fails closed on corrupt, unreadable, or malformed spec sta
     await writeFile(valid.specStatePath, JSON.stringify({ version: 1, items: { D01: { state: "pending", workflowId } } }));
     assert.deepEqual(await valid.archive(), [], "a valid open spec pointer protects its workflow");
     assert.deepEqual(valid.manifest.workflows.map((workflow) => workflow.id), [workflowId]);
+    assert.equal(await readFile(valid.recordedFile, "utf8"), "synthetic launch record");
     await assert.rejects(readFile(archivePath(valid.p)), { code: "ENOENT" });
   } finally {
     await valid.p.cleanup();
@@ -424,6 +471,7 @@ test("parked archival fails closed on corrupt, unreadable, or malformed spec sta
     await rm(absent.specStatePath, { force: true });
     assert.deepEqual(await absent.archive(), [workflowId], "genuinely absent optional spec state preserves no-spec archival");
     assert.deepEqual(absent.manifest.workflows, []);
+    await assert.rejects(readFile(absent.recordedFile), { code: "ENOENT" }, "successful no-spec archival still removes recorded files");
     assert.match(await readFile(archivePath(absent.p), "utf8"), new RegExp(workflowId));
   } finally {
     await absent.p.cleanup();
