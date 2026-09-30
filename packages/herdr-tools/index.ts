@@ -136,7 +136,7 @@ import {
   type LaneRequest,
   type LaneRequestKind,
 } from "./lane-requests.js";
-const { rootRecoveryPlan, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } = (await freshImport("./root-recovery.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-recovery.mjs");
+const { rootRecoveryPlan, rootOwnedWorkflowIds, reconcileRetiredLaneRecords, recoveryHash, readRecoveryFiles, assertNoPendingRecovery, commitRootRecovery } = (await freshImport("./root-recovery.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./root-recovery.mjs");
 const { applyHerdrIdentity, currentAppliedHerdrIdentity, resolveHerdrIdentity } = (await freshImport("./live-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./live-identity.mjs");
 const { legacyStateStatus } = (await freshImport("./state-migration.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./state-migration.mjs");
 const { classifyDevStack, classifyLocalValidation } = (await freshImport("./known-safe.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./known-safe.mjs");
@@ -4606,12 +4606,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   function retireCandidates(
     cwd: string,
     manifest: ManifestWithQueue,
-    options: { auto: boolean; workflowId?: string; laneId?: string; rootPaneId?: string; force?: boolean },
+    options: { auto: boolean; workflowId?: string; workflowIds?: Set<string>; laneId?: string; rootPaneId?: string; force?: boolean },
   ): RetireCandidate[] {
     const policy = acknowledgedPolicy(cwd, manifest.approvalPolicyAck);
     const candidates: RetireCandidate[] = [];
     for (const workflow of manifest.workflows as WorkflowWithRequests[]) {
       if (options.workflowId && workflow.id !== options.workflowId) continue;
+      if (options.workflowIds && !options.workflowIds.has(workflow.id)) continue;
       if (options.rootPaneId && workflow.taskBinding?.rootPaneId !== options.rootPaneId) continue;
       if (workflow.ownership?.createdBy !== OWNER) continue;
       for (const lane of workflow.lanes) {
@@ -6399,7 +6400,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
    * retire lanes whose completion the root has received, when the
    * acknowledged policy grants retire and the lane agent is no longer
    * working. Never throws into the Pi lifecycle. */
-  async function autoRetireFinishedLanes(ctx: ExtensionContext): Promise<void> {
+  async function autoRetireFinishedLanes(ctx: ExtensionContext, options: { workflowIds?: string[] } = {}): Promise<void> {
     try {
       if (!isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return;
       const manifest = await loadManifest(ctx.cwd);
@@ -6410,7 +6411,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       if (refusal && refusal !== "no approvalPolicy is configured") return;
       const candidates = retireCandidates(ctx.cwd, manifest, {
         auto: true,
-        rootPaneId: process.env[HERDR_PANE_ID_ENV],
+        ...(options.workflowIds ? { workflowIds: new Set(options.workflowIds) } : { rootPaneId: process.env[HERDR_PANE_ID_ENV] }),
       });
       for (const candidate of candidates) {
         if (candidate.paneId) {
@@ -6436,7 +6437,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
   /** Archive finished workflows out of the live manifest, delete the files they
    * left, and prune launch scratch no live process uses. Throttled; never throws
    * into the Pi lifecycle; touches no lane that can still run and no Git state. */
-  async function housekeepOrchestratorState(ctx: ExtensionContext, { force = false }: { force?: boolean } = {}) {
+  async function housekeepOrchestratorState(ctx: ExtensionContext, { force = false, workflowIds }: { force?: boolean; workflowIds?: string[] } = {}) {
     const empty = { forced: force, archivedWorkflowIds: [] as string[], removedWorkflowFiles: 0, removedScratchFiles: 0 };
     try {
       if (process.env.BAA_TON_HOUSEKEEPING === "0") return { ...empty, skipped: "disabled by BAA_TON_HOUSEKEEPING=0" };
@@ -6454,7 +6455,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       await withManifestTransaction(ctx.cwd, (manifest) => {
         const wide = manifest as unknown as Record<string, unknown>;
         const protectedIds = mentionedWorkflowIds(Array.from(liveSpecWorkflowIds(specState)), wide.queue, wide.directives, wide.rootSupervision, activeLeases(manifest.leases));
-        const ids = archivableWorkflows(manifest, { protectedIds });
+        const scopedManifest = workflowIds
+          ? { ...manifest, workflows: manifest.workflows.filter((workflow) => workflowIds.includes(workflow.id)) }
+          : manifest;
+        const ids = archivableWorkflows(scopedManifest, { protectedIds });
         if (!ids.size) return;
         const leaving = manifest.workflows.filter((workflow) => ids.has(workflow.id));
         // Written before they leave the manifest; a failure throws and keeps them.
@@ -6465,8 +6469,8 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const removedWorkflowFiles = removed.length
         ? removeFiles(removed.flatMap((workflow) => workflowFiles(workflow, stateDir)))
         : 0;
-      const table = await readProcessTable().catch(() => []);
-      const scratchCandidates = staleScratch({
+      const table = workflowIds ? [] : await readProcessTable().catch(() => []);
+      const scratchCandidates = workflowIds ? [] : staleScratch({
         names: scratchNames(stateDir),
         mtimeOf: mtimeIn(stateDir),
         liveCommandLines: table.map((row) => row.line),
@@ -6476,6 +6480,35 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     } catch (error) {
       return { ...empty, error: clip(error instanceof Error ? error.message : String(error), 500) };
     }
+  }
+
+  /** Reconcile only the recovered root's historical workflows after identity proof. */
+  async function reconcileRecoveredRootState(ctx: ExtensionContext, workflowIds: string[]) {
+    if (!workflowIds.length || !isRootOrchestrator() || !isRootForManifest(ctx.cwd)) return { skipped: "recovered root is not the verified project root" };
+    const selected = new Set(workflowIds);
+    await autoRetireFinishedLanes(ctx, { workflowIds });
+    const reconciliation = await withManifestTransaction(ctx.cwd, (manifest) => {
+      const result = reconcileRetiredLaneRecords(manifest, workflowIds);
+      const stamp = now();
+      const releasedLeaseIds: string[] = [];
+      for (const dead of result.provenDeadLanes) {
+        const released = releaseLeases(
+          manifest.leases,
+          (lease) => lease.workflowId === dead.workflowId && lease.laneId === dead.laneId && lease.kind !== "sequence",
+          "root recovery confirmed lane retired",
+          stamp,
+        );
+        const workflow = manifest.workflows.find((item) => item.id === dead.workflowId);
+        if (workflow && (released.length || result.reconciledLaneIds.includes(`${dead.workflowId}/${dead.laneId}`))) {
+          workflow.evidence.push({ at: stamp, kind: "root-recovery-lane-reconciled", text: `${dead.laneId}: retained retirement proof reconciled${released.length ? `; released ${released.length} lease(s)` : ""}.` });
+          workflow.updatedAt = stamp;
+        }
+        releasedLeaseIds.push(...released.map((lease) => lease.id));
+      }
+      return { reconciledLaneIds: result.reconciledLaneIds, releasedLeaseIds };
+    });
+    const housekeeping = await housekeepOrchestratorState(ctx, { force: true, workflowIds: [...selected] });
+    return { ...reconciliation, housekeeping };
   }
 
   async function retireTool(
@@ -7048,6 +7081,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     configPath: string;
     manifestPath: string;
     evidence: string[];
+    recovered?: boolean;
+    recoveryWorkflowIds?: string[];
+    recoveryPreviousPaneId?: string;
   }> {
     requireHerdr();
     const root = await currentPaneRoot(signal);
@@ -7167,6 +7203,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ? manifest.sessionLog
             : undefined);
         const expectedPersistence = rootSessionPersistence(nextRoot, rootAgent);
+        const sessionChanged = Boolean(currentSession?.sessionRef?.sessionId && expectedPersistence.sessionId && currentSession.sessionRef.sessionId !== expectedPersistence.sessionId);
+        const recoveryWorkflowIds = sessionChanged
+          ? rootOwnedWorkflowIds({ config: latestConfig, manifest, cwd, rootId: current.id })
+          : undefined;
         const sessionNeedsRefresh =
           !currentSession ||
           currentSession.paneId !== nextRoot.pane_id ||
@@ -7218,6 +7258,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
           previousRoot,
           configPath,
           manifestPath: manifestFile,
+          ...(sessionChanged ? { recovered: true, recoveryWorkflowIds, recoveryPreviousPaneId: current.root.pane_id } : {}),
           evidence: changes.length
             ? [`Reconciled current verified root ${current.id}: ${changes.join("; ")}.`]
             : [`Root ${current.id} identity is already current; no state changed.`],
@@ -7230,13 +7271,21 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     }
   }
 
-  /** Whether a root pane no longer holds any agent (Herdr answers agent_not_found). */
+  /** Only Herdr's structured not-found codes prove a root pane is gone. */
   async function rootPaneGone(paneId: string, signal?: AbortSignal): Promise<boolean> {
     try {
       await runHerdr(["agent", "get", paneId], signal);
       return false;
     } catch (error) {
-      return /agent_not_found|pane_not_found|\bnot found\b/i.test(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      const prefix = `herdr agent get ${paneId} failed: `;
+      if (!message.startsWith(prefix)) return false;
+      try {
+        const parsed = JSON.parse(message.slice(prefix.length));
+        return ["agent_not_found", "pane_not_found"].includes(parsed?.error?.code);
+      } catch {
+        return false;
+      }
     }
   }
 
@@ -7285,6 +7334,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       previousRoot: stale.root,
       configPath,
       manifestPath: manifestFile,
+      recovered: true,
+      recoveryWorkflowIds: plan.workflowIds,
+      recoveryPreviousPaneId: stale.root.pane_id,
       evidence: [`Rebound root ${stale.id} to ${plan.newRootId} (${stale.root.pane_id} -> ${root.pane_id}): ${evidence}.`],
     };
   }
@@ -7391,11 +7443,34 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     ).agent;
     const resolvedCwd = resolve(cwd);
     const configPath = await controllerConfigPath(signal);
-    const config = await loadControllerConfig(configPath);
+    let config = await loadControllerConfig(configPath);
+    // Plain baa-ton-start goes through the same audited identity path as an
+    // explicit reconcile. Exact same-pane ownership handles a replaced native
+    // session; a renamed pane is eligible only when its sole gone project root
+    // has the same recorded native session.
+    if (!reset && config) {
+      const projectRoots = config.orchestrators.filter((record) => record.program.id !== "legacy-global" && rootOwnsManifest(record, cwd));
+      const samePane = projectRoots.filter((record) => record.root.pane_id === root.pane_id && record.root.workspace_id === root.workspace_id);
+      if (samePane.length > 1) throw new Error(`Current pane ${root.pane_id} has ambiguous project root mappings; bootstrap is refused.`);
+      let automaticRecovery = samePane.length === 1;
+      if (!automaticRecovery && projectRoots.length) {
+        const gone: ControllerOrchestrator[] = [];
+        for (const record of projectRoots) if (await rootPaneGone(record.root.pane_id, signal)) gone.push(record);
+        if (gone.length === 1) {
+          const manifest = await loadManifest(cwd);
+          const recorded = manifest.rootSessionLogs?.find((entry) => entry.rootId === gone[0].id)?.sessionRef;
+          const live = rootSessionPersistence(root, rootAgent);
+          automaticRecovery = Boolean(recorded?.sessionId && live.sessionId && recorded.sessionId === live.sessionId);
+        }
+      }
+      if (automaticRecovery) {
+        const reconciled = await reconcileRootIdentity(cwd, signal, ctx.sessionManager?.getSessionFile?.());
+        if (reconciled.recovered && reconciled.recoveryWorkflowIds) await reconcileRecoveredRootState(ctx, reconciled.recoveryWorkflowIds);
+        config = await loadControllerConfig(configPath);
+      }
+    }
     // One project, one orchestrator per root: a root whose pane is gone (a
-    // Herdr restart renames panes) is rebound by herdr_reconcile_root, never
-    // joined by a second orchestrator that leaves the supervisor and spec
-    // host targeting the dead pane.
+    // Herdr restart renames panes) is recovered here before any new claim.
     if (add && config)
       for (const record of config.orchestrators)
         if (
@@ -11960,11 +12035,11 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_reconcile_root",
     label: "Reconcile Herdr Root",
     description:
-      "Safely reconcile the current verified root pane's live harness identity in place without resetting or replacing any controller state.",
+      "Safely recover this project's exact prior root when its pane is gone with the same native session, or its registered pane now carries a new session; then reconcile only that root's finished lanes and eligible old workflows. Fails closed on ambiguous identity and preserves concurrent roots and historical task bindings.",
     promptSnippet:
       "Repair a stale root harness identity from the affected live Herdr pane.",
     promptGuidelines: [
-      "Use herdr_reconcile_root only from the affected live root pane after herdr_doctor reports root identity drift. It updates that exact pane/workspace mapping and durable root session snapshots only; it never resets a root, changes workflows, or repairs a different pane.",
+      "Use herdr_reconcile_root only from the affected live root pane after herdr_doctor reports root identity drift. It rebinds only a proven prior project root, preserves concurrent roots and historical task bindings, then reconciles that root's eligible finished lanes and old workflows.",
     ],
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_id, _params, signal, _update, ctx) {
@@ -11973,6 +12048,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         signal,
         ctx.sessionManager?.getSessionFile?.(),
       );
+      const recovery = result.recovered && result.recoveryWorkflowIds
+        ? await reconcileRecoveredRootState(ctx, result.recoveryWorkflowIds)
+        : undefined;
       return {
         content: [
           {
@@ -11980,7 +12058,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             text: result.evidence.join(" "),
           },
         ],
-        details: result,
+        details: { ...result, ...(recovery ? { recovery } : {}) },
       };
     },
   });

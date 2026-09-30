@@ -1,5 +1,17 @@
 export function recoveryHash(value: string): string;
 
+export function rootOwnedWorkflowIds(input: {
+  config: any;
+  manifest: any;
+  cwd: string;
+  rootId: string;
+}): string[];
+
+export function reconcileRetiredLaneRecords(
+  manifest: any,
+  workflowIds: string[],
+): { provenDeadLanes: Array<{ workflowId: string; laneId: string }>; reconciledLaneIds: string[] };
+
 export type RootRecoveryPlan = {
   oldRootId: string;
   newRootId: string;

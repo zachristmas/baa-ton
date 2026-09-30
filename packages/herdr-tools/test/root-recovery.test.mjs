@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
-import { rootRecoveryPlan, commitRootRecovery, assertNoPendingRecovery } from '../root-recovery.mjs';
+import { rootRecoveryPlan, rootOwnedWorkflowIds, reconcileRetiredLaneRecords, commitRootRecovery, assertNoPendingRecovery } from '../root-recovery.mjs';
 const require = createRequire(import.meta.url);
 const { default: extension } = await require('jiti')(import.meta.url).import('../index.ts');
 const root = (pane, workspace) => ({ target: pane, target_kind: 'pane_id', pane_id: pane, workspace_id: workspace, agent_kind: 'pi' });
@@ -38,6 +38,37 @@ async function fixture(t) {
   await writeFile(manifestPath, before.manifest, { mode: 0o600 });
   return { cwd, configDir, configPath, manifestPath, before, config, manifest, oldRootId: 'old-root', root: current, session, liveWorkspaceIds: ['w-new', 'w-other'], auditDir: join(cwd, '.baa-ton/herdr-orchestrator/root-recovery') };
 }
+
+test('recovery scopes cleanup to the exact registered root and adopts its unfinished goal', async t => {
+  const f = await fixture(t);
+  f.manifest.workflows.push({ id: 'herdr-other', status: 'completed', taskBinding: { rootPaneId: 'w-other:p1', workspaceId: 'w-other' }, lanes: [] });
+  assert.deepEqual(rootOwnedWorkflowIds({ config: f.config, manifest: f.manifest, cwd: f.cwd, rootId: f.oldRootId }), ['herdr-done', 'herdr-unused']);
+  const plan = rootRecoveryPlan(f);
+  assert.equal(plan.manifest.parentGoals[plan.newRootId].objective, 'old goal');
+  assert.equal(plan.manifest.workflows.find(flow => flow.id === 'herdr-other').taskBinding.rootPaneId, 'w-other:p1');
+});
+
+test('running lanes reconcile only from durable retirement proof; those lanes alone prove dead for lease release', () => {
+  const manifest = { workflows: [
+    { id: 'herdr-owned', lanes: [
+      { id: 'retired', status: 'running', completionReceipt: { id: 'r', summary: 'done' }, retirement: { status: 'retired', tabClosed: true }, sessionLog: { status: 'retired' } },
+      { id: 'uncertain', status: 'running', completionReceipt: { id: 'r2', summary: 'done' }, retirement: { status: 'retired', tabClosed: false }, sessionLog: { status: 'retired' } },
+      { id: 'legacy-retired', status: 'running', retirement: { status: 'retired', tabClosed: true }, sessionLog: { status: 'retired' } },
+    ] },
+    { id: 'herdr-other', lanes: [{ id: 'other', status: 'running', completionReceipt: { id: 'r3', summary: 'done' }, retirement: { status: 'retired', tabClosed: true }, sessionLog: { status: 'retired' } }] },
+  ] };
+  const result = reconcileRetiredLaneRecords(manifest, ['herdr-owned']);
+  assert.deepEqual(result.reconciledLaneIds, ['herdr-owned/retired', 'herdr-owned/legacy-retired']);
+  assert.deepEqual(result.provenDeadLanes, [
+    { workflowId: 'herdr-owned', laneId: 'retired' },
+    { workflowId: 'herdr-owned', laneId: 'legacy-retired' },
+  ]);
+  assert.equal(manifest.workflows[0].lanes[0].status, 'completion-reported');
+  assert.equal(manifest.workflows[0].lanes[1].status, 'running');
+  assert.equal(manifest.workflows[0].lanes[2].status, 'done');
+  assert.equal(manifest.workflows[0].lanes[2].completionReceipt, undefined, 'no successful receipt is invented');
+  assert.equal(manifest.workflows[1].lanes[0].status, 'running');
+});
 
 test('migration preserves other roots, workflow provenance, receipts, queues and unknown metadata', async t => {
   const f = await fixture(t), original = structuredClone(f.manifest);
