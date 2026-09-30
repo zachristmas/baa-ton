@@ -73,7 +73,7 @@ const MAX_DIGEST_WINDOW_SECONDS = 3_600;
 const MAX_ESCALATE_MINUTES = 1_440;
 const ROOT_WATCH_INTERVAL_MS = 30_000;
 import { ROOT_GONE_GRACE_MS, ROOT_PARK_ARCHIVE_DELAY_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "./root-watch.mjs";
-import { archiveParkedWorkflows, retireParkedFinishedLanes } from "./parked-maintenance.mjs";
+import { archiveParkedWorkflows, canonicalIsoTimestamp, retireParkedFinishedLanes } from "./parked-maintenance.mjs";
 
 const execFileAsync = promisify(execFile);
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
@@ -4053,6 +4053,12 @@ export async function runSupervisorTick({
       const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
       if (goal?.status === "parked" || hasParkedRootMarker) {
         if (typeof orchestrator.root?.pane_id === "string") parkedRootPanes.add(orchestrator.root.pane_id);
+        const timestampMs = canonicalIsoTimestamp(timestamp);
+        const parkedAtMs = hasParkedRootMarker ? canonicalIsoTimestamp(parkedRoot.rootParkedAt) : undefined;
+        if (!Number.isFinite(timestampMs) || (hasParkedRootMarker && (!Number.isFinite(parkedAtMs) || timestampMs < parkedAtMs))) {
+          results.push({ manifestPath, status: goal?.status === "completed" ? "goal-completed-parked" : "goal-parked", reason: "invalid-parked-timestamp" });
+          continue;
+        }
         let changed = false;
         if (hasParkedRootMarker && goal && goal.status !== "completed" && goal.status !== "parked") {
           goal.status = "parked";

@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { HerdrApiError, runRootWatch, runSupervisorTick } from "../controller.mjs";
 import { ROOT_DEAD_CONFIRM_MS, ROOT_DRIFT_ADOPT_MS, ROOT_GONE_GRACE_MS, ROOT_PARK_ARCHIVE_DELAY_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "../root-watch.mjs";
 import { classifyScreen } from "../blocked-lane.mjs";
 import { archiveParkedWorkflows, parkedFinishedLanes, retireParkedFinishedLanes } from "../parked-maintenance.mjs";
+import { hermeticEnvironment } from "../../herdr-tools/test/support/run-hermetic.mjs";
 
 const T0 = Date.parse("2026-09-29T08:00:00.000Z");
 const at = (ms) => new Date(T0 + ms).toISOString();
@@ -60,6 +61,82 @@ async function project({ root = ROOT, parentGoal = goal(), items = { D01: "done"
       await rm(directory, { recursive: true, force: true });
     },
   };
+}
+
+async function withHermeticEnvironment(callback) {
+  const inherited = { ...process.env };
+  const isolated = hermeticEnvironment(inherited);
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, isolated);
+  try {
+    assert.equal(process.env.BAA_STARTUP_INTENT, undefined);
+    assert.equal(Object.keys(process.env).some((key) => /^(?:HERDR_|PI_)/.test(key)), false);
+    return await callback();
+  } finally {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, inherited);
+  }
+}
+
+async function parkedSupervisorFixture({ parkedAt, timestamp }) {
+  const p = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
+  const bound = { rootPaneId: ROOT.pane_id, workspaceId: ROOT.workspace_id };
+  const finished = {
+    id: "herdr-ffffffff", ownership: { createdBy: "herdr-orchestrator" }, taskBinding: bound,
+    status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS),
+    lanes: [{ id: "lane-finished", paneId: "w9:p1", workspaceId: "w9", tabId: "tab-finished", status: "completion-reported", completionReceipt: { summary: "done" } }],
+    laneServices: [
+      { id: "service-pane", laneId: "lane-finished", name: "pane-service", kind: "pane", paneId: "w9:service", state: "active" },
+      { id: "service-process", laneId: "lane-finished", name: "process-service", kind: "process", pid: 99999999, start: "never", state: "active" },
+    ], evidence: [],
+  };
+  const archivedTargetId = "herdr-00000001";
+  const archiveCandidates = Array.from({ length: 101 }, (_, index) => ({
+    id: `herdr-${(index + 1).toString(16).padStart(8, "0")}`,
+    ownership: { createdBy: "herdr-orchestrator" }, taskBinding: bound, status: "completed",
+    updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS - (index === 0 ? 120_000 : 60_000)), lanes: [],
+  }));
+  const manifest = await p.manifest();
+  manifest.workflows = [finished, ...archiveCandidates];
+  manifest.leases = [];
+  manifest.rootSupervision = [{ rootId: p.id, rootParkedAt: parkedAt }];
+  const policy = { version: 2, grants: ["retire"] };
+  manifest.approvalPolicyAck = { hash: createHash("sha256").update('{"grants":["retire"],"version":2}').digest("hex"), rootPaneId: ROOT.pane_id, ackedAt: at(0) };
+  await writeFile(p.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await mkdir(join(p.projectDir, ".baa-ton"), { recursive: true });
+  await writeFile(join(p.projectDir, ".baa-ton", "config.json"), JSON.stringify({ approvalPolicy: policy }));
+  const store = await p.store();
+  store.messages = [{ id: "op-parked", from: "operator", target: "root:cic", resolved: { kind: "root", label: "root:cic", paneId: ROOT.pane_id, workspaceId: ROOT.workspace_id, agentKind: "pi" }, text: "Continue.", createdAt: timestamp, delivery: { status: "pending", attempts: 0, updatedAt: timestamp }, replies: [] }];
+  await writeFile(p.storePath, JSON.stringify(store));
+
+  const binDir = join(p.stateDir, "test-bin");
+  await mkdir(binDir);
+  const tabLog = join(p.stateDir, "tab-calls.jsonl");
+  const processLog = join(p.stateDir, "process-calls.jsonl");
+  const shim = async (name, logPath) => {
+    const source = `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2) }) + ${JSON.stringify("\n")});\n`;
+    const path = join(binDir, name);
+    await writeFile(path, source);
+    await chmod(path, 0o755);
+  };
+  await shim("herdr", tabLog);
+  await shim("ps", processLog);
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+  const requests = [];
+  const processInfoCalls = [];
+  const api = {
+    async request(method, params = {}) {
+      requests.push([method, params.target]);
+      if (method === "pane.report_metadata") return { result: {} };
+      if (method === "agent.get") return { type: "agent_info", agent: { pane_id: params.target, workspace_id: "w9", agent_status: "done" } };
+      throw new Error(`Unexpected Herdr method ${method}`);
+    },
+    async processInfo(paneId) {
+      processInfoCalls.push(paneId);
+      return { process_info: { shell_pid: 10, foreground_processes: [] } };
+    },
+  };
+  return { p, finished, archivedTargetId, requests, processInfoCalls, tabLog, processLog, api, manifestBytes: await readFile(p.manifestPath, "utf8"), timestamp };
 }
 
 /** A Herdr with one agent in the root pane (agent: null for none), recording prompts. */
@@ -568,6 +645,63 @@ test("stale-but-live roots and ambiguous pane identities fail closed instead of 
   } finally {
     await p.cleanup();
   }
+});
+
+test("the supervisor validates parked timestamps before mutation or finished-lane retirement", async () => {
+  await withHermeticEnvironment(async () => {
+    for (const scenario of [
+      { name: "numeric-like parkedAt", parkedAt: "0", timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS) },
+      { name: "future parkedAt", parkedAt: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS + 1), timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS) },
+      { name: "invalid tick timestamp", parkedAt: at(0), timestamp: "not-a-date" },
+    ]) {
+      const fixture = await parkedSupervisorFixture(scenario);
+      try {
+        const tick = await runSupervisorTick({ stateDir: fixture.p.stateDir, configDir: fixture.p.stateDir, herdr: fixture.api, timestamp: scenario.timestamp });
+        assert.equal(tick.results[0].reason, "invalid-parked-timestamp", `${scenario.name} aborts this root's parked branch`);
+        assert.equal(await readFile(fixture.p.manifestPath, "utf8"), fixture.manifestBytes, `${scenario.name} leaves manifest bytes unchanged`);
+        assert.deepEqual(fixture.requests.filter(([method]) => method === "agent.get"), [], `${scenario.name} never checks or retires the eligible lane`);
+        assert.deepEqual(fixture.processInfoCalls, [], `${scenario.name} never stops a registered pane service`);
+        await assert.rejects(readFile(fixture.tabLog), { code: "ENOENT" }, `${scenario.name} never invokes tab close`);
+        await assert.rejects(readFile(fixture.processLog), { code: "ENOENT" }, `${scenario.name} never probes or signals a registered process`);
+        await assert.rejects(readdir(join(dirname(fixture.p.manifestPath), "archive")), { code: "ENOENT" }, `${scenario.name} writes no archive files`);
+        const queued = (await fixture.p.store()).messages.find((message) => message.id === "op-parked");
+        assert.equal(queued.delivery.status, "pending", `${scenario.name} does not lose the parked-root message`);
+        assert.equal(queued.delivery.updatedAt, scenario.timestamp, `${scenario.name} leaves the queued message untouched`);
+      } finally {
+        await fixture.p.cleanup();
+      }
+    }
+
+    const beforeGraceTimestamp = at(ROOT_PARK_ARCHIVE_DELAY_MS - 1);
+    const beforeGrace = await parkedSupervisorFixture({ parkedAt: at(0), timestamp: beforeGraceTimestamp });
+    try {
+      const tick = await runSupervisorTick({ stateDir: beforeGrace.p.stateDir, configDir: beforeGrace.p.stateDir, herdr: beforeGrace.api, timestamp: beforeGraceTimestamp });
+      assert.deepEqual(tick.results[0].archived ?? [], [], "archival waits for the full grace period");
+      assert.equal((await beforeGrace.p.manifest()).workflows.find((workflow) => workflow.id === beforeGrace.finished.id).lanes[0].retirement.status, "retired", "canonical past parkedAt still permits eligible lane retirement before archive grace");
+      await assert.rejects(readdir(join(dirname(beforeGrace.p.manifestPath), "archive")), { code: "ENOENT" });
+    } finally {
+      await beforeGrace.p.cleanup();
+    }
+
+    const validTimestamp = at(2 * ROOT_PARK_ARCHIVE_DELAY_MS);
+    const valid = await parkedSupervisorFixture({ parkedAt: at(0), timestamp: validTimestamp });
+    try {
+      const tick = await runSupervisorTick({ stateDir: valid.p.stateDir, configDir: valid.p.stateDir, herdr: valid.api, timestamp: validTimestamp });
+      assert.ok(tick.results[0].archived?.includes(valid.archivedTargetId), "canonical timing after the full grace permits archival");
+      const manifest = await valid.p.manifest();
+      assert.equal(manifest.parentGoal.status, "parked");
+      assert.equal(manifest.workflows.some((workflow) => workflow.id === valid.archivedTargetId), false);
+      assert.equal(manifest.workflows.find((workflow) => workflow.id === valid.finished.id).lanes[0].retirement.status, "retired", "canonical past parkedAt permits eligible lane retirement");
+      assert.match(await readFile(valid.tabLog, "utf8"), /tab.*close.*tab-finished/, "normal parked housekeeping closes the finished tab");
+      assert.match(await readFile(valid.processLog, "utf8"), /99999999/, "normal parked housekeeping checks the registered process identity");
+      assert.deepEqual(valid.processInfoCalls, ["w9:service"], "normal parked housekeeping stops the registered pane service");
+      const archiveNames = await readdir(join(dirname(valid.p.manifestPath), "archive"));
+      assert.ok(archiveNames.some((name) => name.startsWith("workflows-")), "normal parked housekeeping writes an archive record");
+      assert.equal((await valid.p.store()).messages.find((message) => message.id === "op-parked").delivery.status, "pending", "the root's queued message remains available");
+    } finally {
+      await valid.p.cleanup();
+    }
+  });
 });
 
 test("parked archival accepts only canonical ISO timestamps and leaves invalid timestamps untouched", async () => {

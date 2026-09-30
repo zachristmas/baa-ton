@@ -23,7 +23,7 @@ function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function canonicalIsoTimestamp(value) {
+export function canonicalIsoTimestamp(value) {
   if (typeof value !== "string" || !CANONICAL_ISO_TIMESTAMP.test(value)) return Number.NaN;
   const milliseconds = Date.parse(value);
   if (!Number.isFinite(milliseconds)) return Number.NaN;
