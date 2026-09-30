@@ -239,7 +239,7 @@ test("a pulled update restarts the real supervisor from the new code", { timeout
   const copy = join(directory, "checkout");
   const configDir = join(directory, "config");
   const stateDir = join(directory, "state");
-  for (const part of [["packages", "controller"], ["packages", "herdr-tools", "inbox"]])
+  for (const part of [["packages", "controller"], ["packages", "herdr-tools", "inbox"], ["packages", "herdr-tools", "housekeeping.mjs"]])
     await cp(join(checkout, ...part), join(copy, ...part), { recursive: true, filter: (source) => !/[/\\](test|node_modules)([/\\]|$)/.test(source) });
   await mkdir(configDir, { recursive: true, mode: 0o700 });
   await chmod(configDir, 0o700);

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { HerdrApiError, runRootWatch, runSupervisorTick } from "../controller.mjs";
-import { ROOT_DEAD_CONFIRM_MS, ROOT_DRIFT_ADOPT_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "../root-watch.mjs";
+import { ROOT_DEAD_CONFIRM_MS, ROOT_DRIFT_ADOPT_MS, ROOT_GONE_GRACE_MS, ROOT_PARK_ARCHIVE_DELAY_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "../root-watch.mjs";
+import { archiveParkedWorkflows, parkedFinishedLanes, retireParkedFinishedLanes } from "../parked-maintenance.mjs";
 
 const T0 = Date.parse("2026-09-29T08:00:00.000Z");
 const at = (ms) => new Date(T0 + ms).toISOString();
@@ -59,13 +61,18 @@ async function project({ root = ROOT, parentGoal = goal(), items = { D01: "done"
 }
 
 /** A Herdr with one agent in the root pane (agent: null for none), recording prompts. */
-function herdr({ agent = { agent: "pi", name: "w2J:p1", agent_status: "idle" }, shell = false } = {}) {
+function herdr({ agent = { agent: "pi", name: "w2J:p1", agent_status: "idle" }, shell = false, paneExists = true } = {}) {
   const api = {
     agent,
     shell,
+    paneExists,
     prompts: [],
     async request(method, params = {}) {
       if (method === "pane.report_metadata") return { result: {} };
+      if (method === "pane.get") {
+        if (!api.paneExists) throw new HerdrApiError("pane_not_found", "root pane is gone");
+        return { type: "pane_info", pane: { pane_id: ROOT.pane_id, workspace_id: ROOT.workspace_id } };
+      }
       if (method === "agent.prompt") {
         api.prompts.push(params);
         return { result: { type: "agent_prompted" } };
@@ -97,6 +104,7 @@ test("spec progress counts what is left; classification tells drift from a dead 
   assert.deepEqual([drift.status, drift.registered, drift.live], ["drift", "pi", { kind: "claude", status: "done", session: "b9d80eda" }]);
   assert.deepEqual(classifyRootPane({ shell: false, info: undefined, root: ROOT }), { status: "dead", reason: "no_agent_in_pane" });
   assert.deepEqual(classifyRootPane({ shell: true, info: info({ agent: "pi" }), root: ROOT }), { status: "dead", reason: "pane_shows_shell_prompt" });
+  assert.deepEqual(classifyRootPane({ shell: false, info: undefined, root: ROOT, paneGone: true }), { status: "gone", reason: "pane_not_found" });
   assert.equal(classifyRootPane({ shell: false, info: info({ agent: "claude" }), root: { ...ROOT, agent_kind: undefined } }).status, "ok", "no registered kind: nothing to drift from");
 });
 
@@ -115,6 +123,12 @@ test("a root health episode adopts a drifted harness after 5 minutes and relaunc
   const bare = {};
   assert.deepEqual(advanceRootHealth(bare, dead, { timestamp: at(0), resumable: false }), {});
   assert.deepEqual(advanceRootHealth(bare, dead, { timestamp: at(ROOT_DEAD_CONFIRM_MS), resumable: false }), { anomaly: "root-dead" }, "nothing to relaunch with: flagged at once");
+  const gone = { status: "gone", reason: "pane_not_found" };
+  const vanished = {};
+  assert.deepEqual(advanceRootHealth(vanished, gone, { timestamp: at(0) }), {});
+  assert.deepEqual(advanceRootHealth(vanished, gone, { timestamp: at(ROOT_GONE_GRACE_MS - 1) }), {});
+  assert.deepEqual(advanceRootHealth(vanished, gone, { timestamp: at(ROOT_GONE_GRACE_MS) }), { park: true, anomaly: "root-pane-gone" }, "only a confirmed missing pane parks after the grace");
+
   const resumable = {};
   advanceRootHealth(resumable, dead, { timestamp: at(0), resumable: true });
   assert.deepEqual(advanceRootHealth(resumable, dead, { timestamp: at(ROOT_DEAD_CONFIRM_MS), resumable: true }), { relaunch: true }, "relaunch first, flag later");
@@ -311,4 +325,95 @@ test("a root pane left with no agent is relaunched with the configured resume co
   } finally {
     await paused.cleanup();
   }
+});
+
+test("only a structurally missing pane parks a root after grace; parked goals stop nudges without pausing the run and do not auto-resume", async () => {
+  const p = await project({ runState: { state: "running", by: "zach", at: at(0) } });
+  const api = herdr({ agent: null, paneExists: false });
+  const watch = (ms) => runRootWatch({ stateDir: p.stateDir, herdr: api, timestamp: at(ms), notify: async () => undefined, paneRun: async () => assert.fail("a missing pane is never relaunched") });
+  try {
+    await watch(0);
+    let manifest = await p.manifest();
+    assert.equal(manifest.rootSupervision[0].rootHealth.status, "gone");
+    assert.equal(manifest.parentGoal.status, "review-requested");
+    await watch(ROOT_GONE_GRACE_MS - 1);
+    assert.equal((await p.manifest()).parentGoal.status, "review-requested", "grace boundary is exclusive until reached");
+    await watch(ROOT_GONE_GRACE_MS);
+    manifest = await p.manifest();
+    assert.equal(manifest.parentGoal.status, "parked");
+    assert.equal(manifest.parentGoal.supervisor.state, "stopped");
+    assert.equal(manifest.parentGoal.supervisor.nextNudgeAt, null);
+    assert.equal(manifest.rootSupervision[0].rootParkedAt, at(ROOT_GONE_GRACE_MS));
+    assert.equal((await p.store()).runState.state, "running", "parking never writes the operator run state");
+    const tick = await runSupervisorTick({ stateDir: p.stateDir, herdr: api, timestamp: at(ROOT_GONE_GRACE_MS + 10 * 60_000) });
+    assert.equal(tick.results[0].status, "goal-parked");
+    assert.equal(api.prompts.length, 0, "there is no nudge or digest prompt after parking");
+    assert.equal((await p.manifest()).parentGoal.status, "parked");
+
+    api.agent = { agent: "pi", name: "w2J:p1", agent_status: "idle" };
+    await watch(ROOT_GONE_GRACE_MS + 20 * 60_000);
+    manifest = await p.manifest();
+    assert.equal(manifest.parentGoal.status, "parked", "a live-looking return does not bypass bootstrap/start");
+    assert.equal(manifest.rootSupervision[0].rootParkedAt, at(ROOT_GONE_GRACE_MS));
+  } finally {
+    await p.cleanup();
+  }
+});
+
+test("stale-but-live roots and ambiguous pane identities fail closed instead of being parked", async () => {
+  const p = await project({ parentGoal: goal({ status: "active", supervisor: "running" }) });
+  const live = herdr({ agent: { agent: "pi", name: "w2J:p1", agent_status: "working" } });
+  try {
+    await runRootWatch({ stateDir: p.stateDir, herdr: live, timestamp: at(10 * ROOT_GONE_GRACE_MS), notify: async () => undefined });
+    assert.equal((await p.manifest()).parentGoal.status, "active");
+    assert.equal((await p.manifest()).rootSupervision, undefined, "a live pane does not age into vanished");
+
+    const absentAgent = herdr({ agent: null });
+    absentAgent.request = async (method, params = {}) => {
+      if (method === "agent.get") throw new HerdrApiError("agent_not_found", "agent registry is stale");
+      if (method === "pane.get") return { type: "pane_info", pane: { pane_id: params.target, workspace_id: "another-workspace" } };
+      throw new Error(`Unexpected Herdr method ${method}`);
+    };
+    await runRootWatch({ stateDir: p.stateDir, herdr: absentAgent, timestamp: at(10 * ROOT_GONE_GRACE_MS), notify: async () => undefined });
+    assert.equal((await p.manifest()).rootSupervision, undefined, "mismatched pane identity gives no authority to park");
+  } finally {
+    await p.cleanup();
+  }
+});
+
+test("parked maintenance retires only finished root-owned lanes and archives only after delay, never touching live lanes or worktrees", async () => {
+  const p = await project();
+  const old = at(-ROOT_PARK_ARCHIVE_DELAY_MS - 60_000);
+  const finished = { id: "herdr-11111111", ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: old, lanes: [{ id: "lane-finished", paneId: "w9:p1", workspaceId: "w9", tabId: "tab-finished", status: "completion-reported", completionReceipt: { delivery: "pending", summary: "done" }, startupIntentPath: "/tmp/lane-finished.intent" }], evidence: [] };
+  const concurrent = { id: "herdr-22222222", ownership: { createdBy: "herdr-orchestrator" }, taskBinding: { rootPaneId: "w8:p1", workspaceId: "w8" }, status: "completed", updatedAt: old, lanes: [{ id: "lane-other", paneId: "w8:p1", tabId: "tab-other", status: "completion-reported", completionReceipt: { delivery: "pending" } }], evidence: [] };
+  const running = { id: "herdr-33333333", ownership: { createdBy: "herdr-orchestrator" }, status: "running", updatedAt: old, worktree: join(p.projectDir, "live-worktree"), lanes: [{ id: "lane-live", paneId: "w9:p2", tabId: "tab-live", status: "working" }], evidence: [] };
+  const manifest = { workflows: [finished, concurrent, running], leases: [], rootSupervision: [{ rootId: p.id, rootParkedAt: at(0) }] };
+  const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: finished.id }] };
+  assert.deepEqual(parkedFinishedLanes(manifest, orchestrator).map(({ lane }) => lane.id), ["lane-finished"]);
+  const closed = [];
+  const swept = [];
+  const api = { async request(method, params) { assert.equal(method, "agent.get"); return { type: "agent_info", agent: { pane_id: params.target, workspace_id: "w9", agent_status: "done" } }; } };
+  await mkdir(join(p.projectDir, ".baa-ton"), { recursive: true });
+  const projectConfig = join(p.projectDir, ".baa-ton", "config.json");
+  await writeFile(projectConfig, JSON.stringify({ approvalPolicy: { version: 2, grants: ["local-validation"] } }));
+  const denied = await retireParkedFinishedLanes({ manifest, orchestrator, herdr: api, timestamp: at(ROOT_PARK_ARCHIVE_DELAY_MS), closeTab: async () => assert.fail("unapproved retire must not close a lane"), persist: async () => undefined });
+  assert.deepEqual(denied, [], "parked cleanup does not bypass a missing retire grant");
+  assert.equal(finished.lanes[0].retirement, undefined);
+  const policy = { version: 2, grants: ["retire"] };
+  await writeFile(projectConfig, JSON.stringify({ approvalPolicy: policy }));
+  manifest.approvalPolicyAck = { hash: createHash("sha256").update('{"grants":["retire"],"version":2}').digest("hex"), grants: ["retire"], rootPaneId: ROOT.pane_id, ackedAt: at(0) };
+  const retired = await retireParkedFinishedLanes({ manifest, orchestrator, herdr: api, timestamp: at(ROOT_PARK_ARCHIVE_DELAY_MS), closeTab: async (tabId) => closed.push(tabId), runCommand: async () => ({ code: 0 }), processSweep: async ({ intentPath }) => { swept.push(intentPath); return { signalled: [], survivors: [] }; }, portProbe: async () => [], persist: async () => undefined });
+  assert.deepEqual(retired, [finished.id + "/lane-finished"]);
+  assert.deepEqual(closed, ["tab-finished"]);
+  assert.deepEqual(swept, ["/tmp/lane-finished.intent"]);
+  assert.equal(running.lanes[0].retirement, undefined, "a working lane remains untouched");
+  assert.equal(running.worktree, join(p.projectDir, "live-worktree"), "the live worktree is never removed");
+  assert.equal(concurrent.lanes[0].retirement, undefined, "a concurrent root's lane stays out of scope");
+
+  assert.deepEqual(await archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt: at(0), timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS - 1), persist: async () => undefined, processTable: async () => [], keepRecent: 0 }), [], "not archived before the parked and terminal-record delays");
+  const archived = await archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt: at(0), timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS), persist: async () => undefined, processTable: async () => [], keepRecent: 0 });
+  assert.deepEqual(archived, [finished.id]);
+  assert.deepEqual(manifest.workflows.map((workflow) => workflow.id), [concurrent.id, running.id]);
+  assert.equal(running.worktree, join(p.projectDir, "live-worktree"));
+  await p.cleanup();
 });

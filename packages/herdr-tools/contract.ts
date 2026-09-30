@@ -489,7 +489,8 @@ export type ParentGoalStatus =
   | "review-requested"
   | "blocked"
   | "completed"
-  | "paused";
+  | "paused"
+  | "parked";
 export type ParentGoalSignal = {
   identity: string;
   workflowId: string;

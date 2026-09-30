@@ -63,6 +63,13 @@ test("a new goal, including after reset, is supervised unless the previous goal 
     const due = Date.parse(first.supervisor.nextNudgeAt) - Date.parse(first.supervisor.createdAt);
     assert.equal(due, 300_000, "the first nudge is one interval out");
 
+    const parked = await goal({ action: "set-state", status: "parked" });
+    assert.equal(parked.status, "parked");
+    assert.equal(parked.supervisor.state, "stopped", "goal parking is distinct from the operator run pause");
+    const resumed = await goal({ action: "start" });
+    assert.equal(resumed.status, "active", "the documented start path resumes a parked goal");
+    assert.equal(resumed.supervisor.state, "running");
+
     await goal({ action: "start", nudgeIntervalSeconds: 120 });
     const afterReset = await fresh();
     assert.equal(afterReset.supervisor.state, "running", "the goal after a reset (parent-goal-73132480's case) is supervised");
