@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { consumeExternalApproval, containsGhPrMutation, issueExternalApproval, parseApprovedGhOperation } from "../external-approval.mjs";
 
-const binding = { repo: "/repo", head: "abc", branch: "topic", target: "main", targetRepo: "owner/repo", paneId: "w:p1", sessionId: "/session", caller: "root" };
+const binding = { repo: "/repo", head: "abc", branch: "topic", target: "main", targetRepo: "owner/repo", host: "github.com", remoteName: "origin", paneId: "w:p1", sessionId: "/session", caller: "root" };
 const command = "gh pr create --repo owner/repo --base main";
 
 test("external operation approval is explicit, exact, bound, expiring and one-use", () => {
@@ -33,10 +33,14 @@ test("command, repository, refs, root identity and expiry mismatches fail closed
 });
 
 test("only literal gh pr create/merge commands are representable; wrappers fail closed", () => {
-  for (const cmd of ["gh pr merge topic -R owner/repo --merge", "gh pr create --repo=owner/repo --base main", "gh pr create --repo owner/repo --base main"]) assert.ok(parseApprovedGhOperation(cmd));
+  for (const cmd of ["gh pr merge topic -R owner/repo --merge", "gh pr create --repo=owner/repo --base main", "gh pr create --repo owner/repo --base main", "gh 'pr' create --repo owner/repo --base main", "gh pr create --repo=owner/repo --base 'main ref'"]) assert.ok(parseApprovedGhOperation(cmd));
   for (const cmd of ["gh pr merge topic --merge", "gh pr create --base main", "gh pr create -R owner/repo --repo owner/other", "env gh pr merge topic -R owner/repo --merge", "GH_TOKEN=x gh pr create -R owner/repo --base main", "echo gh pr create", "gh pr create && echo x", "gh pr merge $(id)", "git push", "npm run deploy"]) assert.equal(parseApprovedGhOperation(cmd), undefined, cmd);
   for (const cmd of ["gh pr merge topic -R owner/repo --merge", "env gh pr merge topic -R owner/repo --merge", "GH_TOKEN=x gh pr create -R owner/repo --base main", "sh -c 'gh pr create'"]) assert.equal(containsGhPrMutation(cmd), true, cmd);
   assert.equal(containsGhPrMutation("gh --hostname github.com pr merge topic -R owner/repo --merge"), true);
   assert.equal(containsGhPrMutation("command 'gh' pr create -R owner/repo --base main"), true);
+  for (const cmd of ["gh pr create --repo owner/repo; echo done", "gh pr create --repo owner/repo\\n", "gh pr\\ create -R owner/repo", "gh pr create -R owner/repo$(id)", "gh pr create -R owner/repo && gh pr merge -R owner/repo", "sh -c 'gh pr create -R owner/repo'", "env GH_TOKEN=x command gh pr merge -R owner/repo"]) assert.equal(containsGhPrMutation(cmd), true, cmd);
+  for (const cmd of ["env gh pr create -R owner/repo", "command gh pr merge -R owner/repo", "sh -c 'gh pr create -R owner/repo'"]) assert.equal(parseApprovedGhOperation(cmd), undefined, cmd);
+  const shownBinding = { ...binding, host: "github.com", remoteName: "fork" };
+  assert.equal(consumeExternalApproval(issueExternalApproval(command, binding), command, shownBinding), false, "remote identity is bound");
   assert.equal(containsGhPrMutation("git status"), false);
 });

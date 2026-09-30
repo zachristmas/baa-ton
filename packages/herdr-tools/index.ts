@@ -11911,12 +11911,22 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const head = await git(["rev-parse", "HEAD"]);
         const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
         const sessionId = await realpath(process.env.PI_SESSION_FILE);
-        const baseFlag = externalOperation.argv.indexOf("--base");
-        const target = externalOperation.operation === "merge" ? externalOperation.argv[3] ?? "" : baseFlag >= 0 ? externalOperation.argv[baseFlag + 1] ?? "" : "(gh-default-base)";
-        const binding = { repo, head, branch, target, targetRepo: externalOperation.repo, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
+        const baseFlag = externalOperation.argv.findIndex((arg) => arg === "--base" || arg.startsWith("--base="));
+        const target = externalOperation.operation === "merge" ? externalOperation.argv[3] ?? "" : baseFlag >= 0 ? (externalOperation.argv[baseFlag].includes("=") ? externalOperation.argv[baseFlag].slice(externalOperation.argv[baseFlag].indexOf("=") + 1) : externalOperation.argv[baseFlag + 1] ?? "") : "(gh-default-base)";
+        const remotes = (await git(["remote", "-v"])).split("\n").flatMap((line) => {
+          const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line);
+          if (!match) return [];
+          const url = match[2].replace(/\.git$/, "");
+          const parsed = /^(?:https?:\/\/|ssh:\/\/|git:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]([^/]+)\/([^/]+)$/.exec(url);
+          return parsed ? [{ name: match[1], host: parsed[1].toLowerCase(), repo: `${parsed[2]}/${parsed[3]}` }] : [];
+        });
+        const matches = remotes.filter((remote) => remote.repo.toLowerCase() === externalOperation.repo.toLowerCase());
+        if (matches.length !== 1) throw new Error("Explicit --repo does not identify exactly one canonical local Git remote.");
+        const remote = matches[0];
+        const binding = { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: externalOperation.repo, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
         const approved = await ctx.ui.confirm(
           `Approve exact gh pr ${externalOperation.operation}?`,
-          `Canonical repository: ${repo}\nExplicit --repo target: ${externalOperation.repo}\nHEAD: ${head} (${branch})\nPR/head/base target: ${target || "(command-defined)"}\nCommand: ${externalOperation.argv.join(" ")}\nThis approves this exact command once.`,
+          `Local root: ${repo}\nGit remote: ${remote.name} (${remote.host}/${remote.repo})\nExplicit --repo target: ${externalOperation.repo}\nHEAD: ${head}\nHead ref: ${branch}\nBase ref: ${target || "(command-defined)"}\nExact argv: ${JSON.stringify(externalOperation.argv)}\nThis approves this exact command once.`,
         );
         const token = approved ? issueExternalApproval(command, binding) : undefined;
         explicitlyApproved = Boolean(token && consumeExternalApproval(token, command, binding));
