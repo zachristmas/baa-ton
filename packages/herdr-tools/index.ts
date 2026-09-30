@@ -11847,7 +11847,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     caller: isRegisteredChildLane() ? "child" : "root",
     hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
     sessionFile: process.env.PI_SESSION_FILE,
-    resolveBinding: async (operation: { operation: string; argv: string[]; repo?: string; remoteName?: string; destinationRef?: string }) => {
+    resolveBinding: async (operation: { operation: string; argv: string[]; repo?: string; remoteName?: string; branch?: string; destinationRef?: string }) => {
       const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
       const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
       const head = await git(["rev-parse", "HEAD"]);
@@ -11865,7 +11865,13 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const matches = remotes.filter((remote) => operation.operation === "push" ? remote.name === operation.remoteName : remote.repo.toLowerCase() === operation.repo?.toLowerCase());
       if (matches.length !== 1) throw new Error(operation.operation === "push" ? "Explicit push remote must identify exactly one local Git remote." : "Explicit --repo does not identify exactly one canonical local Git remote.");
       const remote = matches[0];
-      return { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: operation.repo ?? remote.repo, destinationRef: operation.destinationRef, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
+      const localRefOid = async (ref: string) => {
+        try { return await git(["rev-parse", "--verify", ref]); } catch { return ""; }
+      };
+      const destinationOid = operation.operation === "push" ? await localRefOid(`refs/remotes/${remote.name}/${operation.branch}`) : "";
+      const headRefOid = await localRefOid(`refs/remotes/${remote.name}/${branch}`);
+      const baseRefOid = target.startsWith("(") ? "" : await localRefOid(`refs/remotes/${remote.name}/${target}`);
+      return { repo, head, branch, target, baseRef: target, headRef: branch, headRefOid, baseRefOid, remoteName: remote.name, host: remote.host, targetRepo: operation.repo ?? remote.repo, destinationRef: operation.destinationRef, destinationOid, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
     },
     confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; paneId: string; sessionId: string }) => ctx.ui!.confirm(
       `Approve exact external ${operation.operation}?`,
@@ -11938,7 +11944,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         caller: isRegisteredChildLane() ? "child" : "root",
         hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
         sessionFile: process.env.PI_SESSION_FILE,
-        resolveBinding: async (operation: { operation: string; argv: string[]; repo: string }) => {
+        resolveBinding: async (operation: { operation: string; argv: string[]; repo: string; remoteName?: string; branch?: string; destinationRef?: string }) => {
           const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
           const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
           const head = await git(["rev-parse", "HEAD"]);

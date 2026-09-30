@@ -11,8 +11,11 @@ export async function approveExternalGhCommand({ command, enabled, caller, hasUI
     const binding = await resolveBinding(operation);
     if (!binding || binding.caller !== "root" || (operation.operation === "push" ? binding.remoteName !== operation.remoteName || binding.branch !== operation.branch || binding.destinationRef !== operation.destinationRef : binding.targetRepo?.toLowerCase() !== operation.repo.toLowerCase())) return false;
     const approved = await confirm(operation, binding);
-    const token = approved ? issueExternalApproval(command, binding, now === undefined ? undefined : { now }) : undefined;
-    return Boolean(token && consumeExternalApproval(token, command, binding, now === undefined ? undefined : { now }));
+    if (!approved) return false;
+    const current = await resolveBinding(operation);
+    if (!current || JSON.stringify(current) !== JSON.stringify(binding)) return false;
+    const token = issueExternalApproval(command, binding, now === undefined ? undefined : { now });
+    return Boolean(token && consumeExternalApproval(token, command, current, now === undefined ? undefined : { now }));
   } catch {
     return false;
   }

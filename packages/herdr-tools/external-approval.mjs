@@ -25,9 +25,9 @@ function directOperation(argv) {
   if (!argv) return undefined;
   if (argv[0] === "git" && argv[1] === "push") {
     if (argv.length !== 4 || argv[2].startsWith("-") || argv[2].includes("://") || argv[2].includes("@") || !/^[A-Za-z0-9_.-]+$/.test(argv[2])) return undefined;
-    const match = /^HEAD:refs\/heads\/([A-Za-z0-9][A-Za-z0-9._/-]*)$/.exec(argv[3]);
-    if (!match || match[1].split("/").some((part) => !part || part === "." || part === "..") || match[1].endsWith(".")) return undefined;
-    return { operation: "push", argv, remoteName: argv[2], branch: match[1], sourceRef: "HEAD", destinationRef: `refs/heads/${match[1]}` };
+    const match = /^([0-9a-fA-F]{40}|[0-9a-fA-F]{64}):refs\/heads\/([A-Za-z0-9][A-Za-z0-9._/-]*)$/.exec(argv[3]);
+    if (!match || match[2].split("/").some((part) => !part || part === "." || part === "..") || match[2].endsWith(".")) return undefined;
+    return { operation: "push", argv, remoteName: argv[2], branch: match[2], sourceRef: match[1].toLowerCase(), destinationRef: `refs/heads/${match[2]}` };
   }
   if (argv[0] !== "gh" || argv[1] !== "pr" || !["create", "merge"].includes(argv[2])) return undefined;
   const repos = [];
@@ -90,15 +90,17 @@ export function containsUnsafeShellExecution(command) {
 export function issueExternalApproval(command, binding, { now = Date.now(), ttlMs = 30_000 } = {}) {
   const parsed = parseApprovedExternalOperation(command);
   if (!parsed || !binding?.repo || !binding?.head || !binding?.paneId || !binding?.sessionId || binding?.caller !== "root" || !binding?.remoteName || !binding?.host) return undefined;
-  if (parsed.operation === "push" && (parsed.remoteName !== binding.remoteName || parsed.branch !== binding.branch || binding.destinationRef !== parsed.destinationRef)) return undefined;
+  if (parsed.operation === "push" && (parsed.remoteName !== binding.remoteName || parsed.branch !== binding.branch || binding.destinationRef !== parsed.destinationRef || parsed.sourceRef !== binding.head)) return undefined;
   if (parsed.operation !== "push" && binding.targetRepo?.toLowerCase() !== parsed.repo.toLowerCase()) return undefined;
   return { id: randomUUID(), digest: createHash("sha256").update(JSON.stringify({ argv: parsed.argv, binding, operation: parsed.operation })).digest("hex"), argv: parsed.argv, operation: parsed.operation, binding: { ...binding }, expiresAt: now + ttlMs, used: false };
 }
 export function consumeExternalApproval(token, command, binding, { now = Date.now() } = {}) {
-  if (!token || token.used) return false; token.used = true;
+  if (!token || token.used) return false;
   const parsed = parseApprovedExternalOperation(command); if (!parsed || token.expiresAt <= now) return false;
   if (parsed.operation === "push" && (parsed.remoteName !== binding.remoteName || parsed.branch !== binding.branch || binding.destinationRef !== parsed.destinationRef)) return false;
   if (parsed.operation !== "push" && binding.targetRepo?.toLowerCase() !== parsed.repo.toLowerCase()) return false;
   const digest = createHash("sha256").update(JSON.stringify({ argv: parsed.argv, binding, operation: parsed.operation })).digest("hex");
-  return digest === token.digest && JSON.stringify(parsed.argv) === JSON.stringify(token.argv) && JSON.stringify(binding) === JSON.stringify(token.binding);
+  const valid = digest === token.digest && JSON.stringify(parsed.argv) === JSON.stringify(token.argv) && JSON.stringify(binding) === JSON.stringify(token.binding);
+  if (valid) token.used = true;
+  return valid;
 }
