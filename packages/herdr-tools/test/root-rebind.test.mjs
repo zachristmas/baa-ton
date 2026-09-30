@@ -173,6 +173,27 @@ test("bootstrap is the documented recovery path that resumes a parked root after
   }
 });
 
+test("verified bootstrap clears a stale parked marker and restores an active supervisor", async () => {
+  const f = await fixture({ parkedGoal: true });
+  try {
+    const manifest = await f.manifest();
+    manifest.parentGoals[f.oldId].status = "paused";
+    manifest.parentGoals[f.oldId].supervisor.state = "paused";
+    manifest.parentGoals[f.oldId].supervisor.nextNudgeAt = null;
+    await writeFile(join(f.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    await f.tools.get("herdr_bootstrap_root").execute("start", {}, undefined, undefined, f.context);
+    const config = await f.config();
+    const recovered = await f.manifest();
+    const newId = config.orchestrators[0].id;
+    assert.equal(recovered.parentGoals[newId].status, "active");
+    assert.equal(recovered.parentGoals[newId].supervisor.state, "running");
+    assert.ok(recovered.parentGoals[newId].supervisor.nextNudgeAt);
+    assert.equal(recovered.rootSupervision.find((entry) => entry.rootId === newId).rootParkedAt, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("plain bootstrap recognizes a replacement session on the exact same registered pane", async () => {
   const f = await fixture({ samePane: true, liveSession: "replacement-session" });
   try {

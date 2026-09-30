@@ -1393,6 +1393,12 @@ async function parentGoal(
     const scoped = rootGoalFor(manifest, cwd, scope);
     const record = scoped.record;
     const goal = scoped.goal ?? record?.goal;
+    const parkedRoot = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+    const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
+    if (hasParkedRootMarker && (action === "reset" || action === "initialize"))
+      throw new Error(
+        `Cannot ${action} a parent goal while rootParkedAt is set; recover through herdr_bootstrap_root or herdr_goal action=start first.`,
+      );
     const history = record
       ? ((manifest.goalHistoryByRoot ??= {})[scope.rootId] ??= record.goalHistory)
       : Array.isArray(manifest.goalHistory)
@@ -1589,7 +1595,7 @@ async function parentGoal(
             : Math.min(control.intervalSeconds, DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS)),
       );
       markNudgeIntervalPolicy(manifest, scope.rootId);
-      if (previousSupervisorState !== "running") {
+      if (previousSupervisorState !== "running" || hasParkedRootMarker) {
         control.nextNudgeAt = new Date(
           Date.parse(timestamp) + control.intervalSeconds * 1000,
         ).toISOString();
@@ -1598,9 +1604,8 @@ async function parentGoal(
       delete control.pauseReason;
       control.updatedAt = timestamp;
       if (goal.status === "paused" || goal.status === "parked") goal.status = "active";
-      const parked = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
-      if (parked?.rootParkedAt) delete parked.rootParkedAt;
-      if (parked?.rootHealth?.status === "gone") delete parked.rootHealth;
+      if (hasParkedRootMarker) delete parkedRoot!.rootParkedAt;
+      if (parkedRoot?.rootHealth?.status === "gone") delete parkedRoot.rootHealth;
       if (nextAction?.trim()) goal.nextAction = nextAction.trim();
     } else if (action === "stop") {
       const control = supervisor();
@@ -1610,6 +1615,8 @@ async function parentGoal(
     } else if (action === "pause") {
       if (!pauseReason?.trim())
         throw new Error("pauseReason is required when action=pause.");
+      if (goal.status === "parked" || hasParkedRootMarker)
+        throw new Error("A parked parent goal cannot be paused or downgraded; use herdr_bootstrap_root or herdr_goal action=start to recover it.");
       const control = supervisor();
       control.state = "paused";
       control.pauseReason = pauseReason.trim();
@@ -7560,19 +7567,30 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     let rootTabId: string | undefined;
     const resumeParkedGoal = (manifest: ManifestWithQueue, scope: CurrentRootScope): void => {
       const goal = rootGoalFor(manifest, cwd, scope).goal;
-      if (goal?.status !== "parked") return;
-      const stamp = now();
-      goal.status = "active";
-      goal.nextAction = "Root returned through herdr_bootstrap_root; continue authorized safe local work.";
-      goal.updatedAt = stamp;
-      if (goal.supervisor) {
-        goal.supervisor.state = "running";
-        goal.supervisor.nextNudgeAt = new Date(Date.parse(stamp) + goal.supervisor.intervalSeconds * 1000).toISOString();
-        delete goal.supervisor.pauseReason;
-        delete goal.supervisor.lastDelivery;
-        goal.supervisor.updatedAt = stamp;
-      }
       const supervision = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+      const hasParkedRootMarker = Boolean(supervision && Object.hasOwn(supervision, "rootParkedAt"));
+      if (!goal && !hasParkedRootMarker) return;
+      if (goal && goal.status !== "parked" && !hasParkedRootMarker) return;
+      const stamp = now();
+      if (goal) {
+        if (goal.status !== "completed") {
+          goal.status = "active";
+          goal.nextAction = "Root returned through herdr_bootstrap_root; continue authorized safe local work.";
+          if (goal.supervisor) {
+            goal.supervisor.state = "running";
+            goal.supervisor.nextNudgeAt = new Date(Date.parse(stamp) + goal.supervisor.intervalSeconds * 1000).toISOString();
+            delete goal.supervisor.pauseReason;
+            delete goal.supervisor.lastDelivery;
+            goal.supervisor.updatedAt = stamp;
+          }
+        } else if (goal.supervisor) {
+          goal.supervisor.state = "stopped";
+          goal.supervisor.nextNudgeAt = null;
+          delete goal.supervisor.pauseReason;
+          goal.supervisor.updatedAt = stamp;
+        }
+        goal.updatedAt = stamp;
+      }
       if (supervision) {
         delete supervision.rootParkedAt;
         if (supervision.rootHealth?.status === "gone") delete supervision.rootHealth;

@@ -3834,6 +3834,26 @@ function rootAgentIdentityMatches(raw, root) {
  */
 async function watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun, goal }) {
   const root = orchestrator.root;
+  const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
+  if (parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt")) {
+    let changed = false;
+    if (goal.status !== "completed" && goal.status !== "parked") {
+      goal.status = "parked";
+      goal.nextAction = `Root remains parked; return through herdr_bootstrap_root, then herdr_goal action=start.`;
+      goal.updatedAt = timestamp;
+      changed = true;
+    }
+    if (goal.supervisor && (goal.supervisor.state !== "stopped" || goal.supervisor.nextNudgeAt !== null || goal.supervisor.pauseReason !== undefined)) {
+      goal.supervisor.state = "stopped";
+      goal.supervisor.nextNudgeAt = null;
+      delete goal.supervisor.pauseReason;
+      goal.supervisor.updatedAt = timestamp;
+      if (goal.status !== "completed") goal.updatedAt = timestamp;
+      changed = true;
+    }
+    if (changed) await atomicWriteJson(manifestPath, manifest);
+    return true;
+  }
   const shell = await paneProcessInfo(api, root.pane_id).then(paneShowsShell, () => undefined);
   let info;
   let paneGone = false;
@@ -4023,6 +4043,42 @@ export async function runSupervisorTick({
         await readRegularFile(manifestPath, "Parent manifest"),
         "Parent manifest",
       );
+      const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
+      const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
+      const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
+      const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
+      if (goal?.status === "parked" || hasParkedRootMarker) {
+        let changed = false;
+        if (hasParkedRootMarker && goal && goal.status !== "completed" && goal.status !== "parked") {
+          goal.status = "parked";
+          goal.nextAction = `Root remains parked; return through herdr_bootstrap_root, then herdr_goal action=start.`;
+          goal.updatedAt = timestamp;
+          changed = true;
+        }
+        if (goal?.supervisor) {
+          if (goal.supervisor.state !== "stopped" || goal.supervisor.nextNudgeAt !== null || goal.supervisor.pauseReason !== undefined) {
+            goal.supervisor.state = "stopped";
+            goal.supervisor.nextNudgeAt = null;
+            delete goal.supervisor.pauseReason;
+            goal.supervisor.updatedAt = timestamp;
+            if (goal.status !== "completed") goal.updatedAt = timestamp;
+            changed = true;
+          }
+        }
+        if (changed) await atomicWriteJson(manifestPath, manifest);
+        const rootSupervision = parkedRoot ?? supervisionFor(manifest, orchestrator, true);
+        const persistParked = async () => atomicWriteJson(manifestPath, manifest);
+        const retired = await retireParkedFinishedLanes({ manifest, orchestrator, herdr: api, timestamp, persist: persistParked }).catch((error) => {
+          supervisorLog(configDir, `parked-root retirement failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+          return [];
+        });
+        const archived = await archiveParkedWorkflows({ manifest, orchestrator, manifestPath, parkedAt: rootSupervision.rootParkedAt, timestamp, persist: persistParked }).catch((error) => {
+          supervisorLog(configDir, `parked-root archive failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+          return [];
+        });
+        results.push({ manifestPath, status: goal?.status === "completed" ? "goal-completed-parked" : "goal-parked", ...(retired.length ? { retired } : {}), ...(archived.length ? { archived } : {}) });
+        continue;
+      }
       // Do not schedule against an unowned or stale registration merely because
       // it shares a manifest with a valid workflow in this orchestrator.
       const matchedWorkflows = workflows.map((candidate) =>
@@ -4032,8 +4088,6 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
-      const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
-      const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
       // Forward compatibility: keep parent goals readable by older bridges.
       const policy = stripSupervisorIntervalPolicy(manifest);
       if (policy.changed) {
@@ -4196,20 +4250,6 @@ export async function runSupervisorTick({
       }
       if (!goal) {
         results.push({ manifestPath, status: "no-parent-goal" });
-        continue;
-      }
-      if (goal.status === "parked") {
-        const rootSupervision = supervisionFor(manifest, orchestrator, true);
-        const persistParked = async () => atomicWriteJson(manifestPath, manifest);
-        const retired = await retireParkedFinishedLanes({ manifest, orchestrator, herdr: api, timestamp, persist: persistParked }).catch((error) => {
-          supervisorLog(configDir, `parked-root retirement failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
-          return [];
-        });
-        const archived = await archiveParkedWorkflows({ manifest, orchestrator, manifestPath, parkedAt: rootSupervision.rootParkedAt, timestamp, persist: persistParked }).catch((error) => {
-          supervisorLog(configDir, `parked-root archive failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
-          return [];
-        });
-        results.push({ manifestPath, status: "goal-parked", ...(retired.length ? { retired } : {}), ...(archived.length ? { archived } : {}) });
         continue;
       }
       if (!("supervisor" in goal)) {

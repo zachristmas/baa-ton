@@ -366,6 +366,46 @@ test("only a structurally missing pane parks a root after grace; parked goals st
   }
 });
 
+test("rootParkedAt overrides stale active or paused goals before auto-unpause or unfinished-spec restart", async () => {
+  for (const scenario of [
+    { status: "active", supervisor: "running", runState: "running" },
+    { status: "paused", supervisor: "paused", runState: "running" },
+    { status: "active", supervisor: "paused", runState: "paused" },
+  ]) {
+    const parentGoal = goal({ status: scenario.status, supervisor: scenario.supervisor });
+    if (scenario.supervisor === "paused") parentGoal.supervisor.pauseReason = "Synthetic stale pause.";
+    const p = await project({
+      parentGoal,
+      runState: { state: scenario.runState, by: "zach", at: at(0), reason: "synthetic test" },
+    });
+    const api = herdr();
+    try {
+      const manifest = await p.manifest();
+      manifest.rootSupervision = [{ rootId: p.id, rootParkedAt: at(0), rootHealth: { status: "gone", since: at(0) } }];
+      await writeFile(p.manifestPath, JSON.stringify(manifest));
+      if (scenario.status === "active" && scenario.supervisor === "running") {
+        const requests = [];
+        const request = api.request.bind(api);
+        api.request = async (...args) => { requests.push(args); return request(...args); };
+        await runRootWatch({ stateDir: p.stateDir, herdr: api, timestamp: at(30_000), notify: async () => assert.fail("parked roots are not watched"), paneRun: async () => assert.fail("parked roots are never relaunched") });
+        assert.deepEqual(requests, [], "a parked marker suppresses root liveness probes until authorized recovery");
+      }
+      const tick = await runSupervisorTick({ stateDir: p.stateDir, herdr: api, timestamp: at(60_000) });
+      assert.equal(tick.results[0].status, "goal-parked", `${scenario.status}/${scenario.supervisor} stays parked`);
+      const after = await p.manifest();
+      assert.equal(after.parentGoal.status, "parked");
+      assert.equal(after.parentGoal.supervisor.state, "stopped");
+      assert.equal(after.parentGoal.supervisor.nextNudgeAt, null);
+      assert.equal(after.rootSupervision[0].rootParkedAt, at(0));
+      assert.equal(after.rootSupervision[0].specRestart, undefined, "unfinished work cannot auto-restart supervision");
+      assert.equal(api.prompts.length, 0, "a parked root receives no nudge");
+      assert.equal((await p.store()).runState.state, scenario.runState, "parking never changes the operator run state");
+    } finally {
+      await p.cleanup();
+    }
+  }
+});
+
 test("a recovered and re-parked root starts a fresh archive grace period instead of inheriting its old parkedAt", async () => {
   const recoveryOffset = 3 * ROOT_PARK_ARCHIVE_DELAY_MS;
   const repParkAt = at(recoveryOffset + ROOT_GONE_GRACE_MS);
