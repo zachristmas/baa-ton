@@ -152,6 +152,10 @@ workflow ID when it supervises multiple workflows.
 - Observation is bounded; completion requires every lane to be done.
 - No operation pushes, merges, deploys, invokes external services, or runs detached work.
 
+## External PR approval hook
+
+The Pi `before_tool_call` guard permits only a directly written, canonical `gh pr create` or `gh pr merge` command with one explicit `--repo`/`-R` target. In an eligible root UI session it resolves that target to exactly one local fetch remote, displays the binding in the native confirmation, and issues/consumes an exact-command one-use token in the same hook path. Declines, child/headless callers, missing session identity, ambiguous/mismatched remotes, and wrapped, quoted, or compound forms remain blocked. The reusable logic is `external-approval-hook.mjs`; its injected resolver and confirmation are the supported test seam. `test/external-approval-hook.test.mjs` models the hook block decision and deliberately never invokes an executor.
+
 ## Session log
 
 Each root manifest keeps a durable `sessionLog` root entry, and each lane keeps
