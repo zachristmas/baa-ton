@@ -1554,6 +1554,9 @@ async function parentGoal(
         );
       if (status === "paused")
         throw new Error("Use action=pause with a non-empty pauseReason.");
+      const parked = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+      if ((goal.status === "parked" || (parked && Object.hasOwn(parked, "rootParkedAt"))) && status !== "parked")
+        throw new Error("A parked parent goal can only be resumed with action=start.");
       goal.status = status as ParentGoalStatus;
       if (objective?.trim()) goal.objective = objective.trim();
       if (nextAction?.trim()) goal.nextAction = nextAction.trim();

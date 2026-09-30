@@ -381,6 +381,55 @@ test("stale-but-live roots and ambiguous pane identities fail closed instead of 
   }
 });
 
+test("parked archival fails closed on corrupt, unreadable, or malformed spec state, while absent and valid state retain their behavior", async () => {
+  const workflowId = "herdr-a1b2c3d4";
+  const archivePath = (p) => join(dirname(p.manifestPath), "archive", `workflows-${at(2 * ROOT_PARK_ARCHIVE_DELAY_MS).slice(0, 7)}.jsonl`);
+  const makeEligible = async () => {
+    const p = await project();
+    const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS - 60_000), lanes: [] };
+    const manifest = { workflows: [workflow], leases: [], queue: [], directives: [], rootSupervision: [{ rootId: p.id, rootParkedAt: at(0) }] };
+    await writeFile(p.manifestPath, JSON.stringify(manifest));
+    const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: workflowId }] };
+    return { p, manifest, orchestrator, specStatePath: join(dirname(p.manifestPath), "spec-state.json"), alternateSpecStatePath: join(dirname(dirname(p.manifestPath)), "spec-state.json"),
+      archive: () => archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt: at(0), timestamp: at(2 * ROOT_PARK_ARCHIVE_DELAY_MS), persist: async () => undefined, processTable: async () => [], keepRecent: 0 }) };
+  };
+  for (const [kind, prepare] of [
+    ["corrupt", async ({ alternateSpecStatePath }) => writeFile(alternateSpecStatePath, "{invalid json")],
+    ["unreadable", async ({ p, specStatePath }) => { await rm(specStatePath, { force: true }); await mkdir(specStatePath); }],
+    ["malformed", async ({ alternateSpecStatePath }) => writeFile(alternateSpecStatePath, JSON.stringify({ version: 1, items: { D01: null } }))],
+  ]) {
+    const setup = await makeEligible();
+    try {
+      await prepare(setup);
+      assert.deepEqual(await setup.archive(), [], `${kind} spec state makes selection fail closed`);
+      assert.deepEqual(setup.manifest.workflows.map((workflow) => workflow.id), [workflowId], `${kind} spec state keeps its live manifest record`);
+      await assert.rejects(readFile(archivePath(setup.p)), { code: "ENOENT" }, `${kind} spec state writes no archive record`);
+    } finally {
+      await setup.p.cleanup();
+    }
+  }
+
+  const valid = await makeEligible();
+  try {
+    await writeFile(valid.specStatePath, JSON.stringify({ version: 1, items: { D01: { state: "pending", workflowId } } }));
+    assert.deepEqual(await valid.archive(), [], "a valid open spec pointer protects its workflow");
+    assert.deepEqual(valid.manifest.workflows.map((workflow) => workflow.id), [workflowId]);
+    await assert.rejects(readFile(archivePath(valid.p)), { code: "ENOENT" });
+  } finally {
+    await valid.p.cleanup();
+  }
+
+  const absent = await makeEligible();
+  try {
+    await rm(absent.specStatePath, { force: true });
+    assert.deepEqual(await absent.archive(), [workflowId], "genuinely absent optional spec state preserves no-spec archival");
+    assert.deepEqual(absent.manifest.workflows, []);
+    assert.match(await readFile(archivePath(absent.p), "utf8"), new RegExp(workflowId));
+  } finally {
+    await absent.p.cleanup();
+  }
+});
+
 test("parked maintenance retires only finished root-owned lanes and archives only after delay, never touching live lanes or worktrees", async () => {
   const p = await project();
   const old = at(-ROOT_PARK_ARCHIVE_DELAY_MS - 60_000);

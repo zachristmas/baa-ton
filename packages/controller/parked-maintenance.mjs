@@ -14,11 +14,20 @@ const OWNER = "herdr-orchestrator";
 const STANDING_GRANTS = ["dispatch", "retry", "resume", "retire", "lease", "runtime-launch", "local-validation", "integrate", "spec-push"];
 const FINISHED_LANES = new Set(["completion-reported", "completed", "operator-closed", "superseded"]);
 const FINISHED_WORKFLOWS = new Set(["completed", "superseded", "operator-closed", "dispatch-failed"]);
+const SPEC_ITEM_STATES = new Set(["pending", "deciding", "ready", "building", "reviewing", "integrating", "awaiting-push", "verifying", "done", "blocked", "failed", "deferred", "resolved"]);
 const LANE_MARKER = "BAA_STARTUP_INTENT";
 const SAFE_TEMPLATE = /^(?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+(?: (?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+)*$/;
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseSpecWorkflowIds(source) {
+  const state = JSON.parse(source);
+  if (!isRecord(state) || state.version !== 1 || !isRecord(state.items)) throw new Error("invalid spec-state shape");
+  for (const item of Object.values(state.items))
+    if (!isRecord(item) || (item.state !== undefined && !SPEC_ITEM_STATES.has(item.state))) throw new Error("invalid spec-state item");
+  return [...liveSpecWorkflowIds(state)];
 }
 
 function canonical(value) {
@@ -294,12 +303,22 @@ export async function archiveParkedWorkflows({ manifest, orchestrator, manifestP
   const scope = { ...manifest, workflows: (manifest.workflows ?? []).filter((workflow) => ids.has(workflow.id)) };
   const stateDir = dirname(manifestPath);
   const specCandidates = [join(stateDir, "spec-state.json"), join(dirname(stateDir), "spec-state.json")];
-  const specStates = [];
+  const specWorkflowIds = [];
   for (const path of specCandidates) {
-    try { specStates.push(JSON.parse(await readFile(path, "utf8"))); } catch {}
+    let source;
+    try { source = await readFile(path, "utf8"); }
+    catch (error) {
+      if (error?.code === "ENOENT") continue;
+      return [];
+    }
+    try {
+      specWorkflowIds.push(...parseSpecWorkflowIds(source));
+    } catch {
+      return [];
+    }
   }
   const protectedIds = mentionedWorkflowIds(
-    ...specStates.map((state) => Array.from(liveSpecWorkflowIds(state))),
+    specWorkflowIds,
     manifest.queue,
     manifest.directives,
     manifest.rootSupervision,
