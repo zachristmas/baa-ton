@@ -3,6 +3,15 @@ export interface ApprovedGhOperation {
   argv: string[];
   repo: string;
 }
+export interface ApprovedPushOperation {
+  operation: "push";
+  argv: string[];
+  remoteName: string;
+  branch: string;
+  sourceRef: string;
+  destinationRef: string;
+}
+export type ApprovedExternalOperation = ApprovedGhOperation | ApprovedPushOperation;
 export interface ExternalApprovalBinding {
   repo: string;
   head: string;
@@ -16,6 +25,13 @@ export interface ExternalApprovalBinding {
   paneId: string;
   sessionId: string;
   caller: "root";
+  headRefOid?: string;
+  baseRefOid?: string;
+  remoteRepo?: string;
+  remoteUrl?: string;
+  destinationRef?: string;
+  destinationOid?: string;
+  pr?: Record<string, unknown>;
 }
 export function approveExternalGhCommand(options: {
   command: string;
@@ -23,7 +39,7 @@ export function approveExternalGhCommand(options: {
   caller: "root" | "child";
   hasUI: boolean;
   sessionFile?: string;
-  resolveBinding: (operation: ApprovedGhOperation) => Promise<ExternalApprovalBinding | undefined>;
-  confirm: (operation: ApprovedGhOperation, binding: ExternalApprovalBinding) => Promise<boolean>;
+  resolveBinding: (operation: ApprovedExternalOperation) => Promise<ExternalApprovalBinding | undefined>;
+  confirm: (operation: ApprovedExternalOperation, binding: ExternalApprovalBinding) => Promise<boolean>;
   now?: number;
 }): Promise<boolean>;

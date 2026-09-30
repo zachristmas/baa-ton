@@ -42,6 +42,7 @@ const { approveExternalGhCommand, externalApprovalChecked, externalApprovalGrant
   externalApprovalGranted: WeakSet<object>;
   registerExternalApprovalBeforeToolCall: (pi: ExtensionAPI, dependencies: (event: unknown, ctx: ExtensionContext) => Promise<Record<string, unknown>>) => void;
 };
+const { createExternalApprovalResolver } = (await freshImport("./external-approval-resolver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-resolver.mjs");
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -11847,35 +11848,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     caller: isRegisteredChildLane() ? "child" : "root",
     hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
     sessionFile: process.env.PI_SESSION_FILE,
-    resolveBinding: async (operation: { operation: string; argv: string[]; repo?: string; remoteName?: string; branch?: string; destinationRef?: string }) => {
-      const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
-      const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
-      const head = await git(["rev-parse", "HEAD"]);
-      const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-      const sessionId = await realpath(process.env.PI_SESSION_FILE!);
-      const baseFlag = operation.argv.findIndex((arg) => arg === "--base" || arg.startsWith("--base="));
-      const target = operation.operation === "merge" ? operation.argv[3] ?? "" : baseFlag >= 0 ? (operation.argv[baseFlag].includes("=") ? operation.argv[baseFlag].slice(operation.argv[baseFlag].indexOf("=") + 1) : operation.argv[baseFlag + 1] ?? "") : "(gh-default-base)";
-      const remotes = (await git(["remote", "-v"])).split("\n").flatMap((line) => {
-        const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line);
-        if (!match) return [];
-        const url = match[2].replace(/\.git$/, "");
-        const parsed = /^(?:https?:\/\/|ssh:\/\/|git:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]([^/]+)\/([^/]+)$/.exec(url);
-        return parsed ? [{ name: match[1], host: parsed[1].toLowerCase(), repo: `${parsed[2]}/${parsed[3]}` }] : [];
-      });
-      const matches = remotes.filter((remote) => operation.operation === "push" ? remote.name === operation.remoteName : remote.repo.toLowerCase() === operation.repo?.toLowerCase());
-      if (matches.length !== 1) throw new Error(operation.operation === "push" ? "Explicit push remote must identify exactly one local Git remote." : "Explicit --repo does not identify exactly one canonical local Git remote.");
-      const remote = matches[0];
-      const localRefOid = async (ref: string) => {
-        try { return await git(["rev-parse", "--verify", ref]); } catch { return ""; }
-      };
-      const destinationOid = operation.operation === "push" ? await localRefOid(`refs/remotes/${remote.name}/${operation.branch}`) : "";
-      const headRefOid = await localRefOid(`refs/remotes/${remote.name}/${branch}`);
-      const baseRefOid = target.startsWith("(") ? "" : await localRefOid(`refs/remotes/${remote.name}/${target}`);
-      return { repo, head, branch, target, baseRef: target, headRef: branch, headRefOid, baseRefOid, remoteName: remote.name, host: remote.host, targetRepo: operation.repo ?? remote.repo, destinationRef: operation.destinationRef, destinationOid, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
-    },
-    confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; paneId: string; sessionId: string }) => ctx.ui!.confirm(
+    resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: process.env.PI_SESSION_FILE!, paneId: process.env[HERDR_PANE_ID_ENV] }),
+    confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId: string; sessionId: string }) => ctx.ui!.confirm(
       `Approve exact external ${operation.operation}?`,
-      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.branch}\nDestination ref: ${operation.destinationRef ?? binding.target}\nExact argv: ${JSON.stringify(operation.argv)}\nPane/session: ${binding.paneId} / ${binding.sessionId}\nThis approves this exact command once.`,
+      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nPane/session: ${binding.paneId} / ${binding.sessionId}\nThis approves this exact command once.`,
     ),
   }));
 
@@ -11944,29 +11920,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         caller: isRegisteredChildLane() ? "child" : "root",
         hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
         sessionFile: process.env.PI_SESSION_FILE,
-        resolveBinding: async (operation: { operation: string; argv: string[]; repo: string; remoteName?: string; branch?: string; destinationRef?: string }) => {
-          const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
-          const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
-          const head = await git(["rev-parse", "HEAD"]);
-          const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-          const sessionId = await realpath(process.env.PI_SESSION_FILE!);
-          const baseFlag = operation.argv.findIndex((arg) => arg === "--base" || arg.startsWith("--base="));
-          const target = operation.operation === "merge" ? operation.argv[3] ?? "" : baseFlag >= 0 ? (operation.argv[baseFlag].includes("=") ? operation.argv[baseFlag].slice(operation.argv[baseFlag].indexOf("=") + 1) : operation.argv[baseFlag + 1] ?? "") : "(gh-default-base)";
-          const remotes = (await git(["remote", "-v"])).split("\n").flatMap((line) => {
-            const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line);
-            if (!match) return [];
-            const url = match[2].replace(/\.git$/, "");
-            const parsed = /^(?:https?:\/\/|ssh:\/\/|git:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]([^/]+)\/([^/]+)$/.exec(url);
-            return parsed ? [{ name: match[1], host: parsed[1].toLowerCase(), repo: `${parsed[2]}/${parsed[3]}` }] : [];
-          });
-          const matches = remotes.filter((remote) => remote.repo.toLowerCase() === operation.repo.toLowerCase());
-          if (matches.length !== 1) throw new Error("Explicit --repo does not identify exactly one canonical local Git remote.");
-          const remote = matches[0];
-          return { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: operation.repo, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
-        },
-        confirm: async (operation: { operation: string; argv: string[]; repo: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string }) => ctx.ui!.confirm(
-          `Approve exact gh pr ${operation.operation}?`,
-          `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${operation.repo})\nExplicit --repo target: ${operation.repo}\nHEAD: ${binding.head}\nHead ref: ${binding.branch}\nBase ref: ${binding.target || "(command-defined)"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,
+        resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: process.env.PI_SESSION_FILE!, paneId: process.env[HERDR_PANE_ID_ENV] }),
+        confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId?: string; sessionId?: string }) => ctx.ui!.confirm(
+          `Approve exact external ${operation.operation}?`,
+          `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,
         ),
       });
     }

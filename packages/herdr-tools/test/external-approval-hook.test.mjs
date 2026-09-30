@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { registerExternalApprovalBeforeToolCall } from "../external-approval-hook.mjs";
+import { createExternalApprovalResolver } from "../external-approval-resolver.mjs";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const commandCreate = "gh pr create --repo owner/repo --base main";
-const commandMerge = "gh pr merge topic --repo owner/repo --merge";
+const commandMerge = `gh pr merge 123 --repo owner/repo --match-head-commit ${"a".repeat(40)} --merge`;
 const headOid = "a".repeat(40);
 const binding = { repo: "/repo", head: headOid, branch: "topic", target: "main", baseRef: "main", headRef: "topic", targetRepo: "owner/repo", host: "github.com", remoteName: "origin", paneId: "w:p1", sessionId: "/session", caller: "root" };
 
@@ -23,15 +27,16 @@ async function dispatchToolCall(command, options = {}) {
       caller: options.caller ?? "root",
       hasUI: options.hasUI ?? true,
       sessionFile: Object.hasOwn(options, "sessionFile") ? options.sessionFile : "/session",
-      resolveBinding: async (operation) => {
+      resolveBinding: options.resolveBinding ?? (async (operation) => {
         if (options.remotes && options.remotes.filter((r) => r.repo.toLowerCase() === operation.repo.toLowerCase()).length !== 1) throw new Error("remote identity not unique");
         if (options.mismatch) return { ...currentBinding, targetRepo: "owner/elsewhere" };
         return { ...currentBinding };
-      },
+      }),
       confirm: async (operation, shown) => {
         state.prompts++;
         state.shown = { operation, binding: shown };
         if (options.changeDuringConfirm) currentBinding = { ...currentBinding, ...options.changeDuringConfirm };
+        if (options.onConfirm) await options.onConfirm(operation, shown);
         return options.confirm ?? true;
       },
     };
@@ -98,6 +103,10 @@ test("binding changes while native confirmation is open block execution", async 
     { head: "b".repeat(40) }, { branch: "other" }, { repo: "/other" },
     { host: "evil.example" }, { targetRepo: "owner/other" },
     { headRef: "other" }, { baseRef: "release", target: "release" },
+    { remoteUrl: "ssh://evil.example/owner/repo.git" }, { remoteRepo: "owner/other" },
+    { destinationOid: "c".repeat(40) }, { pr: { number: 123, state: "CLOSED" } },
+    { pr: { number: 123, headOid: "b".repeat(40), state: "OPEN" } },
+    { pr: { number: 123, baseOid: "c".repeat(40), state: "OPEN" } },
   ];
   for (const changeDuringConfirm of changes) {
     const result = await dispatchToolCall(commandCreate, { changeDuringConfirm });
@@ -109,6 +118,48 @@ test("binding changes while native confirmation is open block execution", async 
   assert.equal(changedPush.blocked, true);
   assert.equal(changedPush.executions, 0);
 });
+
+test("resolver binds effective push URL/live OID and authoritative PR metadata from fake servers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "external-approval-"));
+  const session = join(dir, "session");
+  await writeFile(session, "session");
+  const state = { pushUrl: "git@github.com:owner/repo.git", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN" };
+  const calls = [];
+  const fakeExec = async (program, args) => {
+    calls.push([program, ...args]);
+    let stdout = "";
+    if (program === "git" && args.join(" ") === "rev-parse --show-toplevel") stdout = dir;
+    else if (program === "git" && args.join(" ") === "rev-parse HEAD") stdout = state.head;
+    else if (program === "git" && args.join(" ") === "symbolic-ref --quiet --short HEAD") stdout = "topic";
+    else if (program === "git" && args[0] === "remote" && args[1] === "get-url") stdout = state.pushUrl;
+    else if (program === "git" && args[0] === "remote") stdout = "origin";
+    else if (program === "git" && args[0] === "config" && args[1] === "--get" && args[2].startsWith("branch.")) stdout = "origin";
+    else if (program === "git" && args[0] === "config") throw new Error("not configured");
+    else if (program === "git" && args[0] === "ls-remote") stdout = `${args.at(-1).includes("topic") ? state.head : state.destination}\t${args.at(-1)}`;
+    else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
+    else throw new Error(`unexpected fake command ${program} ${args.join(" ")}`);
+    return { stdout };
+  };
+  const resolver = createExternalApprovalResolver({ cwd: dir, execFile: fakeExec, sessionFile: session, paneId: "w:p1" });
+  try {
+    const push = await resolver(parsePushOperation(`git push origin ${state.head}:refs/heads/main`));
+    assert.equal(push.destinationOid, state.destination);
+    assert.equal(push.remoteRepo, "owner/repo");
+    const created = await resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" });
+    assert.equal(created.headRefOid, state.head);
+    assert.equal(created.baseRefOid, state.destination);
+    const prOperation = { operation: "merge", argv: ["gh", "pr", "merge", "123", "--repo", "owner/repo", "--match-head-commit", state.head, "--merge"], repo: "owner/repo" };
+    const pr = await resolver(prOperation);
+    assert.equal(pr.pr.headOid, state.head);
+    assert.equal(pr.pr.baseOid, state.base);
+    assert.ok(calls.some((call) => call[0] === "gh" && call.includes("view")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+function parsePushOperation(command) {
+  const oid = /git push origin ([a-f0-9]{40}):refs\/heads\/([\w./-]+)/.exec(command);
+  return { operation: "push", argv: command.split(" "), remoteName: "origin", branch: oid[2], sourceRef: oid[1], destinationRef: `refs/heads/${oid[2]}` };
+}
 
 test("read-only PR commands pass through without approval", async () => {
   for (const command of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) {
