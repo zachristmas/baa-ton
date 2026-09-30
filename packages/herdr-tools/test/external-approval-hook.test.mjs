@@ -60,6 +60,19 @@ test("wrapped, quoted and compound command forms are blocked and never prompted 
   }
 });
 
+test("before_tool_call never prompts for compound, indirect, or dynamic PR commands", async () => {
+  for (const command of ["gh pr list && eval \"$BAA_PR_COMMAND\"", "gh pr list; \"$RUNNER\" ...", "gh pr list | cat", "(gh pr list)", "bash -c 'gh pr list'", "gh pr `echo list`", "gh pr $(echo list)", "eval \"$BAA_PR_COMMAND\""]) {
+    const result = await beforeToolCall(command);
+    assert.equal(result.prompts, 0, command);
+    assert.equal(result.executions, 0, command);
+  }
+  for (const command of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) {
+    const result = await beforeToolCall(command);
+    assert.equal(result.prompts, 0, command);
+    assert.equal(result.executions, 0, command);
+  }
+});
+
 test("only the exact explicit repository is displayed and accepted", async () => {
   const result = await beforeToolCall(commandCreate, { remotes: [{ repo: "owner/repo" }] });
   assert.equal(result.blocked, false);

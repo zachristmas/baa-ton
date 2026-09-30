@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { consumeExternalApproval, containsGhPrMutation, issueExternalApproval, parseApprovedGhOperation } from "../external-approval.mjs";
+import { consumeExternalApproval, containsGhPrMutation, containsUnsafeShellExecution, issueExternalApproval, parseApprovedGhOperation } from "../external-approval.mjs";
 
 const binding = { repo: "/repo", head: "abc", branch: "topic", target: "main", targetRepo: "owner/repo", host: "github.com", remoteName: "origin", paneId: "w:p1", sessionId: "/session", caller: "root" };
 const command = "gh pr create --repo owner/repo --base main";
@@ -53,6 +53,9 @@ test("gh pr is default-deny except for explicit read-only verbs", () => {
     "close --comment done", "ready", "update-branch", "lock", "unlock", "unknown-verb", "",
   ]) assert.equal(containsGhPrMutation(`gh pr ${args}`), true, args);
   for (const verb of ["list", "view", "status", "diff", "checks"]) assert.equal(containsGhPrMutation(`gh pr ${verb}`), false, verb);
+  for (const cmd of ["gh pr list && eval \"$BAA_PR_COMMAND\"", "gh pr list; \"$RUNNER\" ...", "gh pr list | cat", "(gh pr list)", "bash -c 'gh pr list'", "gh pr `echo list`", "gh pr $(echo list)", "gh 'pr' list", "gh pr li'st'", "GH=gh $GH pr list", "env gh pr list", "gh pr list *", "gh pr list # ignored"]) assert.equal(containsGhPrMutation(cmd), true, cmd);
+  for (const cmd of ["eval \"$BAA_PR_COMMAND\"", "\"$RUNNER\" ...", "bash -c 'git status'"]) assert.equal(containsUnsafeShellExecution(cmd), true, cmd);
+  for (const cmd of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) assert.equal(containsUnsafeShellExecution(cmd), false, cmd);
 });
 
 test("mutator detection survives wrappers, quoting, flags and shell composition", () => {

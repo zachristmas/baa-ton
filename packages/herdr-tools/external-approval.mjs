@@ -59,7 +59,9 @@ export function parseApprovedGhOperation(command) {
 export function containsGhPrMutation(command) {
   const tokens = lexShell(command);
   if (!tokens) return typeof command === "string" && /\b(?:gh|pr)\b/i.test(command);
+  const readonly = wordsOnly(tokens);
   const readOnlyVerbs = new Set(["list", "view", "status", "diff", "checks"]);
+  if (readonly && readonly.length >= 3 && readonly[0] === "gh" && readonly[1] === "pr" && readOnlyVerbs.has(readonly[2]) && command === readonly.join(" ") && !/[$`*?{}~#]/.test(command)) return false;
   const optionTakesValue = new Set(["-R", "--repo", "--hostname", "--config"]);
   let sawGhPr = false;
   const scan = (list, depth = 0) => {
@@ -79,9 +81,8 @@ export function containsGhPrMutation(command) {
             const flag = list[j++].word.split("=", 1)[0];
             if (!list[j - 1].word.includes("=") && optionTakesValue.has(flag) && list[j]?.word) j++;
           }
-          // Deny absent, unknown and mutating verbs; only explicitly verified
-          // read-only operations pass without native approval.
-          if (!readOnlyVerbs.has(list[j]?.word)) return true;
+          // Every PR command except the exact full-command exception above is gated.
+          return true;
         }
       }
       if ((list[i].word === "sh" || list[i].word === "bash") && list[i + 1]?.word === "-c" && list[i + 2]?.word) {
@@ -95,6 +96,16 @@ export function containsGhPrMutation(command) {
   // Syntax outside our lexer mentioning both components is ambiguous, unless
   // the only parsed gh pr command(s) were explicitly read-only.
   return !sawGhPr && /\bgh\b/i.test(command) && /\bpr\b/i.test(command);
+}
+
+// Dynamic/indirect execution and shell composition are denied in Herdr sessions.
+// This catches eval-only commands that cannot be tied lexically to a target.
+export function containsUnsafeShellExecution(command) {
+  const tokens = lexShell(command);
+  if (!tokens || tokens.some((token) => token.op !== undefined)) return true;
+  if (typeof command !== "string" || command !== tokens.map((token) => token.word).join(" ") || /[$`*?{}~#]/.test(command)) return true;
+  const words = wordsOnly(tokens) ?? [];
+  return words.some((word) => ["eval", "source", ".", "env", "command", "exec", "sh", "bash", "zsh", "dash"].includes(word));
 }
 
 export function issueExternalApproval(command, binding, { now = Date.now(), ttlMs = 30_000 } = {}) {

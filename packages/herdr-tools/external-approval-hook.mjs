@@ -1,9 +1,10 @@
-import { containsGhPrMutation, consumeExternalApproval, issueExternalApproval, parseApprovedGhOperation } from "./external-approval.mjs";
+import { containsGhPrMutation, containsUnsafeShellExecution, consumeExternalApproval, issueExternalApproval, parseApprovedGhOperation } from "./external-approval.mjs";
 
 /** The before_tool_call approval path. Dependencies keep UI, Git and execution out of this module. */
 export async function approveExternalGhCommand({ command, enabled, caller, hasUI, sessionFile, resolveBinding, confirm, now }) {
   if (!enabled || caller !== "root" || !hasUI || !sessionFile || typeof confirm !== "function") return false;
-  if (!containsGhPrMutation(command)) return false;
+  if (!containsGhPrMutation(command) && !containsUnsafeShellExecution(command)) return false;
+  if (containsUnsafeShellExecution(command)) return false;
   const operation = parseApprovedGhOperation(command);
   if (!operation || command !== operation.argv.join(" ")) return false;
   try {

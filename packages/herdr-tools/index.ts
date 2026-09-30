@@ -36,7 +36,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
-const { containsGhPrMutation } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs");
+const { containsGhPrMutation, containsUnsafeShellExecution } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs");
 const { approveExternalGhCommand } = (await freshImport("./external-approval-hook.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-hook.mjs");
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
@@ -11895,7 +11895,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const herdrPaneClose =
       /(?:^|[;&|]\s*)herdr\s+(?:tab|pane)\s+close\b/im;
     let explicitlyApproved = false;
-    const externalMutation = containsGhPrMutation(command);
+    const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && containsUnsafeShellExecution(command));
     if (externalMutation) {
       explicitlyApproved = await approveExternalGhCommand({
         command,
