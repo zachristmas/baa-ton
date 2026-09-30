@@ -36,7 +36,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
-import { consumeExternalApproval, containsGhPrMutation, issueExternalApproval, parseApprovedGhOperation } from "./external-approval.mjs";
+const { consumeExternalApproval, containsGhPrMutation, issueExternalApproval, parseApprovedGhOperation } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs");
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,

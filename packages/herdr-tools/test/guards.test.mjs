@@ -271,9 +271,16 @@ test("external push stays blocked even for the root; lanes and other mutations s
   try {
     setPane("w1:p1"); // verified controller-mapped root
     assert.match(await blockedReason(`git ${pushVerb} origin main`), /require/, "root push stays hard-gated");
-    assert.match(await blockedReason("gh pr create --base main"), /require/, "without a native exact approval token PR creation stays blocked");
-    assert.match(await blockedReason("env gh pr merge topic -R owner/repo --merge"), /require/, "wrapped merge never reaches autonomous execution");
+    for (const command of [
+      "gh pr create -R owner/repo --base main",
+      "gh pr merge topic -R owner/repo --merge",
+      "env gh pr create -R owner/repo --base main",
+      "env gh pr merge topic -R owner/repo --merge",
+      "sh -c 'gh pr create -R owner/repo --base main'",
+      "sh -c 'gh pr merge topic -R owner/repo --merge'",
+    ]) assert.match(await blockedReason(command), /require/, `root blocks unapproved direct/wrapped PR mutation: ${command}`);
     assert.equal(await bash("git status"), undefined);
+    assert.equal(await bash("pwd"), undefined, "ordinary Bash remains available");
     assert.match(await blockedReason(`git ${mergeVerb} feature`), /require/);
     assert.match(
       await blockedReason(`git ${pushVerb} origin main && git ${mergeVerb} feature`),
@@ -285,7 +292,14 @@ test("external push stays blocked even for the root; lanes and other mutations s
     assert.match(await blockedReason("npm run deploy"), /require/);
     setPane("w1:p2"); // unmapped pane: not the root
     assert.match(await blockedReason(`git ${pushVerb} origin main`), /require/);
-    assert.match(await blockedReason("gh pr merge topic -R owner/repo --merge"), /require/, "child merge cannot request or consume an approval");
+    for (const command of [
+      "gh pr create -R owner/repo --base main",
+      "gh pr merge topic -R owner/repo --merge",
+      "env gh pr create -R owner/repo --base main",
+      "env gh pr merge topic -R owner/repo --merge",
+      "sh -c 'gh pr create -R owner/repo --base main'",
+      "sh -c 'gh pr merge topic -R owner/repo --merge'",
+    ]) assert.match(await blockedReason(command), /require/, `child blocks direct/wrapped PR mutation: ${command}`);
     assert.match(await blockedReason(`herdr tab ${closeVerb} w1:t3`), /require/);
   } finally {
     for (const [key, value] of Object.entries(saved))
