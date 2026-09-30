@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -17,6 +18,23 @@ const TABLE = [
   `  500     1   2-00:00:01 gitstatusd-darwin-arm64 -s 1 HOME=/u`,
   `  600   555      00:05 grep BAA_STARTUP_INTENT=${INTENT}x`,
 ].join("\n");
+
+function runPowerShellFixture(script, { timezone } = {}) {
+  return spawnSync(process.platform === "win32" ? "powershell.exe" : "pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, ...(timezone ? { TZ: timezone } : {}) },
+  });
+}
+
+function requirePowerShell(testContext, result) {
+  if (result.error?.code === "ENOENT") {
+    testContext.skip("PowerShell runtime unavailable for generated-script integration test");
+    return false;
+  }
+  assert.equal(result.error, undefined, `PowerShell fixture failed to start: ${result.error?.message ?? "unknown error"}`);
+  return true;
+}
 
 test("a lane's process tree: every process carrying its exact marker, reparented ones too, and their children", () => {
   const rows = parseProcessTable(TABLE);
@@ -67,7 +85,7 @@ test("Windows inventory normalizes raw CIM creation dates to invariant UTC round
   assert.deepEqual(rows, [{ pid: 10, ppid: 1, createdAt: utc, line: "node worker.js" }]);
   assert.match(script, /Get-CimInstance -ClassName Win32_Process/);
   assert.match(script, /CreationDate = Convert-CimCreationDateToUtcIso \$_.CreationDate/);
-  assert.match(script, /ManagementDateTimeConverter\]::ToDateTime\(\$text\)/);
+  assert.match(script, /ParseExact\(\$text\.Substring\(0, 21\), 'yyyyMMddHHmmss\.ffffff'/);
   assert.match(script, /ToUniversalTime\(\)\.ToString\('o', \[Globalization\.CultureInfo\]::InvariantCulture\)/);
   assert.match(script, /DateTimeStyles\]::RoundtripKind/);
   assert.doesNotMatch(script, /\/bin\/ps/);
@@ -120,33 +138,99 @@ test("Windows stop script validates held-handle identities before handle-bound t
   assert.ok(rows.some((row) => row.pid === 702), "unrelated same-host process is untouched");
 });
 
-test("Windows normalizer covers equivalent CIM timezone and locale representations", async () => {
+test("generated Windows inventory normalizes raw CIM timezone fixtures invariantly under different cultures", async (t) => {
   let inventory;
   await readProcessTable({ platform: "win32", runPowerShell: async (script) => { inventory = script; return "[]"; } });
-  const utcDmtf = "20260927031530.123456+000";
-  const offsetDmtf = "20260926221530.123456-300";
-  assert.notEqual(utcDmtf, offsetDmtf, "fixtures are distinct raw CIM timestamp representations");
-  const dmtfUtcMillis = (stamp) => {
-    const [, year, month, day, hour, minute, second, fraction, sign, offset] = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/.exec(stamp);
-    const local = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second), Number(fraction.slice(0, 3)));
-    return local - (sign === "+" ? 1 : -1) * Number(offset) * 60_000;
-  };
-  assert.equal(dmtfUtcMillis(utcDmtf), dmtfUtcMillis(offsetDmtf), "timezone-offset CIM fixtures represent the same creation instant");
-  const instant = new Date("2026-09-27T03:15:30.123Z");
-  const localeDisplays = ["en-US", "de-DE"].map((locale) => new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "medium", timeZone: "UTC" }).format(instant));
-  assert.notEqual(localeDisplays[0], localeDisplays[1], "locale fixtures differ even though their typed DateTime instant is the same");
-  assert.match(inventory, /ManagementDateTimeConverter\]::ToDateTime\(\$text\)/, "raw DMTF values retain and apply their explicit timezone offsets");
-  assert.match(inventory, /\$value -is \[datetime\]\) \{ \$date = \[datetime\]\$value \}/, "typed CIM DateTime values bypass locale-dependent string formatting");
-  assert.match(inventory, /InvariantCulture/);
-  let stopScript;
+  assert.match(inventory, /ParseExact\(\$text\.Substring\(0, 21\), 'yyyyMMddHHmmss\.ffffff', \[Globalization\.CultureInfo\]::InvariantCulture/);
+  assert.match(inventory, /\[datetimeoffset\]::new\(\$wall, \[timespan\]::FromMinutes\(\$offsetMinutes\)\)\.UtcDateTime/);
+  assert.match(inventory, /ToUniversalTime\(\)\.ToString\('o', \[Globalization\.CultureInfo\]::InvariantCulture\)/);
+  const fixtures = [
+    { ProcessId: 901, ParentProcessId: 1, CreationDate: "20260927031530.123456+000", CommandLine: "fixture-utc" },
+    { ProcessId: 902, ParentProcessId: 1, CreationDate: "20260926221530.123456-300", CommandLine: "fixture-offset" },
+  ];
+  const encodedFixtures = Buffer.from(JSON.stringify(fixtures)).toString("base64");
+  const outputs = [];
+  for (const [culture, timezone] of [["en-US", "UTC"], ["de-DE", "America/Los_Angeles"]]) {
+    const prelude = `[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('${culture}'); ` +
+      `$script:fixtureRows = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedFixtures}')) | ConvertFrom-Json; ` +
+      `function Get-CimInstance { param([string]$ClassName); $script:fixtureRows }; `;
+    const result = runPowerShellFixture(`${prelude}\n${inventory}`, { timezone });
+    if (!requirePowerShell(t, result)) return;
+    assert.equal(result.status, 0, result.stderr);
+    const rows = parseWindowsProcessTable(result.stdout);
+    assert.deepEqual(rows.map(({ pid, createdAt }) => [pid, createdAt]), [
+      [901, "2026-09-27T03:15:30.1234560Z"],
+      [902, "2026-09-27T03:15:30.1234560Z"],
+    ], `${culture}/${timezone} must produce the same UTC round-trip identity from raw CIM values`);
+    outputs.push(rows.map(({ createdAt }) => createdAt));
+  }
+  assert.deepEqual(outputs[0], outputs[1]);
+});
+
+test("generated Windows stop script holds and verifies all fake handles before any signal", async (t) => {
+  const rows = [
+    { pid: 700, ppid: 1, createdAt: "2026-09-27T03:15:30.1234560Z", line: "claude" },
+    { pid: 701, ppid: 700, createdAt: "2026-09-27T03:16:30.0000000Z", line: "node child" },
+  ];
+  let inventoryScript;
+  await readProcessTable({ platform: "win32", runPowerShell: async (script) => { inventoryScript = script; return "[]"; } });
+  const generated = [];
   await killLaneProcesses({
-    platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 900, createdAt: "2026-09-27T03:15:30.1234560Z" }],
-    table: async () => [{ pid: 900, ppid: 1, createdAt: "2026-09-27T03:15:30.1234560Z", line: `node BAA_STARTUP_INTENT=${INTENT}` }],
-    runPowerShell: async (script) => { stopScript = script; return ""; },
+    platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 700, createdAt: rows[0].createdAt }],
+    table: async () => rows,
+    runPowerShell: async (script) => { generated.push(script); return ""; },
   });
-  assert.equal((stopScript.match(/function Convert-CimCreationDateToUtcIso \{/g) ?? []).length, 1);
-  const normalization = (source) => source.match(/function Convert-CimCreationDateToUtcIso \{[\s\S]*?\n\}/)?.[0];
-  assert.equal(normalization(stopScript), normalization(inventory), "inventory and stop use one identical invariant normalizer");
+  assert.equal(generated.length, 1);
+  const stopScript = generated[0];
+  const normalizer = (source) => source.match(/function Convert-CimCreationDateToUtcIso \{[\s\S]*?\n\}/)?.[0];
+  assert.equal(normalizer(stopScript), normalizer(inventoryScript), "termination identity uses the inventory's exact invariant normalizer");
+  assert.match(stopScript, /OpenProcess\(0x00100401, \$false, \[int\]\$item\.pid\)/);
+  assert.match(stopScript, /GetProcessTimes\(\$handle, \[ref\]\$creationTicks/);
+  assert.match(stopScript, /\$planned = Convert-CimCreationDateToUtcIso \$item\.createdAt/);
+  assert.doesNotMatch(stopScript, /\[string\]\$item\.createdAt/, "ConvertFrom-Json timestamps are normalized, never locale-formatted for comparison");
+  assert.match(stopScript, /::TerminateProcess\(\$candidate\.Handle, 1\)/);
+  assert.ok(stopScript.indexOf("foreach ($item in $items)") < stopScript.indexOf("foreach ($candidate in $held) { if (![HerdrLaneProcessNative]::TerminateProcess"), "the whole acquisition and start-time verification loop precedes termination");
+  assert.doesNotMatch(stopScript, /Stop-Process|taskkill|GetProcessById/);
+  const nativeStub = (killLog, parentActual, missingParent) => String.raw`Add-Type -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.IO;
+public static class HerdrLaneProcessNative {
+  static long Child = DateTime.Parse("2026-09-27T03:16:30.0000000Z", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind).ToFileTimeUtc();
+  static long Parent = DateTime.Parse("${parentActual}", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind).ToFileTimeUtc();
+  public static IntPtr OpenProcess(uint access, bool inherit, int processId) { return ${missingParent ? "processId == 700 ? IntPtr.Zero : new IntPtr(processId)" : "new IntPtr(processId)"}; }
+  public static bool GetProcessTimes(IntPtr process, out long creationTime, out long exitTime, out long kernelTime, out long userTime) { creationTime = process.ToInt32() == 701 ? Child : Parent; exitTime = 0; kernelTime = 0; userTime = 0; return true; }
+  public static bool TerminateProcess(IntPtr process, uint exitCode) { File.AppendAllText(${JSON.stringify(killLog)}, process.ToInt32().ToString(CultureInfo.InvariantCulture) + "\n"); return true; }
+  public static uint WaitForSingleObject(IntPtr handle, uint milliseconds) { return 0; }
+  public static bool CloseHandle(IntPtr handle) { return true; }
+}
+'@`;
+  const nativeBlock = /Add-Type -TypeDefinition @'[\s\S]*?\n'@/;
+  const directory = await mkdtemp(join(tmpdir(), "baa-win-process-fixture-"));
+  try {
+    const killLog = join(directory, "kills.txt");
+    for (const [culture, timezone] of [["en-US", "UTC"], ["de-DE", "America/Los_Angeles"]]) {
+      await rm(killLog, { force: true });
+      const validScript = stopScript.replace(nativeBlock, nativeStub(killLog, rows[0].createdAt, false));
+      const valid = runPowerShellFixture(`[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('${culture}');\n${validScript}`, { timezone });
+      if (!requirePowerShell(t, valid)) return;
+      assert.equal(valid.status, 0, `${culture}/${timezone}: ${valid.stderr}`);
+      assert.equal(await readFile(killLog, "utf8"), "701\n700\n", `${culture}/${timezone} uses normalized identities and terminates in planned child-before-parent order`);
+    }
+    for (const [failure, culture, timezone, parentActual, missingParent] of [
+      ["mismatched start time", "de-DE", "America/Los_Angeles", "2025-01-01T00:00:00.0000000Z", false],
+      ["missing later handle", "fr-FR", "America/New_York", rows[0].createdAt, true],
+    ]) {
+      await rm(killLog, { force: true });
+      const failingScript = stopScript.replace(nativeBlock, nativeStub(killLog, parentActual, missingParent));
+      const result = runPowerShellFixture(`[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('${culture}');\n${failingScript}`, { timezone });
+      assert.notEqual(result.status, 0, `${failure} must fail closed`);
+      assert.match(result.stderr, /identity changed|handle\/access is unavailable/);
+      await assert.rejects(readFile(killLog, "utf8"), { code: "ENOENT" }, `${failure} on the later candidate must result in zero termination calls`);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("Windows refuses a later mismatched or missing candidate identity before any stop script runs", async () => {

@@ -39,7 +39,11 @@ const WINDOWS_CREATION_IDENTITY = String.raw`function Convert-CimCreationDateToU
   elseif ($value -is [datetimeoffset]) { $date = $value.UtcDateTime }
   else {
     $text = [string]$value
-    if ($text -match '^\d{14}\.\d{6}[+-]\d{3}$') { $date = [System.Management.ManagementDateTimeConverter]::ToDateTime($text) }
+    if ($text -match '^\d{14}\.\d{6}[+-]\d{3}$') {
+      $wall = [datetime]::ParseExact($text.Substring(0, 21), 'yyyyMMddHHmmss.ffffff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None)
+      $offsetMinutes = [int]$text.Substring(22, 3); if ($text[21] -eq '-') { $offsetMinutes = -$offsetMinutes }
+      $date = [datetimeoffset]::new($wall, [timespan]::FromMinutes($offsetMinutes)).UtcDateTime
+    }
     else { $date = [datetime]::Parse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
   }
   return $date.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
@@ -170,7 +174,7 @@ async function stopWindowsProcesses(candidates, runPowerShell = powershell) {
     `if ($handle -eq [IntPtr]::Zero) { throw "Process $($item.pid) handle/access is unavailable" }; ` +
     `[long]$creationTicks = 0; [long]$exitTicks = 0; [long]$kernelTicks = 0; [long]$userTicks = 0; ` +
     `if (![HerdrLaneProcessNative]::GetProcessTimes($handle, [ref]$creationTicks, [ref]$exitTicks, [ref]$kernelTicks, [ref]$userTicks)) { throw "Process $($item.pid) start time is unavailable" }; ` +
-    `$created = Convert-CimCreationDateToUtcIso ([datetime]::FromFileTimeUtc($creationTicks)); if (!$created -or $created -cne [string]$item.createdAt) { throw "Process $($item.pid) identity changed" }; ` +
+    `$created = Convert-CimCreationDateToUtcIso ([datetime]::FromFileTimeUtc($creationTicks)); $planned = Convert-CimCreationDateToUtcIso $item.createdAt; if (!$created -or !$planned -or $created -cne $planned) { throw "Process $($item.pid) identity changed: held=$created planned=$planned" }; ` +
     `$held += [pscustomobject]@{ Item = $item; Handle = $handle }; $handle = [IntPtr]::Zero ` +
     `} catch { if ($handle -ne [IntPtr]::Zero) { [void][HerdrLaneProcessNative]::CloseHandle($handle) }; throw } }; ` +
     `foreach ($candidate in $held) { if (![HerdrLaneProcessNative]::TerminateProcess($candidate.Handle, 1)) { throw "Process $($candidate.Item.pid) could not be terminated" } }; ` +
