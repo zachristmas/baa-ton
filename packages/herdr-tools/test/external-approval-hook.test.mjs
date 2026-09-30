@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { approveExternalGhCommand } from "../external-approval-hook.mjs";
+import { registerExternalApprovalBeforeToolCall } from "../external-approval-hook.mjs";
 
 const commandCreate = "gh pr create --repo owner/repo --base main";
 const commandMerge = "gh pr merge topic --repo owner/repo --merge";
 const binding = { repo: "/repo", head: "abc", branch: "topic", target: "main", baseRef: "main", headRef: "topic", targetRepo: "owner/repo", host: "github.com", remoteName: "origin", paneId: "w:p1", sessionId: "/session", caller: "root" };
 
-// Mirrors Pi's before_tool_call result contract. An executor counter proves the harness
-// never runs a command; permitted commands are represented, not executed.
+// Register the real gate on a fake Pi event bus and route unblocked calls to a fake executor.
 async function beforeToolCall(command, options = {}) {
   const state = { prompts: 0, executions: 0 };
-  const approved = await approveExternalGhCommand({
+  const listeners = new Map();
+  const pi = { on: (name, listener) => listeners.set(name, listener) };
+  registerExternalApprovalBeforeToolCall(pi, {
     command,
     enabled: options.enabled ?? true,
     caller: options.caller ?? "root",
@@ -27,17 +28,21 @@ async function beforeToolCall(command, options = {}) {
       return options.confirm ?? true;
     },
   });
-  const blocked = !approved;
-  // Intentionally never invoke a command executor, even when the hook permits it.
-  return { blocked, ...state };
+  const result = await listeners.get("tool_call")({ toolName: "bash", input: { command } });
+  if (!result?.block) {
+    state.executions++;
+    state.executedCommand = command;
+  }
+  return { blocked: Boolean(result?.block), ...state };
 }
 
-test("before_tool_call asks native confirmation and allows exact create/merge path without executing it", async () => {
+test("registered before_tool_call asks confirmation and invokes the fake executor once for exact create/merge", async () => {
   for (const command of [commandCreate, commandMerge]) {
     const result = await beforeToolCall(command);
     assert.equal(result.blocked, false);
     assert.equal(result.prompts, 1);
-    assert.equal(result.executions, 0);
+    assert.equal(result.executions, 1);
+    assert.equal(result.executedCommand, command);
     assert.equal(result.shown.binding.targetRepo, "owner/repo");
   }
 });

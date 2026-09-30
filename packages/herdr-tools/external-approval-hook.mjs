@@ -6,7 +6,7 @@ export async function approveExternalGhCommand({ command, enabled, caller, hasUI
   if (!containsGhPrMutation(command) && !containsUnsafeShellExecution(command)) return false;
   if (containsUnsafeShellExecution(command)) return false;
   const operation = parseApprovedGhOperation(command);
-  if (!operation || command !== operation.argv.join(" ")) return false;
+  if (!operation || !/^\s*gh\s+pr\s+(?:create|merge)(?:\s|$)/.test(command)) return false;
   try {
     const binding = await resolveBinding(operation);
     if (!binding || binding.caller !== "root" || binding.targetRepo?.toLowerCase() !== operation.repo.toLowerCase()) return false;
@@ -16,4 +16,14 @@ export async function approveExternalGhCommand({ command, enabled, caller, hasUI
   } catch {
     return false;
   }
+}
+
+/** Register the approval gate as a before-tool-call listener; executor is injected for hermetic integration tests. */
+export function registerExternalApprovalBeforeToolCall(pi, dependencies) {
+  pi.on("tool_call", async (event) => {
+    if (event?.toolName !== "bash" || typeof event.input?.command !== "string") return;
+    const approved = await approveExternalGhCommand({ ...dependencies, command: event.input.command });
+    if (!approved) return { block: true, reason: "External PR command was not explicitly approved." };
+    return undefined;
+  });
 }

@@ -56,12 +56,34 @@ export function parseApprovedGhOperation(command) {
 
 // Detect target commands even through shell wrappers, quoting, concatenation,
 // environment assignments and `sh -c`. Unknown syntax mentioning gh is blocked.
+function hasDynamicShellSyntax(input) {
+  let quote = "", escaped = false, wordStart = true;
+  for (const c of input) {
+    if (escaped) { escaped = false; wordStart = false; continue; }
+    if (quote === "'") { if (c === "'") quote = ""; wordStart = false; continue; }
+    if (quote === '"') {
+      if (c === '"') quote = "";
+      else if (c === "\\") escaped = true;
+      else if (c === "$" || c === "`") return true;
+      wordStart = false;
+      continue;
+    }
+    if (c === "\\") { escaped = true; wordStart = false; continue; }
+    if (c === "'" || c === '"') { quote = c; wordStart = false; continue; }
+    if (c === "$" || c === "`" || c === "*" || c === "?" || c === "{" || c === "}" || (c === "~" && wordStart) || (c === "#" && wordStart)) return true;
+    if (/\s/.test(c) || /[;&|()<>]/.test(c)) wordStart = true;
+    else wordStart = false;
+  }
+  return false;
+}
+
 export function containsGhPrMutation(command) {
   const tokens = lexShell(command);
   if (!tokens) return typeof command === "string" && /\b(?:gh|pr)\b/i.test(command);
   const readonly = wordsOnly(tokens);
   const readOnlyVerbs = new Set(["list", "view", "status", "diff", "checks"]);
-  if (readonly && readonly.length >= 3 && readonly[0] === "gh" && readonly[1] === "pr" && readOnlyVerbs.has(readonly[2]) && command === readonly.join(" ") && !/[$`*?{}~#]/.test(command)) return false;
+  const literalReadOnlyVerb = /^\s*gh\s+pr\s+([^\s'"]+)/.exec(command)?.[1];
+  if (readonly && readonly.length >= 3 && readonly[0] === "gh" && readonly[1] === "pr" && readOnlyVerbs.has(readonly[2]) && literalReadOnlyVerb === readonly[2] && !hasDynamicShellSyntax(command)) return false;
   const optionTakesValue = new Set(["-R", "--repo", "--hostname", "--config"]);
   let sawGhPr = false;
   const scan = (list, depth = 0) => {
@@ -102,10 +124,14 @@ export function containsGhPrMutation(command) {
 // This catches eval-only commands that cannot be tied lexically to a target.
 export function containsUnsafeShellExecution(command) {
   const tokens = lexShell(command);
-  if (!tokens || tokens.some((token) => token.op !== undefined)) return true;
-  if (typeof command !== "string" || command !== tokens.map((token) => token.word).join(" ") || /[$`*?{}~#]/.test(command)) return true;
+  if (!tokens) return true;
   const words = wordsOnly(tokens) ?? [];
-  return words.some((word) => ["eval", "source", ".", "env", "command", "exec", "sh", "bash", "zsh", "dash"].includes(word));
+  // Composition is not inherently unsafe: ordinary pipelines and quoted static
+  // arguments are common diagnostics. Reject only constructs that can select or
+  // interpret a command indirectly; target-specific policy handles mutations.
+  if (words.some((word) => ["eval", "source", ".", "command", "exec", "sh", "bash", "zsh", "dash"].includes(word))) return true;
+  // Reject actual shell expansions, but preserve quoted/escaped static regex and paths.
+  return hasDynamicShellSyntax(command);
 }
 
 export function issueExternalApproval(command, binding, { now = Date.now(), ttlMs = 30_000 } = {}) {

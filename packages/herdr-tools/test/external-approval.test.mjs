@@ -55,7 +55,10 @@ test("gh pr is default-deny except for explicit read-only verbs", () => {
   for (const verb of ["list", "view", "status", "diff", "checks"]) assert.equal(containsGhPrMutation(`gh pr ${verb}`), false, verb);
   for (const cmd of ["gh pr list && eval \"$BAA_PR_COMMAND\"", "gh pr list; \"$RUNNER\" ...", "gh pr list | cat", "(gh pr list)", "bash -c 'gh pr list'", "gh pr `echo list`", "gh pr $(echo list)", "gh 'pr' list", "gh pr li'st'", "GH=gh $GH pr list", "env gh pr list", "gh pr list *", "gh pr list # ignored"]) assert.equal(containsGhPrMutation(cmd), true, cmd);
   for (const cmd of ["eval \"$BAA_PR_COMMAND\"", "\"$RUNNER\" ...", "bash -c 'git status'"]) assert.equal(containsUnsafeShellExecution(cmd), true, cmd);
-  for (const cmd of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) assert.equal(containsUnsafeShellExecution(cmd), false, cmd);
+  for (const cmd of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12", "grep \"foo bar\" file", "grep \"foo bar\" file | sort", "grep -E \"foo|bar\" \"some path/file\"", "grep -E \"foo.*bar\" \"some path/file\"", "git commit -S -m \"fix shell command classification\""]) assert.equal(containsUnsafeShellExecution(cmd), false, cmd);
+  assert.equal(containsUnsafeShellExecution("env -u BAA_STARTUP_INTENT npm test"), false);
+  assert.equal(containsUnsafeShellExecution("grep -E 'foo.*bar' \"some path/file\""), false);
+  assert.equal(containsUnsafeShellExecution("gh pr list && eval \"$BAA_PR_COMMAND\""), true);
 });
 
 test("mutator detection survives wrappers, quoting, flags and shell composition", () => {
