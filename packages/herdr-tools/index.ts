@@ -37,7 +37,11 @@ import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
 const { containsGhPrMutation, containsUnsafeShellExecution } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs");
-const { approveExternalGhCommand } = (await freshImport("./external-approval-hook.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-hook.mjs");
+const { approveExternalGhCommand, externalApprovalChecked, externalApprovalGranted, registerExternalApprovalBeforeToolCall } = (await freshImport("./external-approval-hook.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-hook.mjs") & {
+  externalApprovalChecked: WeakSet<object>;
+  externalApprovalGranted: WeakSet<object>;
+  registerExternalApprovalBeforeToolCall: (pi: ExtensionAPI, dependencies: (event: unknown, ctx: ExtensionContext) => Promise<Record<string, unknown>>) => void;
+};
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -11838,6 +11842,37 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     else await clearParentGoalSidebar(ctx.signal);
   });
 
+  registerExternalApprovalBeforeToolCall(pi, async (_event: unknown, ctx: ExtensionContext) => ({
+    enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
+    caller: isRegisteredChildLane() ? "child" : "root",
+    hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
+    sessionFile: process.env.PI_SESSION_FILE,
+    resolveBinding: async (operation: { operation: string; argv: string[]; repo: string }) => {
+      const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
+      const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
+      const head = await git(["rev-parse", "HEAD"]);
+      const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+      const sessionId = await realpath(process.env.PI_SESSION_FILE!);
+      const baseFlag = operation.argv.findIndex((arg) => arg === "--base" || arg.startsWith("--base="));
+      const target = operation.operation === "merge" ? operation.argv[3] ?? "" : baseFlag >= 0 ? (operation.argv[baseFlag].includes("=") ? operation.argv[baseFlag].slice(operation.argv[baseFlag].indexOf("=") + 1) : operation.argv[baseFlag + 1] ?? "") : "(gh-default-base)";
+      const remotes = (await git(["remote", "-v"])).split("\n").flatMap((line) => {
+        const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line);
+        if (!match) return [];
+        const url = match[2].replace(/\.git$/, "");
+        const parsed = /^(?:https?:\/\/|ssh:\/\/|git:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]([^/]+)\/([^/]+)$/.exec(url);
+        return parsed ? [{ name: match[1], host: parsed[1].toLowerCase(), repo: `${parsed[2]}/${parsed[3]}` }] : [];
+      });
+      const matches = remotes.filter((remote) => remote.repo.toLowerCase() === operation.repo.toLowerCase());
+      if (matches.length !== 1) throw new Error("Explicit --repo does not identify exactly one canonical local Git remote.");
+      const remote = matches[0];
+      return { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: operation.repo, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
+    },
+    confirm: async (operation: { operation: string; argv: string[]; repo: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string }) => ctx.ui!.confirm(
+      `Approve exact gh pr ${operation.operation}?`,
+      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${operation.repo})\nExplicit --repo target: ${operation.repo}\nHEAD: ${binding.head}\nHead ref: ${binding.branch}\nBase ref: ${binding.target || "(command-defined)"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,
+    ),
+  }));
+
   pi.on("tool_call", async (event, ctx) => {
     if (process.env.HERDR_ENV === "1")
       await refreshHerdrIdentity(ctx.signal);
@@ -11897,7 +11932,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     let explicitlyApproved = false;
     const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && containsUnsafeShellExecution(command));
     if (externalMutation) {
-      explicitlyApproved = await approveExternalGhCommand({
+      explicitlyApproved = externalApprovalChecked.has(event) ? externalApprovalGranted.has(event) : await approveExternalGhCommand({
         command,
         enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
         caller: isRegisteredChildLane() ? "child" : "root",

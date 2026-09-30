@@ -1,6 +1,6 @@
 import { containsGhPrMutation, containsUnsafeShellExecution, consumeExternalApproval, issueExternalApproval, parseApprovedGhOperation } from "./external-approval.mjs";
 
-/** The before_tool_call approval path. Dependencies keep UI, Git and execution out of this module. */
+/** The Pi tool_call pre-execution approval path. Dependencies keep UI, Git and execution out of this module. */
 export async function approveExternalGhCommand({ command, enabled, caller, hasUI, sessionFile, resolveBinding, confirm, now }) {
   if (!enabled || caller !== "root" || !hasUI || !sessionFile || typeof confirm !== "function") return false;
   if (!containsGhPrMutation(command) && !containsUnsafeShellExecution(command)) return false;
@@ -18,12 +18,18 @@ export async function approveExternalGhCommand({ command, enabled, caller, hasUI
   }
 }
 
-/** Register the approval gate as a before-tool-call listener; executor is injected for hermetic integration tests. */
+export const externalApprovalChecked = new WeakSet();
+export const externalApprovalGranted = new WeakSet();
+
+/** Register the production Pi tool_call pre-execution gate. Dependencies may be resolved per Pi context. */
 export function registerExternalApprovalBeforeToolCall(pi, dependencies) {
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (event?.toolName !== "bash" || typeof event.input?.command !== "string") return;
-    const approved = await approveExternalGhCommand({ ...dependencies, command: event.input.command });
+    if (!containsGhPrMutation(event.input.command) && !containsUnsafeShellExecution(event.input.command)) return;
+    externalApprovalChecked.add(event);
+    const resolved = typeof dependencies === "function" ? await dependencies(event, ctx) : dependencies;
+    const approved = await approveExternalGhCommand({ ...resolved, command: event.input.command });
     if (!approved) return { block: true, reason: "External PR command was not explicitly approved." };
-    return undefined;
+    externalApprovalGranted.add(event);
   });
 }
