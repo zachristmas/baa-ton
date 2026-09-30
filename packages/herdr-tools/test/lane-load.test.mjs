@@ -83,20 +83,34 @@ test("Windows kills only recorded pane PIDs with matching creation time and veri
     table: async () => rows,
     runPowerShell: async (script) => {
       scripts.push(script);
-      const pid = Number(/ProcessId = (\d+)/.exec(script)?.[1]);
-      const expected = /CreationDate -ne "([^"]+)"/.exec(script)?.[1];
-      const current = rows.find((row) => row.pid === pid);
-      assert.equal(current?.createdAt, expected, "the synthetic CIM mutation checks the PID creation identity");
-      rows = rows.filter((row) => row.pid !== pid);
+      const payload = /FromBase64String\('([^']+)'/.exec(script)?.[1];
+      const candidates = JSON.parse(Buffer.from(payload, "base64").toString());
+      assert.deepEqual(candidates, [{ pid: 701, createdAt: "start-701" }, { pid: 700, createdAt: "start-700" }]);
+      assert.ok(script.indexOf("$checked = @()") < script.indexOf("Stop-Process"), "all identities are checked before any process is signalled");
+      for (const candidate of candidates) assert.equal(rows.find((row) => row.pid === candidate.pid)?.createdAt, candidate.createdAt);
+      rows = rows.filter((row) => !candidates.some((candidate) => candidate.pid === row.pid));
       return "";
     },
     delay: async () => undefined,
   });
   assert.deepEqual(result.signalled.map(({ pid }) => pid), [701, 700]);
   assert.deepEqual(result.survivors, []);
-  assert.equal(scripts.length, 2);
-  assert.ok(scripts.every((script) => /Stop-Process -Id \d+($|\s)/.test(script)));
+  assert.equal(scripts.length, 1);
   assert.ok(rows.some((row) => row.pid === 702), "unrelated same-host process is untouched");
+});
+
+test("Windows validates every descendant identity before signalling any candidate", async () => {
+  const rows = [
+    { pid: 820, ppid: 1, createdAt: "root-time", line: `node BAA_STARTUP_INTENT=${INTENT}` },
+    { pid: 821, ppid: 820, line: "wrapper child" },
+  ];
+  let signalled = false;
+  await assert.rejects(killLaneProcesses({
+    platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 820, createdAt: "root-time" }],
+    expectedPids: [820, 821], table: async () => rows,
+    runPowerShell: async () => { signalled = true; },
+  }), /candidate PID 821 creation identity is missing/);
+  assert.equal(signalled, false, "no valid earlier candidate is signalled when a later descendant lacks CreationDate");
 });
 
 test("Windows refuses a reused PID between inventory and stop", async () => {

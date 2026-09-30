@@ -397,3 +397,113 @@ test("Windows pane PIDs omitted from CIM inventory block all reset actions", asy
     }
   }
 });
+
+test("Windows no-intent tabs require preflight PID proof and are never broad-killed", async () => {
+  for (const inventory of ["access-denied", "missing-pid"]) {
+    const { root, dir } = project();
+    const manifestPath = join(dir, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const lane = manifest.workflows[0].lanes[0];
+    delete lane.startupIntentPath;
+    Object.assign(lane, { paneId: "p1", workspaceId: "w1", tabId: "w1:t2" });
+    manifest.workflows[1].lanes[0].tabId = undefined;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    let stops = 0;
+    const closes = [];
+    const runHerdr = (args) => {
+      if (args.join(" ") === "pane get p1") return JSON.stringify({ result: { pane: { pane_id: "p1", workspace_id: "w1", tab_id: "w1:t2" } } });
+      if (args.join(" ") === "pane process-info --pane p1") return JSON.stringify({ result: { process_info: { shell_pid: 111, foreground_processes: [{ pid: 222 }] } } });
+      throw new Error(`unexpected native command ${args.join(" ")}`);
+    };
+    try {
+      await assert.rejects(runReset({ projectRoot: root, apply: true, platform: "win32", env: {}, rootTabIds: new Set(["w1:t1"]), runHerdr,
+        processTable: async () => {
+          if (inventory === "access-denied") throw new Error("Access is denied");
+          return [{ pid: 111, ppid: 1, createdAt: "created-111", line: "shell" }];
+        },
+        killLane: async () => { stops++; return {}; }, closeTab: (id) => closes.push(id),
+      }), inventory === "access-denied" ? /process inventory unavailable|missing from the Windows CIM inventory/ : /missing from the Windows CIM inventory/);
+      assert.equal(stops, 0, `${inventory}: no process stop`);
+      assert.deepEqual(closes, [], `${inventory}: no tab close`);
+      assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).workflows.length, 2);
+      assert.equal(existsSync(join(dir, "archive")), false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("Windows pane PID/time proof participates in the one-shot reset fingerprint", async () => {
+  const { root, dir } = project();
+  const manifestPath = join(dir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const lane = manifest.workflows[0].lanes[0];
+  delete lane.startupIntentPath;
+  Object.assign(lane, { paneId: "p1", workspaceId: "w1", tabId: "w1:t2" });
+  manifest.workflows[1].lanes[0].tabId = undefined;
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const runHerdr = (args) => JSON.stringify({ result: args[0] === "pane" && args[1] === "get"
+    ? { pane: { pane_id: "p1", workspace_id: "w1", tab_id: "w1:t2" } }
+    : { process_info: { shell_pid: 111, foreground_processes: [{ pid: 222 }] } } });
+  const rows = (createdAt) => [{ pid: 111, ppid: 1, createdAt: `${createdAt}-111`, line: "shell" }, { pid: 222, ppid: 111, createdAt: `${createdAt}-222`, line: "worker" }];
+  const common = { projectRoot: root, platform: "win32", env: {}, rootTabIds: new Set(["w1:t1"]), runHerdr };
+  const closes = [];
+  let stops = 0;
+  try {
+    const preview = await runReset({ ...common, processTable: async () => rows("preview") });
+    assert.deepEqual(preview.plan.processIdentities.map(({ pid }) => pid), [111, 222]);
+    let inventory = 0;
+    await assert.rejects(runReset({ ...common, apply: true, expectedFingerprint: preview.fingerprint,
+      processTable: async () => rows(++inventory === 1 ? "preview" : "changed"),
+      killLane: async () => { stops++; return {}; }, closeTab: (id) => closes.push(id),
+    }), /inventory changed after preview/);
+    assert.equal(stops, 0);
+    assert.deepEqual(closes, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Windows no-intent tab close is followed by an identity-based survivor check", async () => {
+  const { root, dir } = project();
+  const manifestPath = join(dir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const lane = manifest.workflows[0].lanes[0];
+  delete lane.startupIntentPath;
+  Object.assign(lane, { paneId: "p1", workspaceId: "w1", tabId: "w1:t2" });
+  manifest.workflows[1].lanes[0].tabId = undefined;
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  let inventories = 0;
+  let stops = 0;
+  const closes = [];
+  const runHerdr = (args) => JSON.stringify({ result: args[0] === "pane" && args[1] === "get"
+    ? { pane: { pane_id: "p1", workspace_id: "w1", tab_id: "w1:t2" } }
+    : { process_info: { shell_pid: 111, foreground_processes: [{ pid: 222 }] } } });
+  try {
+    await assert.rejects(runReset({ projectRoot: root, apply: true, platform: "win32", env: {}, rootTabIds: new Set(["w1:t1"]), runHerdr,
+      processTable: async () => { inventories++; return [{ pid: 111, ppid: 1, createdAt: "created-111", line: "shell" }, { pid: 222, ppid: 111, createdAt: "created-222", line: "worker" }]; },
+      killLane: async () => { stops++; return {}; }, closeTab: (id) => closes.push(id),
+    }), /incomplete after closing no-intent tabs.*PID 111 remains/s);
+    assert.equal(inventories, 3, "initial, apply inventory, and post-close process inventories are required");
+    assert.deepEqual(closes, ["w1:t2"]);
+    assert.equal(stops, 0, "no-intent lanes are never broad-killed");
+    assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).workflows.length, 2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("strict planned-file removal leaves durable reset records intact on failure", async () => {
+  const { root, dir } = project();
+  const manifestPath = join(dir, "manifest.json");
+  const controllerConfigPath = join(dir, "controller-config.json");
+  const intentPath = join(dir, "herdr-00000001-lane-1-startup.json");
+  writeFileSync(controllerConfigPath, JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [] }));
+  rmSync(intentPath);
+  mkdirSync(intentPath);
+  writeFileSync(join(intentPath, "blocked-child"), "cannot unlink non-empty directory");
+  const beforeManifest = readFileSync(manifestPath);
+  const beforeConfig = readFileSync(controllerConfigPath);
+  const beforeSpec = readFileSync(join(dir, "spec-state.json"));
+  try {
+    await assert.rejects(runReset({ projectRoot: root, controllerConfigPath, apply: true, rootTabIds: new Set(["w1:t1"]), env: {}, probeRoot: async () => "live", ...ports([]) }), /could not remove planned state files.*durable manifest, controller and spec state were left intact/i);
+    assert.deepEqual(readFileSync(manifestPath), beforeManifest);
+    assert.deepEqual(readFileSync(controllerConfigPath), beforeConfig);
+    assert.deepEqual(readFileSync(join(dir, "spec-state.json")), beforeSpec);
+    assert.equal(existsSync(join(dir, "archive")), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

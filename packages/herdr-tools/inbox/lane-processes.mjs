@@ -35,12 +35,15 @@ export function parseProcessTable(text) {
 export function parseWindowsProcessTable(value) {
   const data = typeof value === "string" ? JSON.parse(value || "[]") : value;
   const records = Array.isArray(data) ? data : data ? [data] : [];
-  return records.map((entry) => ({
+  const rows = records.map((entry) => ({
     pid: Number(entry.ProcessId),
     ppid: Number(entry.ParentProcessId),
     createdAt: typeof entry.CreationDate === "string" ? entry.CreationDate : undefined,
     line: typeof entry.CommandLine === "string" ? entry.CommandLine : "",
-  })).filter((row) => Number.isSafeInteger(row.pid) && row.pid > 0 && Number.isSafeInteger(row.ppid));
+  }));
+  if (rows.some((row) => !Number.isSafeInteger(row.pid) || row.pid <= 0 || !Number.isSafeInteger(row.ppid) || row.ppid < 0))
+    throw new Error("Windows CIM process inventory contains an unusable PID/parent identity");
+  return rows;
 }
 
 async function powershell(script) {
@@ -131,22 +134,71 @@ function signal(kill, pid, name) {
  * depth gets SIGTERM, a grace period, then SIGKILL for stubborn members.
  * Returns the candidates and any that survived.
  */
-async function stopWindowsProcess(pid, createdAt, force, runPowerShell = powershell) {
-  const escaped = JSON.stringify(String(createdAt));
-  const script = `$p = Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId = ${pid}\"; if ($null -eq $p) { exit 3 }; if ([string]$p.CreationDate -ne ${escaped}) { exit 4 }; Stop-Process -Id ${pid}${force ? " -Force" : ""}`;
+async function stopWindowsProcesses(candidates, runPowerShell = powershell) {
+  const data = Buffer.from(JSON.stringify(candidates.map(({ pid, createdAt }) => ({ pid, createdAt })))).toString("base64");
+  const script = `$ErrorActionPreference = 'Stop'; $items = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json; ` +
+    `$checked = @(); foreach ($item in $items) { $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($item.pid)"); if ($rows.Count -ne 1) { throw "Process $($item.pid) has $($rows.Count) CIM identities" }; $created = [string]$rows[0].CreationDate; if (!$created -or $created -cne [string]$item.createdAt) { throw "Process $($item.pid) identity changed" }; $checked += $rows[0] }; ` +
+    `foreach ($item in $items) { Stop-Process -Id ([int]$item.pid) -Force -ErrorAction Stop }`;
   await runPowerShell(script);
 }
 
+export async function killWindowsProcessGroups({ groups, table = () => readProcessTable({ platform: "win32" }), runPowerShell = powershell } = {}) {
+  const lanes = Array.isArray(groups) ? groups : [];
+  const initial = await table();
+  const validate = (rows, group, label) => {
+    if (!Array.isArray(group.recordedProcesses) || !group.recordedProcesses.length)
+      throw new Error(`Windows cannot enumerate process environments or prove pane process identities for ${group.workflowId}/${group.laneId}.`);
+    for (const record of group.recordedProcesses) {
+      const matches = rows.filter((row) => row.pid === Number(record.pid));
+      if (matches.length !== 1) throw new Error(`Windows recorded process PID ${record.pid} is ${matches.length ? "ambiguous" : "missing"} in ${label}; refusing to stop processes`);
+      if (typeof record.createdAt !== "string" || !record.createdAt.trim() || matches[0].createdAt !== record.createdAt)
+        throw new Error(`Windows recorded process PID ${record.pid} was reused or lacks creation time in ${label}; refusing to stop it.`);
+    }
+    const found = laneProcesses(rows, group.intentPath, { recordedProcesses: group.recordedProcesses });
+    if (group.expectedPids !== undefined) {
+      const expected = [...group.expectedPids].map(Number).sort((a, b) => a - b);
+      const observed = found.map((row) => row.pid).sort((a, b) => a - b);
+      if (expected.join(",") !== observed.join(","))
+        throw new Error(`Windows process inventory changed for ${group.workflowId}/${group.laneId}: planned=[${expected}] observed=[${observed}]; refusing to stop processes`);
+    }
+    for (const candidate of found) {
+      const matches = rows.filter((row) => row.pid === candidate.pid);
+      if (matches.length !== 1) throw new Error(`Windows candidate PID ${candidate.pid} has ${matches.length} CIM identities in ${label}; refusing to stop processes`);
+      if (typeof candidate.createdAt !== "string" || !candidate.createdAt.trim() || matches[0].createdAt !== candidate.createdAt)
+        throw new Error(`Windows candidate PID ${candidate.pid} creation identity is missing or changed in ${label}; refusing to stop it.`);
+      if (!Number.isSafeInteger(candidate.ppid) || candidate.ppid < 0)
+        throw new Error(`Windows candidate PID ${candidate.pid} has an unusable parent identity in ${label}; refusing to stop processes`);
+    }
+    return found;
+  };
+  const initialByGroup = lanes.map((group) => ({ group, found: validate(initial, group, "initial inventory") }));
+  const planned = initialByGroup.flatMap(({ group, found }) => found.map((row) => ({ ...row, workflowId: group.workflowId, laneId: group.laneId })));
+  const uniquePids = new Set(planned.map((row) => row.pid));
+  if (uniquePids.size !== planned.length) throw new Error("Windows kill set contains a PID owned by multiple lanes; refusing to stop processes");
+  if (!planned.length) return { signalled: [], killed: [], survivors: [] };
+
+  const beforeSignal = await table();
+  const currentByGroup = lanes.map((group) => ({ group, found: validate(beforeSignal, group, "pre-signal inventory") }));
+  const identity = (items) => items.flatMap(({ group, found }) => found.map((row) => `${group.workflowId}/${group.laneId}/${row.pid}/${row.ppid}/${row.createdAt}`)).sort();
+  if (identity(initialByGroup).join(",") !== identity(currentByGroup).join(","))
+    throw new Error("Windows process tree changed before cleanup; refusing to signal any candidate");
+  const byPid = new Map(beforeSignal.map((row) => [row.pid, row]));
+  const ordered = currentByGroup.flatMap(({ group, found }) => found.map((row) => ({ ...row, workflowId: group.workflowId, laneId: group.laneId })))
+    .sort((a, b) => processDepth(b, byPid) - processDepth(a, byPid));
+  await stopWindowsProcesses(ordered, runPowerShell);
+  const after = await table();
+  const survivors = [];
+  for (const row of ordered) if (after.some((candidate) => candidate.pid === row.pid)) survivors.push(row.pid);
+  for (const { group } of currentByGroup) {
+    for (const row of laneProcesses(after, group.intentPath, { recordedProcesses: group.recordedProcesses }))
+      if (!survivors.includes(row.pid)) survivors.push(row.pid);
+  }
+  return { signalled: ordered.map(({ pid, line }) => ({ pid, command: line.split(/\s+/)[0].split(/[\\/]/).pop() })), killed: ordered.map((row) => row.pid), survivors };
+}
+
 export async function killLaneProcesses({ intentPath, recordedProcesses = [], expectedPids, platform = process.platform, table = () => readProcessTable({ platform }), kill = process.kill.bind(process), runPowerShell = powershell, graceMs = 3_000, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+  if (platform === "win32") return killWindowsProcessGroups({ groups: [{ workflowId: "lane", laneId: "lane", intentPath, recordedProcesses, expectedPids }], table, runPowerShell });
   const snapshot = await table();
-  if (platform === "win32" && !recordedProcesses.length)
-    throw new Error("Windows cannot enumerate process environments; exact recorded lane pane process identities are required.");
-  if (platform === "win32" && recordedProcesses.some((record) => !record?.createdAt))
-    throw new Error("Windows cannot prove creation time for a recorded process identity.");
-  if (platform === "win32" && recordedProcesses.some((record) => snapshot.some((row) => row.pid === Number(record.pid)) && !snapshot.find((row) => row.pid === Number(record.pid))?.createdAt))
-    throw new Error("Windows cannot prove creation time for a recorded process identity.");
-  if (platform === "win32" && recordedProcesses.some((record) => snapshot.some((row) => row.pid === Number(record.pid) && row.createdAt !== record.createdAt)))
-    throw new Error("Windows recorded process PID was reused before cleanup; refusing to stop it.");
   const found = laneProcesses(snapshot, intentPath, { recordedProcesses });
   const snapshotByPid = new Map(snapshot.map((row) => [row.pid, row]));
   found.sort((a, b) => processDepth(b, snapshotByPid) - processDepth(a, snapshotByPid));
@@ -159,9 +211,6 @@ export async function killLaneProcesses({ intentPath, recordedProcesses = [], ex
   if (!found.length) return { signalled: [], killed: [], survivors: [] };
   const signalOne = async (row, signalName) => {
     const current = await table();
-    const samePid = current.find((candidate) => candidate.pid === row.pid);
-    if (platform === "win32" && samePid && samePid.createdAt !== row.createdAt)
-      throw new Error(`Windows process ${row.pid} was reused since inventory; refusing to stop it.`);
     const owned = laneProcesses(current, intentPath, { recordedProcesses });
     if (expectedPids) {
       const expected = new Set(expectedPids.map(Number));
@@ -170,13 +219,6 @@ export async function killLaneProcesses({ intentPath, recordedProcesses = [], ex
     }
     const live = owned.find((candidate) => candidate.pid === row.pid);
     if (!live) return false;
-    if (platform === "win32" && live.createdAt !== row.createdAt)
-      throw new Error(`Windows process ${row.pid} was reused since inventory; refusing to stop it.`);
-    if (platform === "win32") {
-      if (!row.createdAt) throw new Error(`Windows cannot prove creation time for process ${row.pid}.`);
-      await stopWindowsProcess(row.pid, row.createdAt, signalName === "SIGKILL", runPowerShell);
-      return true;
-    }
     return signal(kill, row.pid, signalName);
   };
   const groups = new Map();
@@ -192,13 +234,13 @@ export async function killLaneProcesses({ intentPath, recordedProcesses = [], ex
     for (const row of group) await signalOne(row, "SIGTERM");
     await delay(graceMs);
     const current = await table();
-    const stubborn = group.filter((row) => current.some((candidate) => candidate.pid === row.pid && (platform !== "win32" || candidate.createdAt === row.createdAt)));
+    const stubborn = group.filter((row) => current.some((candidate) => candidate.pid === row.pid));
     for (const row of stubborn) {
       if (await signalOne(row, "SIGKILL")) killed.push(row.pid);
     }
     if (stubborn.length) await delay(Math.min(graceMs, 1_000));
     const afterGroup = await table();
-    const remainingInGroup = group.filter((row) => afterGroup.some((candidate) => candidate.pid === row.pid && (platform !== "win32" || candidate.createdAt === row.createdAt)));
+    const remainingInGroup = group.filter((row) => afterGroup.some((candidate) => candidate.pid === row.pid));
     if (remainingInGroup.length) {
       survivors.push(...remainingInGroup.map((row) => row.pid));
       break;
@@ -207,7 +249,7 @@ export async function killLaneProcesses({ intentPath, recordedProcesses = [], ex
   const afterTable = await table();
   const remaining = new Map(laneProcesses(afterTable, intentPath, { recordedProcesses }).map((row) => [row.pid, row]));
   for (const row of found) {
-    const live = afterTable.find((candidate) => candidate.pid === row.pid && (platform !== "win32" || candidate.createdAt === row.createdAt));
+    const live = afterTable.find((candidate) => candidate.pid === row.pid);
     if (live) remaining.set(live.pid, live);
   }
   survivors.push(...[...remaining.keys()].filter((pid) => !survivors.includes(pid)));
