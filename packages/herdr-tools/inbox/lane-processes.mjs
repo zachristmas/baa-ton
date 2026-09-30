@@ -32,6 +32,32 @@ export function parseProcessTable(text) {
   return rows;
 }
 
+const WINDOWS_CREATION_IDENTITY = String.raw`function Convert-CimCreationDateToUtcIso {
+  param($value)
+  if ($null -eq $value) { return $null }
+  if ($value -is [datetime]) { $date = [datetime]$value }
+  elseif ($value -is [datetimeoffset]) { $date = $value.UtcDateTime }
+  else {
+    $text = [string]$value
+    if ($text -match '^\d{14}\.\d{6}[+-]\d{3}$') { $date = [System.Management.ManagementDateTimeConverter]::ToDateTime($text) }
+    else { $date = [datetime]::Parse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+  }
+  return $date.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+}`;
+
+const WINDOWS_PROCESS_NATIVE = String.raw`Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HerdrLaneProcessNative {
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetProcessTimes(IntPtr process, out long creationTime, out long exitTime, out long kernelTime, out long userTime);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+`;
+
 export function parseWindowsProcessTable(value) {
   const data = typeof value === "string" ? JSON.parse(value || "[]") : value;
   const records = Array.isArray(data) ? data : data ? [data] : [];
@@ -54,7 +80,8 @@ async function powershell(script) {
 export async function readProcessTable(options = {}) {
   const { platform = process.platform, run = (args) => execFileAsync("/bin/ps", args, { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 }), runPowerShell = powershell } = typeof options === "function" ? { run: options } : options;
   if (platform === "win32") {
-    const script = "Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | ConvertTo-Json -Compress";
+    const script = `$ErrorActionPreference = 'Stop'; ${WINDOWS_CREATION_IDENTITY}; ` +
+      `Get-CimInstance -ClassName Win32_Process | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; ParentProcessId = $_.ParentProcessId; CreationDate = Convert-CimCreationDateToUtcIso $_.CreationDate; CommandLine = $_.CommandLine } } | ConvertTo-Json -Compress`;
     return parseWindowsProcessTable(await runPowerShell(script));
   }
   const { stdout } = await run(["-axEww", "-o", "pid=,ppid=,etime=,command="]);
@@ -136,9 +163,21 @@ function signal(kill, pid, name) {
  */
 async function stopWindowsProcesses(candidates, runPowerShell = powershell) {
   const data = Buffer.from(JSON.stringify(candidates.map(({ pid, createdAt }) => ({ pid, createdAt })))).toString("base64");
-  const script = `$ErrorActionPreference = 'Stop'; $items = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json; ` +
-    `$checked = @(); foreach ($item in $items) { $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($item.pid)"); if ($rows.Count -ne 1) { throw "Process $($item.pid) has $($rows.Count) CIM identities" }; $created = [string]$rows[0].CreationDate; if (!$created -or $created -cne [string]$item.createdAt) { throw "Process $($item.pid) identity changed" }; $checked += $rows[0] }; ` +
-    `foreach ($item in $items) { Stop-Process -Id ([int]$item.pid) -Force -ErrorAction Stop }`;
+  const script = `$ErrorActionPreference = 'Stop'; ${WINDOWS_CREATION_IDENTITY}; ${WINDOWS_PROCESS_NATIVE}` +
+    `$items = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json; $held = @(); ` +
+    `try { foreach ($item in $items) { $handle = [IntPtr]::Zero; try { ` +
+    `$handle = [HerdrLaneProcessNative]::OpenProcess(0x00100401, $false, [int]$item.pid); ` +
+    `if ($handle -eq [IntPtr]::Zero) { throw "Process $($item.pid) handle/access is unavailable" }; ` +
+    `[long]$creationTicks = 0; [long]$exitTicks = 0; [long]$kernelTicks = 0; [long]$userTicks = 0; ` +
+    `if (![HerdrLaneProcessNative]::GetProcessTimes($handle, [ref]$creationTicks, [ref]$exitTicks, [ref]$kernelTicks, [ref]$userTicks)) { throw "Process $($item.pid) start time is unavailable" }; ` +
+    `$created = Convert-CimCreationDateToUtcIso ([datetime]::FromFileTimeUtc($creationTicks)); if (!$created -or $created -cne [string]$item.createdAt) { throw "Process $($item.pid) identity changed" }; ` +
+    `$held += [pscustomobject]@{ Item = $item; Handle = $handle }; $handle = [IntPtr]::Zero ` +
+    `} catch { if ($handle -ne [IntPtr]::Zero) { [void][HerdrLaneProcessNative]::CloseHandle($handle) }; throw } }; ` +
+    `foreach ($candidate in $held) { if (![HerdrLaneProcessNative]::TerminateProcess($candidate.Handle, 1)) { throw "Process $($candidate.Item.pid) could not be terminated" } }; ` +
+    `foreach ($candidate in $held) { $wait = [HerdrLaneProcessNative]::WaitForSingleObject($candidate.Handle, 10000); if ($wait -ne 0 -and $wait -ne 258) { throw "Process $($candidate.Item.pid) exit wait failed" } }; ` +
+    `$survivors = @($held | Where-Object { [HerdrLaneProcessNative]::WaitForSingleObject($_.Handle, 0) -ne 0 }); ` +
+    `if ($survivors.Count) { throw "Processes survived termination: $($survivors.Count)" } ` +
+    `} finally { foreach ($candidate in $held) { [void][HerdrLaneProcessNative]::CloseHandle($candidate.Handle) } }`;
   await runPowerShell(script);
 }
 
