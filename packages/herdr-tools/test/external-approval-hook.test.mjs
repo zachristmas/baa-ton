@@ -22,7 +22,7 @@ async function dispatchToolCall(command, options = {}) {
       resolveBinding: async (operation) => {
         if (options.remotes && options.remotes.filter((r) => r.repo.toLowerCase() === operation.repo.toLowerCase()).length !== 1) throw new Error("remote identity not unique");
         if (options.mismatch) return { ...binding, targetRepo: "owner/elsewhere" };
-        return binding;
+        return operation.operation === "push" ? { ...binding, destinationRef: operation.destinationRef } : binding;
       },
       confirm: async (operation, shown) => {
         state.prompts++;
@@ -72,6 +72,18 @@ test("wrapped, quoted, compound, dynamic and unsafe command forms block without 
     const result = await dispatchToolCall(command);
     assert.equal(result.blocked, true, command);
     assert.equal(result.prompts, 0, command);
+    assert.equal(result.executions, 0, command);
+  }
+});
+
+test("direct simple push is natively approved once and unsafe push forms block", async () => {
+  const safe = await dispatchToolCall("git push origin HEAD:refs/heads/topic");
+  assert.equal(safe.blocked, false);
+  assert.equal(safe.prompts, 1);
+  assert.equal(safe.executions, 1);
+  for (const command of ["git push --force origin HEAD:refs/heads/topic", "git push origin HEAD:refs/heads/topic; echo x", "git push https://example.test/o/r HEAD:refs/heads/topic"]) {
+    const result = await dispatchToolCall(command);
+    assert.equal(result.blocked, true, command);
     assert.equal(result.executions, 0, command);
   }
 });

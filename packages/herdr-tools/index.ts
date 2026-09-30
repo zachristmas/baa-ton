@@ -36,7 +36,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
-const { containsGhPrMutation, containsUnsafeShellExecution } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs");
+const { containsGhPrMutation, containsGitPush, containsUnsafeShellExecution } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs") & { containsGitPush: (command: string) => boolean };
 const { approveExternalGhCommand, externalApprovalChecked, externalApprovalGranted, registerExternalApprovalBeforeToolCall } = (await freshImport("./external-approval-hook.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-hook.mjs") & {
   externalApprovalChecked: WeakSet<object>;
   externalApprovalGranted: WeakSet<object>;
@@ -11847,7 +11847,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     caller: isRegisteredChildLane() ? "child" : "root",
     hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
     sessionFile: process.env.PI_SESSION_FILE,
-    resolveBinding: async (operation: { operation: string; argv: string[]; repo: string }) => {
+    resolveBinding: async (operation: { operation: string; argv: string[]; repo?: string; remoteName?: string; destinationRef?: string }) => {
       const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
       const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
       const head = await git(["rev-parse", "HEAD"]);
@@ -11862,14 +11862,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         const parsed = /^(?:https?:\/\/|ssh:\/\/|git:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]([^/]+)\/([^/]+)$/.exec(url);
         return parsed ? [{ name: match[1], host: parsed[1].toLowerCase(), repo: `${parsed[2]}/${parsed[3]}` }] : [];
       });
-      const matches = remotes.filter((remote) => remote.repo.toLowerCase() === operation.repo.toLowerCase());
-      if (matches.length !== 1) throw new Error("Explicit --repo does not identify exactly one canonical local Git remote.");
+      const matches = remotes.filter((remote) => operation.operation === "push" ? remote.name === operation.remoteName : remote.repo.toLowerCase() === operation.repo?.toLowerCase());
+      if (matches.length !== 1) throw new Error(operation.operation === "push" ? "Explicit push remote must identify exactly one local Git remote." : "Explicit --repo does not identify exactly one canonical local Git remote.");
       const remote = matches[0];
-      return { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: operation.repo, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
+      return { repo, head, branch, target, baseRef: target, headRef: branch, remoteName: remote.name, host: remote.host, targetRepo: operation.repo ?? remote.repo, destinationRef: operation.destinationRef, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId, caller: "root" as const };
     },
-    confirm: async (operation: { operation: string; argv: string[]; repo: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string }) => ctx.ui!.confirm(
-      `Approve exact gh pr ${operation.operation}?`,
-      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${operation.repo})\nExplicit --repo target: ${operation.repo}\nHEAD: ${binding.head}\nHead ref: ${binding.branch}\nBase ref: ${binding.target || "(command-defined)"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,
+    confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; paneId: string; sessionId: string }) => ctx.ui!.confirm(
+      `Approve exact external ${operation.operation}?`,
+      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.branch}\nDestination ref: ${operation.destinationRef ?? binding.target}\nExact argv: ${JSON.stringify(operation.argv)}\nPane/session: ${binding.paneId} / ${binding.sessionId}\nThis approves this exact command once.`,
     ),
   }));
 
@@ -11930,7 +11930,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const herdrPaneClose =
       /(?:^|[;&|]\s*)herdr\s+(?:tab|pane)\s+close\b/im;
     let explicitlyApproved = false;
-    const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && containsUnsafeShellExecution(command));
+    const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && (containsGitPush(command) || containsUnsafeShellExecution(command)));
     if (externalMutation) {
       explicitlyApproved = externalApprovalChecked.has(event) ? externalApprovalGranted.has(event) : await approveExternalGhCommand({
         command,
@@ -11968,7 +11968,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       process.env.HERDR_ENV === "1" &&
       ((nonPushMutation.test(command) || externalMutation) && !explicitlyApproved ||
         herdrWorkspaceClose.test(command) ||
-        gitPush.test(command) ||
+        (gitPush.test(command) && !explicitlyApproved) ||
         (herdrPaneClose.test(command) && !isRootOrchestrator()))
     ) {
       return {

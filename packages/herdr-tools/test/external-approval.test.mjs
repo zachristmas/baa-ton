@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { consumeExternalApproval, containsGhPrMutation, containsUnsafeShellExecution, issueExternalApproval, parseApprovedGhOperation } from "../external-approval.mjs";
+import { consumeExternalApproval, containsGhPrMutation, containsGitPush, containsUnsafeShellExecution, issueExternalApproval, parseApprovedExternalOperation, parseApprovedGhOperation } from "../external-approval.mjs";
 
 const binding = { repo: "/repo", head: "abc", branch: "topic", target: "main", targetRepo: "owner/repo", host: "github.com", remoteName: "origin", paneId: "w:p1", sessionId: "/session", caller: "root" };
 const command = "gh pr create --repo owner/repo --base main";
@@ -43,6 +43,23 @@ test("only literal gh pr create/merge commands are representable; wrappers fail 
   const shownBinding = { ...binding, host: "github.com", remoteName: "fork" };
   assert.equal(consumeExternalApproval(issueExternalApproval(command, binding), command, shownBinding), false, "remote identity is bound");
   assert.equal(containsGhPrMutation("git status"), false);
+});
+
+test("safe direct push requires one local remote and an explicit HEAD destination", () => {
+  const accepted = "git push origin HEAD:refs/heads/topic";
+  const parsed = parseApprovedExternalOperation(accepted);
+  assert.deepEqual([parsed.operation, parsed.remoteName, parsed.sourceRef, parsed.destinationRef], ["push", "origin", "HEAD", "refs/heads/topic"]);
+  for (const command of ["git push", "git push origin", "git push origin HEAD", "git push origin HEAD:topic", "git push origin HEAD:refs/heads/topic --force", "git push --all origin HEAD:refs/heads/topic", "git push origin HEAD:refs/heads/topic HEAD:refs/heads/other", "git push https://example.test/o/r HEAD:refs/heads/topic", "git push origin HEAD:refs/heads/../other", "git push origin HEAD:refs/heads/topic; echo done"]) assert.equal(parseApprovedExternalOperation(command), undefined, command);
+  assert.equal(containsGitPush(accepted), true);
+  const token = issueExternalApproval(accepted, { ...binding, destinationRef: parsed.destinationRef });
+  assert.ok(token);
+  assert.equal(consumeExternalApproval(token, accepted, { ...binding, destinationRef: parsed.destinationRef }), true);
+  assert.equal(consumeExternalApproval(token, accepted, { ...binding, destinationRef: parsed.destinationRef }), false);
+});
+
+test("unsupported gh hostname forms fail closed before confirmation", () => {
+  assert.equal(parseApprovedGhOperation("gh --hostname github.com pr create -R owner/repo"), undefined);
+  assert.equal(parseApprovedGhOperation("gh pr create -R owner/repo --hostname=github.com"), undefined);
 });
 
 test("gh pr is default-deny except for explicit read-only verbs", () => {
