@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -62,6 +62,65 @@ test("a new goal, including after reset, is supervised unless the previous goal 
     assert.equal(first.supervisor.intervalSeconds, 300);
     const due = Date.parse(first.supervisor.nextNudgeAt) - Date.parse(first.supervisor.createdAt);
     assert.equal(due, 300_000, "the first nudge is one interval out");
+
+    const parked = await goal({ action: "set-state", status: "parked" });
+    assert.equal(parked.status, "parked");
+    assert.equal(parked.supervisor.state, "stopped", "goal parking is distinct from the operator run pause");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const rootParkedAt = "2026-09-29T08:00:00.000Z";
+    manifest.rootSupervision = [{ rootId: "orchestrator-goal", rootParkedAt, rootHealth: { status: "gone" } }];
+    await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+    await assert.rejects(
+      goal({ action: "pause", pauseReason: "Try to downgrade parking." }),
+      /A parked parent goal cannot be paused or downgraded/,
+    );
+    await assert.rejects(goal({ action: "reset" }), /Cannot reset a parent goal while rootParkedAt is set/);
+    await assert.rejects(goal({ action: "initialize", objective: "Unsafe replacement." }), /Cannot initialize a parent goal while rootParkedAt is set/);
+    const parkedAfterRejectedControls = await goal({ action: "status" });
+    assert.equal(parkedAfterRejectedControls.status, "parked");
+    assert.equal(parkedAfterRejectedControls.supervisor.state, "stopped");
+    assert.equal(JSON.parse(await readFile(manifestPath, "utf8")).rootSupervision[0].rootParkedAt, rootParkedAt);
+    await assert.rejects(
+      goal({ action: "set-state", status: "active", nextAction: "Bypass parking." }),
+      /A parked parent goal can only be resumed with action=start\./,
+    );
+    const stillParked = await goal({ action: "status" });
+    assert.equal(stillParked.status, "parked", "set-state cannot resume a parked goal");
+    assert.equal(stillParked.nextAction, parked.nextAction, "the rejected update is atomic");
+    assert.equal(stillParked.supervisor.state, "stopped", "a rejected update cannot restart nudges");
+    assert.equal(stillParked.supervisor.nextNudgeAt, null);
+    assert.equal(JSON.parse(await readFile(manifestPath, "utf8")).rootSupervision[0].rootParkedAt, rootParkedAt, "the parked timestamp survives until recovery");
+    const staleParked = JSON.parse(await readFile(manifestPath, "utf8"));
+    staleParked.parentGoal.status = "active";
+    staleParked.parentGoal.supervisor.state = "running";
+    staleParked.parentGoal.supervisor.nextNudgeAt = null;
+    await writeFile(manifestPath, JSON.stringify(staleParked), { mode: 0o600 });
+    await assert.rejects(
+      goal({ action: "set-state", status: "active", nextAction: "Clear stale parked state." }),
+      /A parked parent goal can only be resumed with action=start\./,
+    );
+    const stillMarked = await goal({ action: "status" });
+    assert.equal(stillMarked.status, "active", "a stale parked marker also blocks set-state recovery");
+    assert.equal(stillMarked.supervisor.state, "running", "status reports stale persisted state without clearing the authoritative marker");
+    assert.equal(stillMarked.supervisor.nextNudgeAt, null);
+    assert.equal(stillMarked.nextAction, parked.nextAction);
+    assert.equal(JSON.parse(await readFile(manifestPath, "utf8")).rootSupervision[0].rootParkedAt, rootParkedAt);
+    const noGoal = JSON.parse(await readFile(manifestPath, "utf8"));
+    delete noGoal.parentGoal;
+    await writeFile(manifestPath, JSON.stringify(noGoal), { mode: 0o600 });
+    await assert.rejects(goal({ action: "initialize", objective: "Do not replace the parked goal." }), /Cannot initialize a parent goal while rootParkedAt is set/);
+    const stillNoGoal = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.equal(stillNoGoal.parentGoal, undefined);
+    assert.equal(stillNoGoal.rootSupervision[0].rootParkedAt, rootParkedAt);
+    stillNoGoal.parentGoal = staleParked.parentGoal;
+    await writeFile(manifestPath, JSON.stringify(stillNoGoal), { mode: 0o600 });
+    const resumed = await goal({ action: "start" });
+    assert.equal(resumed.status, "active", "the documented start path resumes a parked goal");
+    assert.equal(resumed.supervisor.state, "running");
+    assert.ok(resumed.supervisor.nextNudgeAt, "start re-schedules even when stale persisted state already said running");
+    const recovered = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.equal(recovered.rootSupervision[0].rootParkedAt, undefined, "the authorized recovery path clears the parked timestamp");
+    assert.equal(recovered.rootSupervision[0].rootHealth, undefined);
 
     await goal({ action: "start", nudgeIntervalSeconds: 120 });
     const afterReset = await fresh();

@@ -717,14 +717,14 @@ export async function handleBlockedAgent({ herdr, name, agent, timestamp, storeP
 }
 
 /** Supervisor tick: apply the due default of each registered agent's open prompt. */
-export async function resolveAgentPrompts({ herdr, storePath, timestamp }) {
+export async function resolveAgentPrompts({ herdr, storePath, timestamp, deferPaneIds = new Set() }) {
   const { addOperatorMessage, withOperatorStore } = await import("../herdr-tools/operator.mjs");
   const { existsSync } = await import("node:fs");
   if (!existsSync(storePath)) return [];
   return withOperatorStore(storePath, async (store) => {
     const done = [];
     for (const prompt of store.prompts ?? []) {
-      if (prompt.applied || Date.parse(timestamp) < Date.parse(prompt.defaultAt)) continue;
+      if (deferPaneIds.has(prompt.paneId) || prompt.applied || Date.parse(timestamp) < Date.parse(prompt.defaultAt)) continue;
       const check = await recheck(herdr, { paneId: prompt.paneId, agentKind: prompt.agentKind, fingerprint: prompt.fingerprint });
       if (!check.ok) {
         if (/no longer on screen|not blocked|no agent|now runs/.test(check.reason)) prompt.applied = { at: timestamp, skipped: check.reason };

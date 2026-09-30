@@ -241,12 +241,16 @@ function holdMessage(message, reason, at, changed) {
   changed.push(message.id);
 }
 
-export async function deliverOperatorMessages(store, { ready, prompt, at = nowIso() }) {
+export async function deliverOperatorMessages(store, { ready, prompt, at = nowIso(), defer = () => false }) {
   const changed = [];
   // pane -> why it was held this pass: every message behind the first shows the same reason.
   const busy = new Map();
   for (const message of store.messages) {
     if (message.delivery?.status !== "pending") continue;
+    const target = currentTarget(store, message);
+    // A parked root is intentionally unavailable, not an undeliverable pane.
+    // Leave its durable message untouched while other targets continue.
+    if (defer(target, message)) continue;
     // Answered before it was sent (a queued anomaly its recipient had already
     // handled and replied to): never typed into the pane. Twenty such
     // messages were still queued behind a reply that had closed them.
@@ -256,7 +260,6 @@ export async function deliverOperatorMessages(store, { ready, prompt, at = nowIs
       changed.push(message.id);
       continue;
     }
-    const target = currentTarget(store, message);
     if (!target?.paneId) continue;
     if (busy.has(target.paneId)) {
       holdMessage(message, busy.get(target.paneId), at, changed);

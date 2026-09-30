@@ -13,7 +13,7 @@ const root = (paneId, workspaceId) => ({ target: paneId, target_kind: "pane_id",
 
 // After a Herdr server restart: the root was w22:p1, its pane is gone, and
 // the same Pi session came back as w2J:p1.
-async function fixture({ liveSession = "sess-01a0cc67", samePane = false, concurrent = false, ambiguous = false, oldPaneError = false, withFinishedLane = false } = {}) {
+async function fixture({ liveSession = "sess-01a0cc67", samePane = false, concurrent = false, ambiguous = false, oldPaneError = false, withFinishedLane = false, parkedGoal = false } = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "baa-root-rebind-")));
   const cwd = join(directory, "project");
   const configDir = join(directory, "config");
@@ -62,10 +62,11 @@ async function fixture({ liveSession = "sess-01a0cc67", samePane = false, concur
       ...(concurrent ? [{ id: "herdr-other-live", status: "running", taskBinding: { rootPaneId: otherRoot.pane_id, workspaceId: otherRoot.workspace_id }, lanes: [{ id: "other-lane", status: "working" }], evidence: [] }] : []),
     ],
     parentGoals: {
-      [oldId]: { rootId: oldId, root: oldRoot, objective: "Continue the previous unfinished goal", status: "active", nextAction: "resume safe work" },
+      [oldId]: { rootId: oldId, root: oldRoot, objective: "Continue the previous unfinished goal", status: parkedGoal ? "parked" : "active", nextAction: "resume safe work", ...(parkedGoal ? { supervisor: { version: 1, state: "stopped", intervalSeconds: 300, nudgeCount: 0, nextNudgeAt: null, createdAt: "2026-09-27T02:00:00.000Z", updatedAt: "2026-09-27T02:00:00.000Z" } } : {}) },
       ...(concurrent ? { [otherId]: { rootId: otherId, root: otherRoot, objective: "Concurrent root goal", status: "active", nextAction: "continue" } } : {}),
     },
     ...(withFinishedLane ? { leases: [{ id: "lease-dead", resource: "port", number: 43210, workflowId: finished.id, laneId: "lane-done", state: "active" }] } : {}),
+    ...(parkedGoal ? { rootSupervision: [{ rootId: oldId, rootParkedAt: "2026-09-27T02:00:00.000Z", alerts: [] }] } : {}),
     rootSessionLogs: [
       { rootId: oldId, root: oldRoot, kind: "root", sessionRef: { provider: "pi", sessionId: "sess-01a0cc67", nativeHandle: { kind: "id", value: "sess-01a0cc67" } }, startedAt: "2026-09-27T02:00:00.000Z", status: "idle", paneId: "w22:p1", workspaceId: "w22" },
       ...(concurrent ? [{ rootId: otherId, root: otherRoot, kind: "root", sessionRef: { provider: "pi", sessionId: "other-session", nativeHandle: { kind: "id", value: "other-session" } }, startedAt: "2026-09-27T02:00:00.000Z", status: "idle", paneId: otherRoot.pane_id, workspaceId: otherRoot.workspace_id }] : []),
@@ -151,6 +152,43 @@ test("plain baa-ton-start bootstrap automatically rebinds the exact gone root an
     assert.equal(manifest.parentGoals[newId].objective, "Continue the previous unfinished goal");
     assert.equal(manifest.parentGoals["orchestrator:w22:w22:p1:" + f.cwd], undefined);
     assert.equal(manifest.workflows[0].taskBinding.rootPaneId, "w22:p1", "historical workflow binding is retained");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("bootstrap is the documented recovery path that resumes a parked root after exact identity reconciliation", async () => {
+  const f = await fixture({ parkedGoal: true });
+  try {
+    await f.tools.get("herdr_bootstrap_root").execute("start", {}, undefined, undefined, f.context);
+    const config = await f.config();
+    const manifest = await f.manifest();
+    const newId = config.orchestrators[0].id;
+    assert.equal(manifest.parentGoals[newId].status, "active");
+    assert.equal(manifest.parentGoals[newId].supervisor.state, "running");
+    assert.ok(manifest.parentGoals[newId].supervisor.nextNudgeAt);
+    assert.equal(manifest.rootSupervision.find((entry) => entry.rootId === newId).rootParkedAt, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("verified bootstrap clears a stale parked marker and restores an active supervisor", async () => {
+  const f = await fixture({ parkedGoal: true });
+  try {
+    const manifest = await f.manifest();
+    manifest.parentGoals[f.oldId].status = "paused";
+    manifest.parentGoals[f.oldId].supervisor.state = "paused";
+    manifest.parentGoals[f.oldId].supervisor.nextNudgeAt = null;
+    await writeFile(join(f.cwd, ".baa-ton", "herdr-orchestrator", "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    await f.tools.get("herdr_bootstrap_root").execute("start", {}, undefined, undefined, f.context);
+    const config = await f.config();
+    const recovered = await f.manifest();
+    const newId = config.orchestrators[0].id;
+    assert.equal(recovered.parentGoals[newId].status, "active");
+    assert.equal(recovered.parentGoals[newId].supervisor.state, "running");
+    assert.ok(recovered.parentGoals[newId].supervisor.nextNudgeAt);
+    assert.equal(recovered.rootSupervision.find((entry) => entry.rootId === newId).rootParkedAt, undefined);
   } finally {
     await f.cleanup();
   }

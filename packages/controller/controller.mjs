@@ -72,7 +72,8 @@ const MAX_NUDGE_INTERVAL_SECONDS = 86_400;
 const MAX_DIGEST_WINDOW_SECONDS = 3_600;
 const MAX_ESCALATE_MINUTES = 1_440;
 const ROOT_WATCH_INTERVAL_MS = 30_000;
-import { SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "./root-watch.mjs";
+import { ROOT_GONE_GRACE_MS, ROOT_PARK_ARCHIVE_DELAY_MS, SPEC_RESTART_MIN_MS, advanceRootHealth, classifyRootPane, recordRelaunch, relaunchAllowed, rootRelaunchCommand, specProgress } from "./root-watch.mjs";
+import { archiveParkedWorkflows, canonicalIsoTimestamp, retireParkedFinishedLanes } from "./parked-maintenance.mjs";
 
 const execFileAsync = promisify(execFile);
 const MESSAGE_SUMMARY_MAX_LENGTH = 4_000;
@@ -101,6 +102,7 @@ const TERMINAL_PARENT_GOAL_STATES = new Set([
   "completed",
   "blocked",
   "paused",
+  "parked",
 ]);
 const TERMINAL_WORKFLOW_STATES = new Set([
   "completed",
@@ -654,7 +656,7 @@ function configuredMappings(config) {
 
 const DEFAULT_NUDGE_INTERVAL_SECONDS = 300;
 const NUDGE_INTERVAL_POLICY = 2;
-const QUIET_PARENT_GOAL_STATUSES = new Set(["completed", "paused"]);
+const QUIET_PARENT_GOAL_STATUSES = new Set(["completed", "paused", "parked"]);
 
 /**
  * Remove the short-lived `supervisor.intervalPolicy` key (#28) from every
@@ -1451,7 +1453,7 @@ function parentGoalFor(manifest, orchestrator, shared = false) {
 }
 
 function signalParentGoal(goal, record, timestamp = now()) {
-  if (!goal) return;
+  if (!goal || goal.status === "parked") return;
   if (!ACTIONABLE_CLASSIFICATIONS.has(record.classification)) return;
   if (
     !goal.signals.some(
@@ -1509,7 +1511,7 @@ function workflowIsTerminal(workflow) {
 }
 
 function signalParentGoalMismatch(goal, manifest, routedWorkflows, timestamp = now()) {
-  if (!goal) return false;
+  if (!goal || goal.status === "parked") return false;
   if (!TERMINAL_PARENT_GOAL_STATES.has(goal.status)) return false;
   const active = routedWorkflows
     .map((route) => ({
@@ -1663,7 +1665,7 @@ function queueItemBelongsToRoot(item, mapping, shared) {
 }
 
 function signalParentGoalForQueue(goal, item, timestamp = now()) {
-  if (!goal) return false;
+  if (!goal || goal.status === "parked") return false;
   const nextAction = `Review queue head now dispatchable: ${item.id} ${queueObjectiveSlug(item.objective)}.`;
   if (goal.status === "review-requested" && goal.nextAction === nextAction) return false;
   goal.status = "review-requested";
@@ -1743,7 +1745,7 @@ function signalParentGoalForUserAction(
   shared = false,
   orchestrator,
 ) {
-  if (!goal) return false;
+  if (!goal || goal.status === "parked") return false;
   const pending = pendingParentAction(
     manifest,
     workflows,
@@ -1761,7 +1763,8 @@ function signalParentGoalForUserAction(
   const terminal =
     goal.status === "completed" ||
     goal.status === "blocked" ||
-    goal.status === "paused";
+    goal.status === "paused" ||
+    goal.status === "parked";
   const nextStatus = terminal ? goal.status : "action-required";
   if (goal.status === nextStatus && goal.nextAction === nextAction) return false;
   goal.status = nextStatus;
@@ -3031,6 +3034,7 @@ export async function dispatchRootDigest({
   timestamp = now(),
   notify = herdrNotification,
 }) {
+  if (goal?.status === "parked") return { status: "deferred", reason: "root-parked", count: 0 };
   const { items, changed, open, escalations } = collectDigestItems({
     orchestrator,
     manifestPath,
@@ -3297,7 +3301,7 @@ async function processQueueHeadWake({
 }
 
 function signalParentGoalForMessage(goal, message, timestamp = now()) {
-  if (!goal || !BLOCKING_MESSAGE_KINDS.has(message.kind)) return false;
+  if (!goal || goal.status === "parked" || !BLOCKING_MESSAGE_KINDS.has(message.kind)) return false;
   goal.status = "review-requested";
   goal.nextAction =
     `Review child message ${message.id} from ${message.workflowId}/${message.laneId}: ${message.summary}`;
@@ -3724,7 +3728,7 @@ function specWaiting(manifestPath, manifest, liveStatus) {
  * Operator messages (docs/OPERATOR-MESSAGES.md) waiting for their target:
  * the same live, idle, never-retype rules as root-to-lane delivery.
  */
-export async function deliverOperatorQueue({ herdr, storePath, timestamp = now() } = {}) {
+export async function deliverOperatorQueue({ herdr, storePath, timestamp = now(), deferRootPanes = new Set() } = {}) {
   // Loaded on use: the supervisor starts and runs without it.
   const { deliverOperatorMessages, operatorStorePath, withOperatorStore } = await import("../herdr-tools/operator.mjs");
   storePath ??= operatorStorePath();
@@ -3733,6 +3737,7 @@ export async function deliverOperatorQueue({ herdr, storePath, timestamp = now()
   return withOperatorStore(storePath, (store) =>
     deliverOperatorMessages(store, {
       at: timestamp,
+      defer: (target) => target?.kind === "root" && deferRootPanes.has(target.paneId),
       ready: (paneId, expected) => agentReadyForSend(herdr, paneId, expected),
       prompt: async (paneId, text) => {
         try {
@@ -3768,7 +3773,7 @@ async function adoptRootKind(configDir, orchestratorId, from, to) {
  * escalated, not reopened. Returns whether supervision now runs.
  */
 async function superviseUnfinishedSpec({ manifest, manifestPath, orchestrator, goal, supervisor, run, timestamp, notify, persist }) {
-  if (run?.state === "paused") return false;
+  if (run?.state === "paused" || goal.status === "parked") return false;
   const progress = specProgress(manifestPath);
   if (!progress || progress.open === 0) return false;
   const entry = supervisionFor(manifest, orchestrator, true);
@@ -3801,35 +3806,104 @@ async function superviseUnfinishedSpec({ manifest, manifestPath, orchestrator, g
   return true;
 }
 
+/** A successful pane probe must match the precise pane/workspace binding. */
+async function rootPaneProbe(api, root) {
+  try {
+    const raw = await api.request("pane.get", { target: root.pane_id });
+    const body = isRecord(raw?.result) ? raw.result : raw;
+    const pane = isRecord(body?.pane) ? body.pane : body;
+    if (pane?.pane_id !== root.pane_id || pane?.workspace_id !== root.workspace_id) return undefined;
+    return true;
+  } catch (error) {
+    if (error instanceof HerdrApiError && ["pane_not_found", "agent_pane_not_found"].includes(error.code)) return false;
+    return undefined;
+  }
+}
+
+function rootAgentIdentityMatches(raw, root) {
+  const body = isRecord(raw?.result) ? raw.result : raw;
+  const agent = isRecord(body?.agent) ? body.agent : undefined;
+  return Boolean(agent && agent.pane_id === root.pane_id && agent.workspace_id === root.workspace_id);
+}
+
 /**
  * Watch the root pane's harness. A live agent of another kind than the
- * registered one (a Pi root exited and a plain Claude session took its pane)
- * is followed: after ROOT_DRIFT_ADOPT_MS the live kind is written to the
- * config so nudges and messages reach it, the root is told to attach its
- * tools (baa-ton-start), and lane-admin and the user are told. A pane with no
- * agent or a bare shell is relaunched with the root's configured
- * resume_command (rate limited), and flagged.
+ * registered one is followed after ROOT_DRIFT_ADOPT_MS. A present pane with
+ * no agent may be relaunched; only structured evidence that the pane itself
+ * is gone can park the goal, after ROOT_GONE_GRACE_MS. A returned pane never
+ * unparks itself: only herdr_goal action=start or herdr_bootstrap_root does.
  */
-async function watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun }) {
-  if (run?.state === "paused") return false;
+async function watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun, goal }) {
   const root = orchestrator.root;
+  const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
+  if (goal.status === "parked" || (parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"))) {
+    let changed = false;
+    if (goal.status !== "completed" && goal.status !== "parked") {
+      goal.status = "parked";
+      goal.nextAction = `Root remains parked; return through herdr_bootstrap_root, then herdr_goal action=start.`;
+      goal.updatedAt = timestamp;
+      changed = true;
+    }
+    if (goal.supervisor && (goal.supervisor.state !== "stopped" || goal.supervisor.nextNudgeAt !== null || goal.supervisor.pauseReason !== undefined)) {
+      goal.supervisor.state = "stopped";
+      goal.supervisor.nextNudgeAt = null;
+      delete goal.supervisor.pauseReason;
+      goal.supervisor.updatedAt = timestamp;
+      if (goal.status !== "completed") goal.updatedAt = timestamp;
+      changed = true;
+    }
+    if (changed) await atomicWriteJson(manifestPath, manifest);
+    return true;
+  }
   const shell = await paneProcessInfo(api, root.pane_id).then(paneShowsShell, () => undefined);
   let info;
+  let paneGone = false;
   try {
     info = await api.request("agent.get", { target: root.pane_id });
+    if (!rootAgentIdentityMatches(info, root)) return false;
   } catch (error) {
-    // No agent in the pane is a verdict; an unreachable Herdr or a pane that is gone is not.
-    if (!(error instanceof HerdrApiError && ["agent_not_found", "agent_not_running"].includes(error.code))) return false;
-    info = undefined;
+    if (!(error instanceof HerdrApiError)) return false;
+    if (["pane_not_found", "agent_pane_not_found", "agent_not_found", "agent_not_running"].includes(error.code)) {
+      // agent.get can be stale or scoped to the wrong registry. Its not-found
+      // response is only a candidate; the exact configured pane/workspace must
+      // independently confirm absence before the root can be considered gone.
+      const exists = await rootPaneProbe(api, root);
+      if (exists === false) paneGone = true;
+      else if (exists !== true) return false;
+      info = undefined;
+    } else return false;
   }
-  const observation = classifyRootPane({ shell, info, root });
+  if (run?.state === "paused" && !paneGone) return false;
+  const observation = classifyRootPane({ shell, info, root, paneGone });
   const entry = supervisionFor(manifest, orchestrator, true);
-  const before = JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null]);
+  const before = JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null, entry.rootParkedAt ?? null, goal.status, goal.updatedAt]);
   const command = rootRelaunchCommand(root, orchestrator.program?.id);
   const actions = advanceRootHealth(entry, observation, { timestamp, resumable: Boolean(command) });
+  if (goal.status === "parked") {
+    delete actions.adopt;
+    delete actions.relaunch;
+    if (actions.anomaly !== "root-pane-gone") delete actions.anomaly;
+  }
   const episode = entry.rootHealth;
   const { reportAnomaly } = await import("./anomalies.mjs");
   let adopted;
+  let parked = false;
+  if (actions.park && goal.status !== "completed") {
+    if (goal.status !== "parked") {
+      goal.status = "parked";
+      goal.nextAction = `Root pane ${root.pane_id} is gone. Child lanes continue independently; return through herdr_bootstrap_root, then herdr_goal action=start.`;
+      goal.updatedAt = timestamp;
+      if (goal.supervisor) {
+        goal.supervisor.state = "stopped";
+        goal.supervisor.nextNudgeAt = null;
+        delete goal.supervisor.pauseReason;
+        goal.supervisor.updatedAt = timestamp;
+      }
+      parked = true;
+    }
+    entry.rootParkedAt ??= timestamp;
+    if (parked) queueRootAlert(entry, "root-parked", `The root pane ${root.pane_id} is gone. Goal ${goal.id} is parked, not paused; lanes continue and only bootstrap/start can resume root supervision.`, timestamp);
+  }
   if (actions.adopt && (await adoptRootKind(configDir, orchestrator.id, root.agent_kind, actions.adopt).catch(() => false))) {
     adopted = { from: root.agent_kind, to: actions.adopt };
     root.agent_kind = actions.adopt;
@@ -3863,23 +3937,32 @@ async function watchRootHealth({ api, orchestrator, manifest, manifestPath, conf
             notifyUser: true,
             notifyTitle: "Baa-ton: the root's harness changed",
           }
-        : {
-            kind: "root-dead",
-            signature: `root-dead:${orchestrator.id}:${episode.since}`,
-            summary: `the root pane ${root.pane_id} has had no agent (${episode.reason}) for ${minutes} min`,
-            evidence: [
-              !command
-                ? "no resume_command is configured for this root (config.root.resume_command), so it can not be relaunched from here"
-                : (entry.rootRelaunches ?? []).length
-                  ? `relaunched ${(entry.rootRelaunches ?? []).length} time(s) with the configured resume_command; the pane still has no agent (3 an hour, 10 min apart)`
-                  : "a relaunch is due",
-            ],
-            notifyUser: true,
-            notifyTitle: "Baa-ton: the root has stopped",
-          };
+        : actions.anomaly === "root-pane-gone"
+          ? {
+              kind: "root-pane-gone",
+              signature: `root-pane-gone:${orchestrator.id}:${episode.since}`,
+              summary: `the root pane ${root.pane_id} is confirmed gone after the ${Math.round(ROOT_GONE_GRACE_MS / 60_000)} minute grace; goal ${goal.id} is parked without pausing the operator run`,
+              evidence: [`exact pane/workspace identity ${root.pane_id}/${root.workspace_id} returned structured not-found evidence`, `goal status: ${goal.status}`, `parkedAt: ${entry.rootParkedAt ?? "not parked (goal is terminal)"}`, `eligible finished workflows archive only after ${Math.round(ROOT_PARK_ARCHIVE_DELAY_MS / 60_000)} parked minutes`, "running lanes, worktrees and their processes are left alone; finished lanes retire only under the acknowledged retire grant"],
+              notifyUser: true,
+              notifyTitle: "Baa-ton: the root pane is gone",
+            }
+          : {
+              kind: "root-dead",
+              signature: `root-dead:${orchestrator.id}:${episode.since}`,
+              summary: `the root pane ${root.pane_id} has had no agent (${episode.reason}) for ${minutes} min`,
+              evidence: [
+                !command
+                  ? "no resume_command is configured for this root (config.root.resume_command), so it can not be relaunched from here"
+                  : (entry.rootRelaunches ?? []).length
+                    ? `relaunched ${(entry.rootRelaunches ?? []).length} time(s) with the configured resume_command; the pane still has no agent (3 an hour, 10 min apart)`
+                    : "a relaunch is due",
+              ],
+              notifyUser: true,
+              notifyTitle: "Baa-ton: the root has stopped",
+            };
     await reportAnomaly(anomaly, { timestamp, notify }).catch(() => undefined);
   }
-  if (JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null]) !== before || adopted) await atomicWriteJson(manifestPath, manifest);
+  if (JSON.stringify([entry.rootHealth ?? null, entry.rootRelaunches ?? null, entry.rootParkedAt ?? null, goal.status, goal.updatedAt]) !== before || adopted) await atomicWriteJson(manifestPath, manifest);
   return true;
 }
 
@@ -3916,7 +3999,7 @@ export async function runRootWatch({
       const manifest = parseJson(await readRegularFile(manifestPath, "Parent manifest"), "Parent manifest");
       const goal = parentGoalFor(manifest, orchestrator, manifestHasMultipleRoots(config, manifestPath));
       if (!goal) continue;
-      const watched = await watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun });
+      const watched = await watchRootHealth({ api, orchestrator, manifest, manifestPath, configDir, timestamp, notify, run, paneRun, goal });
       results.push({ root: orchestrator.id, watched });
     } catch (error) {
       supervisorLog(configDir, `root watch failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -3941,6 +4024,7 @@ export async function runSupervisorTick({
   const api = herdr ?? new JsonLineHerdrClient();
   const results = [];
   const pendingWakes = [];
+  const parkedRootPanes = new Set();
   const seenManifests = new Set();
   for (const entry of configuredParentManifests(config)) {
     const { orchestrator, manifestPath, workflows } = entry;
@@ -3963,6 +4047,49 @@ export async function runSupervisorTick({
         await readRegularFile(manifestPath, "Parent manifest"),
         "Parent manifest",
       );
+      const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
+      const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
+      const parkedRoot = manifest.rootSupervision?.find((item) => item.rootId === orchestrator.id);
+      const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
+      if (goal?.status === "parked" || hasParkedRootMarker) {
+        if (typeof orchestrator.root?.pane_id === "string") parkedRootPanes.add(orchestrator.root.pane_id);
+        const timestampMs = canonicalIsoTimestamp(timestamp);
+        const parkedAtMs = hasParkedRootMarker ? canonicalIsoTimestamp(parkedRoot.rootParkedAt) : undefined;
+        if (!Number.isFinite(timestampMs) || (hasParkedRootMarker && (!Number.isFinite(parkedAtMs) || timestampMs < parkedAtMs))) {
+          results.push({ manifestPath, status: goal?.status === "completed" ? "goal-completed-parked" : "goal-parked", reason: "invalid-parked-timestamp" });
+          continue;
+        }
+        let changed = false;
+        if (hasParkedRootMarker && goal && goal.status !== "completed" && goal.status !== "parked") {
+          goal.status = "parked";
+          goal.nextAction = `Root remains parked; return through herdr_bootstrap_root, then herdr_goal action=start.`;
+          goal.updatedAt = timestamp;
+          changed = true;
+        }
+        if (goal?.supervisor) {
+          if (goal.supervisor.state !== "stopped" || goal.supervisor.nextNudgeAt !== null || goal.supervisor.pauseReason !== undefined) {
+            goal.supervisor.state = "stopped";
+            goal.supervisor.nextNudgeAt = null;
+            delete goal.supervisor.pauseReason;
+            goal.supervisor.updatedAt = timestamp;
+            if (goal.status !== "completed") goal.updatedAt = timestamp;
+            changed = true;
+          }
+        }
+        if (changed) await atomicWriteJson(manifestPath, manifest);
+        const rootSupervision = parkedRoot ?? supervisionFor(manifest, orchestrator, true);
+        const persistParked = async () => atomicWriteJson(manifestPath, manifest);
+        const retired = await retireParkedFinishedLanes({ manifest, orchestrator, herdr: api, timestamp, persist: persistParked }).catch((error) => {
+          supervisorLog(configDir, `parked-root retirement failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+          return [];
+        });
+        const archived = await archiveParkedWorkflows({ manifest, orchestrator, manifestPath, parkedAt: rootSupervision.rootParkedAt, timestamp, persist: persistParked }).catch((error) => {
+          supervisorLog(configDir, `parked-root archive failed for ${orchestrator.id}: ${error instanceof Error ? error.message : String(error)}`);
+          return [];
+        });
+        results.push({ manifestPath, status: goal?.status === "completed" ? "goal-completed-parked" : "goal-parked", ...(retired.length ? { retired } : {}), ...(archived.length ? { archived } : {}) });
+        continue;
+      }
       // Do not schedule against an unowned or stale registration merely because
       // it shares a manifest with a valid workflow in this orchestrator.
       const matchedWorkflows = workflows.map((candidate) =>
@@ -3972,8 +4099,6 @@ export async function runSupervisorTick({
           config.owner,
         ),
       );
-      const sharedManifest = manifestHasMultipleRoots(config, manifestPath);
-      const goal = parentGoalFor(manifest, orchestrator, sharedManifest);
       // Forward compatibility: keep parent goals readable by older bridges.
       const policy = stripSupervisorIntervalPolicy(manifest);
       if (policy.changed) {
@@ -3984,6 +4109,7 @@ export async function runSupervisorTick({
       // Queue continuation uses this existing event-driven tick as its retry
       // point. A landed predecessor can wake only a clear ordered head.
       for (const [workflowIndex, stored] of matchedWorkflows.entries()) {
+        if (goal?.status === "parked") break;
         const candidate = workflows[workflowIndex];
         const queueWake = await processQueueHeadWake({
           manifestPath,
@@ -4060,21 +4186,25 @@ export async function runSupervisorTick({
           );
       }
       // The root's own question dialog, when nothing else will answer it.
-      try {
-        const { superviseRootDialog } = await import("./root-dialog.mjs");
-        const dialog = await superviseRootDialog({
-          orchestrator,
-          manifest,
-          manifestPath,
-          entry: supervisionFor(manifest, orchestrator, true),
-          herdr: api,
-          notify,
-          timestamp,
-        });
-        if (dialog.changed) await atomicWriteJson(manifestPath, manifest);
-        if (dialog.action === "answered") pendingWakes.push({ manifestPath, kind: "root-dialog-answered" });
-      } catch {
-        // Best effort: a missing helper or a Herdr hiccup never blocks the tick.
+      // A parked root is never driven through a dialog; bootstrap/start restores
+      // root authority before any root-directed key or prompt is allowed.
+      if (goal?.status !== "parked") {
+        try {
+          const { superviseRootDialog } = await import("./root-dialog.mjs");
+          const dialog = await superviseRootDialog({
+            orchestrator,
+            manifest,
+            manifestPath,
+            entry: supervisionFor(manifest, orchestrator, true),
+            herdr: api,
+            notify,
+            timestamp,
+          });
+          if (dialog.changed) await atomicWriteJson(manifestPath, manifest);
+          if (dialog.action === "answered") pendingWakes.push({ manifestPath, kind: "root-dialog-answered" });
+        } catch {
+          // Best effort: a missing helper or a Herdr hiccup never blocks the tick.
+        }
       }
       const escalatedDirectives = await escalateDirectives({
         orchestrator,
@@ -4443,8 +4573,8 @@ export async function runSupervisorTick({
     const { operatorStorePath } = await import("../herdr-tools/operator.mjs");
     const { resolveAgentPrompts } = await import("./blocked-lane.mjs");
     // Registered agents' due prompt defaults first; their messages then go out.
-    await resolveAgentPrompts({ herdr: api, storePath: operatorStorePath(), timestamp });
-    operator = await deliverOperatorQueue({ herdr: api, timestamp });
+    await resolveAgentPrompts({ herdr: api, storePath: operatorStorePath(), timestamp, deferPaneIds: parkedRootPanes });
+    operator = await deliverOperatorQueue({ herdr: api, timestamp, deferRootPanes: parkedRootPanes });
   } catch {
     operator = [];
   }

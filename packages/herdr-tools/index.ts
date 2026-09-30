@@ -379,6 +379,9 @@ type CapacityGate = {
 };
 type RootSupervision = {
   rootId: string;
+  /** Controller-owned lifecycle marker; cleared only by the documented root start/bootstrap path. */
+  rootParkedAt?: string;
+  rootHealth?: { status: string; since: string; reason?: string; live?: Record<string, unknown>; registered?: string };
   /** 2: the goal's nudge interval was chosen under the repeating-nudge policy. */
   nudgeIntervalPolicy?: 2;
   capacityGate?: CapacityGate;
@@ -1198,6 +1201,7 @@ const PARENT_GOAL_STATUSES = new Set<ParentGoalStatus>([
   "blocked",
   "completed",
   "paused",
+  "parked",
 ]);
 const MIN_PARENT_GOAL_NUDGE_INTERVAL_SECONDS = 5;
 
@@ -1389,6 +1393,12 @@ async function parentGoal(
     const scoped = rootGoalFor(manifest, cwd, scope);
     const record = scoped.record;
     const goal = scoped.goal ?? record?.goal;
+    const parkedRoot = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+    const hasParkedRootMarker = Boolean(parkedRoot && Object.hasOwn(parkedRoot, "rootParkedAt"));
+    if (hasParkedRootMarker && (action === "reset" || action === "initialize"))
+      throw new Error(
+        `Cannot ${action} a parent goal while rootParkedAt is set; recover through herdr_bootstrap_root or herdr_goal action=start first.`,
+      );
     const history = record
       ? ((manifest.goalHistoryByRoot ??= {})[scope.rootId] ??= record.goalHistory)
       : Array.isArray(manifest.goalHistory)
@@ -1550,15 +1560,19 @@ async function parentGoal(
         );
       if (status === "paused")
         throw new Error("Use action=pause with a non-empty pauseReason.");
+      const parked = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+      if ((goal.status === "parked" || (parked && Object.hasOwn(parked, "rootParkedAt"))) && status !== "parked")
+        throw new Error("A parked parent goal can only be resumed with action=start.");
       goal.status = status as ParentGoalStatus;
       if (objective?.trim()) goal.objective = objective.trim();
       if (nextAction?.trim()) goal.nextAction = nextAction.trim();
       // Only completion ends supervision. A blocked goal keeps being nudged
       // while actionable work exists, so the root cannot park out of it.
-      if (status === "completed") {
+      if (status === "completed" || status === "parked") {
         const control = supervisor();
         control.state = "stopped";
         control.nextNudgeAt = null;
+        delete control.pauseReason;
         control.updatedAt = timestamp;
       } else if (goal.supervisor?.state === "paused") {
         // Leaving a pause ends it: a goal set back to active, blocked or
@@ -1581,7 +1595,7 @@ async function parentGoal(
             : Math.min(control.intervalSeconds, DEFAULT_PARENT_GOAL_NUDGE_INTERVAL_SECONDS)),
       );
       markNudgeIntervalPolicy(manifest, scope.rootId);
-      if (previousSupervisorState !== "running") {
+      if (previousSupervisorState !== "running" || hasParkedRootMarker) {
         control.nextNudgeAt = new Date(
           Date.parse(timestamp) + control.intervalSeconds * 1000,
         ).toISOString();
@@ -1589,7 +1603,9 @@ async function parentGoal(
       }
       delete control.pauseReason;
       control.updatedAt = timestamp;
-      if (goal.status === "paused") goal.status = "active";
+      if (goal.status === "paused" || goal.status === "parked") goal.status = "active";
+      if (hasParkedRootMarker) delete parkedRoot!.rootParkedAt;
+      if (parkedRoot?.rootHealth?.status === "gone") delete parkedRoot.rootHealth;
       if (nextAction?.trim()) goal.nextAction = nextAction.trim();
     } else if (action === "stop") {
       const control = supervisor();
@@ -1599,6 +1615,8 @@ async function parentGoal(
     } else if (action === "pause") {
       if (!pauseReason?.trim())
         throw new Error("pauseReason is required when action=pause.");
+      if (goal.status === "parked" || hasParkedRootMarker)
+        throw new Error("A parked parent goal cannot be paused or downgraded; use herdr_bootstrap_root or herdr_goal action=start to recover it.");
       const control = supervisor();
       control.state = "paused";
       control.pauseReason = pauseReason.trim();
@@ -1617,7 +1635,7 @@ async function parentGoal(
       ) {
         delete control.lastDelivery;
         control.nextNudgeAt =
-          goal.status !== "completed" && goal.status !== "paused" && control.state === "running"
+          goal.status !== "completed" && goal.status !== "paused" && goal.status !== "parked" && control.state === "running"
             ? new Date(
                 Date.parse(timestamp) + control.intervalSeconds * 1000,
               ).toISOString()
@@ -7547,6 +7565,37 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         : "Controller config or parent manifest has existing state from a different pane/workspace. This pane's workspace has no existing root, so add=true registers a concurrent root without touching any existing root or manifest state; use reset=true only if you intend to retire every existing root and wipe the shared parent manifest for this cwd.";
     const labelEvidence: string[] = [];
     let rootTabId: string | undefined;
+    const resumeParkedGoal = (manifest: ManifestWithQueue, scope: CurrentRootScope): void => {
+      const goal = rootGoalFor(manifest, cwd, scope).goal;
+      const supervision = manifest.rootSupervision?.find((entry) => entry.rootId === scope.rootId);
+      const hasParkedRootMarker = Boolean(supervision && Object.hasOwn(supervision, "rootParkedAt"));
+      if (!goal && !hasParkedRootMarker) return;
+      if (goal && goal.status !== "parked" && !hasParkedRootMarker) return;
+      const stamp = now();
+      if (goal) {
+        if (goal.status !== "completed") {
+          goal.status = "active";
+          goal.nextAction = "Root returned through herdr_bootstrap_root; continue authorized safe local work.";
+          if (goal.supervisor) {
+            goal.supervisor.state = "running";
+            goal.supervisor.nextNudgeAt = new Date(Date.parse(stamp) + goal.supervisor.intervalSeconds * 1000).toISOString();
+            delete goal.supervisor.pauseReason;
+            delete goal.supervisor.lastDelivery;
+            goal.supervisor.updatedAt = stamp;
+          }
+        } else if (goal.supervisor) {
+          goal.supervisor.state = "stopped";
+          goal.supervisor.nextNudgeAt = null;
+          delete goal.supervisor.pauseReason;
+          goal.supervisor.updatedAt = stamp;
+        }
+        goal.updatedAt = stamp;
+      }
+      if (supervision) {
+        delete supervision.rootParkedAt;
+        if (supervision.rootHealth?.status === "gone") delete supervision.rootHealth;
+      }
+    };
     // Best-effort sync read for display labels only; authoritative manifest
     // access stays on the transactional async path.
     const readManifestForLabel = (
@@ -7650,6 +7699,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ?.startedAt ?? manifest.sessionLog?.startedAt ?? stamp,
           laterTimestamp(priorActivity, stamp),
         );
+        resumeParkedGoal(manifest, scope);
         return manifest;
       });
       await renameRootTab();
@@ -7858,6 +7908,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             ?.startedAt ?? manifest.sessionLog?.startedAt ?? stamp,
           laterTimestamp(priorActivity, stamp),
         );
+        resumeParkedGoal(manifest, scope);
         return manifest;
       });
       await renameRootTab();
@@ -11283,7 +11334,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       const goal = scope ? rootGoalFor(manifest, cwd, scope).goal : manifest.parentGoal;
       if (!goal) return { status: "ok", detail: "No parent goal is registered." };
       const state = goal.supervisor?.state ?? "not configured";
-      if (goal.status !== "completed" && goal.status !== "paused" && state === "stopped")
+      if (goal.status !== "completed" && goal.status !== "paused" && goal.status !== "parked" && state === "stopped")
         return {
           status: "warn",
           detail: `Parent goal ${goal.id} is ${goal.status} but its supervisor is ${state}, so the root gets no nudges. Run herdr_goal action=start, or record the goal as completed or paused.`,

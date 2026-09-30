@@ -20,6 +20,10 @@ export const SPEC_RESTART_MIN_MS = 10 * 60_000;
 export const ROOT_DRIFT_ADOPT_MS = 5 * 60_000;
 /** A root pane with no agent (or a bare shell) this long is dead. */
 export const ROOT_DEAD_CONFIRM_MS = 60_000;
+/** A structurally missing root pane is parked after the same confirmation grace. */
+export const ROOT_GONE_GRACE_MS = ROOT_DEAD_CONFIRM_MS;
+/** A parked root's safely finished workflows are not archived before this delay. */
+export const ROOT_PARK_ARCHIVE_DELAY_MS = 48 * 60 * 60_000;
 export const ROOT_RELAUNCH_INTERVAL_MS = 10 * 60_000;
 export const ROOT_RELAUNCH_MAX_PER_HOUR = 3;
 const HOUR_MS = 60 * 60_000;
@@ -62,9 +66,11 @@ export function specProgress(manifestPath) {
  * What the root's pane holds now. `shell` is true when the pane shows a bare
  * shell prompt (the agent exited), `info` the `agent get` result.
  * ok: the registered agent kind; drift: another agent kind is live in the
- * pane; dead: no agent, or a bare shell.
+ * pane; dead: the pane exists without an agent, or a bare shell; gone: Herdr
+ * returned structured evidence that the pane itself no longer exists.
  */
-export function classifyRootPane({ shell, info, root }) {
+export function classifyRootPane({ shell, info, root, paneGone = false }) {
+  if (paneGone) return { status: "gone", reason: "pane_not_found" };
   if (shell === true) return { status: "dead", reason: "pane_shows_shell_prompt" };
   const body = isRecord(info) && isRecord(info.result) ? info.result : info;
   const agent = isRecord(body) && body.type === "agent_info" && isRecord(body.agent) ? body.agent : undefined;
@@ -81,9 +87,9 @@ export function classifyRootPane({ shell, info, root }) {
 
 /**
  * Advance the root's health episode kept on its supervision entry, and say
- * what to do now: { adopt: <live kind>, relaunch: true, anomaly: <kind> }.
- * An episode starts when a non-ok state is first seen, and ends when the root
- * is ok again.
+ * what to do now: { adopt: <live kind>, relaunch: true, park: true,
+ * anomaly: <kind> }. An episode starts when a non-ok state is first seen, and
+ * ends when the root is ok again.
  */
 export function advanceRootHealth(entry, observation, { timestamp, resumable = false }) {
   if (observation.status === "ok") {
@@ -101,6 +107,8 @@ export function advanceRootHealth(entry, observation, { timestamp, resumable = f
     if (resumable) actions.relaunch = true;
     if (!resumable || age >= 2 * ROOT_DEAD_CONFIRM_MS) actions.anomaly = "root-dead";
   }
+  if (observation.status === "gone" && age >= ROOT_GONE_GRACE_MS)
+    Object.assign(actions, { park: true, anomaly: "root-pane-gone" });
   return actions;
 }
 
