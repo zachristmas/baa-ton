@@ -329,10 +329,40 @@ function getRecordedPaneProcesses(lane, run, rows) {
   if (pane?.pane_id !== lane.paneId || pane?.workspace_id !== lane.workspaceId || (lane.tabId && pane?.tab_id !== lane.tabId))
     throw new Error(`lane ${lane.id} pane/workspace/tab identity could not be proved`);
   const info = nativeResult(run(["pane", "process-info", "--pane", lane.paneId])).process_info;
-  const pids = new Set([info?.shell_pid, ...(info?.foreground_processes ?? []).map((entry) => entry?.pid)].map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1));
-  const records = [...pids].map((pid) => rows.find((row) => row.pid === pid)).filter(Boolean).map(({ pid, createdAt }) => ({ pid, createdAt }));
-  if (records.some((record) => !record.createdAt)) throw new Error(`lane ${lane.id} process creation time is unavailable`);
+  if (!info || !Object.hasOwn(info, "shell_pid") || !Array.isArray(info.foreground_processes))
+    throw new Error(`lane ${lane.id} pane process inventory is incomplete`);
+  const listed = [info.shell_pid, ...info.foreground_processes.map((entry) => entry?.pid)];
+  const pids = new Set();
+  for (const value of listed) {
+    const pid = Number(value);
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`lane ${lane.id} pane process inventory contains an invalid PID`);
+    pids.add(pid);
+  }
+  const records = [];
+  for (const pid of pids) {
+    const matches = rows.filter((row) => row.pid === pid);
+    if (matches.length !== 1) throw new Error(`lane ${lane.id} process PID ${pid} is ${matches.length ? "ambiguous" : "missing"} from the Windows CIM inventory`);
+    const { createdAt } = matches[0];
+    if (typeof createdAt !== "string" || !createdAt) throw new Error(`lane ${lane.id} process PID ${pid} creation time is unavailable`);
+    records.push({ pid, createdAt });
+  }
   return records;
+}
+
+function isProvablyAbsentTab(error, tabId) {
+  const id = String(tabId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const absent = new RegExp(`^(?:tab(?:\\s+${id})?\\s+(?:not found|does not exist)|no such tab(?:\\s+${id})?|unknown tab(?:\\s+${id})?|tab_not_found)[.!]?$`, "i");
+  return [error?.code, error?.stderr, error?.stdout, error?.message]
+    .filter((value) => typeof value === "string")
+    .some((value) => absent.test(value.trim().replace(/^Error:\s*/i, "")));
+}
+
+function readOptionalSpecState(path) {
+  try { return readFileSync(path); }
+  catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 function applyControllerCleanup(config, plan) {
@@ -420,6 +450,8 @@ export async function runReset({
     const manifestBytes = readManifest();
     const manifest = JSON.parse(manifestBytes);
     const controller = readConfig();
+    const specStatePath = join(stateDir, "spec-state.json");
+    const specStateBytes = readOptionalSpecState(specStatePath);
     const roots = {};
     const driftProofs = [...identityDriftRecovery];
     for (const orchestrator of controller.value?.orchestrators ?? []) {
@@ -453,16 +485,17 @@ export async function runReset({
     const sourceHashes = {
       manifest: createHash("sha256").update(manifestBytes).digest("hex"),
       ...(controller.bytes !== undefined ? { controllerConfig: createHash("sha256").update(controller.bytes).digest("hex") } : {}),
+      ...(specStateBytes !== undefined ? { specState: createHash("sha256").update(specStateBytes).digest("hex") } : {}),
     };
     const plan = planReset(manifest, {
       stateDir, projectRoot: project, names: readdirSync(stateDir), rootTabIds, includeSpec,
-      specStatePresent: existsSync(join(stateDir, "spec-state.json")), controllerConfig: controller.value,
+      specStatePresent: specStateBytes !== undefined, controllerConfig: controller.value,
       controllerConfigPath: configPath, rootLiveness: roots, processCandidates, identityDriftRecovery: driftProofs,
       sourceHashes, currentRoot: currentRootIdentity(env),
     });
     if (controller.blocker) plan.blockers.push(controller.blocker);
     plan.blockers.push(...processBlockers);
-    return { plan, manifest, manifestBytes, controller: controller.value, controllerBytes: controller.bytes, processRecords, rootTabIds };
+    return { plan, manifest, manifestBytes, controller: controller.value, controllerBytes: controller.bytes, specStateBytes, processRecords, rootTabIds };
   };
 
   const initial = await inventory();
@@ -500,10 +533,10 @@ export async function runReset({
   }
   if (failures.length) throw new Error(`Reset process cleanup is incomplete; state was not archived or cleared:\n${failures.map((item) => `  ${item}`).join("\n")}`);
   for (const tab of plan.tabs) {
-    try { close(tab.tabId); }
+    try { await close(tab.tabId); }
     catch (error) {
-      const detail = `${error.stdout ?? ""} ${error.stderr ?? ""} ${error.message}`;
-      if (!/not.?found|no such|unknown tab/i.test(detail)) failures.push(`tab ${tab.tabId}: ${String(error.message).split("\n")[0]}`);
+      if (isProvablyAbsentTab(error, tab.tabId)) continue;
+      throw new Error(`Reset could not close tab ${tab.tabId}; durable state was not archived or cleared: ${String(error.message ?? error).split("\n")[0]}`);
     }
   }
 
@@ -527,13 +560,23 @@ export async function runReset({
   }
 
   const stamp = new Date(now).toISOString().replaceAll(":", "").replace(/\..*/, "");
+  const specStatePath = join(stateDir, "spec-state.json");
+  const assertSpecStateUnchanged = () => {
+    const current = readOptionalSpecState(specStatePath);
+    const planned = initial.specStateBytes;
+    if ((current === undefined) !== (planned === undefined) || (current && !current.equals(planned)))
+      throw new Error("spec-state.json content changed before reset commit; preview again. The file was not archived, deleted or overwritten.");
+    return current;
+  };
   await withLock(stateDir, lockWaitMs, () => withControllerLock(configPath, lockWaitMs, async () => {
     const currentManifestBytes = readManifest();
     const currentController = readConfig();
+    assertSpecStateUnchanged();
     if (currentManifestBytes !== initial.manifestBytes || currentController.bytes !== initial.controllerBytes)
       throw new Error("Manifest or controller config changed before reset commit; preview again. No manifest/config reset was applied.");
     const currentManifest = JSON.parse(currentManifestBytes);
     const archive = join(stateDir, "archive");
+    assertSpecStateUnchanged();
     mkdirSync(archive, { recursive: true, mode: 0o700 });
     writeFileSync(join(archive, `reset-${stamp}.manifest.json.gz`), gzipSync(currentManifestBytes), { mode: 0o600 });
     if (configPath && (plan.controllerRoutes.length || plan.controllerRoots.length)) {
@@ -548,10 +591,17 @@ export async function runReset({
     const temporary = `${manifestPath}.reset.tmp`;
     writeFileSync(temporary, `${JSON.stringify(fresh, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, manifestPath);
-    if (includeSpec && existsSync(join(stateDir, "spec-state.json"))) {
-      const spec = join(stateDir, "spec-state.json");
-      writeFileSync(join(archive, `reset-${stamp}.spec-state.json.gz`), gzipSync(readFileSync(spec)), { mode: 0o600 });
-      rmSync(spec);
+    if (includeSpec && initial.specStateBytes !== undefined) {
+      const specArchive = join(archive, `reset-${stamp}.spec-state.json.gz`);
+      assertSpecStateUnchanged();
+      writeFileSync(specArchive, gzipSync(initial.specStateBytes), { mode: 0o600, flag: "wx" });
+      try {
+        assertSpecStateUnchanged();
+        rmSync(specStatePath);
+      } catch (error) {
+        rmSync(specArchive, { force: true });
+        throw error;
+      }
     }
   }));
   removeFiles(plan.files);

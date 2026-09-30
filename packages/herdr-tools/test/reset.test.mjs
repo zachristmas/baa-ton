@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -276,12 +277,123 @@ test("reset unregisters the last exact stale project root but preserves its arch
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("a tab that is already gone is not a failure; other close errors are reported", async () => {
-  const { root } = project();
+test("an unexpected close failure aborts before archives or durable state changes, even after earlier cleanup", async () => {
+  const { root, dir } = project();
+  const manifestPath = join(dir, "manifest.json");
+  const controllerConfigPath = join(dir, "controller-config.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.workflows[0].taskBinding = { rootPaneId: "root-pane", workspaceId: "root-workspace" };
+  manifest.workflows[1].lanes[0].status = "running";
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  writeFileSync(controllerConfigPath, JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [{ id: "root-a", program: { id: root, parent_manifest_path: manifestPath }, root: { pane_id: "root-pane", workspace_id: "root-workspace" }, workflows: [{ workflow_id: manifest.workflows[0].id, manifest_path: manifestPath, lanes: [] }] }] }));
+  const before = new Map(readdirSync(dir).map((name) => [name, readFileSync(join(dir, name))]));
+  const closed = [];
+  let stopped = 0;
   try {
-    const result = await runReset({ projectRoot: root, apply: true, ...ports([]), closeTab: (id) => { throw new Error(id === "w1:t2" ? "tab not found" : "socket closed"); } });
-    assert.deepEqual(result.failures, ["tab w1:t9: socket closed"]);
+    await assert.rejects(runReset({ projectRoot: root, controllerConfigPath, probeRoot: async () => "live", apply: true, includeSpec: true, rootTabIds: new Set(["w1:t1"]), env: {},
+      killLane: async () => { stopped++; return {}; },
+      closeTab: (id) => { closed.push(id); if (id === "w1:t9") throw new Error("socket closed"); },
+    }), /could not close tab w1:t9.*durable state was not archived or cleared/);
+    assert.equal(stopped, 1, "an earlier lane process may already have stopped");
+    assert.deepEqual(closed, ["w1:t2", "w1:t9"], "stop closing further tabs after the unexpected failure");
+    for (const [name, bytes] of before) assert.deepEqual(readFileSync(join(dir, name)), bytes, name);
+    assert.deepEqual(readdirSync(dir).sort(), [...before.keys()].sort());
+    assert.equal(existsSync(join(dir, "archive")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("only an explicit already-absent tab error is ignorable", async () => {
+  const { root, dir } = project();
+  try {
+    const manifest = readFileSync(join(dir, "manifest.json"), "utf8");
+    await assert.rejects(runReset({ projectRoot: root, apply: true, ...ports([]), closeTab: (id) => { throw new Error(id === "w1:t2" ? "tab not found" : "socket closed"); } }), /could not close tab w1:t9/);
+    assert.equal(readFileSync(join(dir, "manifest.json"), "utf8"), manifest);
+    assert.equal(existsSync(join(dir, "archive")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("spec-state bytes are fingerprinted and a changed same-path file refuses apply", async () => {
+  const { root, dir } = project();
+  const specPath = join(dir, "spec-state.json");
+  const closed = [];
+  try {
+    const common = { projectRoot: root, ...ports(closed) };
+    const preview = await runReset(common);
+    const plannedHash = createHash("sha256").update(readFileSync(specPath)).digest("hex");
+    assert.equal(preview.plan.sourceHashes.specState, plannedHash);
+    writeFileSync(specPath, "still exists, changed content");
+    const changed = await runReset(common);
+    assert.notEqual(changed.plan.sourceHashes.specState, plannedHash);
+    assert.notEqual(changed.fingerprint, preview.fingerprint);
+    await assert.rejects(runReset({ ...common, apply: true, expectedFingerprint: preview.fingerprint }), /fingerprint changed/);
+    assert.deepEqual(closed, []);
+    assert.equal(readFileSync(specPath, "utf8"), "still exists, changed content");
+    assert.equal(JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).workflows.length, 2);
+    assert.equal(existsSync(join(dir, "archive")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a spec-state change immediately before commit is neither archived nor deleted", async () => {
+  const { root, dir } = project();
+  const manifestPath = join(dir, "manifest.json");
+  const controllerConfigPath = join(dir, "controller-config.json");
+  const specPath = join(dir, "spec-state.json");
+  writeFileSync(controllerConfigPath, JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [] }));
+  const beforeManifest = readFileSync(manifestPath, "utf8");
+  const beforeConfig = readFileSync(controllerConfigPath, "utf8");
+  const changedBytes = Buffer.from("changed immediately before commit");
+  try {
+    await assert.rejects(runReset({ projectRoot: root, controllerConfigPath, apply: true, includeSpec: true, rootTabIds: new Set(["w1:t1"]), env: {},
+      killLane: async () => ({}),
+      closeTab: () => writeFileSync(specPath, changedBytes),
+    }), /spec-state.json content changed before reset commit/);
+    assert.equal(readFileSync(manifestPath, "utf8"), beforeManifest);
+    assert.equal(readFileSync(controllerConfigPath, "utf8"), beforeConfig);
+    assert.deepEqual(readFileSync(specPath), changedBytes);
+    assert.equal(existsSync(join(dir, "archive")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows pane PIDs omitted from CIM inventory block all reset actions", async () => {
+  for (const omittedPid of [111, 222]) {
+    const { root, dir } = project();
+    const manifestPath = join(dir, "manifest.json");
+    const controllerConfigPath = join(dir, "controller-config.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const lane = manifest.workflows[0].lanes[0];
+    Object.assign(lane, { paneId: "p1", workspaceId: "w1", tabId: "w1:t2" });
+    manifest.workflows[0].taskBinding = { rootPaneId: "root-pane", workspaceId: "root-workspace" };
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    writeFileSync(controllerConfigPath, JSON.stringify({ version: 2, owner: "herdr-orchestrator", orchestrators: [{ id: "root-a", program: { id: root, parent_manifest_path: manifestPath }, root: { pane_id: "root-pane", workspace_id: "root-workspace" }, workflows: [{ workflow_id: manifest.workflows[0].id, manifest_path: manifestPath, lanes: [] }] }] }));
+    const intent = lane.startupIntentPath;
+    const before = [manifestPath, controllerConfigPath, join(dir, "spec-state.json"), intent].map((path) => [path, readFileSync(path)]);
+    let stops = 0;
+    const closes = [];
+    const infoRun = (args) => {
+      if (args.join(" ") === "pane get p1") return JSON.stringify({ result: { pane: { pane_id: "p1", workspace_id: "w1", tab_id: "w1:t2" } } });
+      if (args.join(" ") === "pane process-info --pane p1") return JSON.stringify({ result: { process_info: { shell_pid: 111, foreground_processes: [{ pid: 222 }] } } });
+      throw new Error(`unexpected native command ${args.join(" ")}`);
+    };
+    try {
+      await assert.rejects(runReset({ projectRoot: root, controllerConfigPath, probeRoot: async () => "live", apply: true, platform: "win32", env: {}, rootTabIds: new Set(["w1:t1"]),
+        runHerdr: infoRun,
+        processTable: async () => [111, 222].filter((pid) => pid !== omittedPid).map((pid) => ({ pid, ppid: 1, createdAt: `created-${pid}`, line: `node BAA_STARTUP_INTENT=${intent}` })),
+        killLane: async () => { stops++; return {}; }, closeTab: (id) => closes.push(id),
+      }), /missing from the Windows CIM inventory/);
+      assert.equal(stops, 0, `no process is stopped when PID ${omittedPid} is omitted`);
+      assert.deepEqual(closes, [], `no tabs close when PID ${omittedPid} is omitted`);
+      for (const [path, bytes] of before) assert.deepEqual(readFileSync(path), bytes, path);
+      assert.equal(existsSync(join(dir, "archive")), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
