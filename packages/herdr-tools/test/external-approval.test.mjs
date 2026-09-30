@@ -44,3 +44,24 @@ test("only literal gh pr create/merge commands are representable; wrappers fail 
   assert.equal(consumeExternalApproval(issueExternalApproval(command, binding), command, shownBinding), false, "remote identity is bound");
   assert.equal(containsGhPrMutation("git status"), false);
 });
+
+test("gh pr is default-deny except for explicit read-only verbs", () => {
+  const mutators = ["create", "merge", "close", "edit", "reopen", "review", "ready", "update-branch", "lock", "unlock", "comment", "delete", "checkout"];
+  for (const verb of mutators) assert.equal(containsGhPrMutation(`gh pr ${verb}`), true, verb);
+  for (const args of [
+    "review --approve", "review --comment", "review --request-changes", "edit --title changed",
+    "close --comment done", "ready", "update-branch", "lock", "unlock", "unknown-verb", "",
+  ]) assert.equal(containsGhPrMutation(`gh pr ${args}`), true, args);
+  for (const verb of ["list", "view", "status", "diff", "checks"]) assert.equal(containsGhPrMutation(`gh pr ${verb}`), false, verb);
+});
+
+test("mutator detection survives wrappers, quoting, flags and shell composition", () => {
+  for (const cmd of [
+    "gh pr close 12", "gh 'pr' 'edit' 12", "gh \"pr\" re'view' 12", "GH_TOKEN=x gh pr ready",
+    "env command gh pr update-branch", "command gh --hostname github.com pr lock 12",
+    "sh -c 'gh pr unlock 12'", "bash -c \"gh pr review --approve\"",
+    "gh pr list && gh pr close 12", "echo safe; gh pr edit 12", "gh pr close\\ 12",
+    "gh pr close $(printf 12)", "/usr/bin/gh pr reopen 12",
+  ]) assert.equal(containsGhPrMutation(cmd), true, cmd);
+  for (const cmd of ["gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) assert.equal(containsGhPrMutation(cmd), false, cmd);
+});

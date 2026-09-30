@@ -59,14 +59,30 @@ export function parseApprovedGhOperation(command) {
 export function containsGhPrMutation(command) {
   const tokens = lexShell(command);
   if (!tokens) return typeof command === "string" && /\b(?:gh|pr)\b/i.test(command);
-  const isMut = (a) => a === "create" || a === "merge";
+  const readOnlyVerbs = new Set(["list", "view", "status", "diff", "checks"]);
+  const optionTakesValue = new Set(["-R", "--repo", "--hostname", "--config"]);
+  let sawGhPr = false;
   const scan = (list, depth = 0) => {
     if (depth > 4) return true;
     for (let i = 0; i < list.length; i++) {
-      if (list[i].word === "gh") {
+      const executable = list[i]?.word;
+      if (executable === "gh" || executable?.endsWith("/gh") || executable === "gh.exe") {
         let j = i + 1;
-        while (list[j]?.word?.startsWith("-") && j < list.length) j += list[j].word.includes("=") ? 1 : 2;
-        if (list[j]?.word === "pr" && isMut(list[j + 1]?.word)) return true;
+        while (list[j]?.word?.startsWith("-")) {
+          const flag = list[j++].word.split("=", 1)[0];
+          if (!list[j - 1].word.includes("=") && optionTakesValue.has(flag) && list[j]?.word) j++;
+        }
+        if (list[j]?.word === "pr") {
+          sawGhPr = true;
+          j++;
+          while (list[j]?.word?.startsWith("-")) {
+            const flag = list[j++].word.split("=", 1)[0];
+            if (!list[j - 1].word.includes("=") && optionTakesValue.has(flag) && list[j]?.word) j++;
+          }
+          // Deny absent, unknown and mutating verbs; only explicitly verified
+          // read-only operations pass without native approval.
+          if (!readOnlyVerbs.has(list[j]?.word)) return true;
+        }
       }
       if ((list[i].word === "sh" || list[i].word === "bash") && list[i + 1]?.word === "-c" && list[i + 2]?.word) {
         const nested = lexShell(list[i + 2].word);
@@ -76,8 +92,9 @@ export function containsGhPrMutation(command) {
     return false;
   };
   if (scan(tokens)) return true;
-  // Dynamic command construction/indirection cannot be proven harmless.
-  return (/\b(?:gh|pr|create|merge)\b/i.test(command) && /[$`\\]|(?:&&|\|\||[;|])/.test(command)) || (/(?:^|[\s;&|])(?:\$[({]|eval\b|exec\b)/.test(command) && /\b(?:pr|create|merge)\b/i.test(command));
+  // Syntax outside our lexer mentioning both components is ambiguous, unless
+  // the only parsed gh pr command(s) were explicitly read-only.
+  return !sawGhPr && /\bgh\b/i.test(command) && /\bpr\b/i.test(command);
 }
 
 export function issueExternalApproval(command, binding, { now = Date.now(), ttlMs = 30_000 } = {}) {
