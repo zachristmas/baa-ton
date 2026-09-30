@@ -36,6 +36,7 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
+import { consumeExternalApproval, issueExternalApproval, parseApprovedGhOperation } from "./external-approval.mjs";
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -11884,25 +11885,51 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     if (call.toolName !== "bash" || typeof command !== "string") return;
     const gitPush = /(?:^|[;&|]\s*)git(?:\s+\S+)*\s+push\b/im;
     const nonAutonomousMutation =
-      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
-    // 2026-09-16 ruling: the verified controller-mapped root is the parent
-    // executor acting with the user present, so a plain `git push` is allowed
-    // there, and it may retire its own lane tabs/panes (children remain
-    // reachable through durable manifests). Every other mutation stays
-    // blocked for every caller, workspace closure is never allowed from an
-    // agent shell (it would close the root's own session), and a compound
-    // command that also carries a non-push mutation keeps the block.
+      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+(?:create|merge)\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
+    // External operations stay hard-gated. Only the exact gh PR operation
+    // below can be approved through the native root confirmation; push,
+    // arbitrary Git mutation and scripts remain denied.
     const nonPushMutation =
       /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b)/im;
     const herdrWorkspaceClose =
       /(?:^|[;&|]\s*)herdr\s+workspace\s+close\b/im;
     const herdrPaneClose =
       /(?:^|[;&|]\s*)herdr\s+(?:tab|pane)\s+close\b/im;
+    let explicitlyApproved = false;
+    const externalOperation = parseApprovedGhOperation(command);
     if (
       process.env.HERDR_ENV === "1" &&
-      (nonPushMutation.test(command) ||
+      externalOperation &&
+      isRootOrchestrator() &&
+      isRootForManifest(ctx.cwd) &&
+      ctx.hasUI &&
+      ctx.ui?.confirm &&
+      process.env.PI_SESSION_FILE
+    ) {
+      try {
+        const git = async (args: string[]) => (await execFile("git", args, { cwd: ctx.cwd, encoding: "utf8" })).stdout.trim();
+        const repo = await realpath(await git(["rev-parse", "--show-toplevel"]));
+        const head = await git(["rev-parse", "HEAD"]);
+        const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        const sessionId = await realpath(process.env.PI_SESSION_FILE);
+        const baseFlag = externalOperation.argv.indexOf("--base");
+        const target = externalOperation.operation === "merge" ? externalOperation.argv[3] ?? "" : baseFlag >= 0 ? externalOperation.argv[baseFlag + 1] ?? "" : "(gh-default-base)";
+        const binding = { repo, head, branch, target, paneId: process.env[HERDR_PANE_ID_ENV] ?? "", sessionId };
+        const approved = await ctx.ui.confirm(
+          `Approve exact gh pr ${externalOperation.operation}?`,
+          `Repository: ${repo}\nHEAD: ${head} (${branch})\nTarget: ${target || "(command-defined)"}\nCommand: ${externalOperation.argv.join(" ")}\nThis approves this exact command once.`,
+        );
+        const token = approved ? issueExternalApproval(command, binding) : undefined;
+        explicitlyApproved = Boolean(token && consumeExternalApproval(token, command, binding));
+      } catch {
+        explicitlyApproved = false;
+      }
+    }
+    if (
+      process.env.HERDR_ENV === "1" &&
+      (nonPushMutation.test(command) && !explicitlyApproved ||
         herdrWorkspaceClose.test(command) ||
-        (gitPush.test(command) && !isRootOrchestrator()) ||
+        gitPush.test(command) ||
         (herdrPaneClose.test(command) && !isRootOrchestrator()))
     ) {
       return {

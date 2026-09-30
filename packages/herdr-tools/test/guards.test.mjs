@@ -212,7 +212,7 @@ test("child question routing failures are visible and never masquerade as an app
   }
 });
 
-test("verified root may push; lanes and every other mutation stay blocked", async () => {
+test("external push stays blocked even for the root; lanes and other mutations stay blocked", async () => {
   const dir = await mkdtemp(join(tmpdir(), "baa-guard-push-"));
   const saved = Object.fromEntries(
     ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_PLUGIN_CONFIG_DIR"].map(
@@ -270,7 +270,8 @@ test("verified root may push; lanes and every other mutation stay blocked", asyn
   const blockedReason = async (command) => (await bash(command))?.reason ?? "";
   try {
     setPane("w1:p1"); // verified controller-mapped root
-    assert.equal(await bash(`git ${pushVerb} origin main`), undefined, "root push allowed");
+    assert.match(await blockedReason(`git ${pushVerb} origin main`), /require/, "root push stays hard-gated");
+    assert.match(await blockedReason("gh pr create --base main"), /require/, "without a native exact approval token PR creation stays blocked");
     assert.equal(await bash("git status"), undefined);
     assert.match(await blockedReason(`git ${mergeVerb} feature`), /require/);
     assert.match(
