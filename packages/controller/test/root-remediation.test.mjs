@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -570,26 +570,43 @@ test("stale-but-live roots and ambiguous pane identities fail closed instead of 
   }
 });
 
-test("parked archival rejects missing, malformed, and future parked timestamps and malformed current timestamps", async () => {
+test("parked archival accepts only canonical ISO timestamps and leaves invalid timestamps untouched", async () => {
   const p = await project();
   const workflowId = "herdr-timeguard1";
   const workflow = { id: workflowId, ownership: { createdBy: "herdr-orchestrator" }, status: "completed", updatedAt: at(-2 * ROOT_PARK_ARCHIVE_DELAY_MS), lanes: [] };
   const manifest = { workflows: [workflow], rootSupervision: [{ rootId: p.id, rootParkedAt: at(0) }] };
+  const originalManifest = structuredClone(manifest);
   const orchestrator = { ...ROOT, id: p.id, root: ROOT, program: { id: p.projectDir }, workflows: [{ workflow_id: workflowId }] };
-  const archivePath = join(dirname(p.manifestPath), "archive", `workflows-${at(2 * ROOT_PARK_ARCHIVE_DELAY_MS).slice(0, 7)}.jsonl`);
-  const archive = (parkedAt, timestamp) => archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt, timestamp, persist: async () => undefined, processTable: async () => [], keepRecent: 0 });
+  const archiveDir = join(dirname(p.manifestPath), "archive");
+  let persistCalls = 0;
+  await writeFile(p.manifestPath, JSON.stringify(manifest));
+  const manifestFileBefore = await readFile(p.manifestPath, "utf8");
+  const archive = (parkedAt, timestamp) => archiveParkedWorkflows({ manifest, orchestrator, manifestPath: p.manifestPath, parkedAt, timestamp, persist: async () => { persistCalls += 1; await writeFile(p.manifestPath, JSON.stringify(manifest)); }, processTable: async () => [], keepRecent: 0 });
   try {
     for (const [label, parkedAt, timestamp] of [
       ["missing parked timestamp", undefined, at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
       ["empty parked timestamp", "", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["numeric-like permissive parse", "0", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
       ["malformed parked timestamp", "not-a-date", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
+      ["normalized-invalid parked date", "2026-02-30T08:00:00.000Z", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
       ["future parked timestamp", at(2 * ROOT_PARK_ARCHIVE_DELAY_MS + 1), at(2 * ROOT_PARK_ARCHIVE_DELAY_MS)],
       ["malformed current timestamp", at(0), "not-a-date"],
+      ["normalized-invalid current date", at(0), "2026-11-31T08:00:00.000Z"],
     ]) {
-      assert.deepEqual(await archive(parkedAt, timestamp), [], `${label} fails closed`);
-      assert.deepEqual(manifest.workflows.map((item) => item.id), [workflowId]);
+      assert.deepEqual(await archive(parkedAt, timestamp), [], `${label} fails closed with an empty archive list`);
+      assert.deepEqual(manifest, originalManifest, `${label} does not mutate the in-memory manifest`);
+      assert.equal(await readFile(p.manifestPath, "utf8"), manifestFileBefore, `${label} does not persist a manifest mutation`);
+      assert.equal(persistCalls, 0, `${label} does not invoke persistence`);
+      await assert.rejects(readdir(archiveDir), { code: "ENOENT" }, `${label} creates no archive directory or file`);
     }
-    await assert.rejects(readFile(archivePath), { code: "ENOENT" }, "invalid timestamps never create an archive");
+
+    const validTimestamp = at(2 * ROOT_PARK_ARCHIVE_DELAY_MS);
+    assert.deepEqual(await archive(at(0), validTimestamp), [workflowId], "canonical timestamps archive after the full parked grace");
+    assert.deepEqual(manifest.workflows, []);
+    assert.equal(persistCalls, 1);
+    assert.deepEqual(JSON.parse(await readFile(p.manifestPath, "utf8")).workflows, [], "valid archival persists the updated manifest");
+    const archivePath = join(archiveDir, `workflows-${validTimestamp.slice(0, 7)}.jsonl`);
+    assert.match(await readFile(archivePath, "utf8"), new RegExp(workflowId), "valid archival writes its archive record");
   } finally {
     await p.cleanup();
   }

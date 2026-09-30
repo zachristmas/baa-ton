@@ -16,10 +16,22 @@ const FINISHED_LANES = new Set(["completion-reported", "completed", "operator-cl
 const FINISHED_WORKFLOWS = new Set(["completed", "superseded", "operator-closed", "dispatch-failed"]);
 const SPEC_ITEM_STATES = new Set(["pending", "deciding", "ready", "building", "reviewing", "integrating", "awaiting-push", "verifying", "done", "blocked", "failed", "deferred", "resolved"]);
 const LANE_MARKER = "BAA_STARTUP_INTENT";
+const CANONICAL_ISO_TIMESTAMP = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const SAFE_TEMPLATE = /^(?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+(?: (?:[A-Za-z0-9_./:=@,+%-]|\{[A-Za-z0-9_.:[\]-]+\})+)*$/;
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonicalIsoTimestamp(value) {
+  if (typeof value !== "string" || !CANONICAL_ISO_TIMESTAMP.test(value)) return Number.NaN;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return Number.NaN;
+  try {
+    return new Date(milliseconds).toISOString() === value ? milliseconds : Number.NaN;
+  } catch {
+    return Number.NaN;
+  }
 }
 
 function parseSpecWorkflowIds(source) {
@@ -298,9 +310,9 @@ function hasOwnedProcess(workflow, processRows) {
 
 /** Archive only this root's unreferenced, settled workflows after the parked grace. */
 export async function archiveParkedWorkflows({ manifest, orchestrator, manifestPath, parkedAt, timestamp, persist = async () => {}, processTable = readProcessTable, keepRecent = 100 } = {}) {
-  const parkedAtMs = typeof parkedAt === "string" && parkedAt.trim() ? Date.parse(parkedAt) : Number.NaN;
-  const timestampMs = typeof timestamp === "string" && timestamp.trim() ? Date.parse(timestamp) : Number.NaN;
-  if (!Number.isFinite(parkedAtMs) || !Number.isFinite(timestampMs) || timestampMs - parkedAtMs < ROOT_PARK_ARCHIVE_DELAY_MS) return [];
+  const parkedAtMs = canonicalIsoTimestamp(parkedAt);
+  const timestampMs = canonicalIsoTimestamp(timestamp);
+  if (!Number.isFinite(parkedAtMs) || !Number.isFinite(timestampMs) || timestampMs < parkedAtMs || timestampMs - parkedAtMs < ROOT_PARK_ARCHIVE_DELAY_MS) return [];
   const ids = rootWorkflowIds(manifest, orchestrator);
   const scope = { ...manifest, workflows: (manifest.workflows ?? []).filter((workflow) => ids.has(workflow.id)) };
   const stateDir = dirname(manifestPath);
@@ -328,14 +340,14 @@ export async function archiveParkedWorkflows({ manifest, orchestrator, manifestP
   );
   let rows = [];
   try { rows = await processTable(); } catch { return []; }
-  const candidates = archivableWorkflows(scope, { now: Date.parse(timestamp), protectedIds, keepRecent });
+  const candidates = archivableWorkflows(scope, { now: timestampMs, protectedIds, keepRecent });
   const archiveable = new Set([...candidates].filter((id) => {
     const workflow = scope.workflows.find((item) => item.id === id);
     return workflow && FINISHED_WORKFLOWS.has(workflow.status) && !hasOwnedProcess(workflow, rows);
   }));
   if (!archiveable.size) return [];
   const leaving = (manifest.workflows ?? []).filter((workflow) => archiveable.has(workflow.id));
-  writeArchive(stateDir, leaving, Date.parse(timestamp));
+  writeArchive(stateDir, leaving, timestampMs);
   manifest.workflows = (manifest.workflows ?? []).filter((workflow) => !archiveable.has(workflow.id));
   await persist();
   removeFiles(leaving.flatMap((workflow) => workflowFiles(workflow, stateDir)));
