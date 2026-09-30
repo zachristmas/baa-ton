@@ -32,8 +32,8 @@ test("a full policy validates and grants come back in canonical order", () => {
   assert.equal(validated.runtimeLaunch.commands[0].stop, "docker compose -p {lane} down");
 });
 
-test("push, merge, deploy, production, close, sweep and reparent can never be granted", () => {
-  for (const grant of ["push", "merge", "deploy", "production", "close", "sweep", "reparent", "external-message"])
+test("push, merge, PR, deploy, production, reset, close, sweep, reparent and external messages can never be granted", () => {
+  for (const grant of ["push", "merge", "pr", "pr-create", "pr-merge", "pull-request", "deploy", "production", "reset", "close", "sweep", "reparent", "external-message"])
     assert.throws(
       () => validateApprovalPolicy({ version: 2, grants: ["dispatch", grant] }),
       /always requires explicit confirmation/,
@@ -150,7 +150,7 @@ test("first routine dispatch shows one policy dialog, later ones none", async ()
   assert.equal(first.granted, true);
   assert.equal(p.dialogs.length, 1);
   assert.match(p.dialogs[0].message, /Runs without a dialog: dispatch, retry, resume, retire, lease, runtime-launch/);
-  assert.match(p.dialogs[0].message, /Always asks: push, merge, deploy, production, close, sweep, reparent/);
+  assert.match(p.dialogs[0].message, /Always asks: integrate, spec-push, general push, merge, PR creation\/merge, deploy, production, reset, close, sweep, reparent, external messages/);
   assert.match(p.dialogs[0].message, /Record this policy and dispatch wf-1\?/);
   assert.deepEqual(first.evidence.map((item) => item.kind), ["approval-policy-acknowledged", "authorization-policy-granted"]);
   assert.equal(first.ack.rootPaneId, "w-root:p1");
@@ -221,18 +221,44 @@ test("local-validation is grantable, sorts last and leaves existing policy hashe
   assert.deepEqual(withValidation.grants, ["dispatch", "local-validation"]);
   const summary = approvalPolicySummary(withValidation, approvalPolicyHash(withValidation));
   assert.match(summary, /Local validation: a lane's frozen install, build, codegen, typecheck, lint and tests/);
-  assert.match(summary, /Always asks: package or lockfile edits, shared databases or services, push, merge/);
+  assert.match(summary, /Always asks: package or lockfile edits, shared databases or services, integrate, spec-push, general push, merge/);
   assert.doesNotMatch(approvalPolicySummary(validateApprovalPolicy(policy), "h"), /Local validation/);
 });
 
-test("adding the spec-push grant keeps the acknowledgement; any other change needs a new one", () => {
+test("adding spec-push requires a fresh exact acknowledgement", () => {
   const before = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate"] });
   const ack = { hash: approvalPolicyHash(before) };
   const withPush = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate", "spec-push"] });
-  assert.equal(approvalAckMatches(ack, withPush), true, "no Record-this-policy dialog for spec-push");
+  assert.equal(approvalAckMatches(ack, withPush), false);
   assert.equal(approvalAckMatches(ack, before), true);
-  const widened = validateApprovalPolicy({ version: 2, grants: ["dispatch", "integrate", "retire", "spec-push"] });
-  assert.equal(approvalAckMatches(ack, widened), false, "another new grant still needs the root");
-  assert.equal(approvalAckMatches(undefined, withPush), false);
   assert.equal(approvalAckMatches({ hash: approvalPolicyHash(withPush) }, withPush), true);
+});
+
+test("local-yolo is an explicit opt-in with normalized routine grants and no implicit runtime templates", () => {
+  const yolo = validateApprovalPolicy({ version: 2, preset: "local-yolo" });
+  assert.deepEqual(yolo, { version: 2, preset: "local-yolo", grants: ["dispatch", "retry", "resume", "retire", "lease", "runtime-launch", "local-validation"] });
+  assert.equal(yolo.runtimeLaunch, undefined);
+  assert.equal(yolo.grants.includes("integrate"), false);
+  assert.equal(yolo.grants.includes("spec-push"), false);
+  const withRuntime = validateApprovalPolicy({ version: 2, preset: "local-yolo", runtimeLaunch: { commands: [{ name: "web", start: "npm run dev" }] } });
+  assert.deepEqual(withRuntime.runtimeLaunch.commands.map(({ name }) => name), ["web"]);
+  assert.notEqual(approvalPolicyHash(yolo), approvalPolicyHash(withRuntime));
+  assert.throws(() => validateApprovalPolicy({ version: 2, preset: "local-yolo", grants: ["dispatch"] }), /defines its grants/);
+  assert.throws(() => validateApprovalPolicy({ version: 2, preset: "wide-open" }), /preset cannot be/);
+  for (const forbidden of ["integrate", "spec-push", "push", "merge", "deploy", "production", "close", "sweep", "reparent", "external-message", "reset"])
+    assert.equal(yolo.grants.includes(forbidden), false, forbidden);
+});
+
+test("local-yolo normalized hash and acknowledgement change for grants and runtime templates", () => {
+  const raw = { version: 2, preset: "local-yolo" };
+  const first = validateApprovalPolicy(raw);
+  const ack = { hash: approvalPolicyHash(first) };
+  assert.equal(approvalAckMatches(ack, validateApprovalPolicy({ preset: "local-yolo", version: 2 })), true);
+  const withTemplate = validateApprovalPolicy({ ...raw, runtimeLaunch: { commands: [{ name: "web", start: "npm run dev" }] } });
+  assert.notEqual(approvalPolicyHash(first), approvalPolicyHash(withTemplate));
+  assert.equal(approvalAckMatches(ack, withTemplate), false);
+  const summary = approvalPolicySummary(first, approvalPolicyHash(first));
+  assert.match(summary, /preset: local-yolo/);
+  assert.match(summary, /dispatch, retry, resume, retire, lease, runtime-launch, local-validation/);
+  assert.match(summary, /Always asks:.*integrate, spec-push.*reset/);
 });

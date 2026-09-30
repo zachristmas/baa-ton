@@ -4,7 +4,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { busyPorts, elapsedMs, killLaneProcesses, laneProcesses, orphanShells, parseProcessTable, portListening } from "../inbox/lane-processes.mjs";
+import { busyPorts, elapsedMs, killLaneProcesses, laneProcesses, orphanShells, parseProcessTable, parseWindowsProcessTable, portListening, readProcessTable } from "../inbox/lane-processes.mjs";
 import { readSpawnProbe, recordSpawnProbe, spawnThrottled, startupWait } from "../inbox/spawn-load.mjs";
 
 const INTENT = "/state/herdr-d03-lane-1-startup.json";
@@ -27,7 +27,7 @@ test("a lane's process tree: every process carrying its exact marker, reparented
   assert.deepEqual(laneProcesses(rows, undefined), []);
 });
 
-test("retire kills the tree: SIGTERM, then SIGKILL for what is left", async () => {
+test("retire stops descendants before parents and SIGKILLs stubborn leaf processes", async () => {
   let rows = parseProcessTable(TABLE);
   const signals = [];
   const result = await killLaneProcesses({
@@ -40,9 +40,77 @@ test("retire kills the tree: SIGTERM, then SIGKILL for what is left", async () =
     },
     delay: async () => undefined,
   });
-  assert.deepEqual(signals, ["SIGTERM 200", "SIGTERM 300", "SIGTERM 301", "SIGKILL 301"]);
+  assert.deepEqual(signals, ["SIGTERM 200", "SIGTERM 301", "SIGKILL 301", "SIGTERM 300"]);
   assert.deepEqual(result.killed, [301]);
   assert.deepEqual(result.survivors, []);
+});
+
+test("process cleanup refuses a candidate-set change before signalling anything", async () => {
+  const rows = parseProcessTable(TABLE);
+  const signals = [];
+  await assert.rejects(killLaneProcesses({ intentPath: INTENT, expectedPids: [200], table: async () => rows, kill: (pid, name) => signals.push(`${name} ${pid}`), delay: async () => undefined }), /process inventory changed before cleanup/);
+  assert.deepEqual(signals, []);
+});
+
+test("a process spawned after inventory aborts before its parent is signalled", async () => {
+  let calls = 0;
+  let rows = parseProcessTable(TABLE);
+  const signals = [];
+  await assert.rejects(killLaneProcesses({ intentPath: INTENT, expectedPids: [200, 300, 301], table: async () => { calls += 1; if (calls === 2) rows = [...rows, { pid: 302, ppid: 300, line: "late child" }]; return rows; }, kill: (pid, name) => signals.push(`${name} ${pid}`), delay: async () => undefined }), /inventory changed during cleanup/);
+  assert.deepEqual(signals, []);
+});
+
+test("Windows process inventory uses CIM process identities instead of /bin/ps", async () => {
+  let script;
+  const rows = await readProcessTable({ platform: "win32", runPowerShell: async (value) => { script = value; return JSON.stringify([{ ProcessId: 10, ParentProcessId: 1, CreationDate: "stamp-10", CommandLine: "node worker.js" }]); } });
+  assert.deepEqual(rows, [{ pid: 10, ppid: 1, createdAt: "stamp-10", line: "node worker.js" }]);
+  assert.match(script, /Get-CimInstance -ClassName Win32_Process/);
+  assert.doesNotMatch(script, /\/bin\/ps/);
+  assert.deepEqual(parseWindowsProcessTable("[]"), []);
+});
+
+test("Windows kills only recorded pane PIDs with matching creation time and verifies after", async () => {
+  let rows = [
+    { pid: 700, ppid: 1, createdAt: "start-700", line: "claude" },
+    { pid: 701, ppid: 700, createdAt: "start-701", line: "node child" },
+    { pid: 702, ppid: 1, createdAt: "reused-pid", line: "unrelated process" },
+  ];
+  const scripts = [];
+  const result = await killLaneProcesses({
+    platform: "win32",
+    intentPath: INTENT,
+    recordedProcesses: [{ pid: 700, createdAt: "start-700" }],
+    table: async () => rows,
+    runPowerShell: async (script) => {
+      scripts.push(script);
+      const pid = Number(/ProcessId = (\d+)/.exec(script)?.[1]);
+      const expected = /CreationDate -ne "([^"]+)"/.exec(script)?.[1];
+      const current = rows.find((row) => row.pid === pid);
+      assert.equal(current?.createdAt, expected, "the synthetic CIM mutation checks the PID creation identity");
+      rows = rows.filter((row) => row.pid !== pid);
+      return "";
+    },
+    delay: async () => undefined,
+  });
+  assert.deepEqual(result.signalled.map(({ pid }) => pid), [701, 700]);
+  assert.deepEqual(result.survivors, []);
+  assert.equal(scripts.length, 2);
+  assert.ok(scripts.every((script) => /Stop-Process -Id \d+($|\s)/.test(script)));
+  assert.ok(rows.some((row) => row.pid === 702), "unrelated same-host process is untouched");
+});
+
+test("Windows refuses a reused PID between inventory and stop", async () => {
+  let calls = 0;
+  const table = async () => {
+    calls += 1;
+    return [{ pid: 810, ppid: 1, createdAt: calls === 1 ? "old-creation" : "new-creation", line: "reused" }];
+  };
+  await assert.rejects(killLaneProcesses({ platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 810, createdAt: "old-creation" }], table, runPowerShell: async () => assert.fail("must refuse before Stop-Process"), delay: async () => undefined }), /was reused/);
+});
+
+test("Windows refuses to claim process cleanup without recorded identity or creation-time evidence", async () => {
+  await assert.rejects(killLaneProcesses({ platform: "win32", intentPath: INTENT, table: async () => [] }), /cannot enumerate process environments/);
+  await assert.rejects(killLaneProcesses({ platform: "win32", intentPath: INTENT, recordedProcesses: [{ pid: 800, createdAt: "old" }], table: async () => [{ pid: 800, ppid: 1, line: "node" }], delay: async () => undefined }), /creation time/);
 });
 
 test("ports are checked free after retire", async () => {

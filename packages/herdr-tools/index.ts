@@ -12632,10 +12632,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_policy",
     label: "Herdr Policy",
     description:
-      "Show or acknowledge the project's standing approvalPolicy in .baa-ton/config.json. Once the root acknowledges its hash, routine local dispatch, retry and resume inside it run without a native dialog, and a local-validation grant answers lanes' frozen installs, builds, codegen, typecheck, lint and tests in their own worktrees. Push, merge, deploy, production, close and sweep always ask.",
+      "Show the full SHA-256 and normalized grants/templates of the project's approvalPolicy, or acknowledge that exact hash once. The explicit preset local-yolo grants dispatch, retry, resume, retire, lease, runtime-launch and local-validation, but adds no runtime templates by default. Policy/template changes require a new root acknowledgement. Under local-yolo, integrate/spec-push, push/merge/PR, deploy/production, reset, close/sweep/reparent and external messages still escalate; local-validation excludes package/lockfile edits and shared services.",
     promptSnippet: "Show or acknowledge the standing approval policy.",
     promptGuidelines: [
-      "Use herdr_policy action=show to inspect the standing approvalPolicy and whether its current hash is acknowledged. Use action=ack only from the root after showing the user the policy summary. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
+      "Use herdr_policy action=show to inspect the full hash, normalized grants, configured runtime templates, escalations and acknowledgement state. Use action=ack only from the root after showing the exact policy summary; any grant or template change needs a new acknowledgement. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
     ],
     parameters: Type.Object({
       action: Type.Union([Type.Literal("show"), Type.Literal("ack")]),

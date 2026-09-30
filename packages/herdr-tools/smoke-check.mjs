@@ -724,7 +724,7 @@ try {
     .get("herdr_policy")
     .execute("policy-show", { action: "show" }, undefined, undefined, headlessRootCtx);
   assert.equal(policyShown.details.acknowledged, false, "a new policy starts unacknowledged");
-  assert.match(policyShown.content[0].text, /Always asks: push, merge, deploy/);
+  assert.match(policyShown.content[0].text, /Always asks: integrate, spec-push, general push, merge, PR creation\/merge, deploy/);
   await assert.rejects(
     tools
       .get("herdr_policy")
