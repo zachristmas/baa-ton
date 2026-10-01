@@ -32,9 +32,6 @@
   <path class="branch" d="M380 395 V435 M185 435 H575 M185 435 V480 M575 435 V480"/>
   <path class="edge" d="M185 435 V480"/>
   <path class="edge" d="M575 435 V480"/>
-  <text class="small" x="185" y="462">local scope</text>
-  <text class="small" x="575" y="462">remote scope</text>
-
   <rect class="card" x="30" y="490" width="310" height="78"/>
   <text class="label" x="185" y="537">Native HERDR</text>
   <path class="edge" d="M185 568 V625"/>
@@ -42,10 +39,10 @@
   <text class="label" x="185" y="671">Authorized local</text>
   <text class="label" x="185" y="701">workspace</text>
 
-  <rect class="card" x="420" y="490" width="310" height="78"/>
-  <text class="label" x="575" y="537">Native SSH</text>
-  <text class="small" x="575" y="595">to prepared host runtime</text>
-  <path class="edge" d="M575 568 V620"/>
+  <rect class="card" x="420" y="490" width="310" height="84"/>
+  <text class="label" x="575" y="526">Native SSH</text>
+  <text class="small" x="575" y="553">to prepared host runtime</text>
+  <path class="edge" d="M575 574 V620"/>
   <rect class="card" x="420" y="625" width="310" height="78"/>
   <text class="label" x="575" y="672">Remote Baa-ton CLI</text>
   <path class="edge" d="M575 703 V745"/>
