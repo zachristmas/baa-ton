@@ -22,18 +22,26 @@ function parseGhView(output) {
   const text = (v) => typeof v === "string" && v.trim() ? v.trim() : "";
   const owner = (v) => text(v?.login ?? v?.name);
   const number = Number(value.number);
+  let baseRepo = "";
+  try {
+    const url = new URL(text(value.url));
+    const match = /^\/([^/]+\/[^/]+)\/pull\/(\d+)\/?$/.exec(url.pathname);
+    if (url.protocol === "https:" && match && Number(match[2]) === number) baseRepo = match[1].toLowerCase();
+  } catch {}
   const result = {
     number,
     state: text(value.state).toUpperCase(),
     mergeStateStatus: text(value.mergeStateStatus).toUpperCase(),
+    mergeable: text(value.mergeable).toUpperCase(),
+    mergedAt: value.mergedAt ?? null,
     headRepo: `${owner(value.headRepositoryOwner)}/${text(value.headRepository?.name)}`.toLowerCase(),
     headOid: text(value.headRefOid).toLowerCase(),
     headBranch: text(value.headRefName),
-    baseRepo: `${owner(value.baseRepositoryOwner)}/${text(value.baseRepository?.name)}`.toLowerCase(),
+    baseRepo,
     baseBranch: text(value.baseRefName),
     baseOid: text(value.baseRefOid).toLowerCase(),
   };
-  if (!Number.isSafeInteger(number) || number < 1 || !["OPEN", "CLOSED", "MERGED"].includes(result.state) || !["CLEAN", "MERGEABLE"].includes(result.mergeStateStatus) || !result.headRepo || !result.baseRepo || !SAFE_OID.test(result.headOid) || !SAFE_OID.test(result.baseOid) || !SAFE_BRANCH.test(result.headBranch) || !SAFE_BRANCH.test(result.baseBranch)) throw new Error("PR metadata is incomplete or unsupported.");
+  if (!Number.isSafeInteger(number) || number < 1 || !["OPEN", "CLOSED", "MERGED"].includes(result.state) || !["CLEAN", "MERGEABLE"].includes(result.mergeStateStatus) || result.mergeable !== "MERGEABLE" || result.mergedAt !== null || !result.headRepo || !result.baseRepo || !SAFE_OID.test(result.headOid) || !SAFE_OID.test(result.baseOid) || !SAFE_BRANCH.test(result.headBranch) || !SAFE_BRANCH.test(result.baseBranch)) throw new Error("PR metadata is incomplete or unsupported.");
   return result;
 }
 
@@ -109,7 +117,7 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     let pr;
     if (operation.operation === "merge") {
       failurePhase = "pr_metadata";
-      const view = await gh(["pr", "view", prSelector, "--repo", operation.repo, "--json", "number,state,mergeStateStatus,headRefName,headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,baseRepositoryOwner,baseRepository"]);
+      const view = await gh(["pr", "view", prSelector, "--repo", operation.repo, "--json", "number,state,headRefOid,baseRefOid,mergeStateStatus,mergeable,mergedAt,url,headRefName,baseRefName,headRepositoryOwner,headRepository"]);
       pr = parseGhView(view);
       if (pr.state !== "OPEN" || String(pr.number) !== prSelector || pr.baseRepo !== operation.repo.toLowerCase()) throw new Error("PR is stale, closed, merged, or targets another repository.");
       const matchHead = argValue(operation.argv, "--match-head-commit");

@@ -130,8 +130,8 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
   await writeFile(session, "session");
   const state = { pushUrl: "git@github.com:owner/repo.git", branch: "topic", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN", mergeStateStatus: "CLEAN" };
   const calls = [];
-  const fakeExec = async (program, args) => {
-    calls.push([program, ...args]);
+  const fakeExec = async (program, args, options) => {
+    calls.push({ program, args: [...args], options });
     let stdout = "";
     if (program === "git" && args.join(" ") === "rev-parse --show-toplevel") stdout = dir;
     else if (program === "git" && args.join(" ") === "rev-parse HEAD") stdout = state.head;
@@ -141,7 +141,7 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     else if (program === "git" && args[0] === "config" && args[1] === "--get" && args[2].startsWith("branch.")) stdout = "origin";
     else if (program === "git" && args[0] === "config") throw new Error("not configured");
     else if (program === "git" && args[0] === "ls-remote") stdout = args.at(-1) === state.missingRef ? "" : `${args.at(-1) === `refs/heads/${state.branch}` ? state.head : state.destination}\t${args.at(-1)}`;
-    else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, mergeStateStatus: state.mergeStateStatus, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
+    else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, mergeStateStatus: state.mergeStateStatus, mergeable: "MERGEABLE", mergedAt: null, url: "https://github.com/owner/repo/pull/123", headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base });
     else throw new Error(`unexpected fake command ${program} ${args.join(" ")}`);
     return { stdout };
   };
@@ -171,8 +171,9 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     assert.equal(pr.pr.baseOid, state.base);
     assert.equal(pr.pr.state, "OPEN");
     assert.equal(pr.pr.mergeStateStatus, "CLEAN");
-    const viewCall = calls.find((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "view");
-    assert.deepEqual(viewCall.slice(1), ["pr", "view", "123", "--repo", "owner/repo", "--json", "number,state,mergeStateStatus,headRefName,headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,baseRepositoryOwner,baseRepository"]);
+    const viewCall = calls.find((call) => call.program === "gh" && call.args[0] === "pr" && call.args[1] === "view");
+    assert.deepEqual(viewCall.args, ["pr", "view", "123", "--repo", "owner/repo", "--json", "number,state,headRefOid,baseRefOid,mergeStateStatus,mergeable,mergedAt,url,headRefName,baseRefName,headRepositoryOwner,headRepository"]);
+    assert.deepEqual(viewCall.options, { cwd: dir, encoding: "utf8", maxBuffer: 1024 * 1024 });
     state.head = "d".repeat(40);
     await assert.rejects(resolver(prOperation), (error) => error.resolverPhase === "pr_metadata");
     state.head = "a".repeat(40);
