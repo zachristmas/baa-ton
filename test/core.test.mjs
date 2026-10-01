@@ -1,0 +1,378 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { Baton } from '../src/core.mjs';
+import { Store } from '../src/store.mjs';
+import { Herdr, identity, sameAgent } from '../src/herdr.mjs';
+import { launch } from '../src/profiles.mjs';
+import { requestApproval, decideApproval, consumeApproval } from '../src/approvals.mjs';
+import { invoke, toolList } from '../src/tools.mjs';
+
+class FakeHerdr {
+  constructor() { this.agents = new Map(); this.calls = []; this.serial = 0; }
+  async workspace(workspace) { this.calls.push(['workspace', workspace]); return { workspace: { workspace_id: workspace } }; }
+  async workspaces() { return { workspaces: [] }; }
+  async create(scope, job) {
+    this.calls.push(['create', scope, job.id]);
+    const pane = `w${++this.serial}:p1`, workspace = job.branch ? `w${this.serial}` : scope.workspace;
+    this.agents.set(pane, { pane_id: pane, workspace_id: workspace, terminal_id: `t${this.serial}`, agent_status: 'idle', interactive_ready: true, state_change_seq: 1 });
+    return { root_pane: { pane_id: pane, workspace_id: workspace }, ...(job.branch ? { worktree: { path: `/tmp/${job.id}` } } : {}) };
+  }
+  async start(job, profile, argv) {
+    this.calls.push(['start', job.id, profile, argv]);
+    const agent = this.agents.get(job.pane); Object.assign(agent, { agent: profile.harness, name: job.id, agent_session: { kind: 'id', value: `session-${job.id}`, source: 'native', agent: profile.harness } });
+    return { agent: structuredClone(agent) };
+  }
+  async get(pane) { if (!this.agents.has(pane)) throw new Error('missing pane'); return structuredClone(this.agents.get(pane)); }
+  async prompt(pane, text) { this.calls.push(['prompt', pane, text]); if (this.error) throw this.error; return { agent: await this.get(pane) }; }
+  async wait(pane) { this.calls.push(['wait', pane]); return { agent: await this.get(pane) }; }
+  async read() { return 'observed output'; }
+}
+
+async function fixture(t) {
+  const directory = await mkdtemp(join(tmpdir(), 'baa-native-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = { version: 2, file: join(directory, 'config.json'), stateDir: join(directory, 'state'), source: resolve(import.meta.dirname, '..'), scopes: { a: { cwd: directory, workspace: 'wa' }, b: { cwd: directory, workspace: 'wb' } }, profiles: { fast: { harness: 'codex', model: 'model-exact', effort: 'high' }, review: { harness: 'claude', model: 'claude-exact', effort: 'low', permissions: 'broker' } } };
+  await writeFile(config.file, JSON.stringify(config));
+  const herdr = new FakeHerdr(); let clock = 1000000;
+  const baton = new Baton(config, { herdr, now: () => clock });
+  const dispatch = (scope = 'a', extra = {}) => baton.dispatch({ scope, profile: 'fast', task: 'Inspect and return evidence.', requestId: 'job1', ...extra });
+  return { baton, herdr, config, dispatch, advance: seconds => { clock += seconds * 1000; } };
+}
+const proof = { summary: 'Done', checks: ['Ran named test; exit 0.'], artifacts: ['report.txt'] };
+
+test('multiple scopes: pause is local, direct user messages still work, resume keeps state', async t => {
+  const { baton, dispatch, herdr, advance } = await fixture(t);
+  for (const scope of ['a', 'b']) { await baton.goal({ scope, action: 'set', objective: 'Work', intervalSeconds: 60 }); await dispatch(scope); }
+  await baton.goal({ scope: 'a', action: 'pause' }); advance(61);
+  const before = herdr.calls.filter(call => call[0] === 'prompt').length;
+  assert.equal((await baton.tick({ scope: 'a' })).quiet, 'paused');
+  assert.equal((await baton.tick({ scope: 'b' })).changes.length, 1);
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, before + 1);
+  await assert.rejects(dispatch('a', { requestId: 'job2' }), /paused/);
+  await baton.message({ scope: 'a', job: 'job1', text: 'Human correction', requestId: 'redirect1', redirect: true });
+  assert.equal((await baton.state('a')).jobs.job1.revision, 1);
+  await baton.goal({ scope: 'a', action: 'resume' });
+  assert.equal((await baton.state('b')).goal.status, 'active');
+});
+
+test('concurrent identical dispatch creates and prompts only once; changed arguments refuse', async t => {
+  const { baton, dispatch, herdr } = await fixture(t);
+  await Promise.all([dispatch(), dispatch(), dispatch()]);
+  assert.equal(herdr.calls.filter(call => call[0] === 'create').length, 1);
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, 1);
+  await assert.rejects(dispatch('a', { task: 'different' }), /already bound/);
+  assert.equal((await baton.state('a')).jobs.job1.status, 'running');
+});
+
+test('lost prompt reply and crashed sending claim never replay on retry or watchdog', async t => {
+  const { baton, dispatch, herdr, advance } = await fixture(t);
+  await baton.goal({ scope: 'a', action: 'set', objective: 'Work', intervalSeconds: 60 });
+  await dispatch(); herdr.error = Object.assign(new Error('timeout after write'), { uncertain: true });
+  const message = await baton.message({ scope: 'a', job: 'job1', text: 'Continue', requestId: 'lost' });
+  assert.equal(message.status, 'uncertain');
+  const count = herdr.calls.filter(call => call[0] === 'prompt').length;
+  delete herdr.error;
+  await baton.message({ scope: 'a', job: 'job1', text: 'Continue', requestId: 'lost' }); advance(100);
+  await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, count);
+  await baton.change('a', state => { state.messages.lost.status = 'sending'; });
+  await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, count);
+});
+
+test('watchdog bounded, blocked/working skipped, native done not treated as completion', async t => {
+  const { baton, dispatch, herdr, advance } = await fixture(t);
+  await baton.goal({ scope: 'a', action: 'set', objective: 'Work', intervalSeconds: 60, maxNudges: 2 });
+  const job = await dispatch();
+  herdr.agents.get(job.pane).agent_status = 'working'; advance(65); await baton.tick({ scope: 'a' });
+  assert.equal((await baton.state('a')).jobs.job1.nudges, 0);
+  herdr.agents.get(job.pane).agent_status = 'blocked'; advance(65); await baton.tick({ scope: 'a' });
+  assert.equal((await baton.state('a')).jobs.job1.nudges, 0);
+  herdr.agents.get(job.pane).agent_status = 'done';
+  for (let i = 0; i < 5; i++) { advance(65); await baton.tick({ scope: 'a' }); }
+  const current = (await baton.state('a')).jobs.job1;
+  assert.equal(current.nudges, 2); assert.equal(current.status, 'stalled'); assert.equal(current.result, undefined);
+});
+
+test('human redirection in a worker is permitted and fences stale result/approvals', async t => {
+  const { baton, config, herdr, dispatch } = await fixture(t);
+  await dispatch(); await baton.result({ scope: 'a', action: 'submit', job: 'job1', revision: 0, evidence: proof });
+  const worker = new Baton(config, { herdr, scope: 'a', worker: 'job1' });
+  await worker.message({ job: 'job1', text: 'New human request', requestId: 'changed', redirect: true });
+  await assert.rejects(worker.result({ action: 'submit', job: 'job1', revision: 0, evidence: proof }), /Stale/);
+  await worker.result({ action: 'submit', job: 'job1', revision: 1, evidence: proof });
+  await assert.rejects(worker.result({ action: 'verify', job: 'job1', revision: 1, evidence: proof, reviewer: 'job1' }), /Independent/);
+  await assert.rejects(worker.goal({ scope: 'b', action: 'pause' }), /scoped/);
+  assert.ok(!toolList('job1').some(tool => tool.name === 'herdr_approve'));
+});
+
+test('reconnect requires inspected terminal and invalidates old results without resending', async t => {
+  const { baton, dispatch, herdr } = await fixture(t);
+  const job = await dispatch();
+  await baton.result({ scope: 'a', action: 'submit', job: 'job1', revision: 0, evidence: proof });
+  herdr.agents.get(job.pane).agent_session.value = 'replacement-session';
+  const count = herdr.calls.length;
+  const held = await baton.message({ scope: 'a', job: 'job1', text: 'Old session work', requestId: 'held' });
+  assert.equal(held.status, 'pending'); assert.match(held.reason, /Identity changed/);
+  await assert.rejects(baton.reconnect({ scope: 'a', job: 'job1', pane: job.pane, expectedTerminal: 'wrong' }), /Terminal changed/);
+  const next = await baton.reconnect({ scope: 'a', job: 'job1', pane: job.pane, expectedTerminal: job.identity.terminal });
+  assert.equal(next.revision, 1); assert.equal(next.result, undefined);
+  assert.equal((await baton.state('a')).messages.held.status, 'superseded');
+  assert.equal(herdr.calls.length, count);
+});
+
+test('cross-harness sequence gates on evidence and uses each exact profile', async t => {
+  const { baton, herdr } = await fixture(t);
+  await baton.chain({ scope: 'a', action: 'create', chain: 'change', stages: [ { profile: 'fast', task: 'Build', access: 'write', branch: 'task/build' }, { profile: 'review', task: 'Review', access: 'read', after: 'reported', reviewPrevious: true } ] });
+  const writer = await baton.chain({ scope: 'a', action: 'advance', chain: 'change' });
+  await assert.rejects(baton.chain({ scope: 'a', action: 'advance', chain: 'change' }), /requires reported/);
+  await baton.result({ scope: 'a', action: 'submit', job: writer.id, revision: 0, evidence: proof });
+  const reviewer = await baton.chain({ scope: 'a', action: 'advance', chain: 'change' });
+  await baton.result({ scope: 'a', action: 'verify', job: writer.id, revision: 0, reviewer: reviewer.id, evidence: proof });
+  const launches = herdr.calls.filter(call => call[0] === 'start');
+  assert.deepEqual(launches.map(call => [call[2].harness, call[2].model, call[2].effort]), [['codex', 'model-exact', 'high'], ['claude', 'claude-exact', 'low']]);
+  assert.equal((await baton.state('a')).jobs[writer.id].status, 'verified');
+});
+
+test('Claude approval binds exact input/session/revision, is single-use, denies stale/self grants', async t => {
+  const { baton, herdr, config, dispatch, advance } = await fixture(t);
+  const job = await dispatch('a', { profile: 'review' });
+  const binding = { session: `session-${job.id}`, tool: 'Bash', input: { command: 'npm test', description: 'local tests' } };
+  const request = await requestApproval(baton, { scope: 'a', job: job.id, ...binding });
+  const worker = new Baton(config, { herdr, worker: job.id, scope: 'a' });
+  await assert.rejects(decideApproval(worker, { approval: request.id, expectedDigest: request.digest, decision: 'allow' }), /cannot approve/);
+  await assert.rejects(decideApproval(baton, { scope: 'a', approval: request.id, expectedDigest: 'wrong', decision: 'allow' }), /digest/);
+  await decideApproval(baton, { scope: 'a', approval: request.id, expectedDigest: request.digest, decision: 'allow' });
+  assert.equal(await consumeApproval(baton, 'a', request.id, { ...binding, input: { command: 'git push' } }), undefined);
+  assert.deepEqual(await consumeApproval(baton, 'a', request.id, binding), { behavior: 'allow' });
+  assert.equal(await consumeApproval(baton, 'a', request.id, binding), undefined);
+  const stale = await requestApproval(baton, { scope: 'a', job: job.id, ...binding });
+  await baton.message({ scope: 'a', job: job.id, text: 'Change plan', requestId: 'revision', redirect: true });
+  await assert.rejects(decideApproval(baton, { scope: 'a', approval: stale.id, expectedDigest: stale.digest, decision: 'allow' }), /stale/);
+  const expired = await requestApproval(baton, { scope: 'a', job: job.id, ...binding }); advance(301);
+  await assert.rejects(decideApproval(baton, { scope: 'a', approval: expired.id, expectedDigest: expired.digest, decision: 'allow' }), /expired/);
+});
+
+test('atomic scoped store preserves concurrent writers and refuses corrupt state', async t => {
+  const { config } = await fixture(t), store = new Store(config.stateDir);
+  await Promise.all(Array.from({ length: 25 }, () => store.change('a', state => { state.count = (state.count || 0) + 1; })));
+  assert.equal((await store.read('a')).count, 25);
+  assert.equal((await store.read('b')).count, undefined);
+  await writeFile(store.path('a'), '{bad'); await assert.rejects(store.change('a', () => {}));
+  assert.equal(await readFile(store.path('a'), 'utf8'), '{bad');
+});
+
+test('native wrapper never invokes a shell and pins endpoint independently of caller environment', async () => {
+  const calls = [];
+  const herdr = new Herdr({ herdr: '/verified/herdr', machine: 'personal', session: 'work' }, async (...args) => { calls.push(args); return { stdout: '{"result":{"type":"agent_prompted"}}' }; });
+  await herdr.prompt('w1:p1', 'literal $(touch nope); text');
+  assert.deepEqual(calls[0][1], ['--machine', 'personal', '--session', 'work', 'agent', 'prompt', 'w1:p1', 'literal $(touch nope); text']);
+  assert.equal(calls[0][2].shell, false);
+  assert.ok(!Object.keys(calls[0][2].env).some(key => key.startsWith('HERDR_')));
+  const native = { pane_id: 'w1:p1', terminal_id: 't1', workspace_id: 'w1', agent: 'codex', interactive_ready: true, processIdentity: { group: 1, pids: [5] } };
+  const saved = identity(native); assert.ok(sameAgent(saved, native));
+  assert.ok(!sameAgent(saved, { ...native, processIdentity: { group: 1, pids: [6] } }));
+});
+
+test('schema validation rejects unknown actions/properties before mutation', async t => {
+  const { baton } = await fixture(t);
+  await assert.rejects(invoke(baton, 'herdr_goal', { scope: 'a', action: 'delete' }), /one of/);
+  await assert.rejects(invoke(baton, 'herdr_tick', { scope: 'a', all: true }), /not supported/);
+  await assert.rejects(invoke(baton, 'shell', { command: 'anything' }), /not available/);
+  assert.equal((await baton.state('a')).revision, 0);
+});
+
+test('launch mappings keep native permissions and do not overwrite project configuration', async t => {
+  const { config } = await fixture(t);
+  const sentinel = join(config.scopes.a.cwd, 'opencode.json'); await writeFile(sentinel, 'preserve');
+  for (const harness of ['codex', 'claude', 'pi', 'opencode']) {
+    const prepared = await launch(config, 'a', { id: harness, access: 'write' }, { harness, model: 'exact-model', effort: 'low', provider: 'openai' });
+    assert.ok(prepared.argv.includes('exact-model') || prepared.argv.includes('openai/exact-model'));
+    assert.ok(!prepared.argv.join(' ').includes('bypass'));
+    if (harness === 'opencode') assert.equal(JSON.parse(prepared.env.OPENCODE_CONFIG_CONTENT).provider.openai.models['exact-model'].options.reasoningEffort, 'low');
+  }
+  assert.equal(await readFile(sentinel, 'utf8'), 'preserve');
+});
+
+test('uncertain send fences every later message until explicit user redirection', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  await dispatch(); herdr.error = Object.assign(new Error('reply lost'), { uncertain: true });
+  await baton.message({ scope: 'a', job: 'job1', text: 'ambiguous', requestId: 'lost' }); delete herdr.error;
+  const before = herdr.calls.filter(call => call[0] === 'prompt').length;
+  await baton.message({ scope: 'a', job: 'job1', text: 'queued next', requestId: 'next' });
+  await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, before);
+  await baton.message({ scope: 'a', job: 'job1', text: 'Human inspected; new task', requestId: 'new', redirect: true });
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, before + 1);
+  assert.equal((await baton.state('a')).messages.lost.previousStatus, 'uncertain');
+});
+
+test('worker records direct human intervention without sending the completed task again', async t => {
+  const { baton, config, herdr, dispatch } = await fixture(t);
+  const job = await dispatch(); herdr.agents.get(job.pane).agent_status = 'working';
+  const worker = new Baton(config, { herdr, scope: 'a', worker: job.id });
+  const message = await worker.message({ job: job.id, text: 'New user task already in context', requestId: 'direct', redirect: true });
+  assert.equal(message.status, 'recorded');
+  await worker.result({ action: 'submit', job: job.id, revision: 1, evidence: proof });
+  const before = herdr.calls.length; herdr.agents.get(job.pane).agent_status = 'idle';
+  await baton.tick({ scope: 'a' }); assert.equal(herdr.calls.length, before);
+});
+
+test('messages drain without a goal; no watchdog is created implicitly', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const job = await dispatch(); herdr.agents.get(job.pane).agent_status = 'working';
+  await baton.message({ scope: 'a', job: job.id, text: 'queued', requestId: 'later' });
+  assert.equal((await baton.state('a')).messages.later.status, 'pending');
+  herdr.agents.get(job.pane).agent_status = 'idle'; await baton.tick({ scope: 'a' });
+  assert.equal((await baton.state('a')).messages.later.status, 'delivered');
+  assert.equal((await baton.state('a')).goal, null);
+});
+
+test('pause during native start holds assignment; resume drains without launching again', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  await baton.goal({ scope: 'a', action: 'set', objective: 'Work' });
+  const start = herdr.start.bind(herdr);
+  herdr.start = async (...args) => { const result = await start(...args); await baton.goal({ scope: 'a', action: 'pause' }); return result; };
+  await dispatch();
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, 0);
+  await baton.goal({ scope: 'a', action: 'resume' }); await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'start').length, 1);
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, 1);
+});
+
+test('pause during resource creation holds start; same-ID retry resumes without duplicate resource', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  await baton.goal({ scope: 'a', action: 'set', objective: 'Work' });
+  const create = herdr.create.bind(herdr);
+  herdr.create = async (...args) => { const result = await create(...args); await baton.goal({ scope: 'a', action: 'pause' }); return result; };
+  const held = await dispatch(); assert.equal(held.status, 'ready-to-start');
+  assert.equal(herdr.calls.filter(call => call[0] === 'start').length, 0);
+  await baton.goal({ scope: 'a', action: 'resume' }); await Promise.all([dispatch(), dispatch()]);
+  assert.equal(herdr.calls.filter(call => call[0] === 'create').length, 1);
+  assert.equal(herdr.calls.filter(call => call[0] === 'start').length, 1);
+});
+
+test('old reviewer cannot approve a redirected result and read-only worker cannot spawn writer', async t => {
+  const { baton, config, herdr, dispatch } = await fixture(t);
+  const writer = await dispatch(); await baton.result({ scope: 'a', action: 'submit', job: writer.id, revision: 0, evidence: proof });
+  const reviewer = await dispatch('a', { requestId: 'reviewer', profile: 'review', reviewOf: writer.id });
+  await baton.message({ scope: 'a', job: writer.id, text: 'Changed', requestId: 'changed', redirect: true });
+  await baton.result({ scope: 'a', action: 'submit', job: writer.id, revision: 1, evidence: proof });
+  await assert.rejects(baton.result({ scope: 'a', action: 'verify', job: writer.id, revision: 1, reviewer: reviewer.id, evidence: proof }), /earlier result/);
+  const worker = new Baton(config, { herdr, worker: reviewer.id, scope: 'a' });
+  await assert.rejects(worker.dispatch({ profile: 'fast', task: 'Write', access: 'write', branch: 'unauthorized', requestId: 'writer2' }), /read-only/);
+});
+
+test('long dispatch IDs work and explicit cancel recovers capacity without native interruption', async t => {
+  const { baton, config, herdr, dispatch } = await fixture(t); config.maxActive = 1;
+  const job = await dispatch('a', { requestId: 'x'.repeat(80) });
+  assert.equal(job.status, 'running');
+  await assert.rejects(dispatch(), /limit reached/);
+  const before = herdr.calls.length;
+  const cancelled = await baton.cancel({ scope: 'a', job: job.id, reason: 'Human cancelled this orchestration.' });
+  assert.equal(cancelled.status, 'cancelled'); assert.equal(herdr.calls.length, before);
+  await dispatch();
+});
+
+test('process fallback survives normal native session discovery; changed process still refuses', async () => {
+  const native = { pane_id: 'w1:p1', terminal_id: 't', workspace_id: 'w1', agent: 'codex', interactive_ready: true, processIdentity: { group: 1, pids: [22] } };
+  const saved = identity(native);
+  assert.ok(sameAgent(saved, { ...native, agent_session: { kind: 'id', value: 'newly-discovered' } }));
+  assert.ok(!sameAgent(saved, { ...native, agent_session: { kind: 'id', value: 'replacement' }, processIdentity: { group: 1, pids: [23] } }));
+});
+
+test('cancel during create or start never revives work or accepts a late result', async t => {
+  for (const phase of ['create', 'start']) {
+    const { baton, herdr, dispatch } = await fixture(t);
+    const original = herdr[phase].bind(herdr);
+    herdr[phase] = async (...args) => { const value = await original(...args); await baton.cancel({ scope: 'a', job: 'job1', reason: 'Human cancelled during launch.' }); return value; };
+    const job = await dispatch();
+    assert.equal(job.status, 'cancelled');
+    assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, 0);
+    await assert.rejects(baton.result({ scope: 'a', action: 'submit', job: 'job1', revision: job.revision, evidence: proof }), /cancelled/);
+  }
+});
+
+test('first native session is pinned after process discovery; a later same-process session is fenced', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const job = await dispatch(), live = herdr.agents.get(job.pane);
+  live.processIdentity = { group: 123, pids: [123] };
+  const fallback = identity({ ...live, agent_session: undefined });
+  await baton.change('a', state => { state.jobs.job1.identity = fallback; });
+  await baton.status({ scope: 'a', job: 'job1' });
+  assert.equal((await baton.state('a')).jobs.job1.identity.session.value, 'session-job1');
+  live.agent_session.value = 'new-session-same-process';
+  assert.equal((await baton.status({ scope: 'a', job: 'job1' })).identityMatches, false);
+  const before = herdr.calls.filter(call => call[0] === 'prompt').length;
+  await baton.message({ scope: 'a', job: 'job1', requestId: 'stale', text: 'Must not reach another session.' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'prompt').length, before);
+});
+
+test('late failed delivery cannot restore uncertainty after reconnect', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const job = await dispatch(); let rejectSend, sending;
+  const began = new Promise(resolve => { sending = resolve; });
+  herdr.prompt = async () => { sending(); await new Promise((_, reject) => { rejectSend = reject; }); };
+  const pending = baton.message({ scope: 'a', job: 'job1', text: 'Old task', requestId: 'old' });
+  await began;
+  const replacement = { ...herdr.agents.get(job.pane), pane_id: 'replacement', terminal_id: 't-new', agent_session: { kind: 'id', value: 'new', source: 'native', agent: 'codex' } };
+  herdr.agents.set('replacement', replacement);
+  await baton.reconnect({ scope: 'a', job: 'job1', pane: 'replacement', expectedTerminal: 't-new' });
+  rejectSend(Object.assign(new Error('timeout after reconnect'), { uncertain: true })); await pending;
+  assert.equal((await baton.state('a')).messages.old.status, 'superseded');
+  herdr.prompt = FakeHerdr.prototype.prompt.bind(herdr);
+  assert.equal((await baton.message({ scope: 'a', job: 'job1', text: 'New task', requestId: 'new' })).status, 'delivered');
+});
+
+test('missing pane does not starve another queued job and maximum task length launches', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const first = await dispatch('a', { task: 'x'.repeat(16000) });
+  const second = await dispatch('a', { requestId: 'second' });
+  for (const job of [first, second]) { herdr.agents.get(job.pane).agent_status = 'working'; await baton.message({ scope: 'a', job: job.id, text: 'queued', requestId: job.id + '-queued' }); }
+  herdr.agents.delete(first.pane); herdr.agents.get(second.pane).agent_status = 'idle';
+  await baton.tick({ scope: 'a' });
+  const state = await baton.state('a');
+  assert.equal(state.messages['job1-queued'].status, 'pending'); assert.match(state.messages['job1-queued'].reason, /missing/);
+  assert.equal(state.messages['second-queued'].status, 'delivered');
+});
+
+test('native permission broker refuses process-only and switched same-process sessions', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const job = await dispatch('a', { profile: 'review' }), native = herdr.agents.get(job.pane);
+  const binding = { scope: 'a', job: 'job1', session: 'session-job1', tool: 'Read', input: { file_path: '/tmp/file' } };
+  const request = await requestApproval(baton, binding);
+  native.processIdentity = { group: 1, pids: [1] };
+  delete native.agent_session;
+  await assert.rejects(requestApproval(baton, binding), /identity changed|native session/);
+  native.agent_session = { kind: 'id', source: 'native', agent: 'claude', value: 'new-same-process-session' };
+  await assert.rejects(decideApproval(baton, { scope: 'a', approval: request.id, expectedDigest: request.digest, decision: 'allow' }), /target changed|Identity changed/);
+  await baton.change('a', state => { state.approvals[request.id].status = 'allow'; });
+  assert.equal(await consumeApproval(baton, 'a', request.id, { session: binding.session, tool: binding.tool, input: binding.input }), undefined);
+});
+
+test('stale worker session cannot report and cancelled reviewer cannot verify', async t => {
+  const { baton, config, herdr, dispatch } = await fixture(t);
+  const job = await dispatch(), worker = new Baton(config, { herdr, scope: 'a', worker: 'job1' });
+  const native = herdr.agents.get(job.pane), original = native.agent_session.value;
+  native.agent_session.value = 'another-session';
+  await assert.rejects(worker.result({ action: 'submit', job: 'job1', revision: 0, evidence: proof }), /session changed/);
+  native.agent_session.value = original;
+  await worker.result({ action: 'submit', job: 'job1', revision: 0, evidence: proof });
+  await dispatch('a', { requestId: 'reviewer', reviewOf: 'job1' });
+  await baton.cancel({ scope: 'a', job: 'reviewer', reason: 'Human stopped this review.' });
+  await assert.rejects(baton.result({ scope: 'a', action: 'verify', job: 'job1', revision: 0, reviewer: 'reviewer', evidence: proof }), /cancelled/);
+});
+
+test('all worker launch adapters exclude the canonical controlling connection', async t => {
+  const { config } = await fixture(t);
+  for (const harness of ['codex', 'claude', 'pi', 'opencode']) {
+    const result = await launch(config, 'a', { id: 'worker-' + harness, access: 'read' }, { harness, model: 'exact', effort: 'low', provider: 'openai' });
+    if (harness === 'codex') assert.ok(result.argv.includes('mcp_servers.baa-ton-native.enabled=false'));
+    if (harness === 'claude') assert.ok(result.argv.includes('--strict-mcp-config'));
+    if (harness === 'pi') { assert.ok(result.argv.includes('--no-extensions')); assert.ok(result.argv.includes('--extension')); }
+    if (harness === 'opencode') assert.equal(JSON.parse(result.env.OPENCODE_CONFIG_CONTENT).mcp['baa-ton-native'].enabled, false);
+  }
+});

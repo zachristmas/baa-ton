@@ -79,7 +79,15 @@ export function containsGhPrMutation(command) {
 }
 export function containsGitPush(command) {
   const tokens = lexShell(command); if (!tokens) return typeof command === "string" && /\bgit\b/i.test(command) && /\bpush\b/i.test(command);
-  return tokens.some((token, i) => token.word === "push" && (tokens[i - 1]?.word === "git" || tokens[i - 1]?.word?.endsWith("/git")));
+  // Global Git flags (-C/-c/--git-dir) must not bypass the pre-execution gate.
+  // Conservatively fence any push word after a Git executable in a command.
+  let git = false;
+  for (const token of tokens) {
+    if (token.op) { git = false; continue; }
+    if (token.word === "git" || token.word === "git.exe" || /[/\\]git(?:\.exe)?$/.test(token.word)) git = true;
+    if (git && token.word === "push") return true;
+  }
+  return false;
 }
 export function containsUnsafeShellExecution(command) {
   const tokens = lexShell(command); if (!tokens) return true;

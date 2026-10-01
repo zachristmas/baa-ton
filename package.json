@@ -1,30 +1,14 @@
 {
   "name": "baa-ton",
   "private": true,
-  "version": "0.1.0",
+  "version": "2.0.0",
   "type": "module",
-  "bin": { "baa-ton": "packages/herdr-tools/operator-cli.mjs" },
-  "keywords": ["pi-package"],
-  "pi": {
-    "extensions": ["./packages/herdr-tools/index.ts"]
+  "description": "Small, scoped orchestration over native HERDR",
+  "bin": {
+    "baa-ton": "src/cli.mjs"
   },
   "scripts": {
-    "test": "node packages/herdr-tools/test/support/run-hermetic.mjs",
-    "test:extension": "node packages/herdr-tools/test/support/run-hermetic.mjs extension",
-    "test:controller": "node packages/herdr-tools/test/support/run-hermetic.mjs controller"
-  },
-  "dependencies": {
-    "@earendil-works/pi-tui": "0.85.1",
-    "jiti": "^2.7.0"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@types/node": "^24.0.0",
-    "typescript": "^7.0.2"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "test": "node --test test/*.test.mjs packages/herdr-tools/test/external-approval.test.mjs packages/herdr-tools/test/external-approval-hook.test.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
