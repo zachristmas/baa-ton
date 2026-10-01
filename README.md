@@ -13,7 +13,7 @@
 </p>
 
 ```mermaid
-flowchart LR
+flowchart TB
   Dot[dot] -->|host app handoff| Codex[Local Codex executor]
   Codex --> BT[Baa-ton CLI / stdio MCP]
   BT --> HERDR[Native HERDR]
@@ -23,7 +23,7 @@ flowchart LR
   RemoteHERDR --> Remote[Authorized remote workspaces]
 ```
 
-The host app hands a request from **dot** to a **local Codex executor**. Baa-ton gives that executor a compact **CLI/MCP** for scoped goals, workers, messages, and evidence. **HERDR owns the panes, worktrees, and agents**; For remote scopes, Baa-ton uses native SSH to reach a prepared host-local Baa-ton CLI and HERDR runtime. Dot does not connect directly to a local MCP server.
+The host app hands a request from **dot** to a **local Codex executor**. Baa-ton gives that executor a compact **CLI/MCP** for scoped goals, workers, messages, and evidence. **HERDR owns the panes, worktrees, and agents**. For remote scopes, Baa-ton uses native SSH to reach a prepared host-local Baa-ton CLI and HERDR runtime. Dot does not connect directly to a local MCP server.
 
 ## Get started
 

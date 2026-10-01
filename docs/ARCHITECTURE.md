@@ -1,7 +1,7 @@
 # A thin execution path from dot to native HERDR
 
 ```mermaid
-flowchart LR
+flowchart TB
   Dot[dot / voice coordinator] -->|host application handoff| Client[Local Codex executor]
   Human[Human in any pane] --> Workers
   Client --> Interface[12 MCP tools or CLI]
