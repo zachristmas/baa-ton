@@ -37,9 +37,10 @@ const USAGE = `Usage:
   baa-ton operator agents
   baa-ton deliver
   baa-ton run status|pause|resume [--reason <text>] [--from <name>]
-  baa-ton reset [--project-root <folder>] [--include-spec] [--yes]
-      clean slate: close all lane tabs, release leases, archive then empty the manifest, delete old lane files.
-      Dry run unless --yes. Keeps config, approval policy, spec, operator registry and the root pane. Never touches Git or worktrees.`;
+  baa-ton reset [--project-root <folder>] [--include-spec] [--yes] [--fingerprint <sha256>]
+      dry run prints the itemized target manifest, controller routes/roots, tabs and exact process candidates.
+      --yes applies that fingerprinted inventory without a follow-up prompt; an optional --fingerprint binds it to a prior dry run.
+      Ambiguous controller/process identity or any inventory change refuses before reset. Keeps config, policy, spec, registry, live roots and other manifests; never touches Git/worktrees.`;
 
 /** Split argv into positionals and --flags (a flag takes the next word unless boolean). */
 export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "unread", "resume", "yes", "include-spec"])) {
@@ -62,7 +63,7 @@ export function parseArgs(argv, booleans = new Set(["notify", "json", "all", "un
 
 export async function runOperatorCli(argv, { env = process.env, out = (text) => process.stdout.write(`${text}\n`) } = {}) {
   const [command, ...rest] = argv;
-  const { positional, flags } = parseArgs(rest);
+  const { positional, flags } = parseArgs(rest, new Set(["notify", "json", "all", "unread", "resume", "yes", "include-spec"]));
   switch (command) {
     case "message": {
       const [target, ...words] = positional;
@@ -99,7 +100,7 @@ export async function runOperatorCli(argv, { env = process.env, out = (text) => 
     }
     case "reset": {
       const { runReset, formatPlan } = await import("./reset.mjs");
-      const result = await runReset({ projectRoot: flags["project-root"] ?? process.cwd(), apply: Boolean(flags.yes), includeSpec: Boolean(flags["include-spec"]), env });
+      const result = await runReset({ projectRoot: flags["project-root"] ?? process.cwd(), apply: Boolean(flags.yes), includeSpec: Boolean(flags["include-spec"]), expectedFingerprint: flags.fingerprint, env });
       out(result.note ?? formatPlan(result.plan, { applied: result.applied }));
       if (result.failures?.length) out(`Not fully clean:\n  ${result.failures.join("\n  ")}`);
       return result;

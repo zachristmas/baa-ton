@@ -95,11 +95,12 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
 }
 ```
 
-- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch | local-validation | integrate`.
+- `grants` accepts only `dispatch | retry | resume | retire | lease | runtime-launch | local-validation | integrate | spec-push`.
+  - Optional `preset: "local-yolo"` is an explicit opt-in alternative to `grants`; omit `grants` when using it. It normalizes to `dispatch, retry, resume, retire, lease, runtime-launch, local-validation`. It does not add runtime templates: only templates explicitly present in `runtimeLaunch.commands` are covered. It never includes `integrate`, `spec-push`, push/merge/PR, deploy/production, reset, close/sweep/reparent or external messages.
   - `integrate` lets the spec loop's driver create `spec/<item>` worktrees from the target tip and, from its integration stage, make local commits and merges on the integration branch. It never pushes (see docs/SPEC-LOOP.md).
   - `retire` covers closing a finished lane's session and stopping its leased services. It never removes a worktree.
   - `local-validation` answers a lane's own permission and runtime-launch requests for routine checks in its worktree: frozen installs (`npm ci`, `pnpm|yarn|bun install --frozen-lockfile`, `yarn install --immutable`), and build, codegen, typecheck, lint and test scripts (through npm, pnpm, yarn, bun, workspace filters or turbo) or tools (`tsc`, `eslint`, `prettier --check`, `vitest`, `jest`, `playwright test` including `--headed`, `node --test`). The classifier is `classifyLocalValidation` in `packages/herdr-tools/known-safe.mjs`. It is outside the grant when a script name mentions deploy, publish, release, prod, push, migrate, seed, reset, drop, add, remove, update or upgrade; when an install has package arguments or rewrites the lockfile; when an environment assignment (other than CI, NODE_ENV=test or development, colour and debug flags) or a `PORT=` outside the lane's leases could point a command at a shared service; and when a `cd` or redirect leaves the worktree. Database and service stacks stay with `runtime-launch` templates, whose placeholders bind them to the lane's leases. The grant is last in the list, so adding it re-hashes only the policies that add it.
-  - Push, merge, deploy, production, close, sweep, reparent and external messages are rejected by name.
+  - General push, merge, PR creation/merge, deploy, production, reset, close, sweep, reparent and external messages are rejected by name. The narrow `spec-push` grant is separate and needs this policy's exact fresh acknowledgement.
   - Any invalid field makes the whole policy count as absent (fail closed).
 - The task-profile and clean-worktree rules are fixed, not configurable.
 - `runtimeLaunch` requires the `runtime-launch` grant.
@@ -116,9 +117,9 @@ As built in PR 2 (`packages/herdr-tools/approval-policy.ts`):
 
 The policy file is plain JSON in the repo, and a lane could edit it by accident. To guard against that, the root acknowledges it:
 
-- **Hash:** the policy hash is SHA-256 over the validated, canonicalized policy. Reformatting the file keeps the acknowledgement, but any change to what it grants needs a new one.
+- **Hash:** the policy hash is SHA-256 over the validated, canonicalized policy, including the preset and its normalized grants and any configured runtime templates. Reformatting the file keeps the acknowledgement; changing grants, preset or templates requires a new one. There is no acknowledgement compatibility exception for `spec-push`.
 - **Stored acknowledgement:** `approvalPolicyAck { hash, grants, ackedAt, rootPaneId }` is kept in the manifest and in `approval-policy-ack.json` beside it; the newer copy wins on load. The side file exists because pre-#21 writers and stale in-memory saves rewrote the manifest without the ack. A bootstrap `reset=true` removes it.
-- **Acknowledging on a TUI root:** the first routine operation after the policy appears or changes shows one dialog. It lists the grants and says what always asks, then "Record this policy and dispatch X?". Declining falls back to the ordinary one-off dialog.
+- **Acknowledging on a TUI root:** the first routine operation after the policy appears or changes shows one dialog. It lists the exact normalized grants and says what always asks, then "Record this policy and dispatch X?". A changed preset or runtime template re-prompts. Declining falls back to the ordinary one-off dialog.
 - **Acknowledging on a headless root:** there is never an implicit acknowledgement. `herdr_policy action=ack confirm=true` is allowed only after the user approves the exact policy shown by `herdr_policy action=show`. Until then, headless dispatch keeps the existing `confirm=true` one-off path.
 - **Evidence:** each standing decision adds workflow evidence: `authorization-policy-granted`, `approval-policy-not-applied` (with the reason) or `approval-policy-acknowledged`. Standing grants don't wake the root.
 

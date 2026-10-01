@@ -36,6 +36,14 @@ import type {
 import { Type } from "typebox";
 import { blocksUnmanagedAgentCommand } from "./command-policy.js";
 import { ConfirmQueue } from "./confirm-queue.js";
+const { containsGhPrMutation, containsGitPush, containsUnsafeShellExecution } = (await freshImport("./external-approval.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval.mjs") & { containsGitPush: (command: string) => boolean };
+const { approveExternalGhCommand, externalApprovalChecked, externalApprovalGranted, registerExternalApprovalBeforeToolCall } = (await freshImport("./external-approval-hook.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-hook.mjs") & {
+  externalApprovalChecked: WeakSet<object>;
+  externalApprovalGranted: WeakSet<object>;
+  registerExternalApprovalBeforeToolCall: (pi: ExtensionAPI, dependencies: (event: unknown, ctx: ExtensionContext) => Promise<Record<string, unknown>>) => void;
+};
+const { createExternalApprovalResolver } = (await freshImport("./external-approval-resolver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-resolver.mjs");
+const { resolveApprovalSessionFile } = (await freshImport("./approval-session.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./approval-session.mjs");
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -103,7 +111,7 @@ import {
 } from "./harness-adapter.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 const { acknowledgeActivation } = (await freshImport("./activation-ack.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./activation-ack.mjs");
-const { loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
+const { findTaskProfile, loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
 const { ownerRecord: lockOwnerRecord, reclaimLockDir } = (await freshImport("./inbox/lock-owner.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lock-owner.mjs");
 import {
   authorizeStanding,
@@ -1740,6 +1748,7 @@ function normalizedLanes(
   rootGoalId: string,
   defaultReadOnly = false,
   profileResolver?: (name: string) => ReturnType<typeof resolveTaskProfile>,
+  profileMatcher?: (profile: LaunchProfile) => string | undefined,
 ): Lane[] {
   const values = inputs.length ? inputs : [objective];
   return values.map((input, index) => {
@@ -1791,6 +1800,7 @@ function normalizedLanes(
             input.launchProfile,
             `Lane ${laneId} launchProfile`,
           ));
+    const canonicalTaskProfile = input.taskProfile ?? (launchProfile ? profileMatcher?.(launchProfile) : undefined);
     return {
       id: laneId,
       objective: input.objective,
@@ -1817,7 +1827,7 @@ function normalizedLanes(
             launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
           }
         : {}),
-      ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
+      ...(canonicalTaskProfile ? { taskProfile: canonicalTaskProfile } : {}),
       ...(configuredProfile?.permissionMode ? { permissionMode: configuredProfile.permissionMode } : {}),
       ...((input.allowArtifact ?? configuredProfile?.allowArtifact) === true ? { allowArtifact: true } : {}),
       ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
@@ -8611,6 +8621,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       rootGoalId,
       configuredProfile?.readOnly === true,
       (name) => resolveTaskProfile(cwd, name),
+      (profile) => findTaskProfile(cwd, profile),
     );
     if (
       target.worktree &&
@@ -8667,6 +8678,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       (launchProfileInput === undefined
         ? undefined
         : validateLaunchProfile(launchProfileInput));
+    const canonicalTaskProfile = taskProfile ?? (launchProfile ? findTaskProfile(cwd, launchProfile) : undefined);
     const stamp = now();
     const goals = createWorkflowGoals(id, objective, lanes);
     const workflow: Workflow = {
@@ -8687,7 +8699,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         rootPaneId: root.pane_id,
         rootSessionPath,
       },
-      ...(taskProfile ? { taskProfile } : {}),
+      ...(canonicalTaskProfile ? { taskProfile: canonicalTaskProfile } : {}),
       launchProfile,
       ...(launchProfile
         ? { launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION }
@@ -8886,6 +8898,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             `dispatch ${w.id}`,
             signal,
           );
+          const policyRefusal = standing.evidence.find((entry) => entry.kind === "approval-policy-not-applied")?.text;
+          if (policyRefusal && /uses an ad-hoc launchProfile|has no configured taskProfile/.test(policyRefusal))
+            throw new Error(`Dispatch refused before approval: ${policyRefusal.replace(/^Standing dispatch: /, "")}. Use a configured named taskProfile.`);
           await persistStanding(cwd, w.id, standing);
           const approved =
             standing.granted ||
@@ -11836,6 +11851,24 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     else await clearParentGoalSidebar(ctx.signal);
   });
 
+  registerExternalApprovalBeforeToolCall(pi, async (_event: unknown, ctx: ExtensionContext) => {
+    const sessionFile = await resolveApprovalSessionFile(ctx);
+    return {
+    enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
+    caller: isRegisteredChildLane() ? "child" : "root",
+    hasUI: ctx.hasUI,
+    mode: (ctx as ExtensionContext & { mode?: string }).mode ?? "unknown",
+    confirmAvailable: Boolean(ctx.ui?.confirm),
+    sessionFile,
+    diagnostic: (record: { mode: string; hasUI: boolean; confirmAvailable: boolean; stage: string; denial: string; failurePhase?: string }) => console.info("[baa-external-approval-diagnostic]", JSON.stringify(record)),
+    resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile, paneId: process.env[HERDR_PANE_ID_ENV] }),
+    confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId: string; sessionId: string }) => ctx.ui!.confirm(
+      `Approve exact external ${operation.operation}?`,
+      `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nPane/session: ${binding.paneId} / ${binding.sessionId}\nThis approves this exact command once.`,
+    ),
+    };
+  });
+
   pi.on("tool_call", async (event, ctx) => {
     if (process.env.HERDR_ENV === "1")
       await refreshHerdrIdentity(ctx.signal);
@@ -11883,26 +11916,37 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     const command = call.input?.command;
     if (call.toolName !== "bash" || typeof command !== "string") return;
     const gitPush = /(?:^|[;&|]\s*)git(?:\s+\S+)*\s+push\b/im;
-    const nonAutonomousMutation =
-      /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+(?:push|merge)\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b|herdr\s+(?:workspace|tab|pane)\s+close\b)/im;
-    // 2026-09-16 ruling: the verified controller-mapped root is the parent
-    // executor acting with the user present, so a plain `git push` is allowed
-    // there, and it may retire its own lane tabs/panes (children remain
-    // reachable through durable manifests). Every other mutation stays
-    // blocked for every caller, workspace closure is never allowed from an
-    // agent shell (it would close the root's own session), and a compound
-    // command that also carries a non-push mutation keeps the block.
+    // External operations stay hard-gated. Only the exact gh PR operation
+    // below can be approved through the native root confirmation; push,
+    // arbitrary Git mutation and scripts remain denied.
     const nonPushMutation =
       /(?:^|[;&|]\s*)(?:git(?:\s+\S+)*\s+merge\b|gh\s+pr\s+create\b|glab\s+mr\s+create\b|hub\s+pull-request\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:deploy|publish|release)\b|(?:wrangler|vercel|netlify|flyctl|kubectl)\s+(?:deploy|publish|apply)\b)/im;
     const herdrWorkspaceClose =
       /(?:^|[;&|]\s*)herdr\s+workspace\s+close\b/im;
     const herdrPaneClose =
       /(?:^|[;&|]\s*)herdr\s+(?:tab|pane)\s+close\b/im;
+    let explicitlyApproved = false;
+    const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && (containsGitPush(command) || containsUnsafeShellExecution(command)));
+    if (externalMutation) {
+      const sessionFile = await resolveApprovalSessionFile(ctx);
+      explicitlyApproved = externalApprovalChecked.has(event) ? externalApprovalGranted.has(event) : await approveExternalGhCommand({
+        command,
+        enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
+        caller: isRegisteredChildLane() ? "child" : "root",
+        hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
+        sessionFile,
+        resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: sessionFile!, paneId: process.env[HERDR_PANE_ID_ENV] }),
+        confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId?: string; sessionId?: string }) => ctx.ui!.confirm(
+          `Approve exact external ${operation.operation}?`,
+          `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,
+        ),
+      });
+    }
     if (
       process.env.HERDR_ENV === "1" &&
-      (nonPushMutation.test(command) ||
+      ((nonPushMutation.test(command) || externalMutation) && !explicitlyApproved ||
         herdrWorkspaceClose.test(command) ||
-        (gitPush.test(command) && !isRootOrchestrator()) ||
+        (gitPush.test(command) && !explicitlyApproved) ||
         (herdrPaneClose.test(command) && !isRootOrchestrator()))
     ) {
       return {
@@ -12632,10 +12676,10 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     name: "herdr_policy",
     label: "Herdr Policy",
     description:
-      "Show or acknowledge the project's standing approvalPolicy in .baa-ton/config.json. Once the root acknowledges its hash, routine local dispatch, retry and resume inside it run without a native dialog, and a local-validation grant answers lanes' frozen installs, builds, codegen, typecheck, lint and tests in their own worktrees. Push, merge, deploy, production, close and sweep always ask.",
+      "Show the full SHA-256 and normalized grants/templates of the project's approvalPolicy, or acknowledge that exact hash once. The explicit preset local-yolo grants dispatch, retry, resume, retire, lease, runtime-launch and local-validation, but adds no runtime templates by default. Policy/template changes require a new root acknowledgement. Under local-yolo, integrate/spec-push, push/merge/PR, deploy/production, reset, close/sweep/reparent and external messages still escalate; local-validation excludes package/lockfile edits and shared services.",
     promptSnippet: "Show or acknowledge the standing approval policy.",
     promptGuidelines: [
-      "Use herdr_policy action=show to inspect the standing approvalPolicy and whether its current hash is acknowledged. Use action=ack only from the root after showing the user the policy summary. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
+      "Use herdr_policy action=show to inspect the full hash, normalized grants, configured runtime templates, escalations and acknowledgement state. Use action=ack only from the root after showing the exact policy summary; any grant or template change needs a new acknowledgement. On a headless bridge pass confirm=true only after the user has explicitly approved this exact policy in this conversation; never set it speculatively.",
     ],
     parameters: Type.Object({
       action: Type.Union([Type.Literal("show"), Type.Literal("ack")]),

@@ -152,6 +152,10 @@ workflow ID when it supervises multiple workflows.
 - Observation is bounded; completion requires every lane to be done.
 - No operation pushes, merges, deploys, invokes external services, or runs detached work.
 
+## External PR approval hook
+
+The Pi `tool_call` pre-execution guard permits directly written static `gh pr create` / `gh pr merge` with one explicit `--repo`/`-R`, and direct `git push <remote> HEAD:refs/heads/<branch>` only. In an eligible root UI session it resolves that target to exactly one local fetch remote, displays the binding in the native confirmation, and issues/consumes an exact-command one-use token in the same hook path. Declines, child/headless callers, missing session identity, ambiguous/mismatched remotes, wrappers, compositions, and dynamic forms remain blocked. Unsupported `gh --hostname` syntax fails before confirmation. Force, delete, mirror, tags, all, and prune push forms are rejected. Ordinary static shell quoting (including spaces and regex metacharacters in quoted arguments) and safe commands such as `env -u BAA_STARTUP_INTENT npm test` remain usable. A direct static read-only `gh pr` command is the sole exception to default-deny PR command gating. The reusable logic is `external-approval-hook.mjs`; its injected resolver and confirmation are the supported test seam. `test/external-approval-hook.test.mjs` dispatches through the same registered Pi `tool_call` callback used by `index.ts` and invokes only a fake Bash executor. The legacy `before_tool_call` wording refers to this pre-execution phase, not a separate event. Chat answers currently have no trusted transport or verifiable receipt into this hook: model-supplied evidence and chat transcripts never authorize an operation. Native `ctx.ui.confirm` remains the sole source of exact external authorization.
+
 ## Session log
 
 Each root manifest keeps a durable `sessionLog` root entry, and each lane keeps

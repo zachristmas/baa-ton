@@ -39,11 +39,18 @@ const NEVER_GRANTABLE = [
   "sweep",
   "reparent",
   "external-message",
+  "pr",
+  "pr-create",
+  "pr-merge",
+  "pull-request",
+  "reset",
 ];
 
 export type RuntimeLaunchTemplate = { name: string; start: string; stop?: string };
 export type ApprovalPolicy = {
   version: 2;
+  /** Opt-in preset; validated output contains its normalized grants. */
+  preset?: "local-yolo";
   grants: StandingGrant[];
   runtimeLaunch?: { commands: RuntimeLaunchTemplate[] };
 };
@@ -96,11 +103,16 @@ function template(value: unknown, label: string): string {
 
 export function validateApprovalPolicy(input: unknown): ApprovalPolicy {
   if (!isRecord(input)) throw new Error("approvalPolicy must be an object.");
-  onlyKeys(input, ["version", "grants", "runtimeLaunch"], "approvalPolicy");
+  onlyKeys(input, ["version", "preset", "grants", "runtimeLaunch"], "approvalPolicy");
   if (input.version !== 2) throw new Error("approvalPolicy.version must be 2.");
-  if (!Array.isArray(input.grants) || input.grants.length === 0)
+  const localYolo = input.preset === "local-yolo";
+  if (input.preset !== undefined && !localYolo)
+    throw new Error(`approvalPolicy.preset cannot be ${String(input.preset)}.`);
+  if (localYolo && input.grants !== undefined)
+    throw new Error("approvalPolicy.preset local-yolo defines its grants; omit grants.");
+  if (!localYolo && (!Array.isArray(input.grants) || input.grants.length === 0))
     throw new Error("approvalPolicy.grants must be a non-empty array.");
-  const grants = input.grants.map((grant) => {
+  const grants = (localYolo ? ["dispatch", "retry", "resume", "retire", "lease", "runtime-launch", "local-validation"] : input.grants as unknown[]).map((grant) => {
     if (typeof grant === "string" && NEVER_GRANTABLE.includes(grant))
       throw new Error(
         `approvalPolicy cannot grant ${grant}; it always requires explicit confirmation.`,
@@ -113,6 +125,7 @@ export function validateApprovalPolicy(input: unknown): ApprovalPolicy {
     throw new Error("approvalPolicy.grants must not contain duplicates.");
   const policy: ApprovalPolicy = {
     version: 2,
+    ...(localYolo ? { preset: "local-yolo" as const } : {}),
     grants: STANDING_GRANTS.filter((grant) => grants.includes(grant)),
   };
   if (input.runtimeLaunch !== undefined) {
@@ -164,16 +177,9 @@ export function approvalPolicyHash(policy: ApprovalPolicy): string {
   return createHash("sha256").update(canonical(policy)).digest("hex");
 }
 
-/**
- * Whether the root's acknowledgement covers this policy. Adding the
- * spec-push grant (approved by the user in the config file) keeps an
- * existing acknowledgement valid: the acknowledged hash may be that of the
- * same policy without spec-push. Any other change needs a new one.
- */
+/** An acknowledgement covers only the exact normalized policy hash. */
 export function approvalAckMatches(ack: { hash?: string } | undefined, policy: ApprovalPolicy): boolean {
-  if (!ack?.hash) return false;
-  if (ack.hash === approvalPolicyHash(policy)) return true;
-  return policy.grants.includes("spec-push") && ack.hash === approvalPolicyHash({ ...policy, grants: policy.grants.filter((grant) => grant !== "spec-push") });
+  return Boolean(ack?.hash && ack.hash === approvalPolicyHash(policy));
 }
 
 /** Why an operation falls outside the standing policy, or undefined when it
@@ -245,7 +251,7 @@ export type StandingPorts = {
 
 export function approvalPolicySummary(policy: ApprovalPolicy, hash: string): string {
   const lines = [
-    `Policy ${hash.slice(0, 12)} from .baa-ton/config.json.`,
+    `Policy SHA-256 ${hash} from .baa-ton/config.json${policy.preset ? ` (preset: ${policy.preset})` : ""}.`,
     `Runs without a dialog: ${policy.grants.join(", ")}.`,
     "Only inside policy: configured task profiles, no extra MCP servers, clean worktree.",
   ];
@@ -265,11 +271,12 @@ export function approvalPolicySummary(policy: ApprovalPolicy, hash: string): str
     lines.push(
       "Local validation: a lane's frozen install, build, codegen, typecheck, lint and tests (headed browser tests too) in its own worktree and leased ports.",
     );
-  lines.push(
-    policy.grants.includes("local-validation")
-      ? "Always asks: package or lockfile edits, shared databases or services, push, merge, deploy, production, close, sweep, reparent."
-      : "Always asks: push, merge, deploy, production, close, sweep, reparent.",
-  );
+  const asks = [
+    ...(!policy.grants.includes("integrate") ? ["integrate"] : []),
+    ...(!policy.grants.includes("spec-push") ? ["spec-push"] : []),
+    "general push", "merge", "PR creation/merge", "deploy", "production", "reset", "close", "sweep", "reparent", "external messages",
+  ];
+  lines.push(`Always asks: ${policy.grants.includes("local-validation") ? "package or lockfile edits, shared databases or services, " : ""}${asks.join(", ")}.`);
   return lines.join("\n");
 }
 
