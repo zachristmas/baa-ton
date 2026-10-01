@@ -140,7 +140,7 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     else if (program === "git" && args[0] === "remote") stdout = "origin";
     else if (program === "git" && args[0] === "config" && args[1] === "--get" && args[2].startsWith("branch.")) stdout = "origin";
     else if (program === "git" && args[0] === "config") throw new Error("not configured");
-    else if (program === "git" && args[0] === "ls-remote") stdout = `${args.at(-1).includes("topic") ? state.head : state.destination}\t${args.at(-1)}`;
+    else if (program === "git" && args[0] === "ls-remote") stdout = args.at(-1) === state.missingRef ? "" : `${args.at(-1).includes("topic") ? state.head : state.destination}\t${args.at(-1)}`;
     else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
     else throw new Error(`unexpected fake command ${program} ${args.join(" ")}`);
     return { stdout };
@@ -153,11 +153,17 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     const created = await resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" });
     assert.equal(created.headRefOid, state.head);
     assert.equal(created.baseRefOid, state.destination);
+    assert.equal(created.targetRepo, "owner/repo");
+    assert.equal(created.baseRef, "main");
+    assert.equal(created.headRef, "topic");
     const prOperation = { operation: "merge", argv: ["gh", "pr", "merge", "123", "--repo", "owner/repo", "--match-head-commit", state.head, "--merge"], repo: "owner/repo" };
     const pr = await resolver(prOperation);
     assert.equal(pr.pr.headOid, state.head);
     assert.equal(pr.pr.baseOid, state.base);
     assert.ok(calls.some((call) => call[0] === "gh" && call.includes("view")));
+    state.missingRef = "refs/heads/main";
+    await assert.rejects(resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" }), { message: "Could not resolve one live branch OID." });
+    state.missingRef = "";
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

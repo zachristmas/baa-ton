@@ -115,11 +115,11 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     const queryOid = async (repoRemote, ref) => {
       const rows = (await git(["ls-remote", "--", repoRemote.url, `refs/heads/${ref}`])).split(/\r?\n/).filter(Boolean);
       const found = rows.map((line) => /^(\S+)\s+(\S+)$/.exec(line)).filter((m) => m && m[2] === `refs/heads/${ref}`);
-      if (found.length !== 1 || !SAFE_OID.test(found[0][1])) throw new Error(`Could not resolve live ${repository}:${ref} OID.`);
+      if (found.length !== 1 || !SAFE_OID.test(found[0][1])) throw new Error("Could not resolve one live branch OID.");
       return found[0][1].toLowerCase();
     };
     const [headRefOid, baseRefOid] = operation.operation === "merge" ? [pr.headOid, pr.baseOid] : await Promise.all([queryOid(sourceRemote, headRef), queryOid(remote, target)]);
-    return { ...local, target, baseRef: target, headRef, headRefOid, baseRefOid, targetRepo: operation.repo, remoteName: operation.operation === "merge" ? remote.name : sourceRemote.name, host: operation.operation === "merge" ? remote.host : sourceRemote.host, remoteRepo: operation.operation === "merge" ? remote.repo : sourceRemote.repo, remoteUrl: operation.operation === "merge" ? remote.url : sourceRemote.url, pr, paneId: pane, caller: "root" };
+    return { ...local, target, baseRef: target, headRef, headRefOid, baseRefOid, targetRepo: remote.repo, remoteName: operation.operation === "merge" ? remote.name : sourceRemote.name, host: operation.operation === "merge" ? remote.host : sourceRemote.host, remoteRepo: operation.operation === "merge" ? remote.repo : sourceRemote.repo, remoteUrl: operation.operation === "merge" ? remote.url : sourceRemote.url, pr, paneId: pane, caller: "root" };
   };
 }
 
