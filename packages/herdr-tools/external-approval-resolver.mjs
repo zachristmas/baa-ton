@@ -40,6 +40,14 @@ function argValue(argv, name) {
   const index = argv.findIndex((arg) => arg === name || arg.startsWith(`${name}=`));
   return index < 0 ? "" : argv[index].includes("=") ? argv[index].slice(argv[index].indexOf("=") + 1) : argv[index + 1] ?? "";
 }
+function optionValues(argv, name) {
+  const values = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name) values.push(argv[++i] ?? "");
+    else if (argv[i].startsWith(`${name}=`)) values.push(argv[i].slice(name.length + 1));
+  }
+  return values;
+}
 
 export function createExternalApprovalResolver({ cwd, execFile, sessionFile, paneId }) {
   const run = async (program, args) => (await execFile(program, args, { cwd, encoding: "utf8", maxBuffer: 1024 * 1024 })).stdout.trim();
@@ -93,7 +101,8 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     failurePhase = "pr_arguments";
     const base = argValue(operation.argv, "--base");
     const prSelector = operation.operation === "merge" ? operation.argv[3] : "";
-    if (operation.operation === "create" && (!base || !SAFE_BRANCH.test(base) || operation.argv.some((arg) => arg === "--head" || arg.startsWith("--head=")))) throw new Error("PR create requires an explicit supported --base and implicit bound head branch.");
+    const requestedHeads = operation.operation === "create" ? optionValues(operation.argv, "--head") : [];
+    if (operation.operation === "create" && (!base || !SAFE_BRANCH.test(base) || requestedHeads.length > 1 || (requestedHeads.length === 1 && (!SAFE_BRANCH.test(requestedHeads[0]) || requestedHeads[0] !== local.branch)))) throw new Error("PR create requires an explicit supported --base and a head branch bound to local HEAD.");
     if (operation.operation === "merge" && !/^\d+$/.test(prSelector)) throw new Error("PR merge requires an exact numeric PR number.");
     let target = base;
     let pr;

@@ -128,19 +128,19 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
   const dir = await mkdtemp(join(tmpdir(), "external-approval-"));
   const session = join(dir, "session");
   await writeFile(session, "session");
-  const state = { pushUrl: "git@github.com:owner/repo.git", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN" };
+  const state = { pushUrl: "git@github.com:owner/repo.git", branch: "topic", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN" };
   const calls = [];
   const fakeExec = async (program, args) => {
     calls.push([program, ...args]);
     let stdout = "";
     if (program === "git" && args.join(" ") === "rev-parse --show-toplevel") stdout = dir;
     else if (program === "git" && args.join(" ") === "rev-parse HEAD") stdout = state.head;
-    else if (program === "git" && args.join(" ") === "symbolic-ref --quiet --short HEAD") stdout = "topic";
+    else if (program === "git" && args.join(" ") === "symbolic-ref --quiet --short HEAD") stdout = state.branch;
     else if (program === "git" && args[0] === "remote" && args[1] === "get-url") stdout = state.pushUrl;
     else if (program === "git" && args[0] === "remote") stdout = "origin";
     else if (program === "git" && args[0] === "config" && args[1] === "--get" && args[2].startsWith("branch.")) stdout = "origin";
     else if (program === "git" && args[0] === "config") throw new Error("not configured");
-    else if (program === "git" && args[0] === "ls-remote") stdout = args.at(-1) === state.missingRef ? "" : `${args.at(-1).includes("topic") ? state.head : state.destination}\t${args.at(-1)}`;
+    else if (program === "git" && args[0] === "ls-remote") stdout = args.at(-1) === state.missingRef ? "" : `${args.at(-1) === `refs/heads/${state.branch}` ? state.head : state.destination}\t${args.at(-1)}`;
     else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
     else throw new Error(`unexpected fake command ${program} ${args.join(" ")}`);
     return { stdout };
@@ -156,6 +156,15 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     assert.equal(created.targetRepo, "owner/repo");
     assert.equal(created.baseRef, "main");
     assert.equal(created.headRef, "topic");
+    state.pushUrl = "git@github.com:zachristmas/baa-ton.git";
+    state.branch = "feat/reset-yolo-policy";
+    const exactCreate = await resolver({ operation: "create", repo: "zachristmas/baa-ton", argv: ["gh", "pr", "create", "--repo", "zachristmas/baa-ton", "--base", "main", "--head", "feat/reset-yolo-policy", "--title", "Harden reset cleanup and external approval gates", "--body", "Hardens reset and Windows process-identity cleanup; adds routine local-YOLO grants while preserving external escalation; canonicalizes configured dispatch profiles and rejects ad-hoc profiles; binds Git push/PR approvals to the root session, immutable OIDs, live refs and authoritative PR metadata. Validation: npm test 195/195; extension suite 651/651; focused profile policy 36/36. TypeScript reports existing repository diagnostics."] });
+    assert.equal(exactCreate.headRefOid, state.head);
+    assert.equal(exactCreate.baseRefOid, state.destination);
+    assert.equal(exactCreate.targetRepo, "zachristmas/baa-ton");
+    assert.equal(exactCreate.headRef, "feat/reset-yolo-policy");
+    state.pushUrl = "git@github.com:owner/repo.git";
+    state.branch = "topic";
     const prOperation = { operation: "merge", argv: ["gh", "pr", "merge", "123", "--repo", "owner/repo", "--match-head-commit", state.head, "--merge"], repo: "owner/repo" };
     const pr = await resolver(prOperation);
     assert.equal(pr.pr.headOid, state.head);
