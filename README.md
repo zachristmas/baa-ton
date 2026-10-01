@@ -1,8 +1,10 @@
-# Baa-ton v2 — native HERDR orchestration
+# Baa-ton v2 — dot → Codex → HERDR
 
-A small, dependency-free wrapper around HERDR 0.9.1 for Codex, Claude Code, Pi and OpenCode. It keeps scoped goals, explicit results, cross-session messages, exact launch profiles and a supported native permission bridge. HERDR owns terminals, workspaces, worktrees and agent processes.
+Baa-ton is the small execution layer for a voice coordinator (dot) → a fast local Codex executor → native HERDR → the user's authorized local and SSH workspaces. The executor turns a goal into a sequence of native tool calls, launches the selected profiles, exchanges messages, and brings back evidence. HERDR owns terminals, workspaces, worktrees and agent processes.
 
-This branch is a substantial simplification of `dba8e02` for review. It is **not yet qualified with paid/live model launches**. Read [the migration and verification record](docs/MIGRATION.md) before replacing an existing installation.
+The implemented entry points are CLI and stdio MCP, plus the same tools in Pi. The surrounding app supplies the dot-to-Codex handoff; this repository does not install a voice connector or claim that dot can directly discover a local MCP server. Codex, Claude Code, Pi and OpenCode are worker targets selected by profile, not separate orchestration systems. Existing authentication and native permissions stay with each harness.
+
+This review branch replaces the larger control plane at `dba8e02`. A live local Luna Fast worker has reported results through MCP and accepted direct-pane redirection; local pause stayed scoped. The same Luna Fast status/result smoke also passed on POSIX and Windows SSH hosts. Read the [design principles](docs/DESIGN-PHILOSOPHY.md) and [migration and verification record](docs/MIGRATION.md) before replacing an existing installation.
 
 ## One installer, two interfaces
 
@@ -28,7 +30,7 @@ node src/install.mjs --project-root /path/to/project --harnesses codex,claude,op
 
 The seven familiar skills remain: `baa-ton-start`, `configure`, `update`, `end`, `uninstall`, `reset`, and `sweep`. Their instructions reflect the smaller runtime. They never imply permission to kill agents, delete worktrees, push, merge, or change accounts. Skills are installed under `.agents/skills`, `.claude/skills`, `.opencode/skills`, and `.pi/skills` respectively.
 
-The installer preserves unrelated configuration and refuses modified/unowned Baa-ton files or symlinked target paths. It does not clone/update Git, alter global model/authentication settings, restart HERDR, migrate legacy state, or enable a daemon. Legacy v1 configuration and OpenCode JSONC require explicit reconciliation. The old remote `curl | bash` bootstrap is retired; run the installer from the reviewed checkout. Windows wrappers are provided; they have not been executed on Windows in this review.
+The installer preserves unrelated configuration and refuses modified/unowned Baa-ton files or symlinked target paths. It does not clone/update Git, alter global model/authentication settings, restart HERDR, migrate legacy state, or enable a daemon. Legacy v1 configuration and OpenCode JSONC require explicit reconciliation. The old remote `curl | bash` bootstrap is retired; run the installer from the reviewed checkout. Both Windows wrappers have passed native preview checks; the shared agent installer has applied the isolated Windows scratch configuration.
 
 ## Configuration and approval choices
 
@@ -60,7 +62,7 @@ Installation of that proposal into a global host config is a separate explicit c
 
 [examples/fleet.json](examples/fleet.json) routes named local scopes to an existing SSH host and its explicit host-local Baa-ton scope. The same validated tool call runs through native SSH into that host's Node/CLI/config; task JSON stays on stdin, with POSIX quoting or a fixed encoded PowerShell command. There is no relay service, OAuth bridge, shell tool or automatic remote installer. The first call pins the SSH account/runtime/config mapping; changing it requires a new scope name.
 
-Prepare the reviewed runtime, Node, HERDR, authenticated harness and exact profiles on each remote host through its own approved installer run. The TUI can configure a prepared SSH route, and agent setup JSON supports the same `remotes` fields. Remote permissions and state stay on that host. The controlling client can inspect results and send cross-machine messages by targeting each remote scope. A connection failure is uncertain and never automatically retried. POSIX/Windows transport fixtures pass; actual remote execution still needs qualification.
+Prepare the reviewed runtime, Node, HERDR, authenticated harness and exact profiles on each remote host through its own approved installer run. The TUI can configure a prepared SSH route, and agent setup JSON supports the same `remotes` fields. Remote permissions and state stay on that host. The controlling client can inspect results and send cross-machine messages by targeting each remote scope. A connection failure is uncertain and never automatically retried. POSIX/Windows transport fixtures and real Luna Fast status/result round trips pass. Other harness/provider combinations still need live qualification.
 
 ## Working with jobs
 

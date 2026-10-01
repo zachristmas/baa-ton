@@ -24,16 +24,16 @@ Physical lines include comments and blanks. Tests, declarations, docs and config
 | Measure | Baseline | Review candidate |
 |---|---:|---:|
 | Runtime files, including installers/audit script | 94 | 25 |
-| Runtime physical LOC | 42,835 | 1,531 |
-| Runtime nonblank LOC | 41,179 | 1,484 |
-| Runtime UTF-8 bytes | 1,932,770 | 119,889 |
+| Runtime physical LOC | 42,835 | 1,532 |
+| Runtime nonblank LOC | 41,179 | 1,485 |
+| Runtime UTF-8 bytes | 1,932,770 | 119,998 |
 | Test/support/smoke files | 123 | 8 |
 | Test/support/smoke physical LOC | 31,867 | 1,092 |
 | Declaration files / LOC | 28 / 799 | 0 / 0 |
 | Direct runtime npm dependencies | 2 | 0 |
 | Operator tool surface | 33 Pi + 1 MCP-only | 12 MCP/CLI; 9 worker tools |
 
-Runtime LOC falls **96.4%**; bytes fall **93.8%**. Runtime file count falls 73.4%; total files fall from 279 to 50. Tool count falls 64.7%, not 80–90%. These are source-size measures, **not proof of equivalent behavior or a measured percentage of cognitive complexity**. The smaller implementation deliberately removes substantial autonomous lifecycle behavior and its tests. Compact formatting also affects LOC, which is why bytes are included.
+Runtime LOC falls **96.4%**; bytes fall **93.8%**. Runtime file count falls 73.4%; total files fall from 279 to 51. Tool count falls 64.7%, not 80–90%. These are source-size measures, **not proof of equivalent behavior or a measured percentage of cognitive complexity**. The smaller implementation deliberately removes substantial autonomous lifecycle behavior and its tests. Compact formatting also affects LOC, which is why bytes are included.
 
 For state, the baseline `contract.ts` declares 50 exported types, 34 of them object-shaped contracts; these are not 34 independent databases. Its durable graph includes workflows, lanes, per-lane/root goals, supervisors, root turns, retries, approval/question/message records, session logs, controller mappings, ownership, closure and retirement records, alongside operator/controller/inbox state. The candidate has six conceptual records—goal, job, message, embedded result/verification, exact approval, chain—in one JSON file per explicit scope plus generated launch files. There is no global root registry or global run-state switch.
 
@@ -57,7 +57,7 @@ The `baa-ton` binary name, `install.sh`/`.ps1`/`.cmd`, uninstall wrappers, and s
 
 A live v1 job should finish under its existing runtime. Do not point a running v1 session at v2 or have both versions manage the same job. Start v2 with a separate scope/config after inspection, and explicitly connect an existing pane only when intended. Existing legacy config/skills are preserved and conflicting files require reconciliation. Installed absolute runtime paths must remain available until their clients are disconnected.
 
-The remote pipe-to-shell clone/update bootstrap is retired. Install from a reviewed checkout. The Windows wrappers share the Node implementation but were not run on Windows. OpenCode JSONC is deliberately not rewritten. Ask-list matching is tool-level; Claude/OpenCode continue native permissions rather than claiming Codex-specific policy parity.
+The remote pipe-to-shell clone/update bootstrap is retired. Install from a reviewed checkout. Both Windows wrappers have now passed native preview checks, and the agent installer applied the isolated Windows scratch configuration. OpenCode JSONC is deliberately not rewritten. Ask-list matching is tool-level; Claude/OpenCode continue native permissions rather than claiming Codex-specific policy parity.
 
 ## Executable migration slices
 
@@ -78,18 +78,18 @@ Rollback: disconnect/disable only the newly installed v2 host entry, retain its 
 
 | Criterion | Automated observation | Remaining live qualification |
 |---|---|---|
-| Human redirects a spawned session | Worker self-redirect advances revision, sends no duplicate task, fences old results/approvals | Enter each harness pane and redirect it naturally; confirm no root-only refusal |
-| Two independent roots/scopes | Separate state documents and pause tests; A pause leaves B delivery active | Two actual HERDR workspaces, separate goals and profiles |
+| Human redirects a spawned session | Worker self-redirect advances revision, sends no duplicate task, fences old results/approvals; live Codex intervention passed | Repeat the direct-pane check in Claude, Pi and OpenCode |
+| Two independent roots/scopes | Separate state documents and pause tests; two live local workspaces retained independent A-paused/B-active goals | Concurrent live worker delivery under changing pause state |
 | Local pause/resume | Pauses before create/start/delivery are fenced; running processes untouched; resume drains once | Pause while a real harness changes state; inspect in-flight boundary |
 | Cancellation | Create/start continuations cannot revive cancelled jobs; late result rejected | Cancel a disposable live job without closing its native pane |
-| Remote dispatch | Same tools route to explicit host-local config over SSH; POSIX/Windows fixtures and endpoint-change rejection | Approved remote Node/runtime/config installation, actual SSH process and model task/result |
+| Remote dispatch | POSIX/Windows fixtures, real SSH status, and Luna Fast MCP status→result round trips pass on both hosts | Other selected remote harness/provider combinations |
 | Cross-harness messaging | Fixed native argv, queued delivery, no-goal drain, uncertain-send fence | Codex↔Claude↔Pi↔OpenCode round trip with real providers |
 | Reconnect and session changes | Terminal/session/process identity fences, session promotion, explicit reconnect invalidation and late-reply tests | Replace a real pane/session and inspect/reconnect without replay |
 | Evidence and chains | Idle does not complete; stale/self/cancelled reviewers rejected; reported/verified stage gates | Independent reviewer checks an actual artifact before advancement |
 | Exact native approval | Real child Claude hook emits exact one-use native decision through MCP; changed input/session/revision/expiry fails; Bash remains native | Native provider hook delivery/prompt fallback and denial in an actual Claude session |
 | Worker boundaries | Canonical controlling MCP/extension disabled by all four launch adapters; worker catalog omits approve/connect/reconnect | Confirm catalog in each installed harness; same-user shell is not a sandbox |
 | Ask-list | Exact names only; unknown/wildcard rejected; changed snapshot refuses startup | Confirm selected tools prompt and routine tools do not in the local Codex UI |
-| Installer/TUI/agent | All four project integrations, 28 skills, preview/cancel, idempotence, partial selection, conflict/symlink preservation, JSON CLI and POSIX wrapper | Real client skill discovery; native Windows/PowerShell wrapper runs |
+| Installer/TUI/agent | Four project integrations,28 skills, preview/cancel, idempotence, conflicts, applied remote JSON setup, and native Windows wrapper previews pass | Live discovery in every selected harness |
 
 At the recorded candidate, **64 tests pass** under `npm test` in approximately three seconds. Tests use temporary directories, in-memory fake HERDR and a real fake-native executable process. The automated suite launches no paid model. Independent GPT Astra review found and drove fixes for cancellation, stale identity/result/approval, delivery uncertainty and installer inheritance issues. This evidence is meaningful but does not replace live harness qualification.
 
@@ -104,10 +104,16 @@ Installed Codex 0.159.0 accepted the generated config in a read-only config pars
 
 Remote scope routing is implemented via native SSH to a prepared host-local runtime; fixture tests cover both POSIX and Windows command/payload boundaries, immutable endpoint binding and uncertain failure. Native agent labels are persisted separately from durable job IDs, stay below32 characters, include scope identity and are collision-checked against native agents before resource creation.
 
-There is no voice bridge, automatic remote runtime distribution, autonomous stage advancement, retention service, global root, self-healing process supervisor or cross-account credential route here. A future voice coordinator can invoke the local executor's same CLI/MCP; host-local copies can perform fleet work through existing HERDR/SSH. Machine ownership does not decide whether a workspace/account is personal or work-related.
+The intended entry path is dot → local Codex executor → native HERDR/SSH fleet. This repository implements the CLI/MCP and fleet execution layer; the surrounding application supplies the voice/task handoff. It does not implement a direct dot MCP connector, automatic remote distribution, autonomous stage advancement, retention service, global root, self-healing supervisor or cross-account credential route. Machine ownership does not decide whether a workspace/account is personal or work-related.
 
-## Live startup qualification (in progress)
+## Live qualification at runtime commit `58d4c2564ebf4a2f88aab22b56028a8be183cbf3`
 
 The approved Mac host entry is registered with the exact twelve-tool allowlist and native ask-list settings, preserving unrelated configuration. Local HERDR server 0.9.0 accepts the 0.9.1 CLI API; no server upgrade/restart was performed. Native startup initially exposed two issues missed by fake-native tests: a fresh shell can reject start as busy, and a multi-kilobyte inline Codex command can remain truncated at the shell. Startup now retries only the explicit pre-execution busy rejection, and Codex uses a generated per-job MCP loader plus one compact native TOML table (about 910 bytes in the inspected setup). The loader pins config, worker, scope and policy digest; all nine worker tool modes remain explicit.
 
-A fresh local Codex worker now starts with the requested Luna/Fast profile and read-only sandbox. At this checkpoint it is blocked by the native scratch-folder trust dialog, with no task yet delivered. That permission has not been auto-accepted or bypassed. The earlier uncertain records are preserved and were cancelled only after observing shell-only processes and no native agent. The running blocked worker will be inspected/reconnected rather than duplicated. A complete model result and fleet transport qualification remain pending.
+The local Luna Fast worker completed a real status → result MCP round trip, recording `2+2=4`. After a direct native-pane instruction it recorded its own redirection without prompting itself, advanced revision 1→2 and submitted `3+3=6`. No root-only gate blocked it. Pausing local scope A left local scope B active, and resuming A preserved both records. Reconnect reused the inspected terminal after the user explicitly accepted its exact native scratch-folder trust prompt; no duplicate worker was launched.
+
+The same committed archive was copied to two approved SSH hosts with matching SHA256, and the unified JSON installer applied isolated Codex scratch configurations. Actual Baa-ton SSH status calls succeeded for POSIX and Windows. Native Windows `.cmd` and PowerShell installer previews succeeded, as did seven focused native Windows policy/transport tests. A fresh-host startup failure exposed an incomplete disabled MCP entry; the launch override now supplies a valid disabled transport even when no global Baa-ton server exists. Existing global remote MCP settings were not changed.
+
+After explicit approval of their exact native scratch-folder trust prompts, both existing remote workers were reconnected without relaunch. Each called the worker MCP status tool and submitted `2+2=4` for its current revision; the controlling Mac retrieved both records through Baa-ton SSH with matching live identities. The profiles were exactly Luna, low effort, priority/Fast, read-only. Hermes's official npm Codex CLI was updated from 0.140.0 to 0.159.3 after verifying the active desktop app used a separate binary; a rollback archive was retained and the refreshed catalog confirmed Luna/Fast. No account, credential, daemon or global remote MCP change was made.
+
+Failed attempts remain inspectable and were cancelled only after shell-only process inspection. Full cross-harness round trips, live Claude approval delivery, and independent live result verification remain separate qualification gates. The complete local test suite passes 64/64; test success is not a claim of full legacy feature parity. The operating-system account and native sandbox remain the permission boundary. Historical startup errors remain in recovered job records for inspection even after a later reported result.

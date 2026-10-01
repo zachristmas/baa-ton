@@ -1,18 +1,23 @@
-# Small native runtime
+# A thin execution path from dot to native HERDR
 
 ```mermaid
 flowchart LR
-  Human[Human in any pane] --> Client[Codex / Claude / Pi / OpenCode]
+  Dot[dot / voice coordinator] -->|host application handoff| Client[Local Codex executor]
+  Human[Human in any pane] --> Workers
   Client --> Interface[12 MCP tools or CLI]
   Interface --> State[One local JSON document per scope]
   Interface --> Native[Sequenced native HERDR commands]
-  Native --> Workers[Visible agents / workspaces / worktrees]
+  Native --> Workers[Profile-selected Codex / Claude / Pi / OpenCode]
+  Interface --> SSH[Existing SSH → same host-local runtime]
+  SSH --> Fleet[Authorized remote HERDR workspaces]
   Workers --> Interface
   Permission[Claude native PermissionRequest] --> Exact[Exact single-use decision]
   Exact --> Interface
 ```
 
-`src/herdr.mjs` has a fixed list of native operations using argv arrays and no shell. `profiles.mjs` maps explicit profiles to documented launch options. No adapter registry or runtime capability negotiation is added. Remote scopes use one native SSH invocation of this same host-local CLI, with explicit Node/runtime/config paths and immutable account/endpoint binding. The JSON tool payload stays on stdin; POSIX quoting and an encoded fixed PowerShell command cover the two supported host types. Native `--machine` remains available for diagnostics; dispatch uses the prepared host-local runtime. This keeps a future voice coordinator → fast Mac executor → SSH/HERDR fleet bridge straightforward without implementing it now.
+The primary workflow is dot → local Codex executor → native HERDR and its authorized SSH fleet. The CLI/MCP execution layer and SSH routing are implemented here. The surrounding application's conversation/task handoff supplies the first arrow; there is no direct dot-to-local-MCP connector in this repository. Fast is an explicit supported profile choice, not a global model setting.
+
+`src/herdr.mjs` has a fixed list of native operations using argv arrays and no shell. `profiles.mjs` maps explicit profiles to documented launch options. No adapter registry or runtime capability negotiation is added. Remote scopes use one native SSH invocation of this same host-local CLI, with explicit Node/runtime/config paths and immutable account/endpoint binding. The JSON tool payload stays on stdin; POSIX quoting and an encoded fixed PowerShell command cover the two supported host types. Native `--machine` remains available for diagnostics; dispatch uses the prepared host-local runtime.
 
 `core.mjs` sequences those primitives and records six conceptual entities: scope goal, job, message, result/verification evidence, permission request, and chain. Five collections/fields plus binding/revision metadata live in one scope file; result/verification is embedded in its job. Native process status is queried, not mirrored into a second supervisor graph.
 
