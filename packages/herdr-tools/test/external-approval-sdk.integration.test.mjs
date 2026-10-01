@@ -50,15 +50,12 @@ async function runSdkToolCall(options = {}) {
   }
 }
 
-test("installed Pi SDK dispatches a model Bash call through production approval registration", async () => {
+test("installed headless Pi SDK dispatch blocks external approval before fake Bash execution", async () => {
   const source = await (await import("node:fs/promises")).readFile(new URL("../index.ts", import.meta.url), "utf8");
   assert.match(source, /registerExternalApprovalBeforeToolCall\(pi,/);
   const allowed = await runSdkToolCall();
-  assert.equal(allowed.confirmations, 1);
-  assert.deepEqual(allowed.executions, [command]);
-  assert.equal(allowed.blocks.length, 1);
-  assert.equal(allowed.toolResults.length, 1);
-  assert.equal(allowed.toolResults[0].isError, false);
+  assert.equal(allowed.confirmations, 0);
+  assert.deepEqual(allowed.executions, []);
 });
 
 test("SDK tool dispatch blocks declined, ineligible and mismatched calls before fake Bash execution", async () => {

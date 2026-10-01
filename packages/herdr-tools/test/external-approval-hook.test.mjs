@@ -14,7 +14,7 @@ const binding = { repo: "/repo", head: headOid, branch: "topic", target: "main",
 
 // Dispatch through the registered production Pi callback, then emulate Pi's Bash executor only when unblocked.
 async function dispatchToolCall(command, options = {}) {
-  const state = { prompts: 0, executions: 0 };
+  const state = { prompts: 0, executions: 0, diagnostics: [] };
   const listeners = new Map();
   let currentBinding = operationBinding(command);
   function operationBinding(value) { return parsePush(value) ? { ...binding, head: parsePush(value)[2], branch: parsePush(value)[3], destinationRef: `refs/heads/${parsePush(value)[3]}` } : binding; }
@@ -26,6 +26,9 @@ async function dispatchToolCall(command, options = {}) {
       enabled: options.enabled ?? true,
       caller: options.caller ?? "root",
       hasUI: options.hasUI ?? true,
+      mode: options.mode ?? "tui",
+      confirmAvailable: options.confirmAvailable ?? (options.hasUI ?? true),
+      diagnostic: (entry) => state.diagnostics.push(entry),
       sessionFile: Object.hasOwn(options, "sessionFile") ? options.sessionFile : "/session",
       resolveBinding: options.resolveBinding ?? (async (operation) => {
         if (options.remotes && options.remotes.filter((r) => r.repo.toLowerCase() === operation.repo.toLowerCase()).length !== 1) throw new Error("remote identity not unique");
@@ -42,7 +45,7 @@ async function dispatchToolCall(command, options = {}) {
     };
   });
   const event = { toolName: "bash", input: { command } };
-  const result = await listeners.get("tool_call")(event, { cwd: "/repo", hasUI: true });
+  const result = await listeners.get("tool_call")(event, { cwd: "/repo", mode: options.mode ?? "tui", hasUI: options.hasUI ?? true });
   if (!result?.block) {
     state.executions++;
     state.executedCommand = event.input.command;
@@ -53,6 +56,8 @@ async function dispatchToolCall(command, options = {}) {
 test("index.ts registers the same production approval registration seam used by the integration harness", async () => {
   const source = await readFile(new URL("../index.ts", import.meta.url), "utf8");
   assert.match(source, /registerExternalApprovalBeforeToolCall\(pi,/);
+  assert.match(source, /mode: \(ctx as ExtensionContext & \{ mode\?: string \}\)\.mode/);
+  assert.match(source, /baa-external-approval-diagnostic/);
   assert.match(source, /externalApprovalChecked\.has\(event\)/);
   assert.match(source, /externalApprovalGranted\.has\(event\)/);
 });
@@ -160,6 +165,19 @@ function parsePushOperation(command) {
   const oid = /git push origin ([a-f0-9]{40}):refs\/heads\/([\w./-]+)/.exec(command);
   return { operation: "push", argv: command.split(" "), remoteName: "origin", branch: oid[2], sourceRef: oid[1], destinationRef: `refs/heads/${oid[2]}` };
 }
+
+test("diagnostics record only safe state and stable categories, never command or binding data", async () => {
+  const approved = await dispatchToolCall(commandCreate);
+  assert.deepEqual(approved.diagnostics.map(({ stage }) => stage), ["parse", "resolve-before", "confirm", "resolve-after", "allow"]);
+  assert.ok(approved.diagnostics.every((entry) => entry.mode === "tui" && entry.hasUI && entry.confirmAvailable && entry.denial === "none"));
+  const privateCommand = "gh pr create --repo secret-owner/private-repo --base token-abc https://secret.example/private";
+  const denied = await dispatchToolCall(privateCommand, { mode: "headless", hasUI: false, sessionFile: "/private/session/path" });
+  assert.equal(denied.blocked, true);
+  assert.deepEqual(denied.diagnostics, [{ mode: "headless", hasUI: false, confirmAvailable: false, stage: "deny", denial: "no_ui" }]);
+  const serialized = JSON.stringify([...approved.diagnostics, ...denied.diagnostics]);
+  for (const secret of ["secret-owner", "private-repo", "token-abc", "secret.example", "/private/session/path", commandCreate]) assert.equal(serialized.includes(secret), false);
+  assert.deepEqual(Object.keys(denied.diagnostics[0]).sort(), ["confirmAvailable", "denial", "hasUI", "mode", "stage"]);
+});
 
 test("read-only PR commands pass through without approval", async () => {
   for (const command of ["gh pr list", "gh pr list --state open", "gh pr view 12", "gh pr status", "gh pr diff 12", "gh pr checks 12"]) {

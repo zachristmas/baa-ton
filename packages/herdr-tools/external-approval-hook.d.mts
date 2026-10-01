@@ -38,6 +38,9 @@ export function approveExternalGhCommand(options: {
   enabled: boolean;
   caller: "root" | "child";
   hasUI: boolean;
+  mode?: string;
+  confirmAvailable?: boolean;
+  diagnostic?: (record: { mode: string; hasUI: boolean; confirmAvailable: boolean; stage: "parse" | "resolve-before" | "confirm" | "resolve-after" | "allow" | "deny"; denial: string }) => void;
   sessionFile?: string;
   resolveBinding: (operation: ApprovedExternalOperation) => Promise<ExternalApprovalBinding | undefined>;
   confirm: (operation: ApprovedExternalOperation, binding: ExternalApprovalBinding) => Promise<boolean>;
