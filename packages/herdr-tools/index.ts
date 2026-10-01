@@ -43,6 +43,7 @@ const { approveExternalGhCommand, externalApprovalChecked, externalApprovalGrant
   registerExternalApprovalBeforeToolCall: (pi: ExtensionAPI, dependencies: (event: unknown, ctx: ExtensionContext) => Promise<Record<string, unknown>>) => void;
 };
 const { createExternalApprovalResolver } = (await freshImport("./external-approval-resolver.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./external-approval-resolver.mjs");
+const { resolveApprovalSessionFile } = (await freshImport("./approval-session.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./approval-session.mjs");
 const { resolvePiSessionIdentity, registerPiIdentityBridge } = (await freshImport("./pi-session-identity.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./pi-session-identity.mjs");
 import {
   AUTHORIZATION_CAPABILITIES,
@@ -11843,20 +11844,23 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     else await clearParentGoalSidebar(ctx.signal);
   });
 
-  registerExternalApprovalBeforeToolCall(pi, async (_event: unknown, ctx: ExtensionContext) => ({
+  registerExternalApprovalBeforeToolCall(pi, async (_event: unknown, ctx: ExtensionContext) => {
+    const sessionFile = await resolveApprovalSessionFile(ctx);
+    return {
     enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
     caller: isRegisteredChildLane() ? "child" : "root",
     hasUI: ctx.hasUI,
     mode: (ctx as ExtensionContext & { mode?: string }).mode ?? "unknown",
     confirmAvailable: Boolean(ctx.ui?.confirm),
-    sessionFile: process.env.PI_SESSION_FILE,
+    sessionFile,
     diagnostic: (record: { mode: string; hasUI: boolean; confirmAvailable: boolean; stage: string; denial: string }) => console.info("[baa-external-approval-diagnostic]", JSON.stringify(record)),
-    resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: process.env.PI_SESSION_FILE!, paneId: process.env[HERDR_PANE_ID_ENV] }),
+    resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile, paneId: process.env[HERDR_PANE_ID_ENV] }),
     confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId: string; sessionId: string }) => ctx.ui!.confirm(
       `Approve exact external ${operation.operation}?`,
       `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nPane/session: ${binding.paneId} / ${binding.sessionId}\nThis approves this exact command once.`,
     ),
-  }));
+    };
+  });
 
   pi.on("tool_call", async (event, ctx) => {
     if (process.env.HERDR_ENV === "1")
@@ -11917,13 +11921,14 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     let explicitlyApproved = false;
     const externalMutation = containsGhPrMutation(command) || (process.env.HERDR_ENV === "1" && (containsGitPush(command) || containsUnsafeShellExecution(command)));
     if (externalMutation) {
+      const sessionFile = await resolveApprovalSessionFile(ctx);
       explicitlyApproved = externalApprovalChecked.has(event) ? externalApprovalGranted.has(event) : await approveExternalGhCommand({
         command,
         enabled: process.env.HERDR_ENV === "1" && isRootOrchestrator() && isRootForManifest(ctx.cwd),
         caller: isRegisteredChildLane() ? "child" : "root",
         hasUI: ctx.hasUI && Boolean(ctx.ui?.confirm),
-        sessionFile: process.env.PI_SESSION_FILE,
-        resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: process.env.PI_SESSION_FILE!, paneId: process.env[HERDR_PANE_ID_ENV] }),
+        sessionFile,
+        resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile: sessionFile!, paneId: process.env[HERDR_PANE_ID_ENV] }),
         confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId?: string; sessionId?: string }) => ctx.ui!.confirm(
           `Approve exact external ${operation.operation}?`,
           `Local root: ${binding.repo}\nGit remote: ${binding.remoteName} (${binding.host}/${binding.remoteRepo ?? operation.repo ?? binding.targetRepo})\nExplicit --repo target: ${operation.repo ?? "(direct Git remote)"}\nHEAD: ${binding.head}\nHead ref: ${operation.sourceRef ?? binding.headRef ?? binding.branch} (${binding.headRefOid ?? "local commit"})\nBase/destination ref: ${operation.destinationRef ?? binding.target} (${binding.destinationOid ?? binding.baseRefOid ?? "not applicable"})\nPR metadata: ${binding.pr ? JSON.stringify(binding.pr) : "not applicable"}\nExact argv: ${JSON.stringify(operation.argv)}\nThis approves this exact command once.`,

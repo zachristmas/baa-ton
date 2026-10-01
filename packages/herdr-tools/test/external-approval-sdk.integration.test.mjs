@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerExternalApprovalBeforeToolCall } from "../external-approval-hook.mjs";
+import { resolveApprovalSessionFile } from "../approval-session.mjs";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const command = "gh pr create --repo owner/repo --base main";
 const model = { id: "test", name: "Test", api: "openai-completions", provider: "openai", baseUrl: "http://invalid", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1024, maxTokens: 128 };
@@ -17,7 +21,7 @@ async function runSdkToolCall(options = {}) {
       enabled: options.enabled ?? true,
       caller: options.caller ?? "root",
       hasUI: options.hasUI ?? true,
-      sessionFile: options.sessionFile === undefined ? "/session" : options.sessionFile,
+      sessionFile: options.activeSession ? await resolveApprovalSessionFile({ sessionManager: { getSessionFile: () => options.activeSession } }, {}) : options.sessionFile === undefined ? "/session" : options.sessionFile,
       resolveBinding: async () => {
         if (options.mismatch) throw new Error("repository/hostname mismatch");
         return binding;
@@ -29,7 +33,9 @@ async function runSdkToolCall(options = {}) {
   };
   const loader = new DefaultResourceLoader({ cwd: process.cwd(), agentDir: process.cwd(), noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true, extensionFactories: [extension] });
   await loader.reload();
-  const { session } = await createAgentSession({ cwd: process.cwd(), model, tools: ["bash"], resourceLoader: loader, sessionManager: SessionManager.inMemory(process.cwd()) });
+  const sessionManager = SessionManager.inMemory(process.cwd());
+  if (options.activeSession) sessionManager.getSessionFile = () => options.activeSession;
+  const { session } = await createAgentSession({ cwd: process.cwd(), model, tools: ["bash"], resourceLoader: loader, sessionManager });
   try {
     // The SDK agent's documented StreamFn seam supplies one deterministic model tool call.
     session.agent.getApiKey = async () => "deterministic-test-key";
@@ -56,6 +62,30 @@ test("installed headless Pi SDK dispatch blocks external approval before fake Ba
   const allowed = await runSdkToolCall();
   assert.equal(allowed.confirmations, 0);
   assert.deepEqual(allowed.executions, []);
+});
+
+test("SDK seam resolves the active SessionManager file without PI_SESSION_FILE and remains headless-safe", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "approval-session-"));
+  const session = join(dir, "session.jsonl");
+  await writeFile(session, "{}\n");
+  const old = process.env.PI_SESSION_FILE;
+  delete process.env.PI_SESSION_FILE;
+  try {
+    assert.equal(await resolveApprovalSessionFile({ sessionManager: { getSessionFile: () => session } }, {}), await (await import("node:fs/promises")).realpath(session));
+    const allowed = await runSdkToolCall({ activeSession: session });
+    assert.equal(allowed.confirmations, 0);
+    assert.deepEqual(allowed.executions, []);
+    const missing = await runSdkToolCall({ sessionFile: null });
+    assert.equal(missing.confirmations, 0);
+    assert.deepEqual(missing.executions, []);
+    const child = await runSdkToolCall({ activeSession: session, caller: "child" });
+    assert.equal(child.confirmations, 0);
+    assert.deepEqual(child.executions, []);
+  } finally {
+    if (old === undefined) delete process.env.PI_SESSION_FILE;
+    else process.env.PI_SESSION_FILE = old;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SDK tool dispatch blocks declined, ineligible and mismatched calls before fake Bash execution", async () => {
