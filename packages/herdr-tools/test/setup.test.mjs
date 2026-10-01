@@ -29,8 +29,22 @@ import {
   updateSkillPath,
   updateManagedReference,
 } from "../setup.mjs";
-import { resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
+import { findTaskProfile, resolveTaskProfile, taskProfileConfigPath } from "../profile-config.mjs";
 import { EXIT_COMMANDS } from "../root-relaunch.mjs";
+
+test("exact explicit launch profiles canonicalize to configured task profile names", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "baa-profile-match-"));
+  try {
+    const profile = { provider: "claude-code", model: "claude-sonnet-5", thinking: "high", auth: "subscription" };
+    await mkdir(join(directory, ".baa-ton"), { recursive: true });
+    await writeFile(taskProfileConfigPath(directory), JSON.stringify({ version: 1, profiles: { implementation: { agentKind: "claude", launchProfile: profile } } }));
+    assert.equal(findTaskProfile(directory, { ...profile }), "implementation");
+    assert.equal(findTaskProfile(directory, { ...profile, model: "unknown" }), undefined);
+    assert.equal(findTaskProfile(directory, { ...profile, extra: true }), undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function snapshotProject(root) {
   const entries = [];

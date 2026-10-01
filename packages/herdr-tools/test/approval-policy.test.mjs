@@ -199,6 +199,14 @@ test("operations outside policy fall back without a policy dialog", async () => 
   assert.match(result.evidence[0].text, /Standing dispatch: lane a has no configured taskProfile/);
 });
 
+test("an unknown explicit profile cannot use the no-dialog dispatch grant", async () => {
+  const p = ports({ interactive: false });
+  const result = await authorizeStanding(p, { taskProfile: "quick", lanes: [{ id: "a", launchProfile: { provider: "other", model: "unknown" } }] }, "dispatch", "x");
+  assert.equal(result.granted, false);
+  assert.equal(p.dialogs.length, 0);
+  assert.match(result.evidence[0].text, /uses an ad-hoc launchProfile/);
+});
+
 test("a dirty worktree keeps the acknowledgement but falls back", async () => {
   const p = ports({ cleanWorktree: async () => { throw new Error("worktreeCwd must be clean before Herdr dispatch."); } });
   const result = await authorizeStanding(p, profiled, "dispatch", "x");

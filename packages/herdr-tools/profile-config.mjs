@@ -62,6 +62,16 @@ function exactLaunchProfile(value, name) {
   };
 }
 
+export function findTaskProfile(cwd, launchProfile) {
+  if (!isRecord(launchProfile)) return undefined;
+  const config = loadTaskProfileConfig(cwd);
+  for (const name of Object.keys(config?.profiles ?? {})) {
+    const profile = resolveTaskProfile(cwd, name);
+    if (["provider", "model", "thinking", "auth"].every((key) => profile.launchProfile[key] === launchProfile[key]) && Object.keys(launchProfile).length === 4) return name;
+  }
+  return undefined;
+}
+
 export function resolveTaskProfile(cwd, name) {
   if (typeof name !== "string" || !name.trim())
     throw new Error("taskProfile must be a non-empty profile name.");

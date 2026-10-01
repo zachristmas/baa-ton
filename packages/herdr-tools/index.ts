@@ -111,7 +111,7 @@ import {
 } from "./harness-adapter.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 const { acknowledgeActivation } = (await freshImport("./activation-ack.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./activation-ack.mjs");
-const { loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
+const { findTaskProfile, loadTaskProfileConfig, resolveTaskProfile } = (await freshImport("./profile-config.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./profile-config.mjs");
 const { ownerRecord: lockOwnerRecord, reclaimLockDir } = (await freshImport("./inbox/lock-owner.mjs", import.meta.url, MODULES_VERSION)) as typeof import("./inbox/lock-owner.mjs");
 import {
   authorizeStanding,
@@ -1748,6 +1748,7 @@ function normalizedLanes(
   rootGoalId: string,
   defaultReadOnly = false,
   profileResolver?: (name: string) => ReturnType<typeof resolveTaskProfile>,
+  profileMatcher?: (profile: LaunchProfile) => string | undefined,
 ): Lane[] {
   const values = inputs.length ? inputs : [objective];
   return values.map((input, index) => {
@@ -1799,6 +1800,7 @@ function normalizedLanes(
             input.launchProfile,
             `Lane ${laneId} launchProfile`,
           ));
+    const canonicalTaskProfile = input.taskProfile ?? (launchProfile ? profileMatcher?.(launchProfile) : undefined);
     return {
       id: laneId,
       objective: input.objective,
@@ -1825,7 +1827,7 @@ function normalizedLanes(
             launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION,
           }
         : {}),
-      ...(input.taskProfile ? { taskProfile: input.taskProfile } : {}),
+      ...(canonicalTaskProfile ? { taskProfile: canonicalTaskProfile } : {}),
       ...(configuredProfile?.permissionMode ? { permissionMode: configuredProfile.permissionMode } : {}),
       ...((input.allowArtifact ?? configuredProfile?.allowArtifact) === true ? { allowArtifact: true } : {}),
       ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
@@ -8619,6 +8621,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       rootGoalId,
       configuredProfile?.readOnly === true,
       (name) => resolveTaskProfile(cwd, name),
+      (profile) => findTaskProfile(cwd, profile),
     );
     if (
       target.worktree &&
@@ -8675,6 +8678,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
       (launchProfileInput === undefined
         ? undefined
         : validateLaunchProfile(launchProfileInput));
+    const canonicalTaskProfile = taskProfile ?? (launchProfile ? findTaskProfile(cwd, launchProfile) : undefined);
     const stamp = now();
     const goals = createWorkflowGoals(id, objective, lanes);
     const workflow: Workflow = {
@@ -8695,7 +8699,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
         rootPaneId: root.pane_id,
         rootSessionPath,
       },
-      ...(taskProfile ? { taskProfile } : {}),
+      ...(canonicalTaskProfile ? { taskProfile: canonicalTaskProfile } : {}),
       launchProfile,
       ...(launchProfile
         ? { launchProfileVersion: LAUNCH_PROFILE_SCHEMA_VERSION }
@@ -8894,6 +8898,9 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
             `dispatch ${w.id}`,
             signal,
           );
+          const policyRefusal = standing.evidence.find((entry) => entry.kind === "approval-policy-not-applied")?.text;
+          if (policyRefusal && /uses an ad-hoc launchProfile|has no configured taskProfile/.test(policyRefusal))
+            throw new Error(`Dispatch refused before approval: ${policyRefusal.replace(/^Standing dispatch: /, "")}. Use a configured named taskProfile.`);
           await persistStanding(cwd, w.id, standing);
           const approved =
             standing.granted ||
