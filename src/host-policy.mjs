@@ -21,6 +21,14 @@ export function codexPolicy(config, server = 'baa-ton-native', worker) {
     ...tools.map(tool => [`${prefix}.tools.${tool}.approval_mode`, ask.includes(tool) ? 'prompt' : 'approve']),
   ];
 }
+
+export function codexWorkerTable(config, command, loader, worker) {
+  const names = toolList(worker).map(tool => tool.name), ask = askList(config);
+  // A snapshot allowlist and loader policy digest fence new tools/config changes.
+  // Compact native TOML avoids multi-kilobyte commands through a terminal line.
+  const modes = names.map(name => `${name}={approval_mode=${JSON.stringify(ask.includes(name) ? 'prompt' : 'approve')}}`).join(',');
+  return `{command=${JSON.stringify(command)},args=${JSON.stringify([loader])},enabled=true,enabled_tools=${JSON.stringify(names)},default_tools_approval_mode="prompt",tools={${modes}}}`;
+}
 export function codexConfig(config) {
   const server = 'baa-ton-native';
   const entries = [

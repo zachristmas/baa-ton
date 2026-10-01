@@ -2,9 +2,9 @@
 
 ## Version and scope
 
-Baseline: `zachristmas/baa-ton` main at `dba8e02ee06b3830c4de83e9d69d141,06382c1b53` (PR181). Installed native reference: HERDR 0.9.1, API protocol 22/schema 1. Node reference: 22.22.3. Codex CLI reference: 0.159.0; Claude reference: 2.1.286.
+Baseline: `zachristmas/baa-ton` main at `dba8e02ee06b3830c4de83e9d69d1498982c1b53` (PR181). Installed native reference: HERDR 0.9.1, API protocol 22/schema 1. Node reference: 22.22.3. Codex CLI reference: 0.159.0; Claude reference: 2.1.286.
 
-The initial request was a simplification review without implementation. The user subsequently requested the aggressive reduction, unified installer/TUI, agent-ready configuration mode, and a draft PR before installation. This branch implements that local review candidate. No live MCP installation, model launch, machine registration, existing agent interruption or deployment was performed by this implementation task. A separate fleet setup is outside this diff.
+The initial request was a simplification review without implementation. The user subsequently requested the aggressive reduction, unified installer/TUI, agent-ready configuration mode, and a draft PR before installation. This branch implements that local review candidate. The user later approved a local MCP installation, isolated smoke tests, and copying the reviewed runtime to two existing SSH hosts. These operational checks are recorded below; the committed configuration examples remain generic. No existing agent was interrupted or account switched.
 
 No original checkout existed at the expected legacy paths on the inspected Mac; old skills referenced a missing checkout. A clean isolated clone was used, preserving existing work. The baseline remains in Git and an external source archive was retained. No old state/config directories were rewritten.
 
@@ -24,16 +24,16 @@ Physical lines include comments and blanks. Tests, declarations, docs and config
 | Measure | Baseline | Review candidate |
 |---|---:|---:|
 | Runtime files, including installers/audit script | 94 | 25 |
-| Runtime physical LOC | 42,835 | 1,505 |
-| Runtime nonblank LOC | 41,179 | 1,460 |
-| Runtime UTF-8 bytes | 1,932,770 | 117,969 |
+| Runtime physical LOC | 42,835 | 1,531 |
+| Runtime nonblank LOC | 41,179 | 1,484 |
+| Runtime UTF-8 bytes | 1,932,770 | 119,889 |
 | Test/support/smoke files | 123 | 8 |
-| Test/support/smoke physical LOC | 31,867 | 1,063 |
+| Test/support/smoke physical LOC | 31,867 | 1,092 |
 | Declaration files / LOC | 28 / 799 | 0 / 0 |
 | Direct runtime npm dependencies | 2 | 0 |
 | Operator tool surface | 33 Pi + 1 MCP-only | 12 MCP/CLI; 9 worker tools |
 
-Runtime LOC falls **96.5%**; bytes fall **93.9%**. Runtime file count falls 73.4%; total files fall from 279 to 50. Tool count falls 64.7%, not 80–90%. These are source-size measures, **not proof of equivalent behavior or a measured percentage of cognitive complexity**. The smaller implementation deliberately removes substantial autonomous lifecycle behavior and its tests. Compact formatting also affects LOC, which is why bytes are included.
+Runtime LOC falls **96.4%**; bytes fall **93.8%**. Runtime file count falls 73.4%; total files fall from 279 to 50. Tool count falls 64.7%, not 80–90%. These are source-size measures, **not proof of equivalent behavior or a measured percentage of cognitive complexity**. The smaller implementation deliberately removes substantial autonomous lifecycle behavior and its tests. Compact formatting also affects LOC, which is why bytes are included.
 
 For state, the baseline `contract.ts` declares 50 exported types, 34 of them object-shaped contracts; these are not 34 independent databases. Its durable graph includes workflows, lanes, per-lane/root goals, supervisors, root turns, retries, approval/question/message records, session logs, controller mappings, ownership, closure and retirement records, alongside operator/controller/inbox state. The candidate has six conceptual records—goal, job, message, embedded result/verification, exact approval, chain—in one JSON file per explicit scope plus generated launch files. There is no global root registry or global run-state switch.
 
@@ -91,7 +91,7 @@ Rollback: disconnect/disable only the newly installed v2 host entry, retain its 
 | Ask-list | Exact names only; unknown/wildcard rejected; changed snapshot refuses startup | Confirm selected tools prompt and routine tools do not in the local Codex UI |
 | Installer/TUI/agent | All four project integrations, 28 skills, preview/cancel, idempotence, partial selection, conflict/symlink preservation, JSON CLI and POSIX wrapper | Real client skill discovery; native Windows/PowerShell wrapper runs |
 
-At the recorded candidate, **62 tests pass** under `npm test` in approximately three seconds. Tests use temporary directories, in-memory fake HERDR and a real fake-native executable process. No paid model was launched. Independent GPT Astra review found and drove fixes for cancellation, stale identity/result/approval, delivery uncertainty and installer inheritance issues. This evidence is meaningful but does not replace live harness qualification.
+At the recorded candidate, **64 tests pass** under `npm test` in approximately three seconds. Tests use temporary directories, in-memory fake HERDR and a real fake-native executable process. The automated suite launches no paid model. Independent GPT Astra review found and drove fixes for cancellation, stale identity/result/approval, delivery uncertainty and installer inheritance issues. This evidence is meaningful but does not replace live harness qualification.
 
 Installed Codex 0.159.0 accepted the generated config in a read-only config parse. Invalid values for both `default_tools_approval_mode` and per-tool `approval_mode` were rejected with the documented enum; generated TOML was separately parsed after an existing server table and preserved that server. Skill frontmatter validation was run. The old controller suite could not be completed reliably in the sandbox because process/socket checks hit EPERM; no claim is made that every removed legacy test previously passed or that v2 replaces its entire coverage.
 
@@ -105,3 +105,9 @@ Installed Codex 0.159.0 accepted the generated config in a read-only config pars
 Remote scope routing is implemented via native SSH to a prepared host-local runtime; fixture tests cover both POSIX and Windows command/payload boundaries, immutable endpoint binding and uncertain failure. Native agent labels are persisted separately from durable job IDs, stay below32 characters, include scope identity and are collision-checked against native agents before resource creation.
 
 There is no voice bridge, automatic remote runtime distribution, autonomous stage advancement, retention service, global root, self-healing process supervisor or cross-account credential route here. A future voice coordinator can invoke the local executor's same CLI/MCP; host-local copies can perform fleet work through existing HERDR/SSH. Machine ownership does not decide whether a workspace/account is personal or work-related.
+
+## Live startup qualification (in progress)
+
+The approved Mac host entry is registered with the exact twelve-tool allowlist and native ask-list settings, preserving unrelated configuration. Local HERDR server 0.9.0 accepts the 0.9.1 CLI API; no server upgrade/restart was performed. Native startup initially exposed two issues missed by fake-native tests: a fresh shell can reject start as busy, and a multi-kilobyte inline Codex command can remain truncated at the shell. Startup now retries only the explicit pre-execution busy rejection, and Codex uses a generated per-job MCP loader plus one compact native TOML table (about 910 bytes in the inspected setup). The loader pins config, worker, scope and policy digest; all nine worker tool modes remain explicit.
+
+A fresh local Codex worker now starts with the requested Luna/Fast profile and read-only sandbox. At this checkpoint it is blocked by the native scratch-folder trust dialog, with no task yet delivered. That permission has not been auto-accepted or bypassed. The earlier uncertain records are preserved and were cancelled only after observing shell-only processes and no native agent. The running blocked worker will be inspected/reconnected rather than duplicated. A complete model result and fleet transport qualification remain pending.

@@ -42,8 +42,8 @@ process.stdout.write(JSON.stringify({ result }) + '\\n');
   return { dir, config, log };
 }
 
-function client(t, args) {
-  const process = spawn(globalThis.process.execPath, [join(root, 'src/mcp.mjs'), ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+function client(t, args, entry = join(root, 'src/mcp.mjs')) {
+  const process = spawn(globalThis.process.execPath, [entry, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
   let next = 1, buffer = '', errors = ''; const pending = new Map();
   process.stderr.on('data', data => { errors += data; });
   process.stdout.on('data', data => {
@@ -68,7 +68,7 @@ function client(t, args) {
 }
 
 test('real stdio MCP process serves tools and drives native argv through a fake executable', async t => {
-  const { config, log } = await fixture(t), mcp = client(t, ['--config', config]);
+  const { config, log, dir } = await fixture(t), mcp = client(t, ['--config', config]);
   const initialized = await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   assert.equal(initialized.result.serverInfo.name, 'baa-ton-native');
   assert.match(initialized.result.instructions, /human can redirect any pane/);
@@ -80,6 +80,11 @@ test('real stdio MCP process serves tools and drives native argv through a fake 
   const created = await call('herdr_dispatch', { scope: 'a', profile: 'fast', task: 'Read this task only.', requestId: 'dispatch-one' });
   assert.ok(!created.result.isError, JSON.stringify(created));
   assert.equal(created.result.structuredContent.result.status, 'running');
+  const worker = client(t, [], join(dir, 'state/launch/a/dispatch-one/mcp.mjs'));
+  await worker.request('initialize', { protocolVersion: '2025-06-18' });
+  assert.equal((await worker.request('tools/list', {})).result.tools.length, 9);
+  const own = await worker.request('tools/call', { name: 'herdr_status', arguments: { job: 'dispatch-one' } });
+  assert.equal(own.result.structuredContent.result.id, 'dispatch-one');
   const data = JSON.parse(await readFile(log, 'utf8'));
   const start = data.calls.find(args => args[0] === 'agent' && args[1] === 'start');
   assert.ok(start.includes('exact-test-model')); assert.ok(start.includes('model_reasoning_effort="low"'));

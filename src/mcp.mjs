@@ -54,8 +54,7 @@ export async function server(baton, input = process.stdin, output = process.stdo
   for (const controller of active.values()) controller.abort();
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const options = flags(process.argv.slice(2));
+export async function run(options) {
   try {
     const config = await loadConfig(options.config);
     if (options.policy && options.policy !== policyDigest(config)) throw new Error('Approval ask-list or tool surface changed. Regenerate the host config and reconnect before executing tools.');
@@ -63,3 +62,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
   catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1; }
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run(flags(process.argv.slice(2)));

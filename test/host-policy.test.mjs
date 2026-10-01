@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { launch } from '../src/profiles.mjs';
 
 const exec = promisify(execFile);
 test('exact ask-list produces native per-tool prompts and explicit routine approvals', () => {
@@ -20,6 +21,21 @@ test('exact ask-list produces native per-tool prompts and explicit routine appro
   for (const ask of [['herdr_*'], ['herdr_goal.pause'], ['herdr_unknown'], ['herdr_goal', 'herdr_goal'], 'all']) assert.throws(() => askList({ approvals: { ask } }), /exact tool names/);
   assert.throws(() => askList({ approvals: { ask: [], bypass: true } }), /cannot be disabled/);
   assert.notEqual(policyDigest(config), policyDigest({ approvals: { ask: [] } }));
+});
+
+test('compact worker loader retains scope, restricted tools, exact approval modes and policy fence', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'baa-worker-launch-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'config.json');
+  const raw = { version: 2, stateDir: join(dir, 'state'), scopes: { local: { cwd: dir, workspace: 'w1' } }, profiles: {}, approvals: { ask: ['herdr_dispatch'] } };
+  await writeFile(file, JSON.stringify(raw)); const config = await loadConfig(file);
+  const prepared = await launch(config, 'local', { id: 'worker', access: 'read' }, { harness: 'codex', model: 'gpt-6-luna', effort: 'low', serviceTier: 'priority' });
+  const table = prepared.argv.find(value => value.startsWith('mcp_servers.baa-ton={'));
+  assert.match(table, /herdr_dispatch=\{approval_mode="prompt"\}/);
+  assert.match(table, /herdr_result=\{approval_mode="approve"\}/);
+  assert.ok(!table.includes('herdr_approve')); assert.ok(prepared.argv.join(' ').length < 1024);
+  const loader = join(config.stateDir, 'launch/local/worker/mcp.mjs');
+  raw.approvals.ask = []; await writeFile(file, JSON.stringify(raw));
+  await assert.rejects(exec(process.execPath, [loader]), error => error.code === 1 && /ask-list or tool surface changed/.test(error.stderr));
 });
 
 test('generated host snapshot refuses to start after its ask-list changes', async t => {
