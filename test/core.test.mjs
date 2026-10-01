@@ -14,6 +14,7 @@ class FakeHerdr {
   constructor() { this.agents = new Map(); this.calls = []; this.serial = 0; }
   async workspace(workspace) { this.calls.push(['workspace', workspace]); return { workspace: { workspace_id: workspace } }; }
   async workspaces() { return { workspaces: [] }; }
+  async list() { return { agents: [...this.agents.values()] }; }
   async create(scope, job) {
     this.calls.push(['create', scope, job.id]);
     const pane = `w${++this.serial}:p1`, workspace = job.branch ? `w${this.serial}` : scope.workspace;
@@ -22,7 +23,7 @@ class FakeHerdr {
   }
   async start(job, profile, argv) {
     this.calls.push(['start', job.id, profile, argv]);
-    const agent = this.agents.get(job.pane); Object.assign(agent, { agent: profile.harness, name: job.id, agent_session: { kind: 'id', value: `session-${job.id}`, source: 'native', agent: profile.harness } });
+    const agent = this.agents.get(job.pane); Object.assign(agent, { agent: profile.harness, name: job.agentName, agent_session: { kind: 'id', value: `session-${job.id}`, source: 'native', agent: profile.harness } });
     return { agent: structuredClone(agent) };
   }
   async get(pane) { if (!this.agents.has(pane)) throw new Error('missing pane'); return structuredClone(this.agents.get(pane)); }
@@ -375,4 +376,16 @@ test('all worker launch adapters exclude the canonical controlling connection', 
     if (harness === 'pi') { assert.ok(result.argv.includes('--no-extensions')); assert.ok(result.argv.includes('--extension')); }
     if (harness === 'opencode') assert.equal(JSON.parse(result.env.OPENCODE_CONFIG_CONTENT).mcp['baa-ton-native'].enabled, false);
   }
+});
+
+test('long durable IDs receive distinct native labels under32 characters and collision refuses before create', async t => {
+  const { baton, herdr, dispatch } = await fixture(t);
+  const key = 'a'.repeat(80), a = await dispatch('a', { requestId: key }), b = await dispatch('b', { requestId: key });
+  assert.equal(a.id, key); assert.match(a.agentName, /^[A-Za-z0-9_-]{1,32}$/); assert.notEqual(a.agentName, b.agentName);
+  const { digest } = await import('../src/store.mjs');
+  const collided = `b-${digest({ scope: 'a', key: 'collision' }).slice(0, 28)}`;
+  herdr.agents.set('occupied', { name: collided });
+  const before = herdr.calls.filter(call => call[0] === 'create').length;
+  await assert.rejects(dispatch('a', { requestId: 'collision' }), /label already exists/);
+  assert.equal(herdr.calls.filter(call => call[0] === 'create').length, before);
 });

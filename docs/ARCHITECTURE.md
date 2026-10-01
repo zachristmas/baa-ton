@@ -12,7 +12,7 @@ flowchart LR
   Exact --> Interface
 ```
 
-`src/herdr.mjs` has a fixed list of native operations using argv arrays and no shell. `profiles.mjs` maps explicit profiles to documented launch options. No adapter registry or runtime capability negotiation is added. Remote execution uses a host-local copy of this same small runtime; `--machine` native discovery is available, but remote dispatch is rejected until that local runtime is configured. This keeps a future voice coordinator → fast Mac executor → SSH/HERDR fleet bridge straightforward without implementing it now.
+`src/herdr.mjs` has a fixed list of native operations using argv arrays and no shell. `profiles.mjs` maps explicit profiles to documented launch options. No adapter registry or runtime capability negotiation is added. Remote scopes use one native SSH invocation of this same host-local CLI, with explicit Node/runtime/config paths and immutable account/endpoint binding. The JSON tool payload stays on stdin; POSIX quoting and an encoded fixed PowerShell command cover the two supported host types. Native `--machine` remains available for diagnostics; dispatch uses the prepared host-local runtime. This keeps a future voice coordinator → fast Mac executor → SSH/HERDR fleet bridge straightforward without implementing it now.
 
 `core.mjs` sequences those primitives and records six conceptual entities: scope goal, job, message, result/verification evidence, permission request, and chain. Five collections/fields plus binding/revision metadata live in one scope file; result/verification is embedded in its job. Native process status is queried, not mirrored into a second supervisor graph.
 

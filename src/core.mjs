@@ -2,8 +2,10 @@ import { Store, digest, id, name } from './store.mjs';
 import { Herdr, identity, sameAgent } from './herdr.mjs';
 import { profile as resolveProfile } from './config.mjs';
 import { launch } from './profiles.mjs';
+import { remoteCall } from './remote.mjs';
 
 const finished = new Set(['reported', 'verified', 'cancelled']);
+const scopeBinding = (config, scope) => ({ machine: config.machine || 'local', session: config.session || 'default', ...config.scopes[scope], ...(config.scopes[scope].remote ? { endpoint: config.remotes[config.scopes[scope].remote] } : {}) });
 function text(value, label, max = 16000) {
   if (typeof value !== 'string' || !value.trim() || value.length > max || value.includes('\0')) throw new Error(`${label} must be nonempty text, at most ${max} characters.`);
   return value;
@@ -17,8 +19,8 @@ function evidence(value) {
 }
 
 export class Baton {
-  constructor(config, { herdr = new Herdr(config), store = new Store(config.stateDir), now = Date.now, worker, scope } = {}) {
-    Object.assign(this, { config, herdr, store, now, worker, pinnedScope: scope });
+  constructor(config, { herdr = new Herdr(config), store = new Store(config.stateDir), now = Date.now, remote = remoteCall, worker, scope } = {}) {
+    Object.assign(this, { config, herdr, store, now, remote, worker, pinnedScope: scope });
   }
   scope(key) {
     key ||= this.pinnedScope;
@@ -28,12 +30,12 @@ export class Baton {
   }
   async state(key) {
     const scope = this.scope(key), state = await this.store.read(scope);
-    const binding = { machine: this.config.machine || 'local', session: this.config.session || 'default', ...this.config.scopes[scope] };
+    const binding = scopeBinding(this.config, scope);
     if (state.binding && digest(state.binding) !== digest(binding)) throw new Error('Scope configuration changed. Use a new scope name; existing jobs remain bound to their original endpoint/workspace.');
     return state;
   }
   async change(key, mutate) {
-    const scope = this.scope(key), binding = { machine: this.config.machine || 'local', session: this.config.session || 'default', ...this.config.scopes[scope] };
+    const scope = this.scope(key), binding = scopeBinding(this.config, scope);
     return this.store.change(scope, state => {
       if (state.binding && digest(state.binding) !== digest(binding)) throw new Error('Scope binding changed; use a new scope name.');
       state.binding = binding;
@@ -62,10 +64,10 @@ export class Baton {
       if (this.worker) { const state = await this.state(this.scope(scope)); if (live.workspace_id !== this.config.scopes[this.scope(scope)].workspace && !Object.values(state.jobs).some(saved => saved.pane === pane)) throw new Error('This pane is outside the assigned scope.'); }
       return { live };
     }
-    if (!scope && !this.pinnedScope) return { scopes: this.config.scopes, profiles: this.config.profiles, native: await this.herdr.workspaces() };
+    if (!scope && !this.pinnedScope) return { scopes: this.config.scopes, profiles: this.config.profiles, native: await this.herdr.workspaces(), agents: (await this.herdr.list()).agents?.map(agent => ({ name: agent.name, pane: agent.pane_id, workspace: agent.workspace_id, harness: agent.agent, state: agent.agent_status, cwd: agent.cwd, terminal: agent.terminal_id })), machine: this.config.machine || 'local' };
     scope = this.scope(scope);
     const state = await this.state(scope);
-    if (!job) return state;
+    if (!job) return { scope, goal: state.goal, revision: state.revision, binding: state.binding, profiles: this.config.profiles, counts: { jobs: Object.keys(state.jobs).length, pendingMessages: Object.values(state.messages).filter(message => ['pending', 'sending', 'uncertain'].includes(message.status)).length }, jobs: Object.values(state.jobs).slice(-50).map(job => ({ id: job.id, agentName: job.agentName, pane: job.pane, workspace: job.workspace, profile: job.profile.key, status: job.status, revision: job.revision })), approvals: Object.values(state.approvals).filter(request => ['pending', 'allow'].includes(request.status) && request.expiresAt > this.now()), note: 'Newest 50 jobs; drill down with job ID for identity, result and output.' };
     const saved = jobOf(state, job);
     if (!saved.pane) return saved;
     let live;
@@ -100,6 +102,7 @@ export class Baton {
     if (this.config.machine) throw new Error('Remote dispatch needs this small runtime installed on that host. Use a host-local MCP/CLI there; read-only native remote status remains available.');
     const selected = resolveProfile(this.config, profile);
     const key = requestId ? name(requestId) : id('job');
+    const agentName = `b-${digest({ scope, key }).slice(0, 28)}`;
     const signature = digest({ profile: selected, task, access, branch, base, reviewOf, previousStage });
     const reservation = await this.change(scope, state => {
       if (state.jobs[key]) {
@@ -112,13 +115,15 @@ export class Baton {
       if (reviewOf && !jobOf(state, reviewOf).result) throw new Error('Review requires a reported result.');
       if (reviewOf && access !== 'read') throw new Error('Review jobs must be read-only.');
       if (branch && Object.values(state.jobs).some(job => job.branch === branch && job.status !== 'cancelled')) throw new Error('That branch is already reserved in this scope.');
-      const job = { id: key, signature, task, profile: selected, access, ...(branch ? { branch, base: base || 'HEAD' } : {}), ...(reviewOf ? { reviewOf, reviewDigest: digest(state.jobs[reviewOf].result), reviewRevision: state.jobs[reviewOf].revision } : {}), status: 'preparing', createdAt: this.now(), lastActivity: this.now(), nudges: 0, revision: 0 };
+      if (Object.values(state.jobs).some(job => job.agentName === agentName)) throw new Error('Native agent label collision; choose another requestId.');
+      const job = { id: key, agentName, signature, task, profile: selected, access, ...(branch ? { branch, base: base || 'HEAD' } : {}), ...(reviewOf ? { reviewOf, reviewDigest: digest(state.jobs[reviewOf].result), reviewRevision: state.jobs[reviewOf].revision } : {}), status: 'preparing', createdAt: this.now(), lastActivity: this.now(), nudges: 0, revision: 0 };
       state.jobs[key] = job;
       return { job };
     });
     if (reservation.existing) return reservation.existing;
     const job = reservation.job;
     try {
+      if ((await this.herdr.list()).agents?.some(agent => agent.name === job.agentName)) throw new Error('Native agent label already exists. Inspect it; do not overwrite or relaunch it.');
       const spec = this.config.scopes[scope];
       await this.herdr.workspace(spec.workspace);
       const prepared = await launch(this.config, scope, job, selected);

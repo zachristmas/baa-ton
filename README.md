@@ -34,7 +34,7 @@ The installer preserves unrelated configuration and refuses modified/unowned Baa
 
 See [examples/config.json](examples/config.json). Scopes name an explicit workspace and cwd; they are not inferred from the focused pane. Multiple scopes are independent, including their pause state. A scope's endpoint/workspace/cwd binding is immutable once used; use a new name when changing it.
 
-Profiles select an exact harness/model/effort, retain existing authentication, and never change global defaults. Distinct new assignments get fresh jobs and panes; reuse a request ID only to retry the same assignment. The requesting user's preferred fast model can be configured as a profile without becoming another user's default.
+Profiles select an exact harness/model/effort (and optional Codex `serviceTier: "priority"` when Fast is supported), retain existing authentication, and never change global defaults. Distinct new assignments get fresh jobs and panes; reuse a request ID only to retry the same assignment. The requesting user's preferred fast model can be configured as a profile without becoming another user's default.
 
 ```json
 "approvals": {
@@ -55,6 +55,12 @@ node src/cli.mjs host-config --config /absolute/path/config.json
 ```
 
 Installation of that proposal into a global host config is a separate explicit choice. Local Codex clients share their host configuration; cloud-backed chats do not automatically acquire a local MCP server.
+
+## Remote machines
+
+[examples/fleet.json](examples/fleet.json) routes named local scopes to an existing SSH host and its explicit host-local Baa-ton scope. The same validated tool call runs through native SSH into that host's Node/CLI/config; task JSON stays on stdin, with POSIX quoting or a fixed encoded PowerShell command. There is no relay service, OAuth bridge, shell tool or automatic remote installer. The first call pins the SSH account/runtime/config mapping; changing it requires a new scope name.
+
+Prepare the reviewed runtime, Node, HERDR, authenticated harness and exact profiles on each remote host through its own approved installer run. The TUI can configure a prepared SSH route, and agent setup JSON supports the same `remotes` fields. Remote permissions and state stay on that host. The controlling client can inspect results and send cross-machine messages by targeting each remote scope. A connection failure is uncertain and never automatically retried. POSIX/Windows transport fixtures pass; actual remote execution still needs qualification.
 
 ## Working with jobs
 

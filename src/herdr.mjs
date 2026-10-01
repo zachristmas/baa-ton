@@ -58,7 +58,7 @@ export class Herdr {
     for (const [key, value] of Object.entries(environment)) args.push('--env', `${key}=${value}`);
     return this.call(args, { effect: true });
   }
-  start(job, profile, argv) { return this.call(['agent', 'start', job.id, '--kind', profile.harness, '--pane', atom(job.pane), '--timeout', '30000', '--', ...argv], { timeout: 35000, effect: true }); }
+  start(job, profile, argv) { if (!/^[a-z][a-z0-9_-]{0,31}$/.test(job.agentName || '')) throw new Error('Native agent name must be 1..32 lowercase safe characters.'); return this.call(['agent', 'start', job.agentName, '--kind', profile.harness, '--pane', atom(job.pane), '--timeout', '30000', '--', ...argv], { timeout: 35000, effect: true }); }
   prompt(pane, text, signal) { return this.call(['agent', 'prompt', atom(pane), text], { effect: true, signal }); }
 }
 

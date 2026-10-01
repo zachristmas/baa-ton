@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "stateDir": "/absolute/local/path/baa-state",
+  "scopes": {
+    "mac-personal": { "remote": "personal-mac", "scope": "personal" },
+    "windows-personal": { "remote": "personal-windows", "scope": "personal" }
+  },
+  "profiles": {},
+  "remotes": {
+    "personal-mac": {
+      "ssh": "EXISTING_MAC_SSH_ALIAS",
+      "platform": "posix",
+      "node": "/absolute/remote/path/node",
+      "runtime": "/absolute/remote/path/baa-ton",
+      "config": "/absolute/remote/path/config.json"
+    },
+    "personal-windows": {
+      "ssh": "EXISTING_WINDOWS_SSH_ALIAS",
+      "platform": "windows",
+      "node": "C:\\Program Files\\nodejs\\node.exe",
+      "runtime": "C:\\Users\\USER\\baa-ton",
+      "config": "C:\\Users\\USER\\baa-ton-config.json"
+    }
+  },
+  "approvals": { "ask": ["herdr_connect", "herdr_reconnect", "herdr_approve"] }
+}

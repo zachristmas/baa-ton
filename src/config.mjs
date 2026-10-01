@@ -2,6 +2,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, resolve, dirname } from 'node:path';
 import { name } from './store.mjs';
 import { askList } from './host-policy.mjs';
+import { validateRemote } from './remote.mjs';
 
 export async function loadConfig(path = process.env.BAA_CONFIG) {
   if (!path) throw new Error('Pass --config /absolute/path/config.json or set BAA_CONFIG. No global config is guessed.');
@@ -19,8 +20,10 @@ export function validateConfig(config) {
   if (config.maxActive !== undefined && (!Number.isInteger(config.maxActive) || config.maxActive < 1 || config.maxActive > 20)) throw new Error('maxActive must be 1..20.');
   for (const [key, scope] of Object.entries(config.scopes)) {
     name(key);
+    if (scope.remote) { name(scope.remote); name(scope.scope); if (!config.remotes?.[scope.remote] || Object.keys(scope).some(field => !['remote', 'scope'].includes(field))) throw new Error(`Remote scope ${key} requires only remote and scope.`); continue; }
     if (!isAbsolute(scope.cwd || '') || typeof scope.workspace !== 'string' || !scope.workspace) throw new Error(`Scope ${key} requires an absolute cwd and explicit workspace.`);
   }
+  for (const [key, remote] of Object.entries(config.remotes || {})) { name(key); validateRemote(remote); }
   for (const key of Object.keys(config.profiles)) { name(key); profile(config, key); }
   return config;
 }
@@ -35,5 +38,6 @@ export function profile(config, key) {
   if (value.auth && value.auth !== 'existing') throw new Error('Only existing harness authentication is supported; no billing-route changes.');
   if (value.permissions && !['native', 'broker'].includes(value.permissions)) throw new Error('Permissions are native or broker.');
   if (value.permissions === 'broker' && value.harness !== 'claude') throw new Error('Only Claude PermissionRequest supports the broker here. Other harnesses retain native permissions.');
+  if (value.serviceTier && (value.harness !== 'codex' || value.serviceTier !== 'priority')) throw new Error('Only the explicitly supported Codex priority/Fast service tier is mapped here. Verify model support first.');
   return { ...value, key };
 }

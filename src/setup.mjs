@@ -88,10 +88,25 @@ export async function wizard({ input = process.stdin, output = process.stdout, a
     if (existing && JSON.parse(existing).version !== 2) throw new Error('Legacy config requires an explicit migration review; it was not overwritten.');
     const config = existing ? JSON.parse(existing) : { version: 2, stateDir: join(projectRoot, '.baa-ton/state'), scopes: {}, profiles: {} };
     const scope = (await ask('Scope name [local]: ')).trim() || 'local';
-    try { const native = await new Herdr(config).workspaces(); output.write('Native workspaces:\n' + json(native.workspaces || native)); } catch (error) { output.write(`Native discovery unavailable: ${error.message}\nEnter an inspected workspace ID, or leave empty for skills/config only.\n`); }
-    const workspace = (await ask(`HERDR workspace ID [${config.scopes[scope]?.workspace || 'skip'}]: `)).trim() || config.scopes[scope]?.workspace;
-    if (workspace) config.scopes[scope] = { cwd: projectRoot, workspace };
-    for (const harness of harnesses) {
+    const remoteMode = (await ask('Route this scope to an already prepared SSH host? [y/N]: ')).trim().toLowerCase() === 'y';
+    if (remoteMode) {
+      const alias = (await ask('Remote configuration name: ')).trim();
+      config.remotes ||= {}; config.remotes[alias] = {
+        ssh: (await ask('Existing SSH alias or user@host: ')).trim(),
+        platform: (await ask('Remote platform (posix/windows) [posix]: ')).trim() || 'posix',
+        node: (await ask('Absolute remote Node executable: ')).trim(),
+        runtime: (await ask('Absolute remote Baa-ton checkout: ')).trim(),
+        config: (await ask('Absolute remote Baa-ton config JSON: ')).trim(),
+      };
+      config.scopes[scope] = { remote: alias, scope: (await ask('Scope name in that remote config: ')).trim() };
+      output.write('Remote Node/runtime/config/profiles must already be prepared with this installer on that host. This setup does not install remotely or change SSH accounts.\n');
+    } else {
+      if (config.scopes[scope]?.remote) throw new Error('That scope already routes remotely. Choose a new name instead of silently rebinding it.');
+      try { const native = await new Herdr(config).workspaces(); output.write('Native workspaces:\n' + json(native.workspaces || native)); } catch (error) { output.write(`Native discovery unavailable: ${error.message}\nEnter an inspected workspace ID, or leave empty for skills/config only.\n`); }
+      const workspace = (await ask(`HERDR workspace ID [${config.scopes[scope]?.workspace || 'skip'}]: `)).trim() || config.scopes[scope]?.workspace;
+      if (workspace) config.scopes[scope] = { cwd: projectRoot, workspace };
+    }
+    for (const harness of remoteMode ? [] : harnesses) {
       const model = (await ask(`${harness}: exact model ID (empty keeps existing profiles): `)).trim();
       if (!model) continue;
       const key = (await ask(`Profile name [${harness}]: `)).trim() || harness;

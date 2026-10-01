@@ -20,7 +20,8 @@ const state = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file)) : { agents
 state.calls.push(args);
 const flag = name => args[args.indexOf(name) + 1];
 let result;
-if (args[0] === 'workspace' && args[1] === 'list') result = { type: 'workspace_list', workspaces: [{ workspace_id: 'wa', label: 'test' }] };
+if (args[0] === 'agent' && args[1] === 'list') result = { type: 'agent_list', agents: Object.values(state.agents) };
+else if (args[0] === 'workspace' && args[1] === 'list') result = { type: 'workspace_list', workspaces: [{ workspace_id: 'wa', label: 'test' }] };
 else if (args[0] === 'workspace' && args[1] === 'get') result = { type: 'workspace_info', workspace: { workspace_id: args[2] } };
 else if (args[0] === 'tab' && args[1] === 'create') {
   const pane = 'wa:p' + (Object.keys(state.agents).length + 1);
@@ -114,7 +115,7 @@ test('actual Claude hook process returns one exact native decision after MCP app
   t.after(() => child.kill());
   let stdout = '', stderr = ''; child.stdout.on('data', data => { stdout += data; }); child.stderr.on('data', data => { stderr += data; });
   const exited = new Promise(resolve => child.once('exit', resolve));
-  child.stdin.end(JSON.stringify({ hook_event_name: 'PermissionRequest', session_id: 'session-review-job', tool_name: 'Read', tool_input: { file_path: '/tmp/exact-file' } }));
+  child.stdin.end(JSON.stringify({ hook_event_name: 'PermissionRequest', session_id: created.result.structuredContent.result.identity.session.value, tool_name: 'Read', tool_input: { file_path: '/tmp/exact-file' } }));
   let request;
   for (let i = 0; i < 100 && !request; i++) {
     const state = JSON.parse(await readFile(join(dir, 'state/a.json')));

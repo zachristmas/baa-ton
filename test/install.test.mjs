@@ -67,7 +67,7 @@ test('conflicts, symlinks and invalid settings fail before project mutation', as
 
 test('TUI cancellation preserves every file after harness/profile/ask-list selection', async t => {
   const { home, project } = await fixture(t);
-  const answers = [project, 'codex,pi', 'local', '', 'chosen-codex', 'fast', 'low', 'chosen-pi', 'secondary', 'medium', 'openai', 'herdr_approve,herdr_dispatch', 'n', 'n'];
+  const answers = [project, 'codex,pi', 'local', 'n', '', 'chosen-codex', 'fast', 'low', 'chosen-pi', 'secondary', 'medium', 'openai', 'herdr_approve,herdr_dispatch', 'n', 'n'];
   const before = await snapshot(home); let displayed = '';
   const result = await wizard({ ask: async () => answers.shift(), output: { write: text => { displayed += text; } } });
   assert.equal(answers.length, 0); assert.equal(result.applied, false); assert.deepEqual(result.ask, ['herdr_approve', 'herdr_dispatch']);

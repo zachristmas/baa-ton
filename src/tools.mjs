@@ -48,6 +48,12 @@ export async function invoke(baton, name, args, signal) {
   const definition = definitions.find(item => item[0] === name);
   if (!definition || !toolList(baton.worker).some(tool => tool.name === name)) throw new Error(`Tool ${name} is not available on this connection.`);
   validate(definition[2], args);
+  const scope = args.scope || baton.pinnedScope;
+  if (scope && baton.config.scopes[scope]?.remote) {
+    baton.scope(scope);
+    await baton.change(scope, () => null); // Pin the SSH account/runtime/config mapping before any remote action.
+    return baton.remote(baton.config, scope, name, args, { signal, worker: baton.worker });
+  }
   return definition[3] === 'approve' ? decideApproval(baton, args) : baton[definition[3]](args, signal);
 }
 

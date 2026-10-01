@@ -12,7 +12,7 @@ export async function launch(config, scope, job, profile) {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const write = async (file, data) => { const path = join(dir, file); await writeFile(path, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 }); return path; };
   if (profile.harness === 'codex') {
-    return { env, argv: ['--model', profile.model, '--sandbox', job.access === 'read' ? 'read-only' : 'workspace-write', '-c', `model_reasoning_effort=${JSON.stringify(profile.effort)}`, '-c', `mcp_servers.baa-ton.command=${JSON.stringify(command)}`, '-c', `mcp_servers.baa-ton.args=${JSON.stringify(args)}`, '-c', 'mcp_servers.baa-ton.enabled=true', '-c', 'mcp_servers.baa-ton-native.enabled=false', ...codexPolicy(config, 'baa-ton', job.id).flatMap(([key, value]) => ['-c', `${key}=${JSON.stringify(value)}`])] };
+    return { env, argv: ['--model', profile.model, '--sandbox', job.access === 'read' ? 'read-only' : 'workspace-write', '-c', `model_reasoning_effort=${JSON.stringify(profile.effort)}`, ...(profile.serviceTier ? ['-c', `service_tier=${JSON.stringify(profile.serviceTier)}`] : []), '-c', `mcp_servers.baa-ton.command=${JSON.stringify(command)}`, '-c', `mcp_servers.baa-ton.args=${JSON.stringify(args)}`, '-c', 'mcp_servers.baa-ton.enabled=true', '-c', 'mcp_servers.baa-ton-native.enabled=false', ...codexPolicy(config, 'baa-ton', job.id).flatMap(([key, value]) => ['-c', `${key}=${JSON.stringify(value)}`])] };
   }
   if (profile.harness === 'claude') {
     const mcp = await write('mcp.json', { mcpServers: { 'baa-ton': { command, args, env } } });
