@@ -35,6 +35,10 @@ The installer offers the same setup through its interactive terminal wizard or a
 - **Evidence over “done.”** An idle pane is not proof of success. Workers report results; a human or reviewer verifies them.
 - **Cleanup is opt-in.** It is disabled unless explicitly configured. Workspaces and worktrees are never removed by cleanup.
 
+## Repository-owned task roles
+
+Each project keeps its own named roles in `.baa-ton/config.json`. Orientation selects the repository catalog; Codex CLI acts as the control plane and passes only a configured role name to dispatch. That role selects the worker harness, exact model, effort, and existing authentication. The control-plane harness connection is separate from worker profiles, so a repository can use Codex CLI to control Claude-only HERDR workers. Unknown roles and caller-supplied model/effort overrides are rejected.
+
 ## Learn more
 
 [Architecture](docs/ARCHITECTURE.md) · [Operations & configuration](docs/OPERATIONS.md) · [Design principles](docs/DESIGN-PHILOSOPHY.md) · [Migration & qualification history](docs/MIGRATION.md)

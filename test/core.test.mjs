@@ -48,6 +48,12 @@ async function fixture(t) {
 }
 const proof = { summary: 'Done', checks: ['Ran named test; exit 0.'], artifacts: ['report.txt'] };
 
+test('dispatch accepts only a role present in this repository config and does not take model overrides', async t => {
+  const { baton, herdr } = await fixture(t);
+  await assert.rejects(baton.dispatch({ scope: 'a', profile: 'unconfigured-role', task: 'Inspect only.', requestId: 'unknown-role' }), /Unknown profile unconfigured-role/);
+  assert.equal(herdr.calls.length, 0);
+});
+
 async function verifyJob(baton, job, scope = 'a') {
   await baton.result({ scope, action: 'submit', job: job.id, revision: job.revision, evidence: proof });
   return baton.result({ scope, action: 'verify', job: job.id, revision: job.revision, reviewer: 'human', evidence: proof });

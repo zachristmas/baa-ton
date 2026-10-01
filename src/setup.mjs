@@ -7,6 +7,7 @@ import { loadConfig, validateConfig } from './config.mjs';
 import { askList, codexConfig, policyDigest } from './host-policy.mjs';
 import { definitions } from './tools.mjs';
 import { Herdr } from './herdr.mjs';
+import { parseTaskRoleSelection, taskRoles } from './task-roles.mjs';
 
 const source = resolve(import.meta.dirname, '..');
 const begin = '# BEGIN BAA-TON NATIVE', end = '# END BAA-TON NATIVE';
@@ -81,7 +82,7 @@ export async function wizard({ input = process.stdin, output = process.stdout, a
   const ui = suppliedAsk ? null : createInterface({ input, output });
   const ask = suppliedAsk || (question => ui.question(question));
   try {
-    output.write('\nBaa-ton setup · native HERDR · Node 22+\nSelect the project, harnesses, profiles and approval ask-list. Review before applying.\n\n');
+    output.write('\nBaa-ton setup · native HERDR · Node 22+\nSelect the project, control-plane connections, named worker roles and approval ask-list.\nWorker role profiles are saved in this repository; each dispatch selects a role name. Review before applying.\n\n');
     const projectRoot = resolve((await ask(`Project path [${process.cwd()}]: `)).trim() || process.cwd());
     const harnesses = ((await ask('Harnesses (comma separated: codex,claude,opencode,pi) [codex]: ')).trim() || 'codex').split(',').map(value => value.trim());
     const existing = await read(join(projectRoot, '.baa-ton/config.json'));
@@ -106,14 +107,25 @@ export async function wizard({ input = process.stdin, output = process.stdout, a
       const workspace = (await ask(`HERDR workspace ID [${config.scopes[scope]?.workspace || 'skip'}]: `)).trim() || config.scopes[scope]?.workspace;
       if (workspace) config.scopes[scope] = { cwd: projectRoot, workspace };
     }
-    for (const harness of remoteMode ? [] : harnesses) {
-      const model = (await ask(`${harness}: exact model ID (empty keeps existing profiles): `)).trim();
-      if (!model) continue;
-      const key = (await ask(`Profile name [${harness}]: `)).trim() || harness;
-      const effort = (await ask('Effort/thinking [medium]: ')).trim() || 'medium';
-      const provider = ['pi', 'opencode'].includes(harness) ? (await ask('Provider ID [openai]: ')).trim() || 'openai' : undefined;
-      config.profiles[key] = { harness, model, effort, auth: 'existing', ...(provider ? { provider } : {}) };
-      if (harness === 'claude' && (await ask('Enable exact non-Bash native permission broker? [y/N]: ')).trim().toLowerCase() === 'y') config.profiles[key].permissions = 'broker';
+    if (!remoteMode) {
+      const defaultRoles = Object.keys(config.profiles).length ? Object.keys(config.profiles).join(',') : Object.keys(taskRoles).join(',');
+      const selectedRoles = parseTaskRoleSelection(await ask(`Worker task roles (comma-separated, or none) [${defaultRoles}]: `), config.profiles);
+      let lastHarness;
+      for (const key of selectedRoles) {
+        const current = config.profiles[key] || {};
+        const fallbackEffort = taskRoles[key]?.effort || 'medium';
+        const harness = (await ask(`Worker harness for ${key} (codex,claude,opencode,pi) [${current.harness || lastHarness || ''}]: `)).trim() || current.harness || lastHarness;
+        if (!['codex', 'claude', 'opencode', 'pi'].includes(harness)) throw new Error(`Choose a supported worker harness for ${key}.`);
+        lastHarness = harness;
+        const model = (await ask(`Exact model ID for ${key} [${current.model || 'required'}]: `)).trim();
+        if (!model && current.model) continue;
+        if (!model) { output.write(`Skipped ${key}: no exact model ID was supplied.\n`); continue; }
+        const effort = (await ask(`Effort/thinking for ${key} [${current.effort || fallbackEffort}]: `)).trim() || current.effort || fallbackEffort;
+        const provider = ['pi', 'opencode'].includes(harness) ? (await ask(`Provider ID for ${key} [${current.provider || 'openai'}]: `)).trim() || current.provider || 'openai' : undefined;
+        const profile = { ...current, harness, model, effort, auth: current.auth || 'existing', ...(provider ? { provider } : {}) };
+        if (harness === 'claude' && current.permissions !== 'broker' && (await ask(`Enable exact non-Bash native permission broker for ${key}? [y/N]: `)).trim().toLowerCase() === 'y') profile.permissions = 'broker';
+        config.profiles[key] = profile;
+      }
     }
     output.write('Available ask-list tools: ' + definitions.map(entry => entry[0]).join(', ') + '\n');
     const initialAsk = askList(config), response = (await ask(`Ask-list [${initialAsk.join(',')}]; enter none for no extra MCP prompts: `)).trim();

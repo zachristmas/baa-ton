@@ -14,12 +14,9 @@
     }
   },
   "profiles": {
-    "fast": {
-      "harness": "codex",
-      "model": "YOUR_EXACT_MODEL_ID",
-      "effort": "low",
-      "auth": "existing"
-    }
+    "planning": { "harness": "claude", "model": "YOUR_EXACT_MODEL_ID", "effort": "xhigh", "auth": "existing" },
+    "implementation": { "harness": "claude", "model": "YOUR_EXACT_MODEL_ID", "effort": "high", "auth": "existing" },
+    "deep-review": { "harness": "claude", "model": "YOUR_EXACT_MODEL_ID", "effort": "xhigh", "auth": "existing" }
   },
   "approvals": {
     "ask": [

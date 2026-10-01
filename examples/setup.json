@@ -1,7 +1,7 @@
 {
   "version": 2,
   "projectRoot": "/absolute/path/to/project",
-  "harnesses": ["codex", "claude", "opencode", "pi"],
+  "harnesses": ["codex"],
   "connect": true,
   "config": {
     "version": 2,
@@ -11,8 +11,9 @@
       "personal": { "cwd": "/absolute/path/to/project", "workspace": "INSPECTED_WORKSPACE_ID" }
     },
     "profiles": {
-      "fast": { "harness": "codex", "model": "YOUR_EXACT_MODEL_ID", "effort": "low", "auth": "existing" },
-      "review": { "harness": "claude", "model": "YOUR_EXACT_CLAUDE_ID", "effort": "high", "auth": "existing", "permissions": "broker" }
+      "planning": { "harness": "claude", "model": "YOUR_EXACT_CLAUDE_ID", "effort": "high", "auth": "existing" },
+      "implementation": { "harness": "claude", "model": "YOUR_EXACT_CLAUDE_ID", "effort": "high", "auth": "existing" },
+      "deep-review": { "harness": "claude", "model": "YOUR_EXACT_CLAUDE_ID", "effort": "xhigh", "auth": "existing" }
     },
     "approvals": { "ask": ["herdr_connect", "herdr_reconnect", "herdr_approve"] }
   }
