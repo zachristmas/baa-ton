@@ -1,9 +1,21 @@
 import { containsGhPrMutation, containsGitPush, containsUnsafeShellExecution, consumeExternalApproval, issueExternalApproval, parseApprovedExternalOperation } from "./external-approval.mjs";
 
 /** The Pi tool_call pre-execution approval path. Dependencies keep UI, Git and execution out of this module. */
+const stages = new Set(["parse", "resolve-before", "confirm", "resolve-after", "allow", "deny"]);
+const denials = new Set(["none", "disabled", "non_root", "no_ui", "no_session", "no_confirm", "unsafe_command", "unsupported_command", "binding_mismatch", "declined", "binding_changed", "token_rejected", "resolver_error"]);
+
 export async function approveExternalGhCommand({ command, enabled, caller, mode = "unknown", hasUI, confirmAvailable = false, sessionFile, resolveBinding, confirm, now, diagnostic }) {
+  const snapshot = (stage, denial = "none") => ({
+    mode: typeof mode === "string" ? mode : "unknown",
+    hasUI: Boolean(hasUI),
+    confirmAvailable: Boolean(confirmAvailable),
+    stage: stages.has(stage) ? stage : "deny",
+    denial: denials.has(denial) ? denial : "resolver_error",
+  });
   const record = (stage, denial = "none") => {
-    try { diagnostic?.({ mode: typeof mode === "string" ? mode : "unknown", hasUI: Boolean(hasUI), confirmAvailable: Boolean(confirmAvailable), stage, denial }); } catch { /* diagnostics never affect authorization */ }
+    const value = snapshot(stage, denial);
+    try { diagnostic?.(value); } catch { /* diagnostics never affect authorization */ }
+    return value;
   };
   const deny = (category, stage = "deny") => { record(stage, category); return false; };
   if (!enabled) return deny("disabled");
@@ -44,8 +56,12 @@ export function registerExternalApprovalBeforeToolCall(pi, dependencies) {
     if (!containsGhPrMutation(event.input.command) && !containsGitPush(event.input.command) && !containsUnsafeShellExecution(event.input.command)) return;
     externalApprovalChecked.add(event);
     const resolved = typeof dependencies === "function" ? await dependencies(event, ctx) : dependencies;
-    const approved = await approveExternalGhCommand({ ...resolved, mode: ctx?.mode ?? resolved?.mode, hasUI: ctx?.hasUI ?? resolved?.hasUI, confirmAvailable: resolved?.confirmAvailable ?? typeof resolved?.confirm === "function", command: event.input.command });
-    if (!approved) return { block: true, reason: "External command was not explicitly approved." };
+    let finalSnapshot;
+    const approved = await approveExternalGhCommand({ ...resolved, mode: ctx?.mode ?? resolved?.mode, hasUI: ctx?.hasUI ?? resolved?.hasUI, confirmAvailable: resolved?.confirmAvailable ?? typeof resolved?.confirm === "function", command: event.input.command, diagnostic: (value) => { finalSnapshot = value; resolved?.diagnostic?.(value); } });
+    if (!approved) {
+      const state = finalSnapshot;
+      return { block: true, reason: `External command was not explicitly approved (mode=${state.mode}, hasUI=${state.hasUI}, confirmAvailable=${state.confirmAvailable}, stage=${state.stage}, denial=${state.denial}).` };
+    }
     externalApprovalGranted.add(event);
   });
 }

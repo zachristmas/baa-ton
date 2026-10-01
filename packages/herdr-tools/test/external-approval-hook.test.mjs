@@ -50,7 +50,7 @@ async function dispatchToolCall(command, options = {}) {
     state.executions++;
     state.executedCommand = event.input.command;
   }
-  return { blocked: Boolean(result?.block), ...state };
+  return { blocked: Boolean(result?.block), reason: result?.reason, ...state };
 }
 
 test("index.ts registers the same production approval registration seam used by the integration harness", async () => {
@@ -165,6 +165,29 @@ function parsePushOperation(command) {
   const oid = /git push origin ([a-f0-9]{40}):refs\/heads\/([\w./-]+)/.exec(command);
   return { operation: "push", argv: command.split(" "), remoteName: "origin", branch: oid[2], sourceRef: oid[1], destinationRef: `refs/heads/${oid[2]}` };
 }
+
+test("fail-closed tool results expose only the final enum diagnostics and never execute", async () => {
+  const cases = [
+    [commandCreate, { hasUI: false, mode: "headless" }, "deny", "no_ui"],
+    [commandCreate, { enabled: false }, "deny", "disabled"],
+    [commandCreate, { caller: "child" }, "deny", "non_root"],
+    [commandCreate, { sessionFile: null }, "deny", "no_session"],
+    [commandCreate, { confirmAvailable: false }, "deny", "no_confirm"],
+    ["gh pr list && eval \\\"$BAA_PR_COMMAND\\\"", {}, "parse", "unsafe_command"],
+    [commandCreate, { mismatch: true }, "deny", "binding_mismatch"],
+    [commandCreate, { confirm: false }, "deny", "declined"],
+    [commandCreate, { changeDuringConfirm: { head: "b".repeat(40) } }, "deny", "binding_changed"],
+    [commandCreate, { resolveBinding: async () => { throw new Error("token-abc /private/path"); } }, "deny", "resolver_error"],
+  ];
+  for (const [command, options, stage, denial] of cases) {
+    const result = await dispatchToolCall(command, options);
+    assert.equal(result.blocked, true, denial);
+    assert.equal(result.executions, 0, denial);
+    assert.match(result.reason, new RegExp(`stage=${stage}, denial=${denial}`));
+    assert.match(result.reason, /mode=(?:tui|headless|unknown), hasUI=(?:true|false), confirmAvailable=(?:true|false)/);
+    for (const secret of [command, "secret-owner", "private-repo", "token-abc", "/private/path", "/repo"]) assert.equal(result.reason.includes(secret), false);
+  }
+});
 
 test("diagnostics record only safe state and stable categories, never command or binding data", async () => {
   const approved = await dispatchToolCall(commandCreate);
