@@ -26,6 +26,8 @@ On a computer connected to ChatGPT, ask dot to inspect the prerequisites and gui
 
 The installer offers the same setup through its interactive terminal wizard or a reviewed agent-ready JSON plan. Setup is repeated for each project/workspace. Scopes keep goals and pause state independent, but they do not restrict which configured profile a dispatch or chain can select: choose a profile explicitly when assigning work. See [the agent JSON steps and terminal options](docs/OPERATIONS.md#one-installer-two-interfaces) for details.
 
+Worker roles are named in each repository's `.baa-ton/config.json`. The Codex connection is the control plane; `harnesses` selects that connection, while `config.profiles` selects worker harnesses independently. For example, set `harnesses: ["codex"]` and define Claude-only role profiles. The TUI and setup JSON configure the same profile map. Dispatch and every chain stage must name a configured profile; unknown names fail before HERDR starts a worker. See [the CIC role catalog](examples/config.json) and [agent setup example](examples/setup.json).
+
 **Prefer the terminal?** Requirements are Node.js 22.19+ and an installed HERDR CLI. Clone the repository and run `./install.sh` (macOS/Linux/WSL), `./install.ps1` (PowerShell), or `install.cmd` (Windows). The installer previews proposed changes before applying them. Live qualification used HERDR CLI 0.9.1 (with server 0.9.0 compatibility confirmed).
 
 ## Why Baa-ton

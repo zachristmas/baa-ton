@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { install, harnessPaths } from '../src/install.mjs';
 import { setup, wizard } from '../src/setup.mjs';
+import { parseTaskRoleSelection, taskRoles } from '../src/task-roles.mjs';
 const exec = promisify(execFile);
 async function fixture(t) {
   const home = await mkdtemp(join(tmpdir(), 'baa-install-home-')); t.after(() => rm(home, { recursive: true, force: true }));
@@ -67,20 +68,43 @@ test('conflicts, symlinks and invalid settings fail before project mutation', as
 
 test('TUI cancellation preserves every file after harness/profile/ask-list selection', async t => {
   const { home, project } = await fixture(t);
-  const answers = [project, 'codex,pi', 'local', 'n', '', 'chosen-codex', 'fast', 'low', 'chosen-pi', 'secondary', 'medium', 'openai', 'herdr_approve,herdr_dispatch', 'n', 'n'];
+  const answers = [project, 'codex', 'local', 'n', '', 'implementation,deep-review', 'claude', 'claude-sonnet-5-5', 'high', 'n', '', 'claude-fable-5-1', 'xhigh', 'n', 'herdr_approve,herdr_dispatch', 'n', 'n'];
   const before = await snapshot(home); let displayed = '';
   const result = await wizard({ ask: async () => answers.shift(), output: { write: text => { displayed += text; } } });
   assert.equal(answers.length, 0); assert.equal(result.applied, false); assert.deepEqual(result.ask, ['herdr_approve', 'herdr_dispatch']);
+  assert.ok(displayed.includes('implementation')); assert.ok(displayed.includes('claude-fable-5-1')); assert.ok(displayed.includes('deep-review'));
   assert.match(displayed, /nothing installed/); assert.deepEqual(await snapshot(home), before);
 });
 
-test('agent setup JSON and POSIX installer share preview/apply behavior', async t => {
+test('agent setup JSON stores repo-owned named roles while Codex remains a separate control-plane connection', async t => {
   const { home, project, settings } = await fixture(t); settings.harnesses = ['codex'];
+  settings.config.profiles = {
+    implementation: { harness: 'claude', model: 'claude-sonnet-5-5', effort: 'high', auth: 'existing' },
+    'deep-review': { harness: 'claude', model: 'claude-fable-5-1', effort: 'xhigh', auth: 'existing' },
+  };
   const path = join(home, 'agent-setup.json'); await writeFile(path, JSON.stringify(settings));
   const before = await snapshot(project);
   const preview = await exec('sh', ['install.sh', '--settings', path]); assert.equal(JSON.parse(preview.stdout).applied, false); assert.deepEqual(await snapshot(project), before);
   const applied = await exec(process.execPath, ['src/install.mjs', '--settings', path, '--apply']); assert.equal(JSON.parse(applied.stdout).applied, true);
+  const config = JSON.parse(await readFile(join(project, '.baa-ton/config.json'), 'utf8'));
+  assert.equal(config.profiles.implementation.harness, 'claude'); assert.equal(config.profiles.implementation.effort, 'high');
+  assert.equal(config.profiles['deep-review'].model, 'claude-fable-5-1'); assert.equal(config.profiles['deep-review'].auth, 'existing');
+  assert.match(await readFile(join(project, '.codex/config.toml'), 'utf8'), new RegExp(join(project, '.baa-ton/config.json').replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   const final = await snapshot(project); await exec(process.execPath, ['src/install.mjs', '--settings', path, '--apply']); assert.deepEqual(await snapshot(project), final);
+});
+
+test('role picker defaults to the seven exact Claude roles and rejects unsupported role names', () => {
+  assert.deepEqual(parseTaskRoleSelection(''), ['planning', 'quick', 'balanced', 'implementation', 'sustained', 'review', 'deep-review']);
+  assert.deepEqual(Object.fromEntries(Object.entries(taskRoles).map(([role, profile]) => [role, [profile.harness, profile.model, profile.effort]])), {
+    planning: ['claude', 'claude-opus-5-5', 'xhigh'],
+    quick: ['claude', 'claude-sonnet-5-5', 'low'],
+    balanced: ['claude', 'claude-sonnet-5-5', 'medium'],
+    implementation: ['claude', 'claude-sonnet-5-5', 'high'],
+    sustained: ['claude', 'claude-sonnet-5-5', 'medium'],
+    review: ['claude', 'claude-opus-5-5', 'medium'],
+    'deep-review': ['claude', 'claude-fable-5-1', 'xhigh'],
+  });
+  assert.throws(() => parseTaskRoleSelection('planning,unlisted'), /Choose unique task roles/);
 });
 
 test('agent setup rejects removal and ignored target overrides before writes', async t => {

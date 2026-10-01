@@ -17,6 +17,8 @@ node src/install.mjs --settings /absolute/path/setup.json --apply
 
 The first command validates and previews without writes. The second applies the reviewed project changes. The TUI and agent mode call the same implementation. Baa-ton configuration is JSON; Codex's generated MCP settings are TOML. Claude and OpenCode use their native JSON MCP settings; Pi receives a project extension.
 
+`harnesses` selects control-plane connections; each `config.profiles` entry is a named worker role. They are independent, so Codex can control Baa-ton while every configured worker role uses Claude Code. The TUI starts with the seven role names in [the CIC catalog example](../examples/config.json), and pre-fills their Claude model and effort selections. Setup JSON writes the same role map. A role is dispatchable only when its exact name is present in the repository's `.baa-ton/config.json`; dispatch and chain creation reject unknown names before starting a worker.
+
 Skills-only installation remains available:
 
 ```sh
@@ -36,7 +38,7 @@ Optional `cleanup` uses the existing one-shot `tick`, without adding a service. 
 
 HERDR 0.9.1 exposes `pane close` by pane ID only; it has no atomic compare-and-close argument. Baa-ton rechecks the recorded identity, idle state, verified state sequence, and foreground process immediately before the exact-pane call. HERDR documents pane IDs as stable and non-reused after closure, but there remains a narrow race if a human replaces the pane's agent between that final check and the close request.
 
-Profiles select an exact harness/model/effort (and optional Codex `serviceTier: "priority"` when Fast is supported), retain existing authentication, and never change global defaults. Distinct new assignments get fresh jobs and panes; reuse a request ID only to retry the same assignment. The requesting user's preferred fast model can be configured as a profile without becoming another user's default.
+Each role selects an exact harness/model/effort (and optional Codex `serviceTier: "priority"` when Fast is supported), retains existing authentication, and never changes global defaults. Distinct new assignments get fresh jobs and panes; reuse a request ID only to retry the same assignment. The requesting user's preferred fast model can be configured as a repository role without becoming another user's default.
 
 ```json
 "approvals": {
