@@ -19,6 +19,11 @@ export function validateConfig(config) {
   if (!config.scopes || !config.profiles) throw new Error('Configure scopes and profiles. Empty profiles is valid for inspection.');
   askList(config);
   if (config.maxActive !== undefined && (!Number.isInteger(config.maxActive) || config.maxActive < 1 || config.maxActive > 20)) throw new Error('maxActive must be 1..20.');
+  if (config.cleanup !== undefined) {
+    if (!config.cleanup || typeof config.cleanup !== 'object' || Array.isArray(config.cleanup) || Object.keys(config.cleanup).some(key => !['mode', 'idleGraceSeconds'].includes(key))) throw new Error('cleanup accepts only mode and idleGraceSeconds.');
+    if (!['disabled', 'preview', 'close'].includes(config.cleanup.mode)) throw new Error('cleanup.mode must be disabled, preview, or close.');
+    if (config.cleanup.idleGraceSeconds !== undefined && (!Number.isInteger(config.cleanup.idleGraceSeconds) || config.cleanup.idleGraceSeconds < 60 || config.cleanup.idleGraceSeconds > 604800)) throw new Error('cleanup.idleGraceSeconds must be 60..604800.');
+  }
   for (const [key, scope] of Object.entries(config.scopes)) {
     name(key);
     if (scope.remote) { name(scope.remote); name(scope.scope); if (!config.remotes?.[scope.remote] || Object.keys(scope).some(field => !['remote', 'scope'].includes(field))) throw new Error(`Remote scope ${key} requires only remote and scope.`); continue; }

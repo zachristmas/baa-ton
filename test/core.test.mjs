@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Baton } from '../src/core.mjs';
@@ -9,6 +10,8 @@ import { Herdr, identity, sameAgent } from '../src/herdr.mjs';
 import { launch } from '../src/profiles.mjs';
 import { requestApproval, decideApproval, consumeApproval } from '../src/approvals.mjs';
 import { invoke, toolList } from '../src/tools.mjs';
+import { validateConfig } from '../src/config.mjs';
+import { gitChanges } from '../src/cleanup.mjs';
 
 class FakeHerdr {
   constructor() { this.agents = new Map(); this.calls = []; this.serial = 0; }
@@ -18,7 +21,7 @@ class FakeHerdr {
   async create(scope, job) {
     this.calls.push(['create', scope, job.id]);
     const pane = `w${++this.serial}:p1`, workspace = job.branch ? `w${this.serial}` : scope.workspace;
-    this.agents.set(pane, { pane_id: pane, workspace_id: workspace, terminal_id: `t${this.serial}`, agent_status: 'idle', interactive_ready: true, state_change_seq: 1 });
+    this.agents.set(pane, { pane_id: pane, workspace_id: workspace, terminal_id: `t${this.serial}`, agent_status: 'idle', interactive_ready: true, state_change_seq: 1, processIdentity: { group: this.serial, pids: [100 + this.serial] } });
     return { root_pane: { pane_id: pane, workspace_id: workspace }, ...(job.branch ? { worktree: { path: `/tmp/${job.id}` } } : {}) };
   }
   async start(job, profile, argv) {
@@ -29,7 +32,8 @@ class FakeHerdr {
   async get(pane) { if (!this.agents.has(pane)) throw new Error('missing pane'); return structuredClone(this.agents.get(pane)); }
   async prompt(pane, text) { this.calls.push(['prompt', pane, text]); if (this.error) throw this.error; return { agent: await this.get(pane) }; }
   async wait(pane) { this.calls.push(['wait', pane]); return { agent: await this.get(pane) }; }
-  async read() { return 'observed output'; }
+  async read(pane, lines) { this.calls.push(['read', pane, lines]); return 'observed output'; }
+  async close(pane) { this.calls.push(['close', pane]); this.agents.delete(pane); return { type: 'pane_closed', pane_id: pane }; }
 }
 
 async function fixture(t) {
@@ -43,6 +47,16 @@ async function fixture(t) {
   return { baton, herdr, config, dispatch, advance: seconds => { clock += seconds * 1000; } };
 }
 const proof = { summary: 'Done', checks: ['Ran named test; exit 0.'], artifacts: ['report.txt'] };
+
+async function verifyJob(baton, job, scope = 'a') {
+  await baton.result({ scope, action: 'submit', job: job.id, revision: job.revision, evidence: proof });
+  return baton.result({ scope, action: 'verify', job: job.id, revision: job.revision, reviewer: 'human', evidence: proof });
+}
+
+function enableCleanup(baton, mode = 'close') {
+  baton.config.cleanup = { mode, idleGraceSeconds: 60 };
+  baton.workspaceStatus = async () => '';
+}
 
 test('multiple scopes: pause is local, direct user messages still work, resume keeps state', async t => {
   const { baton, dispatch, herdr, advance } = await fixture(t);
@@ -176,6 +190,221 @@ test('native wrapper never invokes a shell and pins endpoint independently of ca
   const native = { pane_id: 'w1:p1', terminal_id: 't1', workspace_id: 'w1', agent: 'codex', interactive_ready: true, processIdentity: { group: 1, pids: [5] } };
   const saved = identity(native); assert.ok(sameAgent(saved, native));
   assert.ok(!sameAgent(saved, { ...native, processIdentity: { group: 1, pids: [6] } }));
+});
+
+test('native pane close uses only the exact pane ID and never invokes a shell', async () => {
+  const calls = [];
+  const herdr = new Herdr({ herdr: '/verified/herdr' }, async (...args) => { calls.push(args); return { stdout: '{"result":{"type":"pane_closed","pane_id":"w1:p1"}}' }; });
+  await herdr.close('w1:p1');
+  assert.deepEqual(calls[0][1], ['pane', 'close', 'w1:p1']);
+  assert.equal(calls[0][2].shell, false);
+});
+
+test('cleanup previews verified owned panes, applies after grace, archives output, and is idempotent', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton, 'preview');
+  const job = await dispatch(); await verifyJob(baton, job); advance(61);
+  await baton.change('a', state => { delete state.jobs[job.id].cleanupOwned; }); // Existing v2 jobs use the Baa-ton-generated native label.
+  const preview = await baton.tick({ scope: 'a' });
+  assert.deepEqual(preview.cleanup.candidates.map(candidate => candidate.pane), [job.pane]);
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+
+  baton.config.cleanup.mode = 'close';
+  const applied = await baton.tick({ scope: 'a' });
+  assert.deepEqual(applied.cleanup.closed.map(candidate => candidate.pane), [job.pane]);
+  assert.equal(herdr.calls.filter(call => call[0] === 'close').length, 1);
+  const saved = (await baton.state('a')).jobs[job.id];
+  assert.equal(saved.cleanup.status, 'closed');
+  assert.equal(saved.cleanup.transcript.text, 'observed output');
+  assert.equal(saved.result.evidence.summary, proof.summary);
+  assert.equal(saved.cwd, job.cwd);
+
+  await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.filter(call => call[0] === 'close').length, 1);
+});
+
+test('native idle alone, blocked attention, and stalled work are never cleanup candidates', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const idle = await dispatch(); herdr.agents.get(idle.pane).agent_status = 'idle'; advance(61);
+  assert.deepEqual((await baton.tick({ scope: 'a' })).cleanup.closed, []);
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+
+  await verifyJob(baton, idle);
+  herdr.agents.get(idle.pane).agent_status = 'blocked'; advance(61);
+  const waiting = await baton.tick({ scope: 'a' });
+  assert.ok(waiting.cleanup.blocked.some(item => item.reason.includes('user attention')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+
+  const stalled = await dispatch('a', { requestId: 'stalled' });
+  await baton.change('a', state => { state.jobs[stalled.id].status = 'stalled'; });
+  await baton.tick({ scope: 'a' });
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+});
+
+test('cleanup never closes adopted or reconnected user panes', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const job = await dispatch(); await verifyJob(baton, job); advance(61);
+  await baton.change('a', state => { state.jobs[job.id].cleanupOwned = false; state.jobs[job.id].adopted = true; });
+  const result = await baton.tick({ scope: 'a' });
+  assert.ok(result.cleanup.blocked.some(item => item.reason.includes('not Baa-ton-created')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+});
+
+test('legacy reconnected jobs without ownership metadata are never cleanup candidates', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const job = await dispatch();
+  const replacement = { ...herdr.agents.get(job.pane), pane_id: 'wa:p-replacement', terminal_id: 't-replacement' };
+  herdr.agents.set(replacement.pane_id, replacement);
+  const reconnected = await baton.reconnect({ scope: 'a', job: job.id, pane: replacement.pane_id, expectedTerminal: replacement.terminal_id });
+  await baton.change('a', state => { delete state.jobs[job.id].cleanupOwned; }); // Simulate state written before cleanup ownership was tracked.
+  await baton.result({ scope: 'a', action: 'submit', job: job.id, revision: reconnected.revision, evidence: proof });
+  await baton.result({ scope: 'a', action: 'verify', job: job.id, revision: reconnected.revision, reviewer: 'human', evidence: proof });
+  advance(61);
+  const result = await baton.tick({ scope: 'a' });
+  assert.ok(result.cleanup.blocked.some(item => item.reason.includes('not Baa-ton-created')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+});
+
+test('cleanup preview requires transcript archival to be possible', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton, 'preview');
+  const job = await dispatch(); await verifyJob(baton, job); advance(61);
+  herdr.read = async () => '';
+  const result = await baton.tick({ scope: 'a' });
+  assert.deepEqual(result.cleanup.candidates, []);
+  assert.ok(result.cleanup.blocked.some(item => item.reason.includes('transcript is empty')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+});
+
+test('approval creation that races a cleanup claim is rejected transactionally', async t => {
+  const { baton, dispatch } = await fixture(t);
+  const job = await dispatch('a', { profile: 'review' });
+  const originalChange = baton.change.bind(baton); let seeded = false;
+  baton.change = async (scope, mutate) => {
+    if (!seeded) {
+      seeded = true;
+      await originalChange(scope, state => { state.jobs[job.id].cleanup = { status: 'closing', claim: 'close-test' }; });
+    }
+    return originalChange(scope, mutate);
+  };
+  await assert.rejects(requestApproval(baton, { scope: 'a', job: job.id, session: `session-${job.id}`, tool: 'Read', input: { file_path: '/tmp/file' } }), /cleanup is in progress/);
+  const state = await baton.state('a');
+  assert.equal(Object.values(state.approvals).filter(request => request.job === job.id).length, 0);
+});
+
+test('cancel is refused after a cleanup claim', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const job = await dispatch(); await verifyJob(baton, job); advance(61);
+  await baton.change('a', state => { state.jobs[job.id].cleanup = { status: 'closing', claim: 'close-test' }; });
+  const before = herdr.calls.filter(call => call[0] === 'close').length;
+  await assert.rejects(baton.cancel({ scope: 'a', job: job.id, reason: 'Stop cleanup.' }), /cleanup is in progress/);
+  assert.equal(herdr.calls.filter(call => call[0] === 'close').length, before);
+});
+
+test('cleanup refuses pending approvals, active descendants, and dirty worktrees', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const job = await dispatch(); await verifyJob(baton, job); advance(61);
+  await baton.change('a', state => { state.approvals.waiting = { id: 'waiting', job: job.id, status: 'pending' }; });
+  const approval = await baton.tick({ scope: 'a' });
+  assert.ok(approval.cleanup.blocked.some(item => item.reason.includes('pending approval')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+
+  const { baton: descendantBaton, herdr: descendantHerdr, dispatch: dispatchParent, advance: advanceDescendant } = await fixture(t);
+  enableCleanup(descendantBaton);
+  const parent = await dispatchParent();
+  await descendantBaton.result({ scope: 'a', action: 'submit', job: parent.id, revision: 0, evidence: proof });
+  await descendantBaton.dispatch({ scope: 'a', profile: 'review', task: 'Review the result.', access: 'read', reviewOf: parent.id, requestId: 'reviewer' });
+  await descendantBaton.result({ scope: 'a', action: 'verify', job: parent.id, revision: 0, reviewer: 'human', evidence: proof });
+  advanceDescendant(61);
+  const descendants = await descendantBaton.tick({ scope: 'a' });
+  assert.ok(descendants.cleanup.blocked.some(item => item.reason.includes('active descendant reviewer')));
+  assert.equal(descendantHerdr.calls.some(call => call[0] === 'close'), false);
+
+  const { baton: dirtyBaton, herdr: dirtyHerdr, dispatch: dispatchDirty, advance: advanceDirty } = await fixture(t);
+  enableCleanup(dirtyBaton);
+  const dirty = await dispatchDirty(); await verifyJob(dirtyBaton, dirty); advanceDirty(61);
+  dirtyBaton.workspaceStatus = async () => ' M changed.txt\n';
+  const dirtyResult = await dirtyBaton.tick({ scope: 'a' });
+  assert.ok(dirtyResult.cleanup.blocked.some(item => item.reason.includes('unrecorded changes')));
+  assert.equal(dirtyHerdr.calls.some(call => call[0] === 'close'), false);
+});
+
+test('cleanup fails closed on stale session/process identity and scopes across workspaces', async t => {
+  const { baton, herdr, dispatch, advance } = await fixture(t);
+  enableCleanup(baton);
+  const stale = await dispatch(); await verifyJob(baton, stale); advance(61);
+  herdr.agents.get(stale.pane).agent_session.value = 'replacement-session';
+  const blocked = await baton.tick({ scope: 'a' });
+  assert.ok(blocked.cleanup.blocked.some(item => item.reason.includes('identity is stale')));
+  assert.equal(herdr.calls.some(call => call[0] === 'close'), false);
+
+  for (const mutate of [
+    live => { live.agent_status = 'working'; },
+    live => { live.state_change_seq++; },
+    live => { live.processIdentity.pids = [999]; },
+  ]) {
+    const { baton: swappedBaton, herdr: swappedHerdr, dispatch: dispatchSwapped, advance: advanceSwapped } = await fixture(t);
+    enableCleanup(swappedBaton);
+    const swapped = await dispatchSwapped(); await verifyJob(swappedBaton, swapped); advanceSwapped(61);
+    const get = swappedHerdr.get.bind(swappedHerdr); let reads = 0;
+    swappedHerdr.get = async pane => {
+      reads++;
+      if (reads === 3) mutate(swappedHerdr.agents.get(pane));
+      return get(pane);
+    };
+    const changedAfterClaim = await swappedBaton.tick({ scope: 'a' });
+    assert.ok(changedAfterClaim.cleanup.blocked.some(item => item.reason.includes('changed after cleanup claim')));
+    assert.equal((await swappedBaton.state('a')).jobs[swapped.id].cleanup.status, 'aborted');
+    assert.equal(swappedHerdr.calls.some(call => call[0] === 'close'), false);
+  }
+
+  const { baton: processBaton, herdr: processHerdr, dispatch: dispatchProcess, advance: advanceProcess } = await fixture(t);
+  enableCleanup(processBaton);
+  const processJob = await dispatchProcess(); await verifyJob(processBaton, processJob); advanceProcess(61);
+  processHerdr.agents.get(processJob.pane).processIdentity.pids = [999];
+  const changedProcess = await processBaton.tick({ scope: 'a' });
+  assert.ok(changedProcess.cleanup.blocked.some(item => item.reason.includes('foreground process identity changed')));
+  assert.equal(processHerdr.calls.some(call => call[0] === 'close'), false);
+
+  const { baton: multi, herdr: multiHerdr, dispatch: multiDispatch, advance: advanceMulti } = await fixture(t);
+  enableCleanup(multi);
+  const a = await multiDispatch('a'); const b = await multiDispatch('b');
+  await verifyJob(multi, a, 'a'); await verifyJob(multi, b, 'b'); advanceMulti(61);
+  const before = multiHerdr.calls.length;
+  await multi.tick({ scope: 'a' });
+  const aCloses = multiHerdr.calls.filter((call, index) => index >= before && call[0] === 'close').map(call => call[1]);
+  assert.deepEqual(aCloses, [a.pane]);
+  assert.equal(multiHerdr.calls.slice(before).some(call => call[0] === 'list'), false);
+  const afterA = multiHerdr.calls.length;
+  await multi.tick({ scope: 'b' });
+  const bCloses = multiHerdr.calls.filter((call, index) => index >= afterA && call[0] === 'close').map(call => call[1]);
+  assert.deepEqual(bCloses, [b.pane]);
+});
+
+test('cleanup policy config is explicit and rejects unsafe or unbounded options', async t => {
+  const { config } = await fixture(t);
+  config.cleanup = { mode: 'preview', idleGraceSeconds: 3600 };
+  assert.doesNotThrow(() => validateConfig(config));
+  config.cleanup.mode = 'close-all';
+  assert.throws(() => validateConfig(config), /mode must be/);
+  config.cleanup = { mode: 'close', idleGraceSeconds: 1 };
+  assert.throws(() => validateConfig(config), /idleGraceSeconds/);
+  config.cleanup = { mode: 'close', allWorkspaces: true };
+  assert.throws(() => validateConfig(config), /only mode and idleGraceSeconds/);
+});
+
+test('read-only Git guard detects untracked worktree changes', async t => {
+  const repo = await mkdtemp(join(tmpdir(), 'baa-cleanup-git-'));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  execFileSync('git', ['-C', repo, 'init', '--quiet'], { shell: false });
+  assert.equal(await gitChanges(repo), '');
+  await writeFile(join(repo, 'unrecorded.txt'), 'keep me');
+  assert.match(await gitChanges(repo), /unrecorded\.txt/);
 });
 
 test('schema validation rejects unknown actions/properties before mutation', async t => {

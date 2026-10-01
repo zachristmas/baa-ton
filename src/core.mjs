@@ -4,6 +4,7 @@ import { profile as resolveProfile } from './config.mjs';
 import { launch } from './profiles.mjs';
 import { remoteCall } from './remote.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { cleanupBlockers, cleanupTranscriptLimit, cleanupTranscriptLines, gitChanges, sameForegroundProcess } from './cleanup.mjs';
 
 const finished = new Set(['reported', 'verified', 'cancelled']);
 const scopeBinding = (config, scope) => ({ machine: config.machine || 'local', session: config.session || 'default', ...config.scopes[scope], ...(config.scopes[scope].remote ? { endpoint: config.remotes[config.scopes[scope].remote] } : {}) });
@@ -20,8 +21,8 @@ function evidence(value) {
 }
 
 export class Baton {
-  constructor(config, { herdr = new Herdr(config), store = new Store(config.stateDir), now = Date.now, remote = remoteCall, worker, scope } = {}) {
-    Object.assign(this, { config, herdr, store, now, remote, worker, pinnedScope: scope });
+  constructor(config, { herdr = new Herdr(config), store = new Store(config.stateDir), now = Date.now, remote = remoteCall, workspaceStatus = gitChanges, worker, scope } = {}) {
+    Object.assign(this, { config, herdr, store, now, remote, workspaceStatus, worker, pinnedScope: scope });
   }
   scope(key) {
     key ||= this.pinnedScope;
@@ -117,7 +118,7 @@ export class Baton {
       if (reviewOf && access !== 'read') throw new Error('Review jobs must be read-only.');
       if (branch && Object.values(state.jobs).some(job => job.branch === branch && job.status !== 'cancelled')) throw new Error('That branch is already reserved in this scope.');
       if (Object.values(state.jobs).some(job => job.agentName === agentName)) throw new Error('Native agent label collision; choose another requestId.');
-      const job = { id: key, agentName, signature, task, profile: selected, access, ...(branch ? { branch, base: base || 'HEAD' } : {}), ...(reviewOf ? { reviewOf, reviewDigest: digest(state.jobs[reviewOf].result), reviewRevision: state.jobs[reviewOf].revision } : {}), status: 'preparing', createdAt: this.now(), lastActivity: this.now(), nudges: 0, revision: 0 };
+      const job = { id: key, agentName, signature, task, profile: selected, access, cleanupOwned: true, ...(branch ? { branch, base: base || 'HEAD' } : {}), ...(reviewOf ? { reviewOf, reviewDigest: digest(state.jobs[reviewOf].result), reviewRevision: state.jobs[reviewOf].revision } : {}), status: 'preparing', createdAt: this.now(), lastActivity: this.now(), nudges: 0, revision: 0 };
       state.jobs[key] = job;
       return { job };
     });
@@ -177,6 +178,7 @@ export class Baton {
     const key = requestId ? name(requestId) : id('msg');
     const saved = await this.change(scope, state => {
       const target = jobOf(state, job);
+      if (target.cleanup?.status) throw new Error('This pane is being retired or needs inspection; reconnect to a freshly inspected pane before sending more work.');
       if (expectedRevision !== undefined && target.revision !== expectedRevision) throw new Error('Task changed while preparing assignment.');
       if (target.status === 'cancelled' && !redirect) throw new Error('Job is cancelled; explicitly redirect it before sending new work.');
       if (!target.identity) throw new Error('Job is not connected to a verified native agent.');
@@ -233,16 +235,24 @@ export class Baton {
     scope = this.scope(scope); proof = evidence(proof);
     if (!['submit', 'verify'].includes(action)) throw new Error('Result action: submit or verify.');
     const reporter = this.worker || (action === 'verify' && reviewer !== 'human' ? reviewer : undefined);
-    let observed;
+    let observed, reporterLive;
     if (reporter) {
       observed = jobOf(await this.state(scope), reporter);
-      const live = await this.live(scope, observed), fresh = jobOf(await this.state(scope), reporter);
-      if (fresh.status === 'cancelled' || fresh.revision !== observed.revision || !sameAgent(fresh.identity, live)) throw new Error('Reporter is cancelled or its native session changed. Reconnect explicitly.');
+      reporterLive = await this.live(scope, observed);
+      const fresh = jobOf(await this.state(scope), reporter);
+      if (fresh.status === 'cancelled' || fresh.revision !== observed.revision || !sameAgent(fresh.identity, reporterLive)) throw new Error('Reporter is cancelled or its native session changed. Reconnect explicitly.');
       observed = fresh;
     }
+    let targetLive;
+    try {
+      const target = jobOf(await this.state(scope), job);
+      const live = reporter === job ? reporterLive : await this.herdr.get(target.pane);
+      if (target.identity && sameAgent(target.identity, live)) targetLive = live;
+    } catch { /* Evidence remains recordable; cleanup will fail closed without a fresh native sequence. */ }
     return this.change(scope, state => {
       if (observed) { const current = jobOf(state, reporter); if (current.status === 'cancelled' || current.revision !== observed.revision || digest(current.identity) !== digest(observed.identity)) throw new Error('Reporter changed during result submission.'); }
       const target = jobOf(state, job);
+      if (target.cleanup?.status === 'closing') throw new Error('Pane cleanup is in progress; wait for its recorded outcome before changing the result.');
       if (target.status === 'cancelled') throw new Error('Job is cancelled; a result cannot revive it.');
       if (target.revision !== revision) throw new Error('Stale task revision; inspect the current job.');
       if (action === 'submit') {
@@ -261,7 +271,7 @@ export class Baton {
           if (other.status === 'cancelled' || other.reviewOf !== job || other.access !== 'read') throw new Error('Reviewer must be an active separate read-only job assigned to this result.');
           if (other.reviewRevision !== target.revision || other.reviewDigest !== digest(target.result)) throw new Error('Reviewer was assigned to an earlier result; dispatch a fresh review.');
         } else if (this.worker) throw new Error('A worker cannot claim to be the human.');
-        target.verification = { reviewer, evidence: proof, resultDigest: digest(target.result), at: this.now() }; target.status = 'verified';
+        target.verification = { reviewer, evidence: proof, resultDigest: digest(target.result), at: this.now(), ...(Number.isSafeInteger(targetLive?.state_change_seq) ? { stateChangeSeq: targetLive.state_change_seq } : {}) }; target.status = 'verified';
       }
       return target;
     });
@@ -272,9 +282,12 @@ export class Baton {
     if (proof.terminal !== expectedTerminal) throw new Error('Terminal changed since inspection.');
     return this.change(scope, state => {
       const target = jobOf(state, job);
+      if (target.cleanup?.status === 'closing') throw new Error('Pane cleanup is in progress; inspect it before reconnecting.');
       if (proof.harness !== target.profile.harness || proof.workspace !== target.workspace) throw new Error('Replacement must match the recorded harness and workspace.');
       target.previousIdentities ||= []; target.previousIdentities.push(target.identity);
       target.identity = proof; target.pane = pane; target.revision++; target.status = 'ready'; target.nudges = 0; target.lastActivity = this.now();
+      if (target.cleanup) { target.previousCleanup ||= []; target.previousCleanup.push(target.cleanup); delete target.cleanup; }
+      target.cleanupOwned = false;
       target.previousResults ||= []; if (target.result) target.previousResults.push(target.result);
       delete target.result; delete target.verification;
       for (const pending of Object.values(state.messages)) if (pending.job === job && ['pending', 'sending', 'uncertain'].includes(pending.status)) { pending.previousStatus = pending.status; pending.status = 'superseded'; }
@@ -289,43 +302,145 @@ export class Baton {
     if (proof.terminal !== expectedTerminal || proof.workspace !== this.config.scopes[scope].workspace || proof.harness !== selected.harness) throw new Error('Fresh terminal, scope workspace, and selected harness must match.');
     return this.change(scope, state => {
       if (state.jobs[job]) throw new Error('Job already exists; inspect or reconnect it.');
-      return state.jobs[job] = { id: job, pane, workspace: proof.workspace, cwd: live.cwd, profile: selected, task, identity: proof, access: 'existing', status: 'ready', revision: 0, nudges: 0, createdAt: this.now(), lastActivity: this.now(), adopted: true, note: 'Profile is caller-declared. Existing session model/effort are not changed or attested.' };
+      return state.jobs[job] = { id: job, pane, workspace: proof.workspace, cwd: live.cwd, profile: selected, task, identity: proof, access: 'existing', cleanupOwned: false, status: 'ready', revision: 0, nudges: 0, createdAt: this.now(), lastActivity: this.now(), adopted: true, note: 'Profile is caller-declared. Existing session model/effort are not changed or attested.' };
     });
+  }
+  async cleanup({ scope }, state = undefined) {
+    scope = this.scope(scope);
+    const policy = this.config.cleanup;
+    if (!policy || policy.mode === 'disabled') return undefined;
+    const idleGraceSeconds = policy.idleGraceSeconds ?? 86400;
+    const report = { mode: policy.mode, idleGraceSeconds, candidates: [], closed: [], blocked: [] };
+    state ||= await this.state(scope);
+    for (const listed of Object.values(state.jobs)) {
+      if (listed.status !== 'verified') continue;
+      let latestState = await this.state(scope);
+      let job = latestState.jobs[listed.id];
+      if (!job) continue;
+      if (job.cleanup?.status) {
+        if (job.cleanup.status !== 'closed') report.blocked.push({ job: job.id, reason: `prior cleanup state is ${job.cleanup.status}; inspect before retrying` });
+        continue;
+      }
+      let live;
+      try { live = await this.herdr.get(job.pane); }
+      catch { report.blocked.push({ job: job.id, reason: 'native pane is missing or unavailable' }); continue; }
+      let blockers = cleanupBlockers(latestState, job, live, this.now(), idleGraceSeconds);
+      if (blockers.length) { report.blocked.push({ job: job.id, reason: blockers.join('; ') }); continue; }
+      let changes;
+      try { changes = await this.workspaceStatus(job.cwd); }
+      catch { report.blocked.push({ job: job.id, reason: 'Git cleanliness could not be confirmed' }); continue; }
+      if (typeof changes !== 'string' || changes.length) { report.blocked.push({ job: job.id, reason: 'worktree has unrecorded changes' }); continue; }
+
+      const candidate = { job: job.id, pane: job.pane, workspace: job.workspace, terminal: job.identity.terminal, verifiedAt: job.verification.at, idleSeconds: Math.floor((this.now() - Math.max(job.lastActivity || 0, job.verification.at)) / 1000) };
+      let transcript;
+      try { transcript = await this.herdr.read(job.pane, cleanupTranscriptLines); }
+      catch { report.blocked.push({ job: job.id, reason: 'terminal transcript could not be captured' }); continue; }
+      if (typeof transcript !== 'string') { report.blocked.push({ job: job.id, reason: 'terminal transcript could not be captured' }); continue; }
+      const transcriptBytes = Buffer.byteLength(transcript, 'utf8');
+      if (!transcriptBytes || transcriptBytes > cleanupTranscriptLimit) {
+        report.blocked.push({ job: job.id, reason: 'terminal transcript is empty or exceeds the archive limit' }); continue;
+      }
+      if (policy.mode === 'preview') { report.candidates.push(candidate); continue; }
+
+      // Snapshot again after reading output so identity or task changes during
+      // inspection cannot retire a replacement session.
+      latestState = await this.state(scope);
+      job = latestState.jobs[listed.id];
+      if (!job) { report.blocked.push({ job: listed.id, reason: 'job record changed during cleanup inspection' }); continue; }
+      try { live = await this.herdr.get(job.pane); }
+      catch { report.blocked.push({ job: listed.id, reason: 'native pane changed during cleanup inspection' }); continue; }
+      blockers = cleanupBlockers(latestState, job, live, this.now(), idleGraceSeconds);
+      if (blockers.length) { report.blocked.push({ job: job.id, reason: blockers.join('; ') }); continue; }
+      try { changes = await this.workspaceStatus(job.cwd); }
+      catch { report.blocked.push({ job: job.id, reason: 'Git cleanliness could not be confirmed before close' }); continue; }
+      if (typeof changes !== 'string' || changes.length) { report.blocked.push({ job: job.id, reason: 'worktree changed during cleanup inspection' }); continue; }
+
+      const claim = id('close');
+      const archivedTranscript = { source: 'recent-unwrapped', lines: cleanupTranscriptLines, capturedAt: this.now(), bytes: transcriptBytes, text: transcript };
+      const claimed = await this.change(scope, current => {
+        const saved = current.jobs[job.id];
+        if (!saved || saved.cleanup || saved.revision !== job.revision || digest(saved.identity) !== digest(job.identity) || digest(saved.result) !== digest(job.result) || digest(saved.verification) !== digest(job.verification)) return false;
+        if (cleanupBlockers(current, saved, live, this.now(), idleGraceSeconds).length) return false;
+        saved.cleanup = { status: 'closing', claim, identityDigest: digest(saved.identity), transcript: archivedTranscript, claimedAt: this.now() };
+        return true;
+      });
+      if (!claimed) { report.blocked.push({ job: job.id, reason: 'job changed during cleanup claim' }); continue; }
+      try { live = await this.herdr.get(job.pane); }
+      catch {
+        await this.change(scope, current => {
+          const saved = current.jobs[job.id];
+          if (saved?.cleanup?.claim === claim) { saved.cleanup.status = 'aborted'; saved.cleanup.outcome = 'Native identity could not be rechecked before close; inspect the exact pane.'; }
+        });
+        report.blocked.push({ job: job.id, reason: 'native identity could not be rechecked before close' }); continue;
+      }
+      const finalActivityMatches = ['idle', 'done'].includes(live.agent_status)
+        && Number.isSafeInteger(job.verification.stateChangeSeq)
+        && live.state_change_seq === job.verification.stateChangeSeq
+        && sameForegroundProcess(job.identity, live);
+      if (!sameAgent(job.identity, live) || live.workspace_id !== job.workspace || live.pane_id !== job.pane || !finalActivityMatches) {
+        await this.change(scope, current => {
+          const saved = current.jobs[job.id];
+          if (saved?.cleanup?.claim === claim) { saved.cleanup.status = 'aborted'; saved.cleanup.outcome = 'Native identity or activity changed after cleanup claim; inspect the exact pane.'; }
+        });
+        report.blocked.push({ job: job.id, reason: 'native identity or activity changed after cleanup claim' }); continue;
+      }
+      try {
+        await this.herdr.close(job.pane);
+        await this.change(scope, current => {
+          const saved = current.jobs[job.id];
+          if (saved?.cleanup?.claim === claim) { saved.cleanup.status = 'closed'; saved.cleanup.closedAt = this.now(); }
+        });
+        report.closed.push(candidate);
+      } catch {
+        await this.change(scope, current => {
+          const saved = current.jobs[job.id];
+          if (saved?.cleanup?.claim === claim) { saved.cleanup.status = 'uncertain'; saved.cleanup.outcome = 'Native close response was not confirmed; inspect the exact pane before retrying.'; }
+        });
+        report.blocked.push({ job: job.id, reason: 'native close outcome is uncertain; inspect the exact pane before retrying' });
+      }
+    }
+    return report;
   }
   async tick({ scope }) {
     scope = this.scope(scope);
     let state = await this.state(scope);
-    if (state.goal && state.goal.status !== 'active') return { scope, quiet: state.goal.status };
+    if (state.goal?.status === 'paused') return { scope, quiet: 'paused', cleanup: await this.cleanup({ scope }, state) };
     const changes = [], sentJobs = new Set();
-    for (const message of Object.values(state.messages)) {
-      if (message.status !== 'pending' || sentJobs.has(message.job)) continue;
-      await this.deliver(scope, message.id); sentJobs.add(message.job);
+    if (!state.goal || state.goal.status === 'active') {
+      for (const message of Object.values(state.messages)) {
+        if (message.status !== 'pending' || sentJobs.has(message.job)) continue;
+        await this.deliver(scope, message.id); sentJobs.add(message.job);
+      }
     }
     state = await this.state(scope);
-    if (!state.goal) return { scope, deliveredJobs: [...sentJobs], quiet: 'No goal: messages drain, nudges disabled.' };
-    for (const job of Object.values(state.jobs)) {
-      if (!['ready', 'running'].includes(job.status) || !job.identity || sentJobs.has(job.id)) continue;
-      if (Object.values(state.messages).some(message => message.job === job.id && ['pending', 'sending', 'uncertain'].includes(message.status))) continue;
-      if (Object.values(state.approvals).some(request => request.job === job.id && ['pending', 'allow'].includes(request.status) && request.expiresAt > this.now())) continue;
-      let live;
-      try { live = await this.live(scope, job); } catch (error) { changes.push({ job: job.id, blocked: error.message }); continue; }
-      if (!sameAgent(job.identity, live)) { changes.push({ job: job.id, blocked: 'identity changed' }); continue; }
-      if (live.agent_status === 'working' || (job.lastSequence !== undefined && live.state_change_seq !== job.lastSequence)) {
-        await this.change(scope, latest => Object.assign(jobOf(latest, job.id), { lastActivity: this.now(), lastSequence: live.state_change_seq })); continue;
+    if (state.goal?.status === 'active') {
+      for (const job of Object.values(state.jobs)) {
+        if (!['ready', 'running'].includes(job.status) || !job.identity || sentJobs.has(job.id)) continue;
+        if (Object.values(state.messages).some(message => message.job === job.id && ['pending', 'sending', 'uncertain'].includes(message.status))) continue;
+        if (Object.values(state.approvals).some(request => request.job === job.id && ['pending', 'allow'].includes(request.status) && request.expiresAt > this.now())) continue;
+        let live;
+        try { live = await this.live(scope, job); } catch (error) { changes.push({ job: job.id, blocked: error.message }); continue; }
+        if (!sameAgent(job.identity, live)) { changes.push({ job: job.id, blocked: 'identity changed' }); continue; }
+        if (live.agent_status === 'working' || (job.lastSequence !== undefined && live.state_change_seq !== job.lastSequence)) {
+          await this.change(scope, latest => Object.assign(jobOf(latest, job.id), { lastActivity: this.now(), lastSequence: live.state_change_seq })); continue;
+        }
+        if (!['idle', 'done'].includes(live.agent_status) || this.now() - job.lastActivity < state.goal.intervalSeconds * 1000) continue;
+        const nudge = await this.change(scope, latest => {
+          const current = jobOf(latest, job.id);
+          if (latest.goal.status !== 'active' || !['ready', 'running'].includes(current.status) || current.revision !== job.revision || this.now() - current.lastActivity < latest.goal.intervalSeconds * 1000) return null;
+          if (current.nudges >= latest.goal.maxNudges) { current.status = 'stalled'; return null; }
+          current.nudges++; current.lastActivity = this.now();
+          const key = `${current.id}.nudge.${current.revision}.${current.nudges}`;
+          latest.messages[key] = { id: key, job: current.id, revision: current.revision, from: 'watchdog', text: 'No result was recorded. If work is complete, submit concrete evidence; otherwise continue your current user-directed task or report the blocker. Do not repeat an uncertain operation.', status: 'pending', createdAt: this.now() };
+          return key;
+        });
+        if (nudge) { await this.deliver(scope, nudge); changes.push({ job: job.id, nudge }); }
       }
-      if (!['idle', 'done'].includes(live.agent_status) || this.now() - job.lastActivity < state.goal.intervalSeconds * 1000) continue;
-      const nudge = await this.change(scope, latest => {
-        const current = jobOf(latest, job.id);
-        if (latest.goal.status !== 'active' || !['ready', 'running'].includes(current.status) || current.revision !== job.revision || this.now() - current.lastActivity < latest.goal.intervalSeconds * 1000) return null;
-        if (current.nudges >= latest.goal.maxNudges) { current.status = 'stalled'; return null; }
-        current.nudges++; current.lastActivity = this.now();
-        const key = `${current.id}.nudge.${current.revision}.${current.nudges}`;
-        latest.messages[key] = { id: key, job: current.id, revision: current.revision, from: 'watchdog', text: 'No result was recorded. If work is complete, submit concrete evidence; otherwise continue your current user-directed task or report the blocker. Do not repeat an uncertain operation.', status: 'pending', createdAt: this.now() };
-        return key;
-      });
-      if (nudge) { await this.deliver(scope, nudge); changes.push({ job: job.id, nudge }); }
     }
-    return { scope, changes };
+    const cleanup = await this.cleanup({ scope }, state);
+    if (state.goal?.status === 'complete') return { scope, quiet: 'complete', cleanup };
+    if (!state.goal) return { scope, deliveredJobs: [...sentJobs], quiet: 'No goal: messages drain, nudges disabled.', cleanup };
+    return { scope, changes, cleanup };
   }
   async chain({ scope, action, chain, stages }) {
     scope = this.scope(scope);
@@ -358,7 +473,9 @@ export class Baton {
     scope = this.scope(scope); text(reason, 'reason', 2000);
     if (this.worker && this.worker !== job) throw new Error('Cancel your own assigned job, or ask its controlling client.');
     return this.change(scope, state => {
-      const target = jobOf(state, job); if (target.status !== 'cancelled') target.revision++; target.status = 'cancelled'; target.cancelledAt = this.now(); target.cancelReason = reason;
+      const target = jobOf(state, job);
+      if (target.cleanup?.status === 'closing') throw new Error('Pane cleanup is in progress; inspect its recorded outcome before cancelling.');
+      if (target.status !== 'cancelled') target.revision++; target.status = 'cancelled'; target.cancelledAt = this.now(); target.cancelReason = reason;
       for (const message of Object.values(state.messages)) if (message.job === job && ['pending', 'sending', 'uncertain'].includes(message.status)) { message.previousStatus = message.status; message.status = 'cancelled'; }
       for (const approval of Object.values(state.approvals)) if (approval.job === job && ['pending', 'allow'].includes(approval.status)) approval.status = 'revoked';
       return { ...target, note: 'Orchestration cancelled. Native agent/pane/worktree remains untouched; inspect it before reusing resources.' };

@@ -39,6 +39,7 @@ export class Herdr {
       try {
         const data = await this.call(['pane', 'process-info', '--pane', atom(pane)]);
         const process = data.process_info ?? data;
+        agent.processInfo = process;
         const pids = process.foreground_processes?.map(entry => entry.pid).sort((a, b) => a - b);
         if (pids?.length && process.foreground_process_group_id) agent.processIdentity = { group: process.foreground_process_group_id, pids };
       } catch (error) { if (!agent.agent_session) throw error; }
@@ -47,6 +48,7 @@ export class Herdr {
   }
   read(pane, lines = 60) { return this.call(['agent', 'read', atom(pane), '--source', 'recent-unwrapped', '--lines', String(lines)], { text: true }); }
   wait(pane, timeout = 30000, signal) { return this.call(['agent', 'wait', atom(pane), '--timeout', String(timeout)], { timeout: timeout + 2000, signal }); }
+  close(pane) { return this.call(['pane', 'close', atom(pane)], { effect: true }); }
   async create(scope, job, environment) {
     if (job.branch) {
       const created = await this.call(['worktree', 'create', '--cwd', scope.cwd, '--branch', atom(job.branch), '--base', atom(job.base || 'HEAD'), '--label', job.id, '--no-focus'], { effect: true });
