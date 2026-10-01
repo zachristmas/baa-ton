@@ -1,36 +1,32 @@
-# Architecture
+# A thin execution path from dot to native HERDR
 
-## Purpose
+```mermaid
+flowchart LR
+  Dot[dot / voice coordinator] -->|host application handoff| Client[Local Codex executor]
+  Human[Human in any pane] --> Workers
+  Client --> Interface[12 MCP tools or CLI]
+  Interface --> State[One local JSON document per scope]
+  Interface --> Native[Sequenced native HERDR commands]
+  Native --> Workers[Profile-selected Codex / Claude / Pi / OpenCode]
+  Interface --> SSH[Existing SSH → same host-local runtime]
+  SSH --> Fleet[Authorized remote HERDR workspaces]
+  Workers --> Interface
+  Permission[Claude native PermissionRequest] --> Exact[Exact single-use decision]
+  Exact --> Interface
+```
 
-Baa-ton is the canonical, versioned source for local Herdr orchestration tooling. It separates workflow operations from event delivery while retaining their shared durable-manifest contract.
+The primary workflow is dot → local Codex executor → native HERDR and its authorized SSH fleet. The CLI/MCP execution layer and SSH routing are implemented here. The surrounding application's conversation/task handoff supplies the first arrow; there is no direct dot-to-local-MCP connector in this repository. Fast is an explicit supported profile choice, not a global model setting.
 
-## Components
+`src/herdr.mjs` has a fixed list of native operations using argv arrays and no shell. `profiles.mjs` maps explicit profiles to documented launch options. No adapter registry or runtime capability negotiation is added. Remote scopes use one native SSH invocation of this same host-local CLI, with explicit Node/runtime/config paths and immutable account/endpoint binding. The JSON tool payload stays on stdin; POSIX quoting and an encoded fixed PowerShell command cover the two supported host types. Native `--machine` remains available for diagnostics; dispatch uses the prepared host-local runtime.
 
-| Component | Repository source | Responsibility |
-| --- | --- | --- |
-| Workflow tools | `packages/herdr-tools/index.ts` | Plans and dispatches explicitly owned lanes, persists workflow manifests, mediates root-only approval, and observes lanes. |
-| MCP bridge | `packages/herdr-tools/mcp-server.mjs` | Exposes the workflow tools to any compatible local MCP client. |
-| Event controller | `packages/controller/controller.mjs` | Validates mapped status hooks, records durable event facts, and sends a non-waiting root notification. |
-| Plugin metadata | `packages/controller/herdr-plugin.toml` | Declares the supported agent-status hook and Herdr-owned startup supervisor. |
+`core.mjs` sequences those primitives and records six conceptual entities: scope goal, job, message, result/verification evidence, permission request, and chain. Five collections/fields plus binding/revision metadata live in one scope file; result/verification is embedded in its job. Native process status is queried, not mirrored into a second supervisor graph.
 
-## Runtime installation
+Short atomic JSON transactions use a per-scope directory lock. Native operations run outside that lock and use durable intent/claim records, task revisions and immutable native identity checks. Process identity is only a bridge until HERDR discovers the native session. A discovered session is pinned; changing it requires explicit reconnect. Native operations already in flight cannot be recalled atomically; late results are recorded without resurrecting cancelled or superseded work.
 
-The workflow tools run through the local MCP bridge. The controller installs with `herdr plugin link … --disabled`. Exact reviewed commands are in the root [README](../README.md). The checked-in source is canonical.
+A crashed lock is not reclaimed by a guessed timeout. Inspect its owner and remove only that abandoned lock after confirming the owner exited. Atomic rename prevents partial JSON; this is a local filesystem implementation, not a distributed database or a power-loss durability guarantee. Messages/history are retained for inspection; there is no automatic compactor or retention service.
 
-## Invariants
+`mcp.mjs` implements stdio JSON-RPC, tool schemas, initialization, bounded input and wait cancellation with Node built-ins. Pi registers the same tools through its public extension API. `host-policy.mjs` compiles an exact tool ask-list to Codex's native settings; it does not mint generic grants. Native approval records separately bind identity, revision, tool/input, digest and expiry.
 
-1. **Local and durable first.** Persist workflow/event state atomically before a notification or other effect.
-2. **Explicit ownership.** A workflow may operate only resources it created and recorded.
-3. **Root-only authority.** Child lanes report requests and evidence; they do not approve dispatch, resume, or close operations.
-4. **Event-driven control.** Treat lifecycle signals as observations. Never turn them into autonomous Git, PR, deployment, production, or external actions. The one exception is the acknowledged `integrate` grant: the spec loop's driver may create local `spec/<item>` worktrees from the target tip and (from its integration stage) make local commits and merges on its integration branch. Push, PR, deploy and production stay excluded.
-5. **Bounded reads and foreground tests.** No polling loops, detached jobs, or hidden background test workers.
-6. **Fail closed.** Reject malformed mappings, identity drift, ambiguous targets, and unsafe local file permissions before mutation.
-7. **Forward-compatible manifests.** Lanes dispatched before an upgrade keep running MCP bridges loaded from the older release, and they share the manifest with the upgraded root and controller. Two rules follow:
-   - **Strict objects:** never add a field inside an object an earlier release validates strictly. That includes parent goals and their `supervisor`, `lastDelivery`, `rootTurn` and `rootActivity`. The oldest supported release's validator is vendored in `packages/controller/test/fixtures/`, and `controller.test.mjs` plus the smoke check run manifests written by current code through it after every write. #28's `supervisor.intervalPolicy` broke `herdr_message`/`herdr_complete` for pre-upgrade lanes; the follow-up moved that marker to `rootSupervision` and strips the key from existing goals.
-   - **New top-level fields:** before #28, `loadManifest` kept only the top-level keys it knew. A pre-upgrade lane's `herdr_complete` therefore rewrites the manifest without `leases`, `directives` or `rootSupervision`. New state must tolerate that loss, live inside an object older writers already carry through unchanged, or live in its own file. The standing-policy acknowledgement is also written to `approval-policy-ack.json` beside the manifest for this reason.
+`install.mjs` owns seven project skill files per selected harness. `setup.mjs` supplies both the terminal wizard and agent JSON mode, validates before writing, and can install project-local connections. Managed files have ownership hashes and conflicts are reported before normal writes. A disk failure can interrupt a multi-file installation; the per-file ownership journal supports inspection/retry. No filesystem-wide transaction is claimed.
 
-## Validation
-
-Run `npm test` from the repository root. The workflow smoke check is deterministic and mocks Herdr CLI interactions; the controller test suite uses a temporary JSON-line socket. Neither test creates a live Herdr workspace, tab, pane, or agent.
-
-`npm test` runs through `packages/herdr-tools/test/support/run-hermetic.mjs`. It removes session variables (`CLAUDE_CODE_*`, `HERDR_*`, `PI_*`, `BAA_*`, `CODEX_*`, `OPENCODE_*`) and puts stub `herdr`, `claude`, `codex`, `opencode` and `pi` binaries first on `PATH`, so results are the same in a terminal, inside a Claude or Pi session in a Herdr pane, and in CI. Running `node --test` directly from an agent session inherits that session's identity and can take live-identity paths the fakes do not model.
+The OS user remains the trust boundary. A worker with arbitrary shell access could edit same-user files or invoke native HERDR directly. Scoped MCP tool restrictions, schema validation, worktrees and native permission settings are useful boundaries, but they are not a hostile multi-tenant sandbox. Work/personal account access must be scoped by the host environment and the user's actual authorization.

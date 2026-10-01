@@ -1,5 +1,0 @@
-{
-  // this is a real line comment
-  "$schema": "https://opencode.ai/config.json",
-  "model": "openai/gpt-5.6-luna"
-}

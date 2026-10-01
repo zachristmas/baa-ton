@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "projectRoot": "/absolute/path/to/project",
+  "harnesses": ["codex", "claude", "opencode", "pi"],
+  "connect": true,
+  "config": {
+    "version": 2,
+    "herdr": "herdr",
+    "maxActive": 4,
+    "scopes": {
+      "personal": { "cwd": "/absolute/path/to/project", "workspace": "INSPECTED_WORKSPACE_ID" }
+    },
+    "profiles": {
+      "fast": { "harness": "codex", "model": "YOUR_EXACT_MODEL_ID", "effort": "low", "auth": "existing" },
+      "review": { "harness": "claude", "model": "YOUR_EXACT_CLAUDE_ID", "effort": "high", "auth": "existing", "permissions": "broker" }
+    },
+    "approvals": { "ask": ["herdr_connect", "herdr_reconnect", "herdr_approve"] }
+  }
+}

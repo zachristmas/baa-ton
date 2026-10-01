@@ -1,8 +1,0 @@
-{
-  "recent": [
-    { "providerID": "opencode", "modelID": "x-preview-f-free" },
-    { "providerID": "openai", "modelID": "gpt-5.6-luna" }
-  ],
-  "favorite": [],
-  "variant": { "openai/gpt-5.6-luna": "medium" }
-}

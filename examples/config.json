@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "herdr": "herdr",
+  "stateDir": "/absolute/path/to/project/.baa-ton/state",
+  "maxActive": 4,
+  "scopes": {
+    "personal": { "cwd": "/absolute/path/to/project", "workspace": "INSPECTED_WORKSPACE_ID" }
+  },
+  "profiles": {
+    "fast": { "harness": "codex", "model": "YOUR_EXACT_MODEL_ID", "effort": "low", "auth": "existing" }
+  },
+  "approvals": { "ask": ["herdr_connect", "herdr_reconnect", "herdr_approve"] }
+}

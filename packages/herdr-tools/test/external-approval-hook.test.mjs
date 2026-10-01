@@ -53,15 +53,6 @@ async function dispatchToolCall(command, options = {}) {
   return { blocked: Boolean(result?.block), reason: result?.reason, ...state };
 }
 
-test("index.ts registers the same production approval registration seam used by the integration harness", async () => {
-  const source = await readFile(new URL("../index.ts", import.meta.url), "utf8");
-  assert.match(source, /registerExternalApprovalBeforeToolCall\(pi,/);
-  assert.match(source, /mode: \(ctx as ExtensionContext & \{ mode\?: string \}\)\.mode/);
-  assert.match(source, /baa-external-approval-diagnostic/);
-  assert.match(source, /externalApprovalChecked\.has\(event\)/);
-  assert.match(source, /externalApprovalGranted\.has\(event\)/);
-});
-
 test("registered tool_call pre-execution hook approves exact create/merge and executes fake Bash exactly once", async () => {
   for (const command of [commandCreate, commandMerge]) {
     const result = await dispatchToolCall(command);
@@ -96,7 +87,7 @@ test("direct simple push is natively approved once and unsafe push forms block",
   assert.equal(safe.blocked, false);
   assert.equal(safe.prompts, 1);
   assert.equal(safe.executions, 1);
-  for (const command of ["git push --force origin HEAD:refs/heads/topic", "git push origin HEAD:refs/heads/topic; echo x", "git push https://example.test/o/r HEAD:refs/heads/topic"]) {
+  for (const command of ["git push --force origin HEAD:refs/heads/topic", "git -C /tmp/repo push origin main", "git -c user.name=X push origin main", "git push origin HEAD:refs/heads/topic; echo x", "git push https://example.test/o/r HEAD:refs/heads/topic"]) {
     const result = await dispatchToolCall(command);
     assert.equal(result.blocked, true, command);
     assert.equal(result.executions, 0, command);
