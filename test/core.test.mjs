@@ -168,9 +168,9 @@ test('atomic scoped store preserves concurrent writers and refuses corrupt state
 
 test('native wrapper never invokes a shell and pins endpoint independently of caller environment', async () => {
   const calls = [];
-  const herdr = new Herdr({ herdr: '/verified/herdr', machine: 'personal', session: 'work' }, async (...args) => { calls.push(args); return { stdout: '{"result":{"type":"agent_prompted"}}' }; });
+  const herdr = new Herdr({ herdr: '/verified/herdr', machine: 'personal' }, async (...args) => { calls.push(args); return { stdout: '{"result":{"type":"agent_prompted"}}' }; });
   await herdr.prompt('w1:p1', 'literal $(touch nope); text');
-  assert.deepEqual(calls[0][1], ['--machine', 'personal', '--session', 'work', 'agent', 'prompt', 'w1:p1', 'literal $(touch nope); text']);
+  assert.deepEqual(calls[0][1], ['--machine', 'personal', 'agent', 'prompt', 'w1:p1', 'literal $(touch nope); text']);
   assert.equal(calls[0][2].shell, false);
   assert.ok(!Object.keys(calls[0][2].env).some(key => key.startsWith('HERDR_')));
   const native = { pane_id: 'w1:p1', terminal_id: 't1', workspace_id: 'w1', agent: 'codex', interactive_ready: true, processIdentity: { group: 1, pids: [5] } };
@@ -388,4 +388,12 @@ test('long durable IDs receive distinct native labels under32 characters and col
   const before = herdr.calls.filter(call => call[0] === 'create').length;
   await assert.rejects(dispatch('a', { requestId: 'collision' }), /label already exists/);
   assert.equal(herdr.calls.filter(call => call[0] === 'create').length, before);
+});
+
+test('native shell initialization busy rejection retries once; ambiguous start never retries', async t => {
+  const { baton, herdr, dispatch } = await fixture(t), start = herdr.start.bind(herdr); let attempts = 0;
+  herdr.start = async (...args) => { if (++attempts === 1) throw Object.assign(new Error('shell starting'), { nativeCode: 'agent_pane_busy', uncertain: false }); return start(...args); };
+  assert.equal((await dispatch()).status, 'running'); assert.equal(attempts, 2);
+  attempts = 0; herdr.start = async () => { attempts++; throw Object.assign(new Error('reply lost'), { uncertain: true }); };
+  await assert.rejects(dispatch('a', { requestId: 'uncertain-start' }), /reply lost/); assert.equal(attempts, 1);
 });

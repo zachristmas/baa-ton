@@ -13,6 +13,7 @@ export class Herdr {
   constructor(config, run = exec) { this.config = config; this.run = run; }
   async call(args, { timeout = 35000, text = false, signal, effect = false } = {}) {
     const prefix = [];
+    if (this.config.machine && this.config.session) throw new Error('Native HERDR forbids combining machine and session selectors.');
     if (this.config.machine) prefix.push('--machine', atom(this.config.machine));
     if (this.config.session) prefix.push('--session', atom(this.config.session));
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HERDR_')));
@@ -23,8 +24,9 @@ export class Herdr {
       if (result.error) throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
       return result.result ?? result;
     } catch (error) {
+      try { error.nativeCode = JSON.parse(error.stderr?.trim() || '{}').error?.code; } catch {}
       // CLI termination after submission cannot prove nondelivery. Never auto-retry.
-      error.uncertain = effect && !['ENOENT', 'EACCES'].includes(error.code);
+      error.uncertain = effect && error.nativeCode !== 'agent_pane_busy' && !['ENOENT', 'EACCES'].includes(error.code);
       throw error;
     }
   }

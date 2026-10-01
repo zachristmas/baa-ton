@@ -14,6 +14,7 @@ export async function loadConfig(path = process.env.BAA_CONFIG) {
 
 export function validateConfig(config) {
   if (config.version !== 2) throw new Error('Expected version: 2. Legacy configuration is never modified or auto-migrated.');
+  if (config.machine && config.session) throw new Error('Use machine or session, not both native selectors.');
   if (!isAbsolute(config.stateDir || '')) throw new Error('stateDir must be absolute.');
   if (!config.scopes || !config.profiles) throw new Error('Configure scopes and profiles. Empty profiles is valid for inspection.');
   askList(config);

@@ -3,6 +3,7 @@ import { Herdr, identity, sameAgent } from './herdr.mjs';
 import { profile as resolveProfile } from './config.mjs';
 import { launch } from './profiles.mjs';
 import { remoteCall } from './remote.mjs';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const finished = new Set(['reported', 'verified', 'cancelled']);
 const scopeBinding = (config, scope) => ({ machine: config.machine || 'local', session: config.session || 'default', ...config.scopes[scope], ...(config.scopes[scope].remote ? { endpoint: config.remotes[config.scopes[scope].remote] } : {}) });
@@ -141,7 +142,17 @@ export class Baton {
         current.status = 'starting'; return true;
       });
       if (!startClaim) return jobOf(await this.state(scope), key);
-      const started = await this.herdr.start({ ...job, pane }, selected, prepared.argv);
+      let started;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const current = await this.state(scope);
+        if (jobOf(current, key).status === 'cancelled' || (current.goal && current.goal.status !== 'active')) return this.change(scope, state => { const saved = jobOf(state, key); if (saved.status !== 'cancelled') saved.status = 'ready-to-start'; return saved; });
+        try { started = await this.herdr.start({ ...job, pane }, selected, prepared.argv); break; }
+        catch (error) {
+          // Only this native rejection guarantees no command was submitted.
+          if (error.nativeCode !== 'agent_pane_busy' || attempt === 19) throw error;
+          await sleep(250);
+        }
+      }
       if (started.agent?.pane_id !== pane || started.agent?.agent !== selected.harness) throw new Error('Native start did not return the expected pane and harness.');
       const proof = identity(await this.herdr.get(pane));
       if (proof.pane !== pane || proof.harness !== selected.harness) throw new Error('Native start returned a different agent identity.');
@@ -157,7 +168,7 @@ export class Baton {
       await this.message({ scope, job: key, text: brief, requestId: `assignment-${digest(key).slice(0, 32)}`, automatic: true, expectedRevision: job.revision });
       return jobOf(await this.state(scope), key);
     } catch (error) {
-      await this.change(scope, state => { const saved = jobOf(state, key); if (saved.status !== 'cancelled' && saved.revision === job.revision) saved.status = error.uncertain || ['creating', 'starting'].includes(saved.status) ? 'uncertain' : 'blocked'; saved.error = error.message; });
+      await this.change(scope, state => { const saved = jobOf(state, key); if (saved.status !== 'cancelled' && saved.revision === job.revision) saved.status = error.nativeCode === 'agent_pane_busy' ? 'ready-to-start' : error.uncertain || ['creating', 'starting'].includes(saved.status) ? 'uncertain' : 'blocked'; saved.error = error.message; });
       throw error;
     }
   }
