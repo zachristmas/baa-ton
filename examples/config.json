@@ -14,10 +14,46 @@
     }
   },
   "profiles": {
-    "fast": {
-      "harness": "codex",
-      "model": "YOUR_EXACT_MODEL_ID",
+    "planning": {
+      "harness": "claude",
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
+      "auth": "existing"
+    },
+    "quick": {
+      "harness": "claude",
+      "model": "claude-sonnet-5-5",
       "effort": "low",
+      "auth": "existing"
+    },
+    "balanced": {
+      "harness": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium",
+      "auth": "existing"
+    },
+    "implementation": {
+      "harness": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "high",
+      "auth": "existing"
+    },
+    "sustained": {
+      "harness": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium",
+      "auth": "existing"
+    },
+    "review": {
+      "harness": "claude",
+      "model": "claude-opus-5-5",
+      "effort": "medium",
+      "auth": "existing"
+    },
+    "deep-review": {
+      "harness": "claude",
+      "model": "claude-fable-5-1",
+      "effort": "xhigh",
       "auth": "existing"
     }
   },

@@ -76,6 +76,10 @@ test('real stdio MCP process serves tools and drives native argv through a fake 
   assert.equal(tools.result.tools.length, 12);
   const call = async (name, args) => mcp.request('tools/call', { name, arguments: args });
   const bad = await call('herdr_goal', { scope: 'a', action: 'delete' }); assert.equal(bad.result.isError, true);
+  const rawOverride = await call('herdr_dispatch', { scope: 'a', profile: 'fast', model: 'caller-model', effort: 'xhigh', task: 'Inspect only.', requestId: 'raw-override' });
+  assert.equal(rawOverride.result.isError, true); assert.match(rawOverride.result.content[0].text, /model is not supported/);
+  const unknownRole = await call('herdr_dispatch', { scope: 'a', profile: 'unconfigured-role', task: 'Inspect only.', requestId: 'unknown-role' });
+  assert.equal(unknownRole.result.isError, true); assert.match(unknownRole.result.content[0].text, /Unknown profile unconfigured-role/);
   const status = await call('herdr_status', {}); assert.equal(status.result.structuredContent.result.native.workspaces[0].workspace_id, 'wa');
   const created = await call('herdr_dispatch', { scope: 'a', profile: 'fast', task: 'Read this task only.', requestId: 'dispatch-one' });
   assert.ok(!created.result.isError, JSON.stringify(created));

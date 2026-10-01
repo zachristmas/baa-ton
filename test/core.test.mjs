@@ -73,6 +73,13 @@ test('multiple scopes: pause is local, direct user messages still work, resume k
   assert.equal((await baton.state('b')).goal.status, 'active');
 });
 
+test('chain rejects an unconfigured role before saving or starting a worker', async t => {
+  const { baton, herdr } = await fixture(t);
+  await assert.rejects(baton.chain({ scope: 'a', action: 'create', chain: 'unknown-role', stages: [{ profile: 'unconfigured-role', task: 'Review only.' }] }), /Unknown profile unconfigured-role/);
+  assert.equal((await baton.state('a')).chains['unknown-role'], undefined);
+  assert.equal(herdr.calls.length, 0);
+});
+
 test('concurrent identical dispatch creates and prompts only once; changed arguments refuse', async t => {
   const { baton, dispatch, herdr } = await fixture(t);
   await Promise.all([dispatch(), dispatch(), dispatch()]);
