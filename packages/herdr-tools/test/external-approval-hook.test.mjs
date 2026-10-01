@@ -128,7 +128,7 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
   const dir = await mkdtemp(join(tmpdir(), "external-approval-"));
   const session = join(dir, "session");
   await writeFile(session, "session");
-  const state = { pushUrl: "git@github.com:owner/repo.git", branch: "topic", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN" };
+  const state = { pushUrl: "git@github.com:owner/repo.git", branch: "topic", destination: "b".repeat(40), head: "a".repeat(40), base: "c".repeat(40), prState: "OPEN", mergeStateStatus: "CLEAN" };
   const calls = [];
   const fakeExec = async (program, args) => {
     calls.push([program, ...args]);
@@ -141,7 +141,7 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     else if (program === "git" && args[0] === "config" && args[1] === "--get" && args[2].startsWith("branch.")) stdout = "origin";
     else if (program === "git" && args[0] === "config") throw new Error("not configured");
     else if (program === "git" && args[0] === "ls-remote") stdout = args.at(-1) === state.missingRef ? "" : `${args.at(-1) === `refs/heads/${state.branch}` ? state.head : state.destination}\t${args.at(-1)}`;
-    else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
+    else if (program === "gh" && args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ number: 123, state: state.prState, mergeStateStatus: state.mergeStateStatus, headRefName: "topic", headRefOid: state.head, headRepositoryOwner: { login: "owner" }, headRepository: { name: "repo" }, baseRefName: "main", baseRefOid: state.base, baseRepositoryOwner: { login: "owner" }, baseRepository: { name: "repo" } });
     else throw new Error(`unexpected fake command ${program} ${args.join(" ")}`);
     return { stdout };
   };
@@ -165,11 +165,23 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     assert.equal(exactCreate.headRef, "feat/reset-yolo-policy");
     state.pushUrl = "git@github.com:owner/repo.git";
     state.branch = "topic";
-    const prOperation = { operation: "merge", argv: ["gh", "pr", "merge", "123", "--repo", "owner/repo", "--match-head-commit", state.head, "--merge"], repo: "owner/repo" };
+    const prOperation = { operation: "merge", argv: ["gh", "pr", "merge", "123", "--repo", "owner/repo", "--squash", "--match-head-commit", state.head], repo: "owner/repo" };
     const pr = await resolver(prOperation);
     assert.equal(pr.pr.headOid, state.head);
     assert.equal(pr.pr.baseOid, state.base);
-    assert.ok(calls.some((call) => call[0] === "gh" && call.includes("view")));
+    assert.equal(pr.pr.state, "OPEN");
+    assert.equal(pr.pr.mergeStateStatus, "CLEAN");
+    const viewCall = calls.find((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "view");
+    assert.deepEqual(viewCall.slice(1), ["pr", "view", "123", "--repo", "owner/repo", "--json", "number,state,mergeStateStatus,headRefName,headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,baseRepositoryOwner,baseRepository"]);
+    state.head = "d".repeat(40);
+    await assert.rejects(resolver(prOperation), (error) => error.resolverPhase === "pr_metadata");
+    state.head = "a".repeat(40);
+    state.prState = "CLOSED";
+    await assert.rejects(resolver(prOperation), (error) => error.resolverPhase === "pr_metadata");
+    state.prState = "OPEN";
+    state.mergeStateStatus = "DIRTY";
+    await assert.rejects(resolver(prOperation), (error) => error.resolverPhase === "pr_metadata");
+    state.mergeStateStatus = "CLEAN";
     state.missingRef = "refs/heads/main";
     await assert.rejects(resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" }), (error) => error.message === "External approval resolver failed." && error.resolverPhase === "base_oid");
     state.missingRef = "";
