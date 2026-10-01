@@ -3,6 +3,10 @@
   "herdr": "herdr",
   "stateDir": "/absolute/path/to/project/.baa-ton/state",
   "maxActive": 4,
+  "cleanup": {
+    "mode": "preview",
+    "idleGraceSeconds": 86400
+  },
   "scopes": {
     "personal": { "cwd": "/absolute/path/to/project", "workspace": "INSPECTED_WORKSPACE_ID" }
   },

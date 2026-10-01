@@ -28,13 +28,17 @@ node src/install.mjs --project-root /path/to/project --harnesses codex,claude,op
 node src/install.mjs --project-root /path/to/project --harnesses codex,claude,opencode,pi --apply
 ```
 
-The seven familiar skills remain: `baa-ton-start`, `configure`, `update`, `end`, `uninstall`, `reset`, and `sweep`. Their instructions reflect the smaller runtime. They never imply permission to kill agents, delete worktrees, push, merge, or change accounts. Skills are installed under `.agents/skills`, `.claude/skills`, `.opencode/skills`, and `.pi/skills` respectively.
+The seven familiar skills remain: `baa-ton-start`, `configure`, `update`, `end`, `uninstall`, `reset`, and `sweep`. Their instructions reflect the smaller runtime. They do not grant general permission to stop agents, remove worktrees, push, merge, or change accounts. Exact-pane cleanup is available only when enabled in the selected scope's config. Skills are installed under `.agents/skills`, `.claude/skills`, `.opencode/skills`, and `.pi/skills` respectively.
 
 The installer preserves unrelated configuration and refuses modified/unowned Baa-ton files or symlinked target paths. It does not clone/update Git, alter global model/authentication settings, restart HERDR, migrate legacy state, or enable a daemon. Legacy v1 configuration and OpenCode JSONC require explicit reconciliation. The old remote `curl | bash` bootstrap is retired; run the installer from the reviewed checkout. Both Windows wrappers have passed native preview checks; the shared agent installer has applied the isolated Windows scratch configuration.
 
 ## Configuration and approval choices
 
 See [examples/config.json](examples/config.json). Scopes name an explicit workspace and cwd; they are not inferred from the focused pane. Multiple scopes are independent, including their pause state. A scope's endpoint/workspace/cwd binding is immutable once used; use a new name when changing it.
+
+Optional `cleanup` uses the existing one-shot `tick`, without adding a service. Omit it or set `mode: "disabled"` to turn cleanup off. `mode: "preview"` lists candidates; `mode: "close"` applies exact-pane closure after the configured `idleGraceSeconds` (default 24 hours; allowed range 1 minute to 7 days). The apply gate requires a Baa-ton-created pane, a saved verified result, no pending messages or approvals, no active review/chain descendants, native `idle`/`done`, unchanged terminal/session/foreground-process identity and state sequence, and clean `git status`. Adopted or reconnected panes, blocked/user-attention states, stale IDs, uncertain prior closes, unreadable transcripts, and dirty or unverifiable worktrees are skipped. Before close, Baa-ton saves up to 2,000 recent unwrapped terminal lines (512 KiB maximum) beside the unchanged result/verification record. Workspaces and worktrees are never removed. A close whose response is lost is recorded as uncertain and is never retried automatically; inspect the exact pane first.
+
+HERDR 0.9.1 exposes `pane close` by pane ID only; it has no atomic compare-and-close argument. Baa-ton rechecks the recorded identity, idle state, verified state sequence, and foreground process immediately before the exact-pane call. HERDR documents pane IDs as stable and non-reused after closure, but there remains a narrow race if a human replaces the pane's agent between that final check and the close request.
 
 Profiles select an exact harness/model/effort (and optional Codex `serviceTier: "priority"` when Fast is supported), retain existing authentication, and never change global defaults. Distinct new assignments get fresh jobs and panes; reuse a request ID only to retry the same assignment. The requesting user's preferred fast model can be configured as a profile without becoming another user's default.
 
@@ -81,9 +85,9 @@ Use `node src/cli.mjs tools` for schemas. Complex inputs use `node src/cli.mjs c
 
 The human can intervene directly in any pane. A worker records its new instruction with `herdr_message redirect=true`; this advances the task revision without replaying the human's message to itself. Cross-session messages wait while an agent works. Lost replies become `uncertain` and block automatic replay until inspected and explicitly redirected/reconnected.
 
-Pause stops new dispatch and automatic delivery in one scope. It does not interrupt an already executing native operation or pause any other scope. Direct explicit messages remain available. Cancel stops orchestration for a job but leaves its agent, pane and worktree intact.
+Pause stops new dispatch and automatic delivery in one scope. It does not interrupt an already executing native operation or pause any other scope. Direct explicit messages remain available. Cancel stops orchestration for a job but leaves its agent, pane and worktree intact. If cleanup has recorded a close claim, cancellation waits for its recorded outcome. When cleanup is explicitly configured, a tick may close only eligible Baa-ton-created panes; it keeps each worktree and its recorded result.
 
-Native `idle`/`done` means attention state, not success. Workers submit concrete evidence with the current revision; independent reviewers or the human verify it separately. Chains advance explicitly after their evidence gate. A watchdog `tick` is a single bounded pass: no hidden daemon, no automatic chain progression. Schedule ticks only when the user wants ongoing delivery/nudges.
+Native `idle`/`done` means attention state, not success. Workers submit concrete evidence with the current revision; independent reviewers or the human verify it separately. Chains advance explicitly after their evidence gate. A watchdog `tick` is a single bounded pass: no hidden daemon, no automatic chain progression. Schedule ticks only when the user wants ongoing delivery, nudges, or configured cleanup.
 
 ## Verification
 

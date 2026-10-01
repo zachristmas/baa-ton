@@ -8,12 +8,13 @@ export async function requestApproval(baton, { scope, job, session, tool, input 
   if (!session || !tool || !input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Incomplete native permission request.');
   if (JSON.stringify(input).length > 64000) throw new Error('Permission input exceeds 64 KiB. Use the native prompt.');
   const state = await baton.state(scope), target = state.jobs[job];
-  if (!target || target.status === 'cancelled' || target.profile.harness !== 'claude' || target.profile.permissions !== 'broker') throw new Error('Job has no active native Claude approval broker.');
+  if (!target || target.status === 'cancelled' || target.cleanup?.status || target.profile.harness !== 'claude' || target.profile.permissions !== 'broker') throw new Error('Job has no active native Claude approval broker.');
   const live = await baton.live(scope, target);
   if (!sameAgent(target.identity, live)) throw new Error('Permission request agent identity changed.');
   if (live.agent_session?.kind !== 'id' || live.agent_session.value !== session) throw new Error('A verified native session ID matching the hook session is required; use the native prompt until it is available.');
   return baton.change(scope, latest => {
     const current = latest.jobs[job];
+    if (current.cleanup?.status) throw new Error('Pane cleanup is in progress or needs inspection; approval cannot be added.');
     if (current.revision !== target.revision || !sameAgent(current.identity, live)) throw new Error('Task changed during permission request.');
     const request = { id: id('approval'), job, session, tool, input, identity: current.identity, revision: current.revision, createdAt: baton.now(), expiresAt: baton.now() + 300000, status: 'pending' };
     request.digest = digest({ id: request.id, job, session, tool, input, identity: request.identity, revision: request.revision, expiresAt: request.expiresAt });
