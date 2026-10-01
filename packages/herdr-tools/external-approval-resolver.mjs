@@ -79,6 +79,8 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     return matches[0];
   };
   return async (operation) => {
+    let failurePhase = "local_identity";
+    try {
     const local = await localIdentity();
     if (!SAFE_OID.test(local.head) || !SAFE_BRANCH.test(local.branch)) throw new Error("Local HEAD binding is unsupported.");
     const pane = paneId ?? "";
@@ -86,7 +88,9 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
       const remote = await remoteBinding(operation);
       return { ...local, target: operation.branch, baseRef: operation.branch, headRef: operation.branch, headRefOid: operation.sourceRef, baseRefOid: remote.destinationOid, targetRepo: remote.remoteRepo, repo: local.repo, remoteName: operation.remoteName, host: remote.host, remoteRepo: remote.remoteRepo, remoteUrl: remote.remoteUrl, destinationRef: operation.destinationRef, destinationOid: remote.destinationOid, paneId: pane, caller: "root" };
     }
+    failurePhase = "repo_remote";
     const remote = await remoteForRepo(operation.repo);
+    failurePhase = "pr_arguments";
     const base = argValue(operation.argv, "--base");
     const prSelector = operation.operation === "merge" ? operation.argv[3] : "";
     if (operation.operation === "create" && (!base || !SAFE_BRANCH.test(base) || operation.argv.some((arg) => arg === "--head" || arg.startsWith("--head=")))) throw new Error("PR create requires an explicit supported --base and implicit bound head branch.");
@@ -94,6 +98,7 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     let target = base;
     let pr;
     if (operation.operation === "merge") {
+      failurePhase = "pr_metadata";
       const view = await gh(["pr", "view", prSelector, "--repo", operation.repo, "--json", "number,state,headRefName,headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,baseRepositoryOwner,baseRepository"]);
       pr = parseGhView(view);
       if (pr.state !== "OPEN" || String(pr.number) !== prSelector || pr.baseRepo !== operation.repo.toLowerCase()) throw new Error("PR is stale, closed, merged, or targets another repository.");
@@ -105,6 +110,7 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
     const headRef = operation.operation === "merge" ? pr.headBranch : local.branch;
     let sourceRemote = remote;
     if (operation.operation === "create") {
+      failurePhase = "head_remote";
       const upstreamName = await git(["config", "--get", `branch.${local.branch}.remote`]).catch(() => "");
       if (!upstreamName || upstreamName === ".") throw new Error("PR create requires a configured remote for the current head branch.");
       const urls = (await git(["remote", "get-url", "--push", "--all", upstreamName])).split(/\r?\n/).filter(Boolean);
@@ -118,8 +124,15 @@ export function createExternalApprovalResolver({ cwd, execFile, sessionFile, pan
       if (found.length !== 1 || !SAFE_OID.test(found[0][1])) throw new Error("Could not resolve one live branch OID.");
       return found[0][1].toLowerCase();
     };
-    const [headRefOid, baseRefOid] = operation.operation === "merge" ? [pr.headOid, pr.baseOid] : await Promise.all([queryOid(sourceRemote, headRef), queryOid(remote, target)]);
+    failurePhase = "head_oid";
+    const headRefOid = operation.operation === "merge" ? pr.headOid : await queryOid(sourceRemote, headRef);
+    failurePhase = "base_oid";
+    const baseRefOid = operation.operation === "merge" ? pr.baseOid : await queryOid(remote, target);
     return { ...local, target, baseRef: target, headRef, headRefOid, baseRefOid, targetRepo: remote.repo, remoteName: operation.operation === "merge" ? remote.name : sourceRemote.name, host: operation.operation === "merge" ? remote.host : sourceRemote.host, remoteRepo: operation.operation === "merge" ? remote.repo : sourceRemote.repo, remoteUrl: operation.operation === "merge" ? remote.url : sourceRemote.url, pr, paneId: pane, caller: "root" };
+    } catch (error) {
+      const safePhase = ["local_identity", "repo_remote", "pr_arguments", "pr_metadata", "head_remote", "head_oid", "base_oid"].includes(failurePhase) ? failurePhase : "resolver";
+      throw Object.assign(new Error("External approval resolver failed."), { resolverPhase: safePhase });
+    }
   };
 }
 

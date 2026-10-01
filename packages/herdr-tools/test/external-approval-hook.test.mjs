@@ -162,7 +162,7 @@ test("resolver binds effective push URL/live OID and authoritative PR metadata f
     assert.equal(pr.pr.baseOid, state.base);
     assert.ok(calls.some((call) => call[0] === "gh" && call.includes("view")));
     state.missingRef = "refs/heads/main";
-    await assert.rejects(resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" }), { message: "Could not resolve one live branch OID." });
+    await assert.rejects(resolver({ operation: "create", argv: ["gh", "pr", "create", "--repo", "owner/repo", "--base", "main"], repo: "owner/repo" }), (error) => error.message === "External approval resolver failed." && error.resolverPhase === "base_oid");
     state.missingRef = "";
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -183,13 +183,14 @@ test("fail-closed tool results expose only the final enum diagnostics and never 
     [commandCreate, { mismatch: true }, "deny", "binding_mismatch"],
     [commandCreate, { confirm: false }, "deny", "declined"],
     [commandCreate, { changeDuringConfirm: { head: "b".repeat(40) } }, "deny", "binding_changed"],
-    [commandCreate, { resolveBinding: async () => { throw new Error("token-abc /private/path"); } }, "deny", "resolver_error"],
+    [commandCreate, { resolveBinding: async () => { throw Object.assign(new Error("token-abc /private/path"), { resolverPhase: "base_oid" }); } }, "deny", "resolver_error"],
   ];
   for (const [command, options, stage, denial] of cases) {
     const result = await dispatchToolCall(command, options);
     assert.equal(result.blocked, true, denial);
     assert.equal(result.executions, 0, denial);
     assert.match(result.reason, new RegExp(`stage=${stage}, denial=${denial}`));
+    if (options.resolveBinding) assert.match(result.reason, /resolverPhase=base_oid/);
     assert.match(result.reason, /mode=(?:tui|headless|unknown), hasUI=(?:true|false), confirmAvailable=(?:true|false)/);
     for (const secret of [command, "secret-owner", "private-repo", "token-abc", "/private/path", "/repo"]) assert.equal(result.reason.includes(secret), false);
   }

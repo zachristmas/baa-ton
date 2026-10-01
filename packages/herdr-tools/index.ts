@@ -11860,7 +11860,7 @@ export default function herdrOrchestrator(pi: ExtensionAPI) {
     mode: (ctx as ExtensionContext & { mode?: string }).mode ?? "unknown",
     confirmAvailable: Boolean(ctx.ui?.confirm),
     sessionFile,
-    diagnostic: (record: { mode: string; hasUI: boolean; confirmAvailable: boolean; stage: string; denial: string }) => console.info("[baa-external-approval-diagnostic]", JSON.stringify(record)),
+    diagnostic: (record: { mode: string; hasUI: boolean; confirmAvailable: boolean; stage: string; denial: string; failurePhase?: string }) => console.info("[baa-external-approval-diagnostic]", JSON.stringify(record)),
     resolveBinding: createExternalApprovalResolver({ cwd: ctx.cwd, execFile, sessionFile, paneId: process.env[HERDR_PANE_ID_ENV] }),
     confirm: async (operation: { operation: string; argv: string[]; repo?: string; sourceRef?: string; destinationRef?: string }, binding: { repo: string; head: string; branch: string; target: string; remoteName: string; host: string; targetRepo?: string; remoteRepo?: string; headRef?: string; headRefOid?: string; destinationOid?: string; baseRefOid?: string; pr?: unknown; paneId: string; sessionId: string }) => ctx.ui!.confirm(
       `Approve exact external ${operation.operation}?`,

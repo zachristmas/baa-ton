@@ -3,17 +3,19 @@ import { containsGhPrMutation, containsGitPush, containsUnsafeShellExecution, co
 /** The Pi tool_call pre-execution approval path. Dependencies keep UI, Git and execution out of this module. */
 const stages = new Set(["parse", "resolve-before", "confirm", "resolve-after", "allow", "deny"]);
 const denials = new Set(["none", "disabled", "non_root", "no_ui", "no_session", "no_confirm", "unsafe_command", "unsupported_command", "binding_mismatch", "declined", "binding_changed", "token_rejected", "resolver_error"]);
+const resolverPhases = new Set(["local_identity", "repo_remote", "pr_arguments", "pr_metadata", "head_remote", "head_oid", "base_oid", "resolver"]);
 
 export async function approveExternalGhCommand({ command, enabled, caller, mode = "unknown", hasUI, confirmAvailable = false, sessionFile, resolveBinding, confirm, now, diagnostic }) {
-  const snapshot = (stage, denial = "none") => ({
+  const snapshot = (stage, denial = "none", failurePhase) => ({
     mode: typeof mode === "string" ? mode : "unknown",
     hasUI: Boolean(hasUI),
     confirmAvailable: Boolean(confirmAvailable),
     stage: stages.has(stage) ? stage : "deny",
     denial: denials.has(denial) ? denial : "resolver_error",
+    ...(failurePhase ? { failurePhase: resolverPhases.has(failurePhase) ? failurePhase : "resolver" } : {}),
   });
-  const record = (stage, denial = "none") => {
-    const value = snapshot(stage, denial);
+  const record = (stage, denial = "none", failurePhase) => {
+    const value = snapshot(stage, denial, failurePhase);
     try { diagnostic?.(value); } catch { /* diagnostics never affect authorization */ }
     return value;
   };
@@ -41,8 +43,9 @@ export async function approveExternalGhCommand({ command, enabled, caller, mode 
     if (!token || !consumeExternalApproval(token, command, current, now === undefined ? undefined : { now })) return deny("token_rejected");
     record("allow");
     return true;
-  } catch {
-    return deny("resolver_error");
+  } catch (error) {
+    record("deny", "resolver_error", error?.resolverPhase);
+    return false;
   }
 }
 
@@ -60,7 +63,7 @@ export function registerExternalApprovalBeforeToolCall(pi, dependencies) {
     const approved = await approveExternalGhCommand({ ...resolved, mode: ctx?.mode ?? resolved?.mode, hasUI: ctx?.hasUI ?? resolved?.hasUI, confirmAvailable: resolved?.confirmAvailable ?? typeof resolved?.confirm === "function", command: event.input.command, diagnostic: (value) => { finalSnapshot = value; resolved?.diagnostic?.(value); } });
     if (!approved) {
       const state = finalSnapshot;
-      return { block: true, reason: `External command was not explicitly approved (mode=${state.mode}, hasUI=${state.hasUI}, confirmAvailable=${state.confirmAvailable}, stage=${state.stage}, denial=${state.denial}).` };
+      return { block: true, reason: `External command was not explicitly approved (mode=${state.mode}, hasUI=${state.hasUI}, confirmAvailable=${state.confirmAvailable}, stage=${state.stage}, denial=${state.denial}${state.failurePhase ? `, resolverPhase=${state.failurePhase}` : ""}).` };
     }
     externalApprovalGranted.add(event);
   });
