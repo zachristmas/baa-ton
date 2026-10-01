@@ -12,16 +12,9 @@
   <img src="https://img.shields.io/badge/HERDR-CLI%200.9.1-6554c0?style=flat" alt="Live-qualified with the HERDR CLI 0.9.1" />
 </p>
 
-```mermaid
-flowchart TB
-  Dot[dot] -->|host app handoff| Codex[Local Codex executor]
-  Codex --> BT[Baa-ton CLI / stdio MCP]
-  BT --> HERDR[Native HERDR]
-  HERDR --> Local[Authorized local workspaces]
-  BT -->|native SSH to prepared host| RemoteCLI[Remote Baa-ton CLI]
-  RemoteCLI --> RemoteHERDR[Native HERDR]
-  RemoteHERDR --> Remote[Authorized remote workspaces]
-```
+<p align="center">
+  <img src="assets/workflow.svg" width="760" alt="dot is handed off by the host app to a local Codex executor, which calls the Baa-ton CLI or stdio MCP. Baa-ton reaches native HERDR locally or uses SSH to a prepared host-local Baa-ton CLI and HERDR runtime." />
+</p>
 
 The host app hands a request from **dot** to a **local Codex executor**. Baa-ton gives that executor a compact **CLI/MCP** for scoped goals, workers, messages, and evidence. **HERDR owns the panes, worktrees, and agents**. For remote scopes, Baa-ton uses native SSH to reach a prepared host-local Baa-ton CLI and HERDR runtime. Dot does not connect directly to a local MCP server.
 
