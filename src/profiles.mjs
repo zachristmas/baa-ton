@@ -15,7 +15,8 @@ export async function launch(config, scope, job, profile) {
   if (profile.harness === 'codex') {
     const loader = join(dir, 'mcp.mjs');
     await writeFile(loader, `import { run } from ${JSON.stringify(pathToFileURL(server).href)};\nawait run(${JSON.stringify({ config: config.file, scope, worker: job.id, policy: policyDigest(config) })});\n`, { mode: 0o600 });
-    return { env, argv: ['--model', profile.model, '--sandbox', job.access === 'read' ? 'read-only' : 'workspace-write', '-c', `model_reasoning_effort=${JSON.stringify(profile.effort)}`, ...(profile.serviceTier ? ['-c', `service_tier=${JSON.stringify(profile.serviceTier)}`] : []), '-c', `mcp_servers.baa-ton=${codexWorkerTable(config, command, loader, job.id)}`, '-c', 'mcp_servers.baa-ton-native.enabled=false'] };
+    // A disabled entry still needs a valid transport when absent from user config.
+    return { env, argv: ['--model', profile.model, '--sandbox', job.access === 'read' ? 'read-only' : 'workspace-write', '-c', `model_reasoning_effort=${JSON.stringify(profile.effort)}`, ...(profile.serviceTier ? ['-c', `service_tier=${JSON.stringify(profile.serviceTier)}`] : []), '-c', `mcp_servers.baa-ton=${codexWorkerTable(config, command, loader, job.id)}`, '-c', 'mcp_servers.baa-ton-native={command="node",args=[],enabled=false}'] };
   }
   if (profile.harness === 'claude') {
     const mcp = await write('mcp.json', { mcpServers: { 'baa-ton': { command, args, env } } });

@@ -371,7 +371,7 @@ test('all worker launch adapters exclude the canonical controlling connection', 
   const { config } = await fixture(t);
   for (const harness of ['codex', 'claude', 'pi', 'opencode']) {
     const result = await launch(config, 'a', { id: 'worker-' + harness, access: 'read' }, { harness, model: 'exact', effort: 'low', provider: 'openai' });
-    if (harness === 'codex') assert.ok(result.argv.includes('mcp_servers.baa-ton-native.enabled=false'));
+    if (harness === 'codex') assert.ok(result.argv.includes('mcp_servers.baa-ton-native={command="node",args=[],enabled=false}'));
     if (harness === 'claude') assert.ok(result.argv.includes('--strict-mcp-config'));
     if (harness === 'pi') { assert.ok(result.argv.includes('--no-extensions')); assert.ok(result.argv.includes('--extension')); }
     if (harness === 'opencode') assert.equal(JSON.parse(result.env.OPENCODE_CONFIG_CONTENT).mcp['baa-ton-native'].enabled, false);
